@@ -1,0 +1,969 @@
+//! Lazy JSON structure for the path bar and the structure panel. `children` lists the direct children of one
+//! container by scanning only that container's bytes; `path_at` finds the path to an offset (`data › [1203] ›
+//! name`) from such lists. Nothing is parsed up front, so it works on huge files: the top level of an 800 MB
+//! document is one background scan, and deeper levels are small. The scan is forgiving: broken JSON just ends the
+//! list early.
+
+use std::sync::Arc;
+
+use super::buffer::Snapshot;
+use super::document::Document;
+use super::job::Ctx;
+
+/// Anything that can hand out its bytes in order.
+pub trait Chunked {
+    fn total(&self) -> u64;
+    fn chunked(&self, a: u64, b: u64, f: &mut dyn FnMut(&[u8]) -> bool) -> bool;
+    fn bytes(&self, a: u64, b: u64) -> Vec<u8> {
+        let mut v = Vec::new();
+        self.chunked(a, b, &mut |c| {
+            v.extend_from_slice(c);
+            true
+        });
+        v
+    }
+}
+
+impl Chunked for Snapshot {
+    fn total(&self) -> u64 {
+        self.len()
+    }
+    fn chunked(&self, a: u64, b: u64, f: &mut dyn FnMut(&[u8]) -> bool) -> bool {
+        self.chunks(a, b, f)
+    }
+}
+
+impl Chunked for Document {
+    fn total(&self) -> u64 {
+        self.len()
+    }
+    fn chunked(&self, a: u64, b: u64, f: &mut dyn FnMut(&[u8]) -> bool) -> bool {
+        self.chunks(a, b, f)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    Object,
+    Array,
+    String,
+    Number,
+    Bool,
+    Null,
+    Other,
+}
+
+impl Kind {
+    pub fn of(first: u8) -> Kind {
+        match first {
+            b'{' => Kind::Object,
+            b'[' => Kind::Array,
+            b'"' => Kind::String,
+            b'-' | b'0'..=b'9' => Kind::Number,
+            b't' | b'f' => Kind::Bool,
+            b'n' => Kind::Null,
+            _ => Kind::Other,
+        }
+    }
+    pub fn is_container(self) -> bool {
+        matches!(self, Kind::Object | Kind::Array)
+    }
+}
+
+/// One child of a container: its value's byte range, and where its key is (objects only).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Child {
+    pub start: u64,
+    pub end: u64,
+    /// Distance from the key's opening quote back from `start` (0 = no key).
+    pub key_back: u32,
+    /// Length of the key including its quotes.
+    pub key_len: u32,
+}
+
+impl Child {
+    pub fn key_range(&self) -> Option<(u64, u64)> {
+        if self.key_len == 0 {
+            None
+        } else {
+            let a = self.start - self.key_back as u64;
+            Some((a, a + self.key_len as u64))
+        }
+    }
+    /// Where this child begins (its key, if it has one).
+    pub fn first(&self) -> u64 {
+        self.start - self.key_back as u64
+    }
+}
+
+/// Lists with more children than this keep only every `STRIDE`-th one (a checkpoint); the others are found by
+/// rescanning at most `STRIDE` children. So a flat array of 25 million numbers costs about 10 MB, not 600 MB.
+pub const DENSE_MAX: u64 = 100_000;
+pub const STRIDE: u64 = 64;
+
+#[derive(Clone, Debug, Default)]
+pub struct Children {
+    /// All children, or when `stride > 1` only children 0, stride, 2·stride…
+    pub items: Vec<Child>,
+    /// How many children there are.
+    pub count: u64,
+    pub stride: u64,
+    pub is_object: bool,
+    /// Where the container ends (after its closing bracket), or the document end for the top level.
+    pub end: u64,
+    /// The scan stopped early (cancelled, or the JSON is broken).
+    pub partial: bool,
+}
+
+impl Children {
+    pub fn len(&self) -> u64 {
+        self.count
+    }
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    /// Children `a..b`.
+    pub fn range(&self, src: &dyn Chunked, a: u64, b: u64) -> Vec<Child> {
+        let b = b.min(self.count);
+        if a >= b {
+            return Vec::new();
+        }
+        if self.stride <= 1 {
+            return self.items[a as usize..(b as usize).min(self.items.len())].to_vec();
+        }
+        let k = a / self.stride;
+        let Some(cp) = self.items.get(k as usize) else { return Vec::new() };
+        let base = k * self.stride;
+        rescan(src, cp.first(), self.is_object, b - base).into_iter().skip((a - base) as usize).collect()
+    }
+
+    pub fn get(&self, src: &dyn Chunked, i: u64) -> Option<Child> {
+        self.range(src, i, i + 1).pop()
+    }
+
+    /// The child that `offset` is in (its key or its value), with its index.
+    pub fn find(&self, src: &dyn Chunked, offset: u64) -> Option<(u64, Child)> {
+        let k = self.items.partition_point(|c| c.first() <= offset).checked_sub(1)?;
+        if self.stride <= 1 {
+            let c = self.items[k];
+            return (offset <= c.end).then_some((k as u64, c));
+        }
+        let base = k as u64 * self.stride;
+        let n = self.stride.min(self.count - base);
+        let block = rescan(src, self.items[k].first(), self.is_object, n);
+        let j = block.partition_point(|c| c.first() <= offset).checked_sub(1)?;
+        let c = block[j];
+        (offset <= c.end).then_some((base + j as u64, c))
+    }
+
+    /// The child whose value starts at `start`.
+    pub fn find_start(&self, src: &dyn Chunked, start: u64) -> Option<Child> {
+        self.find(src, start).map(|(_, c)| c).filter(|c| c.start == start)
+    }
+}
+
+/// Up to `count` children of a container, starting at `from` (where a child begins).
+fn rescan(src: &dyn Chunked, from: u64, is_object: bool, count: u64) -> Vec<Child> {
+    scan_core(src, None, from, is_object, false, u64::MAX, count, None).pop().map(|(_, c)| c.items).unwrap_or_default()
+}
+
+const C_OTHER: u8 = 0;
+const C_WS: u8 = 1;
+const C_QUOTE: u8 = 2;
+const C_OPEN: u8 = 3;
+const C_CLOSE: u8 = 4;
+const C_COMMA: u8 = 5;
+const C_COLON: u8 = 6;
+
+const fn classes() -> [u8; 256] {
+    let mut t = [C_OTHER; 256];
+    t[b' ' as usize] = C_WS;
+    t[b'\t' as usize] = C_WS;
+    t[b'\r' as usize] = C_WS;
+    t[b'\n' as usize] = C_WS;
+    t[b'"' as usize] = C_QUOTE;
+    t[b'{' as usize] = C_OPEN;
+    t[b'[' as usize] = C_OPEN;
+    t[b'}' as usize] = C_CLOSE;
+    t[b']' as usize] = C_CLOSE;
+    t[b',' as usize] = C_COMMA;
+    t[b':' as usize] = C_COLON;
+    t
+}
+static CLASS: [u8; 256] = classes();
+
+/// Lists the direct children of the container whose opening bracket is at `open`; with `open == None`, the
+/// top-level values of the document (one for normal JSON, one per record for JSON Lines).
+pub fn children(src: &dyn Chunked, open: Option<u64>, ctx: Option<&Ctx>) -> Children {
+    scan(src, open, u64::MAX, ctx).pop().map(|(_, c)| c).unwrap_or_default()
+}
+
+/// One level of the scanner's stack: a container being read.
+struct Level {
+    open: Option<u64>,
+    is_object: bool,
+    expect_key: bool,
+    key: Option<(u64, u64)>,
+    val_start: Option<u64>,
+    scalar_last: Option<u64>,
+    /// Where this level's children start in the shared list.
+    items_from: usize,
+    count: u64,
+    /// Only every STRIDE-th child is kept (the level has more than DENSE_MAX).
+    sparse: bool,
+    /// Never thin this level (a rescan, which must return every child it is asked for).
+    dense: bool,
+}
+
+impl Level {
+    fn new(open: Option<u64>, is_object: bool, items_from: usize) -> Level {
+        Level {
+            open,
+            is_object,
+            expect_key: is_object,
+            key: None,
+            val_start: None,
+            scalar_last: None,
+            items_from,
+            count: 0,
+            sparse: false,
+            dense: false,
+        }
+    }
+
+    fn list(&self, items: Vec<Child>, end: u64, partial: bool) -> Children {
+        Children {
+            items,
+            count: self.count,
+            stride: if self.sparse { STRIDE } else { 1 },
+            is_object: self.is_object,
+            end,
+            partial,
+        }
+    }
+}
+
+/// Adds a child to `lv` (whose children are at the end of `items`), thinning the list once it gets big.
+fn add_child(items: &mut Vec<Child>, lv: &mut Level, s: u64, e: u64) {
+    let (key_back, key_len) = match lv.key.take() {
+        Some((ks, ke)) if ks < s => ((s - ks).min(u32::MAX as u64) as u32, (ke - ks).min(u32::MAX as u64) as u32),
+        _ => (0, 0),
+    };
+    if !lv.sparse && !lv.dense && lv.count >= DENSE_MAX {
+        let from = lv.items_from;
+        let mut w = from;
+        for k in (from..items.len()).step_by(STRIDE as usize) {
+            items[w] = items[k];
+            w += 1;
+        }
+        items.truncate(w);
+        lv.sparse = true;
+    }
+    if !lv.sparse || lv.count % STRIDE == 0 {
+        items.push(Child { start: s, end: e, key_back, key_len });
+    }
+    lv.count += 1;
+}
+
+/// Scans the container at `open` (None = the whole document) in one pass. Returns its child list last, preceded by
+/// the lists of all containers inside it that are at least `keep` bytes long, so a single read of a huge file
+/// covers every big level.
+pub fn scan(src: &dyn Chunked, open: Option<u64>, keep: u64, ctx: Option<&Ctx>) -> Vec<(Option<u64>, Children)> {
+    let (start, root_obj) = match open {
+        Some(o) => (o + 1, src.bytes(o, o + 1).first() == Some(&b'{')),
+        None => (0, false),
+    };
+    scan_core(src, open, start, root_obj, open.is_none(), keep, u64::MAX, ctx)
+}
+
+/// The scanner. Reads from `start` (inside the container at `open`, or at the top level when `top`), stops at the
+/// container's end or after `limit` children.
+#[allow(clippy::too_many_arguments)]
+fn scan_core(
+    src: &dyn Chunked,
+    open: Option<u64>,
+    start: u64,
+    root_obj: bool,
+    top: bool,
+    keep: u64,
+    limit: u64,
+    ctx: Option<&Ctx>,
+) -> Vec<(Option<u64>, Children)> {
+    let total = src.total();
+    let mut items: Vec<Child> = Vec::new();
+    let mut stack: Vec<Level> = vec![Level::new(open, root_obj, 0)];
+    stack[0].dense = limit != u64::MAX;
+    let mut out: Vec<(Option<u64>, Children)> = Vec::new();
+    let mut in_str = false;
+    let mut esc = false;
+    let mut str_start = 0u64;
+    let mut end: Option<u64> = None;
+    let mut broken = false;
+    let mut pos = start;
+    let mut since_check = 0u64;
+
+    src.chunked(start, total, &mut |chunk: &[u8]| {
+        let base = pos;
+        let n = chunk.len();
+        let mut i = 0usize;
+        while i < n {
+            if in_str {
+                if esc {
+                    esc = false;
+                    i += 1;
+                    continue;
+                }
+                match memchr::memchr2(b'"', b'\\', &chunk[i..]) {
+                    None => i = n,
+                    Some(k) => {
+                        i += k;
+                        if chunk[i] == b'\\' {
+                            esc = true;
+                        } else {
+                            in_str = false;
+                            let p = base + i as u64;
+                            let lv = stack.last_mut().unwrap();
+                            if lv.is_object && lv.expect_key {
+                                lv.key = Some((str_start, p + 1));
+                            } else {
+                                add_child(&mut items, lv, str_start, p + 1);
+                                lv.val_start = None;
+                                if stack.len() == 1 && stack[0].count >= limit {
+                                    end = Some(p + 1);
+                                    return false;
+                                }
+                            }
+                        }
+                        i += 1;
+                    }
+                }
+                continue;
+            }
+            let b = chunk[i];
+            let c = CLASS[b as usize];
+            let p = base + i as u64;
+            let lv = stack.last_mut().unwrap();
+            if let Some(last) = lv.scalar_last {
+                if c == C_OTHER {
+                    lv.scalar_last = Some(p);
+                    i += 1;
+                    continue;
+                }
+                let s = lv.val_start.take().unwrap_or(last);
+                add_child(&mut items, lv, s, last + 1);
+                lv.scalar_last = None;
+                if stack.len() == 1 && stack[0].count >= limit {
+                    end = Some(p);
+                    return false;
+                }
+            }
+            let lv = stack.last_mut().unwrap();
+            match c {
+                C_WS => {}
+                C_QUOTE => {
+                    in_str = true;
+                    str_start = p;
+                    if !(lv.is_object && lv.expect_key) {
+                        lv.val_start = Some(p);
+                    }
+                }
+                C_OPEN => {
+                    lv.val_start = Some(p);
+                    let from = items.len();
+                    stack.push(Level::new(Some(p), b == b'{', from));
+                }
+                C_CLOSE => {
+                    if stack.len() == 1 {
+                        // The scanned container ends (or a stray closer at the top level: broken JSON).
+                        broken |= top;
+                        end = Some(p + 1);
+                        return false;
+                    }
+                    let child = stack.pop().unwrap();
+                    let cs = child.open.unwrap();
+                    if p + 1 - cs >= keep {
+                        let list = items.split_off(child.items_from);
+                        out.push((child.open, child.list(list, p + 1, false)));
+                    } else {
+                        items.truncate(child.items_from);
+                    }
+                    let parent = stack.last_mut().unwrap();
+                    let s = parent.val_start.take().unwrap_or(cs);
+                    add_child(&mut items, parent, s, p + 1);
+                    if stack.len() == 1 && stack[0].count >= limit {
+                        end = Some(p + 1);
+                        return false;
+                    }
+                }
+                C_COMMA => lv.expect_key = lv.is_object,
+                C_COLON => lv.expect_key = false,
+                _ => {
+                    lv.val_start = Some(p);
+                    lv.scalar_last = Some(p);
+                }
+            }
+            i += 1;
+        }
+        pos = base + n as u64;
+        since_check += n as u64;
+        if since_check >= 4 << 20 {
+            since_check = 0;
+            if let Some(c) = ctx {
+                c.set(pos);
+                if c.cancelled() {
+                    return false;
+                }
+            }
+        }
+        true
+    });
+
+    let cancelled = ctx.is_some_and(|c| c.cancelled());
+    let mut partial = broken || cancelled;
+    if end.is_none() {
+        // Ran to the end of the document without the container closing.
+        if stack.len() == 1 {
+            let lv = stack.last_mut().unwrap();
+            if let Some(last) = lv.scalar_last.take() {
+                let s = lv.val_start.take().unwrap_or(last);
+                add_child(&mut items, lv, s, last + 1);
+            }
+        }
+        partial |= !top || stack.len() > 1 || in_str;
+    }
+    let own = stack.get(1).map_or(items.len(), |l| l.items_from);
+    items.truncate(own);
+    let root = &stack[0];
+    out.push((open, root.list(items, end.unwrap_or(total), partial)));
+    out
+}
+
+/// The first version of the scanner, kept for comparison in tests.
+#[cfg(test)]
+fn children_simple(src: &dyn Chunked, open: Option<u64>, limit: u64, ctx: Option<&Ctx>) -> Children {
+    let total = src.total().min(limit);
+    let (start, is_object) = match open {
+        Some(o) => {
+            let b = src.bytes(o, o + 1);
+            (o + 1, b.first() == Some(&b'{'))
+        }
+        None => (0, false),
+    };
+    let top = open.is_none();
+    let mut out = Children { items: Vec::new(), count: 0, stride: 1, is_object, end: total, partial: false };
+    let mut depth: u32 = 0;
+    let mut in_str = false;
+    let mut esc = false;
+    let mut str_start = 0u64;
+    let mut expect_key = is_object;
+    let mut key: Option<(u64, u64)> = None;
+    let mut val_start: Option<u64> = None;
+    // A number / true / false / null in progress at depth 0, and its last byte.
+    let mut scalar_last: Option<u64> = None;
+    let mut done = false;
+    let mut pos = start;
+    let mut since_check = 0u64;
+
+    let push = |out: &mut Children, key: &mut Option<(u64, u64)>, s: u64, e: u64| {
+        let (key_back, key_len) = match key.take() {
+            Some((ks, ke)) if ks < s => ((s - ks).min(u32::MAX as u64) as u32, (ke - ks).min(u32::MAX as u64) as u32),
+            _ => (0, 0),
+        };
+        out.items.push(Child { start: s, end: e, key_back, key_len });
+        out.count += 1;
+    };
+
+    src.chunked(start, total, &mut |chunk: &[u8]| {
+        let base = pos;
+        let mut i = 0usize;
+        let n = chunk.len();
+        while i < n {
+            if in_str {
+                // Jump to the next quote or backslash.
+                if esc {
+                    esc = false;
+                    i += 1;
+                    continue;
+                }
+                match memchr::memchr2(b'"', b'\\', &chunk[i..]) {
+                    None => {
+                        i = n;
+                        continue;
+                    }
+                    Some(k) => {
+                        i += k;
+                        if chunk[i] == b'\\' {
+                            esc = true;
+                            i += 1;
+                            continue;
+                        }
+                        in_str = false;
+                        let p = base + i as u64;
+                        if depth == 0 {
+                            if expect_key {
+                                key = Some((str_start, p + 1));
+                            } else {
+                                push(&mut out, &mut key, str_start, p + 1);
+                                val_start = None;
+                            }
+                        }
+                        i += 1;
+                        continue;
+                    }
+                }
+            }
+            if depth > 0 {
+                // Inside a nested container: only quotes and brackets matter.
+                while i < n {
+                    let c = CLASS[chunk[i] as usize];
+                    if c == C_QUOTE || c == C_OPEN || c == C_CLOSE {
+                        break;
+                    }
+                    i += 1;
+                }
+                if i >= n {
+                    break;
+                }
+                let p = base + i as u64;
+                match CLASS[chunk[i] as usize] {
+                    C_QUOTE => in_str = true,
+                    C_OPEN => depth += 1,
+                    _ => {
+                        depth -= 1;
+                        if depth == 0 {
+                            if let Some(s) = val_start.take() {
+                                push(&mut out, &mut key, s, p + 1);
+                            }
+                        }
+                    }
+                }
+                i += 1;
+                continue;
+            }
+            // Depth 0: directly inside the container (or at the top level).
+            let b = chunk[i];
+            let p = base + i as u64;
+            let c = CLASS[b as usize];
+            if let Some(last) = scalar_last {
+                if c == C_OTHER {
+                    scalar_last = Some(p);
+                    i += 1;
+                    continue;
+                }
+                push(&mut out, &mut key, val_start.take().unwrap_or(last), last + 1);
+                scalar_last = None;
+            }
+            match c {
+                C_WS => {}
+                C_QUOTE => {
+                    in_str = true;
+                    str_start = p;
+                    if !expect_key {
+                        val_start = Some(p);
+                    }
+                }
+                C_OPEN => {
+                    val_start = Some(p);
+                    depth = 1;
+                }
+                C_CLOSE => {
+                    if top {
+                        // Stray closer at the top level: broken JSON.
+                        out.partial = true;
+                    }
+                    out.end = p + 1;
+                    done = true;
+                    return false;
+                }
+                C_COMMA => expect_key = is_object,
+                C_COLON => expect_key = false,
+                _ => {
+                    val_start = Some(p);
+                    scalar_last = Some(p);
+                }
+            }
+            i += 1;
+        }
+        pos = base + n as u64;
+        since_check += n as u64;
+        if since_check >= 4 << 20 {
+            since_check = 0;
+            if let Some(c) = ctx {
+                c.set(pos);
+                if c.cancelled() {
+                    return false;
+                }
+            }
+        }
+        true
+    });
+    if !done {
+        if let Some(last) = scalar_last {
+            push(&mut out, &mut key, val_start.unwrap_or(last), last + 1);
+        }
+        if !top || depth > 0 || in_str {
+            out.partial = true;
+        }
+        if ctx.is_some_and(|c| c.cancelled()) {
+            out.partial = true;
+        }
+    }
+    out
+}
+
+/// One step of a path: the child's index and its key (if in an object), with its value range.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Step {
+    pub index: u64,
+    pub key: Option<String>,
+    pub start: u64,
+    pub end: u64,
+    /// The container this step is a child of (None = top level).
+    pub parent: Option<u64>,
+}
+
+impl Step {
+    pub fn label(&self) -> String {
+        match &self.key {
+            Some(k) => k.clone(),
+            None => format!("[{}]", self.index),
+        }
+    }
+}
+
+/// A key's text for display: quotes removed, common escapes resolved, very long keys shortened.
+pub fn key_text(raw: &[u8]) -> String {
+    let inner = raw.strip_prefix(b"\"").unwrap_or(raw);
+    let inner = inner.strip_suffix(b"\"").unwrap_or(inner);
+    let s = String::from_utf8_lossy(&inner[..inner.len().min(200)]).into_owned();
+    let s = s.replace("\\\"", "\"").replace("\\\\", "\\").replace("\\n", "⏎").replace("\\t", " ");
+    if inner.len() > 200 { format!("{s}…") } else { s }
+}
+
+/// The path to `offset`. `get(open)` returns the cached children of a container (None = top level); when one
+/// isn't known yet this returns `Err(open)` so the caller can scan it and ask again.
+pub fn path_at(
+    src: &dyn Chunked,
+    offset: u64,
+    get: &mut dyn FnMut(Option<u64>) -> Option<Arc<Children>>,
+) -> Result<Vec<Step>, Option<u64>> {
+    let mut path = Vec::new();
+    let mut open: Option<u64> = None;
+    loop {
+        let Some(ch) = get(open) else { return Err(open) };
+        let Some((i, c)) = ch.find(src, offset) else { break };
+        let key = c.key_range().map(|(a, b)| key_text(&src.bytes(a, b)));
+        // A single top-level value (normal JSON) isn't shown as "[0]".
+        let single_root = open.is_none() && ch.count == 1 && !ch.partial;
+        if !single_root {
+            path.push(Step { index: i, key, start: c.start, end: c.end, parent: open });
+        }
+        let first = src.bytes(c.start, c.start + 1);
+        let kind = first.first().map_or(Kind::Other, |&b| Kind::of(b));
+        if kind.is_container() && offset > c.start && offset < c.end {
+            open = Some(c.start);
+            continue;
+        }
+        break;
+    }
+    Ok(path)
+}
+
+/// A short preview of a value for the structure panel.
+pub fn preview(src: &dyn Chunked, c: &Child, max: usize) -> (Kind, String) {
+    let head = src.bytes(c.start, (c.start + max as u64 * 4).min(c.end));
+    let kind = head.first().map_or(Kind::Other, |&b| Kind::of(b));
+    let text = match kind {
+        Kind::Object | Kind::Array => String::new(),
+        _ => {
+            let s = String::from_utf8_lossy(&head).into_owned();
+            let mut t: String = s.chars().take(max).collect();
+            if (c.end - c.start) as usize > t.len() {
+                t.push('…');
+            }
+            t
+        }
+    };
+    (kind, text)
+}
+
+/// Path text for copying: `data[1203].name`.
+pub fn path_string(path: &[Step]) -> String {
+    let mut s = String::new();
+    for st in path {
+        match &st.key {
+            Some(k) if !k.is_empty() && k.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '$') => {
+                if !s.is_empty() {
+                    s.push('.');
+                }
+                s.push_str(k);
+            }
+            Some(k) => s.push_str(&format!("[{:?}]", k)),
+            None => s.push_str(&format!("[{}]", st.index)),
+        }
+    }
+    s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::document::Document;
+    use std::collections::HashMap;
+
+    fn doc(s: &str) -> Document {
+        Document::from_text(s.as_bytes())
+    }
+
+    fn all(d: &Document, ch: &Children) -> Vec<Child> {
+        ch.range(d, 0, ch.count)
+    }
+
+    fn texts(d: &Document, ch: &Children) -> Vec<(Option<String>, String)> {
+        all(d, ch)
+            .iter()
+            .map(|c| {
+                let k = c.key_range().map(|(a, b)| key_text(&d.read(a, b)));
+                (k, String::from_utf8(d.read(c.start, c.end)).unwrap())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn lists_children() {
+        let s = r#"{"a": 1, "b" : [1, {"x": "]}"}, 3], "c":{"d":null} , "e": "s\"t", "f": -2.5e3 }"#;
+        let d = doc(s);
+        let top = children(&d, None, None);
+        assert_eq!(top.count, 1);
+        assert!(!top.partial);
+        let root = children(&d, Some(0), None);
+        let t = texts(&d, &root);
+        assert_eq!(
+            t,
+            vec![
+                (Some("a".into()), "1".into()),
+                (Some("b".into()), r#"[1, {"x": "]}"}, 3]"#.into()),
+                (Some("c".into()), r#"{"d":null}"#.into()),
+                (Some("e".into()), r#""s\"t""#.into()),
+                (Some("f".into()), "-2.5e3".into()),
+            ]
+        );
+        assert_eq!(root.end, s.len() as u64);
+        let b = root.get(&d, 1).unwrap();
+        let arr = children(&d, Some(b.start), None);
+        assert_eq!(texts(&d, &arr).len(), 3);
+        assert_eq!(texts(&d, &arr)[1].1, r#"{"x": "]}"}"#);
+    }
+
+    #[test]
+    fn json_lines_top_level() {
+        let d = doc("{\"a\":1}\n{\"a\":2}\n[3]\n\"x\"\n42\n");
+        let top = children(&d, None, None);
+        let t: Vec<String> = texts(&d, &top).into_iter().map(|x| x.1).collect();
+        assert_eq!(t, vec!["{\"a\":1}", "{\"a\":2}", "[3]", "\"x\"", "42"]);
+    }
+
+    #[test]
+    fn paths() {
+        let s = r#"{"data": [{"id": 1, "name": "x"}, {"id": 2, "name": "yy", "tags": ["a", "b"]}], "n": 5}"#;
+        let d = doc(s);
+        let mut cache: HashMap<Option<u64>, Arc<Children>> = HashMap::new();
+        let mut path = |off: u64| loop {
+            let r = path_at(&d, off, &mut |o| cache.get(&o).cloned());
+            match r {
+                Ok(p) => return path_string(&p),
+                Err(o) => {
+                    let ch = children(&d, o, None);
+                    cache.insert(o, Arc::new(ch));
+                }
+            }
+        };
+        let at = |needle: &str| s.find(needle).unwrap() as u64;
+        assert_eq!(path(at("\"yy\"") + 1), "data[1].name");
+        assert_eq!(path(at("\"b\"]")), "data[1].tags[1]");
+        assert_eq!(path(at("\"id\": 2")), "data[1].id");
+        assert_eq!(path(at("5}")), "n");
+        assert_eq!(path(0), "");
+    }
+
+    #[test]
+    fn broken_json_is_partial() {
+        let d = doc(r#"{"a": [1, 2"#);
+        let root = children(&d, Some(0), None);
+        assert!(root.partial);
+        assert_eq!(root.count, 0);
+        let arr = children(&d, Some(6), None);
+        assert!(arr.partial);
+        assert_eq!(texts(&d, &arr).into_iter().map(|x| x.1).collect::<Vec<_>>(), vec!["1", "2"]);
+    }
+
+    fn rnd(r: &mut u64) -> u64 {
+        *r ^= *r << 13;
+        *r ^= *r >> 7;
+        *r ^= *r << 17;
+        *r
+    }
+
+    fn random_json(r: &mut u64, depth: u32, out: &mut String) {
+        let ws = |n: u64, out: &mut String| {
+            for _ in 0..(n % 3) {
+                out.push(if n % 2 == 0 { ' ' } else { '\n' });
+            }
+        };
+        let k = rnd(r) % if depth > 4 { 4 } else { 7 };
+        match k {
+            0 => out.push_str(&format!("{}", rnd(r) % 1000)),
+            1 => out.push_str("\"s\\\"t]}{[,:\""),
+            2 => out.push_str(["true", "false", "null", "-1.5e3"][(rnd(r) % 4) as usize]),
+            3 => out.push_str("\"plain\""),
+            4 | 5 => {
+                out.push('[');
+                let n = rnd(r) % 6;
+                for i in 0..n {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    let w = rnd(r);
+                    ws(w, out);
+                    random_json(r, depth + 1, out);
+                }
+                out.push(']');
+            }
+            _ => {
+                out.push('{');
+                let n = rnd(r) % 6;
+                for i in 0..n {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    out.push_str(&format!("\"k{i}\\\"\" :"));
+                    let w = rnd(r);
+                    ws(w, out);
+                    random_json(r, depth + 1, out);
+                }
+                out.push('}');
+            }
+        }
+    }
+
+    /// Opening brackets outside strings.
+    fn containers(s: &[u8]) -> Vec<u64> {
+        let (mut in_str, mut esc) = (false, false);
+        let mut v = Vec::new();
+        for (i, &b) in s.iter().enumerate() {
+            if in_str {
+                if esc {
+                    esc = false;
+                } else if b == b'\\' {
+                    esc = true;
+                } else if b == b'"' {
+                    in_str = false;
+                }
+            } else if b == b'"' {
+                in_str = true;
+            } else if b == b'{' || b == b'[' {
+                v.push(i as u64);
+            }
+        }
+        v
+    }
+
+    #[test]
+    fn one_pass_scan_matches_the_simple_scanner() {
+        let mut r = 0x1234_5678_9ABC_DEF0u64;
+        for round in 0..200 {
+            let mut s = String::new();
+            let records = 1 + round % 4;
+            for i in 0..records {
+                if i > 0 {
+                    s.push('\n');
+                }
+                random_json(&mut r, 0, &mut s);
+            }
+            let d = doc(&s);
+            let top_new = children(&d, None, None);
+            let top_old = children_simple(&d, None, u64::MAX, None);
+            assert_eq!(all(&d, &top_new), top_old.items, "top level of {s}");
+            let lists: HashMap<Option<u64>, Children> = scan(&d, None, 20, None).into_iter().collect();
+            for o in containers(s.as_bytes()) {
+                let old = children_simple(&d, Some(o), u64::MAX, None);
+                let new = children(&d, Some(o), None);
+                assert_eq!(all(&d, &new), old.items, "container at {o} of {s}");
+                assert_eq!(new.end, old.end);
+                if let Some(kept) = lists.get(&Some(o)) {
+                    assert_eq!(all(&d, kept), old.items, "kept list at {o}");
+                    assert!(kept.end - o >= 20);
+                } else {
+                    assert!(old.end - o < 20 || old.partial, "big container at {o} not kept: {s}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn huge_lists_are_thinned_but_complete() {
+        // 300,000 numbers in an array and an object with 150,000 keys.
+        let n = 300_000u64;
+        let mut s = String::from("{\"nums\": [");
+        for i in 0..n {
+            if i > 0 {
+                s.push(',');
+            }
+            s.push_str(&(i * 7 % 1000).to_string());
+        }
+        s.push_str("], \"obj\": {");
+        for i in 0..150_000 {
+            if i > 0 {
+                s.push_str(", ");
+            }
+            s.push_str(&format!("\"k{i}\": [{i}]"));
+        }
+        s.push_str("}}");
+        let d = doc(&s);
+        let lists: HashMap<Option<u64>, Children> = scan(&d, None, 1 << 20, None).into_iter().collect();
+        let root = children(&d, Some(0), None);
+        let nums = root.get(&d, 0).unwrap();
+        let obj = root.get(&d, 1).unwrap();
+        for (open, expect) in [(nums.start, n), (obj.start, 150_000)] {
+            let fast = &lists[&Some(open)];
+            assert_eq!(fast.count, expect);
+            assert!(fast.stride > 1 && (fast.items.len() as u64) < expect / 32, "thinned");
+            let simple = children_simple(&d, Some(open), u64::MAX, None);
+            assert_eq!(all(&d, fast), simple.items);
+            // random access and lookups by position agree with the full list
+            for i in [0, 1, 63, 64, 65, 12_345, expect - 1] {
+                let c = simple.items[i as usize];
+                assert_eq!(fast.get(&d, i), Some(c));
+                assert_eq!(fast.find(&d, c.start), Some((i, c)));
+                assert_eq!(fast.find(&d, c.first()), Some((i, c)));
+                assert_eq!(fast.find_start(&d, c.start), Some(c));
+            }
+            assert_eq!(fast.range(&d, 100, 230), simple.items[100..230].to_vec());
+        }
+        // paths into thinned lists
+        let mut cache: HashMap<Option<u64>, Arc<Children>> = lists.into_iter().map(|(k, v)| (k, Arc::new(v))).collect();
+        cache.insert(None, Arc::new(children(&d, None, None)));
+        cache.insert(Some(0), Arc::new(root));
+        let target = s.find("\"k123456\"").unwrap() as u64 + 3;
+        let p = loop {
+            match path_at(&d, target, &mut |o| cache.get(&o).cloned()) {
+                Ok(p) => break p,
+                Err(o) => {
+                    let ch = children(&d, o, None);
+                    cache.insert(o, Arc::new(ch));
+                }
+            }
+        };
+        assert_eq!(path_string(&p), "obj.k123456");
+        // JSON Lines with many records
+        let lines: String = (0..200_000).map(|i| format!("{{\"i\":{i}}}\n")).collect();
+        let d = doc(&lines);
+        let top = children(&d, None, None);
+        assert_eq!(top.count, 200_000);
+        assert!(top.stride > 1);
+        let c = top.get(&d, 199_999).unwrap();
+        assert_eq!(d.read(c.start, c.end), b"{\"i\":199999}");
+    }
+}
+

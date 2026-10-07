@@ -1,0 +1,932 @@
+//! Syntax coloring for the files people open in a text editor: code, markup, config, data and logs.
+//!
+//! Each language is a small hand-written lexer that colors one display segment (a line, or a piece of a very long
+//! line) and returns the `State` it ends in, so things that span lines — block comments, multi-line strings, XML
+//! tags, Markdown code blocks — can be followed: the view keeps the state at checkpoints through the document
+//! (`editor::HlIndex`). Huge files skip that and color each line on its own, which is exact for everything that
+//! doesn't span lines. Lexers never fail: any bytes are fine, what isn't understood just stays uncolored.
+
+mod code;
+mod markup;
+
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Lang {
+    Plain,
+    Json,
+    Log,
+    Ini,
+    Xml,
+    Html,
+    Markdown,
+    Csv,
+    CsvSemi,
+    Tsv,
+    Yaml,
+    Python,
+    JavaScript,
+    TypeScript,
+    C,
+    Cpp,
+    CSharp,
+    Java,
+    Kotlin,
+    Swift,
+    Go,
+    Rust,
+    Php,
+    Ruby,
+    Lua,
+    Sql,
+    PowerShell,
+    Batch,
+    Shell,
+    Dockerfile,
+    Css,
+    Diff,
+}
+
+/// How a language writes comments (for "Toggle comment").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommentStyle {
+    Line(&'static str),
+    Block(&'static str, &'static str),
+}
+
+impl Lang {
+    pub fn label(self) -> &'static str {
+        match self {
+            Lang::Plain => "Plain text",
+            Lang::Json => "JSON",
+            Lang::Log => "Log",
+            Lang::Ini => "INI / Config",
+            Lang::Xml => "XML",
+            Lang::Html => "HTML",
+            Lang::Markdown => "Markdown",
+            Lang::Csv => "CSV",
+            Lang::CsvSemi => "CSV (semicolons)",
+            Lang::Tsv => "TSV (tabs)",
+            Lang::Yaml => "YAML",
+            Lang::Python => "Python",
+            Lang::JavaScript => "JavaScript",
+            Lang::TypeScript => "TypeScript",
+            Lang::C => "C",
+            Lang::Cpp => "C++",
+            Lang::CSharp => "C#",
+            Lang::Java => "Java",
+            Lang::Kotlin => "Kotlin",
+            Lang::Swift => "Swift",
+            Lang::Go => "Go",
+            Lang::Rust => "Rust",
+            Lang::Php => "PHP",
+            Lang::Ruby => "Ruby",
+            Lang::Lua => "Lua",
+            Lang::Sql => "SQL",
+            Lang::PowerShell => "PowerShell",
+            Lang::Batch => "Batch",
+            Lang::Shell => "Shell",
+            Lang::Dockerfile => "Dockerfile",
+            Lang::Css => "CSS",
+            Lang::Diff => "Diff",
+        }
+    }
+
+    /// Menu order: plain text, then by name.
+    pub const ALL: [Lang; 32] = [
+        Lang::Plain,
+        Lang::Batch,
+        Lang::C,
+        Lang::CSharp,
+        Lang::Cpp,
+        Lang::Css,
+        Lang::Csv,
+        Lang::CsvSemi,
+        Lang::Diff,
+        Lang::Dockerfile,
+        Lang::Go,
+        Lang::Html,
+        Lang::Ini,
+        Lang::Java,
+        Lang::JavaScript,
+        Lang::Json,
+        Lang::Kotlin,
+        Lang::Log,
+        Lang::Lua,
+        Lang::Markdown,
+        Lang::Php,
+        Lang::PowerShell,
+        Lang::Python,
+        Lang::Ruby,
+        Lang::Rust,
+        Lang::Shell,
+        Lang::Sql,
+        Lang::Swift,
+        Lang::Tsv,
+        Lang::TypeScript,
+        Lang::Xml,
+        Lang::Yaml,
+    ];
+
+    pub fn comment(self) -> Option<CommentStyle> {
+        use CommentStyle::*;
+        Some(match self {
+            Lang::C
+            | Lang::Cpp
+            | Lang::CSharp
+            | Lang::Java
+            | Lang::Kotlin
+            | Lang::Swift
+            | Lang::Go
+            | Lang::Rust
+            | Lang::JavaScript
+            | Lang::TypeScript
+            | Lang::Php => Line("//"),
+            Lang::Python | Lang::Ruby | Lang::Shell | Lang::PowerShell | Lang::Yaml | Lang::Dockerfile | Lang::Ini => {
+                Line("#")
+            }
+            Lang::Sql | Lang::Lua => Line("--"),
+            Lang::Batch => Line("REM "),
+            Lang::Xml | Lang::Html | Lang::Markdown => Block("<!--", "-->"),
+            Lang::Css => Block("/*", "*/"),
+            Lang::Plain | Lang::Json | Lang::Log | Lang::Csv | Lang::CsvSemi | Lang::Tsv | Lang::Diff => return None,
+        })
+    }
+
+    /// Picks a language from the file name, then from the first bytes.
+    pub fn detect(name: Option<&str>, head: &[u8]) -> Lang {
+        name.and_then(|n| Lang::from_name(n, head)).unwrap_or_else(|| Lang::sniff(head))
+    }
+
+    fn from_name(name: &str, head: &[u8]) -> Option<Lang> {
+        let lower = name.to_ascii_lowercase();
+        match lower.as_str() {
+            "dockerfile" | "containerfile" => return Some(Lang::Dockerfile),
+            "makefile" | "gnumakefile" | ".bashrc" | ".bash_profile" | ".profile" | ".zshrc" | ".zprofile"
+            | ".gitignore" | ".gitattributes" | ".dockerignore" | ".npmignore" => return Some(Lang::Shell),
+            "gemfile" | "rakefile" | "podfile" | "vagrantfile" => return Some(Lang::Ruby),
+            _ => {}
+        }
+        if lower.starts_with("dockerfile.") {
+            return Some(Lang::Dockerfile);
+        }
+        let ext = lower.rsplit_once('.')?.1;
+        Some(match ext {
+            "json" | "jsonl" | "ndjson" | "geojson" | "jsonc" | "json5" | "har" | "webmanifest" | "ipynb" => Lang::Json,
+            "log" | "out" => Lang::Log,
+            "ini" | "cfg" | "conf" | "toml" | "properties" | "env" | "inf" | "reg" | "desktop" | "editorconfig"
+            | "gitconfig" | "service" | "socket" | "timer" | "mount" => Lang::Ini,
+            "xml" | "xsd" | "xsl" | "xslt" | "svg" | "xaml" | "csproj" | "vbproj" | "fsproj" | "vcxproj" | "proj"
+            | "props" | "targets" | "nuspec" | "resx" | "config" | "plist" | "kml" | "gpx" | "rss" | "atom" | "wsdl"
+            | "xlf" | "xliff" | "manifest" | "ps1xml" | "storyboard" | "xib" | "fxml" | "dtd" => Lang::Xml,
+            "html" | "htm" | "xhtml" | "shtml" | "vue" | "svelte" | "cshtml" | "razor" | "jsp" | "asp" | "aspx" => {
+                Lang::Html
+            }
+            "md" | "markdown" | "mdown" | "mkd" | "mdx" => Lang::Markdown,
+            "csv" => {
+                let first = head.split(|&b| b == b'\n').next().unwrap_or(b"");
+                let count = |c: u8| first.iter().filter(|&&b| b == c).count();
+                if count(b';') > count(b',') { Lang::CsvSemi } else { Lang::Csv }
+            }
+            "tsv" | "tab" => Lang::Tsv,
+            "yaml" | "yml" => Lang::Yaml,
+            "py" | "pyw" | "pyi" | "pyx" => Lang::Python,
+            "js" | "mjs" | "cjs" | "jsx" => Lang::JavaScript,
+            "ts" | "tsx" | "mts" | "cts" => Lang::TypeScript,
+            "c" | "h" => Lang::C,
+            "cpp" | "cc" | "cxx" | "c++" | "hpp" | "hh" | "hxx" | "h++" | "ino" | "inl" | "ipp" | "tpp" => Lang::Cpp,
+            "cs" | "csx" => Lang::CSharp,
+            "java" | "gradle" | "groovy" => Lang::Java,
+            "kt" | "kts" => Lang::Kotlin,
+            "swift" => Lang::Swift,
+            "go" => Lang::Go,
+            "rs" => Lang::Rust,
+            "php" | "phtml" | "php3" | "php4" | "php5" | "phps" => Lang::Php,
+            "rb" | "rake" | "gemspec" | "ru" => Lang::Ruby,
+            "lua" => Lang::Lua,
+            "sql" | "ddl" | "dml" | "psql" | "pgsql" | "mysql" => Lang::Sql,
+            "ps1" | "psm1" | "psd1" => Lang::PowerShell,
+            "bat" | "cmd" | "btm" => Lang::Batch,
+            "sh" | "bash" | "zsh" | "ksh" | "fish" | "mk" => Lang::Shell,
+            "dockerfile" => Lang::Dockerfile,
+            "css" | "scss" | "sass" | "less" => Lang::Css,
+            "diff" | "patch" | "rej" => Lang::Diff,
+            // rotated logs: app.log.1, app.log.2026-10-07
+            _ if lower.contains(".log.") => Lang::Log,
+            _ => return None,
+        })
+    }
+
+    /// Recognizes a file by its first bytes (a `.txt` holding JSON, a script with a `#!` line...).
+    fn sniff(head: &[u8]) -> Lang {
+        let t = head.trim_ascii_start();
+        if t.starts_with(b"#!") {
+            let line = t.split(|&b| b == b'\n').next().unwrap_or(b"").to_ascii_lowercase();
+            let has = |w: &[u8]| line.windows(w.len()).any(|x| x == w);
+            return if has(b"python") {
+                Lang::Python
+            } else if has(b"node") || has(b"deno") || has(b"bun") {
+                Lang::JavaScript
+            } else if has(b"pwsh") || has(b"powershell") {
+                Lang::PowerShell
+            } else if has(b"ruby") {
+                Lang::Ruby
+            } else if has(b"lua") {
+                Lang::Lua
+            } else if has(b"php") {
+                Lang::Php
+            } else {
+                Lang::Shell
+            };
+        }
+        let starts_ci = |p: &[u8]| t.len() >= p.len() && t[..p.len()].eq_ignore_ascii_case(p);
+        if starts_ci(b"<?xml") {
+            return Lang::Xml;
+        }
+        if starts_ci(b"<?php") {
+            return Lang::Php;
+        }
+        if starts_ci(b"<!doctype html") || starts_ci(b"<html") {
+            return Lang::Html;
+        }
+        if t.starts_with(b"<!--") || (t.first() == Some(&b'<') && t.get(1).is_some_and(|c| c.is_ascii_alphabetic())) {
+            return Lang::Xml;
+        }
+        if t.starts_with(b"diff --git ") || (t.starts_with(b"--- ") && t.windows(5).any(|w| w == b"\n+++ ")) {
+            return Lang::Diff;
+        }
+        if matches!(t.first(), Some(b'{') | Some(b'[')) {
+            // "[section]" lines are INI, not JSON arrays.
+            if t.first() == Some(&b'[') {
+                let line = t.split(|&b| b == b'\n').next().unwrap_or(b"").trim_ascii_end();
+                if line.ends_with(b"]")
+                    && line.len() > 2
+                    && line[1].is_ascii_alphabetic()
+                    && line.iter().all(|&b| b.is_ascii_alphanumeric() || b" []._-:".contains(&b))
+                {
+                    return Lang::Ini;
+                }
+            }
+            return Lang::Json;
+        }
+        if looks_like_log(head) {
+            return Lang::Log;
+        }
+        Lang::Plain
+    }
+}
+
+/// Whether most of the first lines start with a date or time, like log files do.
+fn looks_like_log(head: &[u8]) -> bool {
+    let lines: Vec<&[u8]> = head.split(|&b| b == b'\n').filter(|l| !l.trim_ascii().is_empty()).take(5).collect();
+    let stamped = lines
+        .iter()
+        .filter(|l| {
+            let l = l.strip_prefix(b"[").unwrap_or(l);
+            let p = &l[..l.len().min(12)];
+            l.first().is_some_and(|c| c.is_ascii_digit())
+                && p.iter().filter(|c| c.is_ascii_digit()).count() >= 6
+                && p.iter().filter(|c| matches!(c, b'-' | b'/' | b':' | b'.')).count() >= 2
+        })
+        .count();
+    !lines.is_empty() && stamped * 2 > lines.len()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Tok {
+    Key,
+    Str,
+    Num,
+    Lit,
+    Punct,
+    Comment,
+    Section,
+    Error,
+    Warn,
+    Info,
+    Dim,
+    Keyword,
+    Control,
+    Type,
+    Func,
+    Tag,
+    Attr,
+    Var,
+    Heading,
+    Bold,
+    Italic,
+    Link,
+    Added,
+    Removed,
+    /// A CSV column (1..7; column 0 and every 8th keep the normal text color).
+    Col(u8),
+}
+
+/// A colored byte range of a segment.
+pub type Span = (u32, u32, Tok);
+
+/// Where a lexer is at some byte position: inside nothing, a block comment, a string... Small and comparable, so
+/// colored layouts can be cached by the state they start in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct State {
+    /// What we're inside (each lexer has its own meanings; 0 = nothing special).
+    kind: u8,
+    /// A detail of `kind`: the quote character, a nesting depth, a fence character...
+    a: u8,
+    /// A second detail: a CSV column, a YAML block indent, a fence length, a CSS brace depth...
+    b: u16,
+    /// HTML: 1 inside `<script>`, 2 inside `<style>` (`kind`, `a`, `b` then belong to that language).
+    mode: u8,
+    /// At the very start of a line.
+    col0: bool,
+    /// Nothing but whitespace so far on this line.
+    bol: bool,
+}
+
+impl State {
+    /// The start of a document.
+    pub const START: State = State { kind: 0, a: 0, b: 0, mode: 0, col0: true, bol: true };
+    /// Somewhere in the middle of a line, inside nothing.
+    pub const MID_LINE: State = State { kind: 0, a: 0, b: 0, mode: 0, col0: false, bol: false };
+}
+
+/// Where spans go (nowhere when only the end state is wanted), and the offset added to them.
+struct Out<'a> {
+    v: Option<&'a mut Vec<Span>>,
+    base: usize,
+}
+
+impl Out<'_> {
+    #[inline]
+    fn put(&mut self, s: usize, e: usize, tok: Tok) {
+        if e > s {
+            if let Some(v) = self.v.as_mut() {
+                v.push(((s + self.base) as u32, (e + self.base) as u32, tok));
+            }
+        }
+    }
+
+    fn on(&self) -> bool {
+        self.v.is_some()
+    }
+
+    /// The same output, for a slice starting `off` bytes later.
+    fn at(&mut self, off: usize) -> Out<'_> {
+        Out { v: self.v.as_deref_mut(), base: self.base + off }
+    }
+}
+
+/// Colors `text` starting in state `st` and returns the state after it. Spans (byte ranges within `text`) go to
+/// `out` when given; without it only the state is worked out (cheaper).
+pub fn lex(lang: Lang, text: &[u8], st: State, out: Option<&mut Vec<Span>>) -> State {
+    let mut o = Out { v: out, base: 0 };
+    if let Some(v) = o.v.as_mut() {
+        v.clear();
+    }
+    let mut end = match lang {
+        Lang::Plain => st,
+        Lang::Json => json(text, st, &mut o),
+        Lang::Log => by_line(text, st, &mut o, log_line),
+        Lang::Ini => by_line(text, st, &mut o, ini_line),
+        Lang::Diff => by_line(text, st, &mut o, diff_line),
+        Lang::Csv => csv(text, st, b',', &mut o),
+        Lang::CsvSemi => csv(text, st, b';', &mut o),
+        Lang::Tsv => csv(text, st, b'\t', &mut o),
+        Lang::Xml | Lang::Html => markup::markup(lang == Lang::Html, text, st, &mut o),
+        Lang::Markdown => markup::markdown(text, st, &mut o),
+        Lang::Yaml => markup::yaml(text, st, &mut o),
+        Lang::Css => code::css(text, st, &mut o),
+        _ => code::code(code::syntax(lang), text, st, &mut o),
+    };
+    line_flags(text, st, &mut end);
+    end
+}
+
+/// The state a segment of a huge file starts in when it doesn't start its line: worked out from up to a few KB
+/// of that line before it (`from_line_start`: whether `prefix` starts the line).
+pub fn guess(lang: Lang, prefix: &[u8], from_line_start: bool) -> State {
+    if lang == Lang::Json && !from_line_start {
+        return State { kind: if json_starts_in_string(prefix) { J_STR } else { 0 }, ..State::MID_LINE };
+    }
+    lex(lang, prefix, if from_line_start { State::START } else { State::MID_LINE }, None)
+}
+
+fn line_flags(t: &[u8], st: State, end: &mut State) {
+    match memchr::memrchr(b'\n', t) {
+        Some(p) => {
+            end.col0 = p + 1 == t.len();
+            end.bol = t[p + 1..].iter().all(|b| b.is_ascii_whitespace());
+        }
+        None => {
+            end.col0 = st.col0 && t.is_empty();
+            end.bol = st.bol && t.iter().all(|b| b.is_ascii_whitespace());
+        }
+    }
+}
+
+// ---- helpers shared by the lexers ----
+
+/// The byte at `i`, or 0 past the end.
+#[inline]
+fn at(t: &[u8], i: usize) -> u8 {
+    t.get(i).copied().unwrap_or(0)
+}
+
+/// End of the line containing `i` (the position of its `\n`, or the end of `t`).
+fn line_end(t: &[u8], i: usize) -> usize {
+    memchr::memchr(b'\n', &t[i.min(t.len())..]).map_or(t.len(), |p| i + p)
+}
+
+fn find(t: &[u8], from: usize, pat: &[u8]) -> Option<usize> {
+    memchr::memmem::find(t.get(from..)?, pat).map(|p| from + p)
+}
+
+/// Scans a string body from `i` up to its closing `quote`. `esc` is the escape character (0: none), `esc_pending`
+/// whether the text starts right after one. A one-line string ends at the line break even when unclosed. Returns
+/// (end, closed, escape pending at the end).
+fn scan_str(t: &[u8], mut i: usize, quote: u8, esc: u8, mut esc_pending: bool, one_line: bool) -> (usize, bool, bool) {
+    while i < t.len() {
+        let b = t[i];
+        if esc_pending {
+            esc_pending = false;
+        } else if b == esc && esc != 0 {
+            esc_pending = true;
+        } else if b == quote {
+            return (i + 1, true, false);
+        } else if b == b'\n' && one_line {
+            return (i, true, false);
+        }
+        i += 1;
+    }
+    (i, false, esc_pending)
+}
+
+fn is_num_word(w: &[u8]) -> bool {
+    let w = w.strip_prefix(b"-").or_else(|| w.strip_prefix(b"+")).unwrap_or(w);
+    !w.is_empty()
+        && w[0].is_ascii_digit()
+        && w.iter().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'+' | b':'))
+}
+
+// ---- JSON ----
+
+const J_STR: u8 = 1;
+const J_LINE_COMMENT: u8 = 2;
+const J_BLOCK_COMMENT: u8 = 3;
+
+/// Whether a JSON segment that doesn't start its line starts inside a string, judged from the bytes before it:
+/// exact from the line start, otherwise a guess from the last quote that clearly closed a string.
+fn json_starts_in_string(prefix: &[u8]) -> bool {
+    // A quote followed by ':' ',' '}' or ']' almost always ends a string.
+    let Some(start) = (1..prefix.len()).rev().find(|&i| matches!(prefix[i], b':' | b',' | b'}' | b']') && prefix[i - 1] == b'"')
+    else {
+        return false;
+    };
+    let mut in_str = false;
+    let mut esc = false;
+    for &b in &prefix[start..] {
+        if in_str {
+            if esc {
+                esc = false;
+            } else if b == b'\\' {
+                esc = true;
+            } else if b == b'"' {
+                in_str = false;
+            }
+        } else if b == b'"' {
+            in_str = true;
+        }
+    }
+    in_str
+}
+
+fn json(t: &[u8], st: State, o: &mut Out) -> State {
+    let n = t.len();
+    let mut i = 0;
+    // Strings are keys when a ':' follows.
+    let string = |o: &mut Out, s: usize, e: usize| {
+        let j = e + t[e..].iter().take_while(|&&b| b == b' ' || b == b'\t').count();
+        o.put(s, e, if at(t, j) == b':' { Tok::Key } else { Tok::Str });
+    };
+    match st.kind {
+        J_STR => {
+            let (e, closed, esc) = scan_str(t, 0, b'"', b'\\', st.a == 1, true);
+            string(o, 0, e);
+            if !closed {
+                return State { kind: J_STR, a: esc as u8, ..st };
+            }
+            i = e;
+        }
+        J_LINE_COMMENT => {
+            i = line_end(t, 0);
+            o.put(0, i, Tok::Comment);
+            if i == n {
+                return st;
+            }
+        }
+        J_BLOCK_COMMENT => match find(t, 0, b"*/") {
+            Some(p) => {
+                o.put(0, p + 2, Tok::Comment);
+                i = p + 2;
+            }
+            None => {
+                o.put(0, n, Tok::Comment);
+                return st;
+            }
+        },
+        _ => {}
+    }
+    while i < n {
+        let b = t[i];
+        match b {
+            b'"' => {
+                let (e, closed, esc) = scan_str(t, i + 1, b'"', b'\\', false, true);
+                string(o, i, e);
+                if !closed {
+                    return State { kind: J_STR, a: esc as u8, b: 0, ..st };
+                }
+                i = e;
+            }
+            b'-' | b'0'..=b'9' => {
+                let s = i;
+                while i < n && matches!(t[i], b'-' | b'+' | b'.' | b'e' | b'E' | b'0'..=b'9') {
+                    i += 1;
+                }
+                o.put(s, i, Tok::Num);
+            }
+            b't' | b'f' | b'n' => {
+                let s = i;
+                while i < n && t[i].is_ascii_alphabetic() {
+                    i += 1;
+                }
+                if matches!(&t[s..i], b"true" | b"false" | b"null") {
+                    o.put(s, i, Tok::Lit);
+                }
+            }
+            b'{' | b'}' | b'[' | b']' | b':' | b',' => {
+                let s = i;
+                while i < n && matches!(t[i], b'{' | b'}' | b'[' | b']' | b':' | b',') {
+                    i += 1;
+                }
+                o.put(s, i, Tok::Punct);
+            }
+            // JSONC / JSON5 comments
+            b'/' if at(t, i + 1) == b'/' => {
+                let e = line_end(t, i);
+                o.put(i, e, Tok::Comment);
+                if e == n {
+                    return State { kind: J_LINE_COMMENT, a: 0, b: 0, ..st };
+                }
+                i = e;
+            }
+            b'/' if at(t, i + 1) == b'*' => match find(t, i + 2, b"*/") {
+                Some(p) => {
+                    o.put(i, p + 2, Tok::Comment);
+                    i = p + 2;
+                }
+                None => {
+                    o.put(i, n, Tok::Comment);
+                    return State { kind: J_BLOCK_COMMENT, a: 0, b: 0, ..st };
+                }
+            },
+            _ => i += 1,
+        }
+    }
+    State { kind: 0, a: 0, b: 0, ..st }
+}
+
+// ---- line by line: logs, INI files, diffs ----
+
+/// Runs a lexer that only looks at one line at a time over each line of `t`. It gets the line, whether the line
+/// starts there (not mid-line) and whether only whitespace came before.
+fn by_line(t: &[u8], st: State, o: &mut Out, f: fn(&[u8], bool, bool, &mut Out)) -> State {
+    if o.on() {
+        let (mut col0, mut bol) = (st.col0, st.bol);
+        let mut start = 0;
+        loop {
+            let end = line_end(t, start);
+            f(&t[start..end], col0, bol, &mut o.at(start));
+            if end >= t.len() {
+                break;
+            }
+            start = end + 1;
+            (col0, bol) = (true, true);
+        }
+    }
+    State { kind: 0, ..st }
+}
+
+const LEVELS: [(&[u8], Tok); 12] = [
+    (b"FATAL", Tok::Error),
+    (b"CRITICAL", Tok::Error),
+    (b"ERROR", Tok::Error),
+    (b"Error", Tok::Error),
+    (b"Exception", Tok::Error),
+    (b"FAIL", Tok::Error),
+    (b"WARNING", Tok::Warn),
+    (b"WARN", Tok::Warn),
+    (b"Warning", Tok::Warn),
+    (b"INFO", Tok::Info),
+    (b"DEBUG", Tok::Dim),
+    (b"TRACE", Tok::Dim),
+];
+
+fn log_line(t: &[u8], col0: bool, _bol: bool, o: &mut Out) {
+    let n = t.len();
+    let mut i = 0usize;
+    if col0 {
+        // A timestamp at the start: digits and date/time punctuation.
+        let mut j = 0;
+        let mut digits = 0;
+        while j < n.min(40) {
+            let b = t[j];
+            if b.is_ascii_digit() {
+                digits += 1;
+            } else if !matches!(b, b'-' | b':' | b'.' | b',' | b'/' | b'T' | b'Z' | b' ' | b'[' | b']' | b'+') {
+                break;
+            }
+            j += 1;
+        }
+        while j > 0 && t[j - 1] == b' ' {
+            j -= 1;
+        }
+        if digits >= 6 && j > 0 {
+            o.put(0, j, Tok::Dim);
+            i = j;
+        }
+    }
+    // Level keywords as whole words.
+    while i < n {
+        if t[i].is_ascii_alphabetic() && (i == 0 || !t[i - 1].is_ascii_alphanumeric()) {
+            let mut j = i;
+            while j < n && t[j].is_ascii_alphanumeric() {
+                j += 1;
+            }
+            let w = &t[i..j];
+            if let Some((_, tok)) = LEVELS.iter().find(|(k, _)| w == *k || (*k == b"Exception" && w.ends_with(b"Exception"))) {
+                o.put(i, j, *tok);
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+}
+
+fn ini_line(t: &[u8], _col0: bool, bol: bool, o: &mut Out) {
+    if !bol {
+        return;
+    }
+    let n = t.len();
+    let s = t.iter().position(|b| !b.is_ascii_whitespace()).unwrap_or(n);
+    if s >= n {
+        return;
+    }
+    match t[s] {
+        b';' | b'#' => o.put(s, n, Tok::Comment),
+        b'[' => o.put(s, n, Tok::Section),
+        _ => {
+            let Some(eq) = t[s..].iter().position(|&b| b == b'=' || b == b':').map(|p| s + p) else { return };
+            o.put(s, eq, Tok::Key);
+            o.put(eq, eq + 1, Tok::Punct);
+            ini_value(t, eq + 1, o);
+        }
+    }
+}
+
+/// A value after `key =`: a quoted string, number or true/false, and a comment after it.
+fn ini_value(t: &[u8], mut i: usize, o: &mut Out) {
+    let n = t.len();
+    while i < n && (t[i] == b' ' || t[i] == b'\t') {
+        i += 1;
+    }
+    let s = i;
+    if matches!(at(t, i), b'"' | b'\'') {
+        let q = t[i];
+        let (e, _, _) = scan_str(t, i + 1, q, if q == b'"' { b'\\' } else { 0 }, false, true);
+        o.put(s, e, Tok::Str);
+        i = e;
+    } else {
+        // the value runs to a comment (" #" or " ;") or the end of the line
+        let mut e = s;
+        while e < n && !(matches!(t[e], b'#' | b';') && e > s && matches!(t[e - 1], b' ' | b'\t')) {
+            e += 1;
+        }
+        let v = t[s..e].trim_ascii_end();
+        let ve = s + v.len();
+        if is_num_word(v) {
+            o.put(s, ve, Tok::Num);
+        } else if matches!(v.to_ascii_lowercase().as_slice(), b"true" | b"false" | b"yes" | b"no" | b"on" | b"off") {
+            o.put(s, ve, Tok::Lit);
+        }
+        i = e;
+    }
+    // a comment after the value
+    if let Some(p) = t[i..].iter().position(|&b| b == b'#' || b == b';') {
+        o.put(i + p, n, Tok::Comment);
+    }
+}
+
+fn diff_line(t: &[u8], col0: bool, _bol: bool, o: &mut Out) {
+    if !col0 {
+        return;
+    }
+    let tok = if t.starts_with(b"+++") || t.starts_with(b"---") {
+        Tok::Heading
+    } else if t.starts_with(b"@@") {
+        Tok::Section
+    } else if t.starts_with(b"+") {
+        Tok::Added
+    } else if t.starts_with(b"-") {
+        Tok::Removed
+    } else if t.starts_with(b"diff ") || t.starts_with(b"index ") || t.starts_with(b"new file") || t.starts_with(b"deleted file") {
+        Tok::Keyword
+    } else {
+        return;
+    };
+    o.put(0, t.len(), tok);
+}
+
+// ---- CSV ----
+
+/// Each column gets its own color ("rainbow CSV"). Quoted fields may contain separators and line breaks.
+/// `a`: 0 at the start of a field, 1 inside an unquoted field, 2 inside quotes, 3 right after a closing quote.
+/// `b`: the column.
+fn csv(t: &[u8], st: State, sep: u8, o: &mut Out) -> State {
+    let mut col = st.b;
+    let mut q = st.a;
+    let mut field = 0;
+    let put = |o: &mut Out, s: usize, e: usize, col: u16| {
+        if col % 8 != 0 {
+            o.put(s, e, Tok::Col((col % 8) as u8));
+        }
+    };
+    for (i, &b) in t.iter().enumerate() {
+        match q {
+            2 => {
+                if b == b'"' {
+                    q = 3;
+                }
+                continue;
+            }
+            3 if b == b'"' => {
+                // "" inside quotes is a quote character
+                q = 2;
+                continue;
+            }
+            0 if b == b'"' => {
+                q = 2;
+                continue;
+            }
+            _ => {}
+        }
+        if b == sep {
+            put(o, field, i, col);
+            col = col.saturating_add(1);
+            field = i + 1;
+            q = 0;
+        } else if b == b'\n' {
+            put(o, field, i, col);
+            col = 0;
+            field = i + 1;
+            q = 0;
+        } else if q == 0 || q == 3 {
+            q = 1;
+        }
+    }
+    put(o, field, t.len(), col);
+    State { kind: 0, a: q, b: col, ..st }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    pub(super) fn toks(lang: Lang, text: &str, st: State) -> Vec<(String, Tok)> {
+        let mut v = Vec::new();
+        lex(lang, text.as_bytes(), st, Some(&mut v));
+        v.into_iter().map(|(s, e, t)| (text[s as usize..e as usize].to_string(), t)).collect()
+    }
+
+    pub(super) fn has(lang: Lang, text: &str, want: &[(&str, Tok)]) {
+        let t = toks(lang, text, State::START);
+        for (s, tok) in want {
+            assert!(t.contains(&(s.to_string(), *tok)), "{lang:?}: {s:?} as {tok:?} in {text:?}\ngot {t:?}");
+        }
+    }
+
+    /// The state after `text`, lexed in one piece and split at every position, must be the same.
+    pub(super) fn end_state(lang: Lang, text: &str) -> State {
+        let whole = lex(lang, text.as_bytes(), State::START, None);
+        for cut in 1..text.len() {
+            if !text.is_char_boundary(cut) || text.as_bytes()[cut - 1] != b'\n' {
+                continue;
+            }
+            let mid = lex(lang, &text.as_bytes()[..cut], State::START, None);
+            let end = lex(lang, &text.as_bytes()[cut..], mid, None);
+            assert_eq!(end, whole, "{lang:?} split after byte {cut} of {text:?}");
+        }
+        whole
+    }
+
+    #[test]
+    fn json_tokens() {
+        has(Lang::Json, r#"{"name": "x\"y", "n": -1.5, "ok": true}"#, &[
+            ("\"name\"", Tok::Key),
+            ("\"x\\\"y\"", Tok::Str),
+            ("-1.5", Tok::Num),
+            ("true", Tok::Lit),
+        ]);
+        // continuation of a long line that starts inside a string
+        let st = guess(Lang::Json, br#"{"a": 1, "b": "some"#, false);
+        let t = toks(Lang::Json, r#"rest of string", "k": 1"#, st);
+        assert_eq!(t[0], ("rest of string\"".into(), Tok::Str));
+        assert!(t.contains(&("\"k\"".into(), Tok::Key)));
+        // a string cut at the segment end continues in the next one
+        let st = lex(Lang::Json, br#"{"long": "abc"#, State::START, None);
+        assert_eq!(toks(Lang::Json, r#"def": 1"#, st)[0], ("def\"".into(), Tok::Key));
+    }
+
+    #[test]
+    fn detection() {
+        let d = Lang::detect;
+        assert_eq!(d(Some("data.JSON"), b""), Lang::Json);
+        assert_eq!(d(Some("app.log"), b""), Lang::Log);
+        assert_eq!(d(Some("x.txt"), b"  {\"a\":1}"), Lang::Json);
+        assert_eq!(d(Some("x.txt"), b"[general]\nkey=1"), Lang::Ini);
+        assert_eq!(d(Some("x.txt"), b"[1, 2]"), Lang::Json);
+        assert_eq!(d(None, b"hello"), Lang::Plain);
+        assert_eq!(d(Some("build.ps1"), b""), Lang::PowerShell);
+        assert_eq!(d(Some("Dockerfile"), b""), Lang::Dockerfile);
+        assert_eq!(d(Some("web.config"), b""), Lang::Xml);
+        assert_eq!(d(Some("notes.md"), b""), Lang::Markdown);
+        assert_eq!(d(Some("data.csv"), b"a;b;c\n1;2;3"), Lang::CsvSemi);
+        assert_eq!(d(Some("data.csv"), b"a,b,c\n1,2,3"), Lang::Csv);
+        assert_eq!(d(Some("script"), b"#!/usr/bin/env python3\nprint(1)"), Lang::Python);
+        assert_eq!(d(Some("run"), b"#!/bin/bash\necho hi"), Lang::Shell);
+        assert_eq!(d(None, b"<?xml version=\"1.0\"?><a/>"), Lang::Xml);
+        assert_eq!(d(None, b"<!DOCTYPE html><html>"), Lang::Html);
+        assert_eq!(d(None, b"diff --git a/x b/x\n"), Lang::Diff);
+        assert_eq!(d(Some("x.txt"), b"2026-10-07 12:00:01 INFO start\n2026-10-07 12:00:02 WARN slow\n"), Lang::Log);
+        assert_eq!(d(Some("readme.txt"), b"Hello there.\nThis is a note.\n"), Lang::Plain);
+    }
+
+    #[test]
+    fn log_ini_diff() {
+        let t = toks(Lang::Log, "2026-10-07 12:00:01.123 ERROR something failed", State::START);
+        assert_eq!(t[0], ("2026-10-07 12:00:01.123".into(), Tok::Dim));
+        assert!(t.contains(&("ERROR".into(), Tok::Error)));
+        has(Lang::Ini, "  port = 8080", &[("port ", Tok::Key), ("8080", Tok::Num)]);
+        has(Lang::Ini, "name = \"Slate\" # the app", &[("\"Slate\"", Tok::Str), ("# the app", Tok::Comment)]);
+        has(Lang::Ini, "[server]", &[("[server]", Tok::Section)]);
+        has(Lang::Ini, "debug=true", &[("true", Tok::Lit)]);
+        has(Lang::Diff, "+added", &[("+added", Tok::Added)]);
+        has(Lang::Diff, "@@ -1,2 +1,3 @@", &[("@@ -1,2 +1,3 @@", Tok::Section)]);
+    }
+
+    #[test]
+    fn csv_columns() {
+        let t = toks(Lang::Csv, "a,b,\"c,still c\",d", State::START);
+        assert_eq!(t, vec![("b".into(), Tok::Col(1)), ("\"c,still c\"".into(), Tok::Col(2)), ("d".into(), Tok::Col(3))]);
+        // a quoted field with a line break keeps its column on the next line
+        let st = lex(Lang::Csv, b"x,\"first", State::START, None);
+        let t = toks(Lang::Csv, "second\",y", st);
+        assert_eq!(t, vec![("second\"".into(), Tok::Col(1)), ("y".into(), Tok::Col(2))]);
+        // "" is a quote inside a quoted field
+        let t = toks(Lang::Tsv, "1\t\"say \"\"hi\"\"\t!\"\t3", State::START);
+        assert_eq!(t[0], ("\"say \"\"hi\"\"\t!\"".into(), Tok::Col(1)));
+        end_state(Lang::Csv, "a,\"b\nc\",d\ne,f\n");
+    }
+
+    #[test]
+    fn never_panics_on_odd_input() {
+        let samples: Vec<Vec<u8>> = vec![
+            b"\"".to_vec(),
+            b"/*".to_vec(),
+            b"<".to_vec(),
+            b"<!--".to_vec(),
+            b"r#\"".to_vec(),
+            b"@\"".to_vec(),
+            b"```".to_vec(),
+            b"key: |".to_vec(),
+            b"\\".to_vec(),
+            vec![0xFF, 0xFE, b'"', 0x80, b'\n', b'#'],
+            b"--[==[".to_vec(),
+            b"'a".to_vec(),
+            b"$".to_vec(),
+            b"%~".to_vec(),
+        ];
+        for lang in Lang::ALL {
+            for s in &samples {
+                let mut v = Vec::new();
+                let mut st = lex(lang, s, State::START, Some(&mut v));
+                for _ in 0..3 {
+                    st = lex(lang, s, st, Some(&mut v));
+                    for &(a, b, _) in &v {
+                        assert!(a < b && b as usize <= s.len(), "{lang:?} span {a}..{b} of {s:?}");
+                    }
+                }
+            }
+        }
+    }
+}

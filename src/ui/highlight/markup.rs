@@ -1,0 +1,726 @@
+//! Markup and data languages: XML and HTML (with the scripts and styles inside HTML pages), Markdown and YAML.
+
+use super::code;
+use super::{Lang, Out, State, Tok, at, find, is_num_word, line_end, scan_str};
+
+// ---- XML and HTML ----
+
+// What `State::kind` means here.
+const TEXT: u8 = 0;
+/// Inside `<name …>` (attributes); `b`: what the element's content is (`SCRIPT`, `STYLE`, or 0).
+const TAG: u8 = 1;
+/// A quoted attribute value; `a`: the quote, `b` as for `TAG`.
+const VALUE: u8 = 2;
+const COMMENT: u8 = 3;
+const CDATA: u8 = 4;
+/// `<?xml …?>`
+const PI: u8 = 5;
+/// `<!DOCTYPE …>`; `a`: depth of `[…]`.
+const DOCTYPE: u8 = 6;
+
+/// `State::mode` inside an HTML `<script>` / `<style>` element.
+const SCRIPT: u8 = 1;
+const STYLE: u8 = 2;
+
+fn name_start(c: u8) -> bool {
+    c.is_ascii_alphabetic() || c == b'_' || c == b':' || c >= 0x80
+}
+
+fn name_end(t: &[u8], mut i: usize) -> usize {
+    while i < t.len() && (t[i].is_ascii_alphanumeric() || matches!(t[i], b'_' | b':' | b'-' | b'.') || t[i] >= 0x80) {
+        i += 1;
+    }
+    i
+}
+
+/// `&amp;`, `&#123;`, `&#x1F;` at `i`: its end.
+fn entity_end(t: &[u8], i: usize) -> Option<usize> {
+    let mut j = i + 1;
+    if at(t, j) == b'#' {
+        j += 1;
+    }
+    let s = j;
+    while j < t.len() && j - s < 32 && t[j].is_ascii_alphanumeric() {
+        j += 1;
+    }
+    (j > s && at(t, j) == b';').then_some(j + 1)
+}
+
+/// The next `</script` (or `</style`) at or after `from`, in any letter case.
+fn find_end_tag(t: &[u8], mut from: usize, tag: &[u8]) -> Option<usize> {
+    while let Some(p) = memchr::memchr(b'<', &t[from.min(t.len())..]) {
+        let i = from + p;
+        if t.len() >= i + tag.len() && t[i..i + tag.len()].eq_ignore_ascii_case(tag) {
+            return Some(i);
+        }
+        from = i + 1;
+    }
+    None
+}
+
+/// Colors from `s` up to and including `end` (found from `from`); when the text ends first, the state to go on in.
+fn until(t: &[u8], s: usize, from: usize, end: &[u8], tok: Tok, kind: u8, st: State, o: &mut Out) -> Result<usize, State> {
+    match find(t, from, end) {
+        Some(p) => {
+            o.put(s, p + end.len(), tok);
+            Ok(p + end.len())
+        }
+        None => {
+            o.put(s, t.len(), tok);
+            Err(State { kind, a: 0, ..st })
+        }
+    }
+}
+
+/// A `<!DOCTYPE …>` from `s`, scanning from `from` with `depth` open `[`.
+fn doctype(t: &[u8], s: usize, mut i: usize, mut depth: u8, st: State, o: &mut Out) -> Result<usize, State> {
+    while i < t.len() {
+        match t[i] {
+            b'[' => depth = depth.saturating_add(1),
+            b']' => depth = depth.saturating_sub(1),
+            b'>' if depth == 0 => {
+                o.put(s, i + 1, Tok::Keyword);
+                return Ok(i + 1);
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    o.put(s, t.len(), Tok::Keyword);
+    Err(State { kind: DOCTYPE, a: depth, ..st })
+}
+
+/// A quoted attribute value from `s`, closing quote `q` searched from `from`.
+fn value(t: &[u8], s: usize, from: usize, q: u8, st: State, o: &mut Out) -> Result<usize, State> {
+    match memchr::memchr(q, &t[from.min(t.len())..]) {
+        Some(p) => {
+            o.put(s, from + p + 1, Tok::Str);
+            Ok(from + p + 1)
+        }
+        None => {
+            o.put(s, t.len(), Tok::Str);
+            Err(State { kind: VALUE, a: q, ..st })
+        }
+    }
+}
+
+pub(super) fn markup(html: bool, t: &[u8], mut st: State, o: &mut Out) -> State {
+    let n = t.len();
+    let mut i = 0;
+    macro_rules! step {
+        ($e:expr, $then:expr) => {
+            match $e {
+                Ok(e) => {
+                    i = e;
+                    st.kind = $then;
+                    st.a = 0;
+                }
+                Err(s) => return s,
+            }
+        };
+    }
+    loop {
+        if st.mode != 0 {
+            // A script or style: that language, up to its end tag.
+            let tag: &[u8] = if st.mode == SCRIPT { b"</script" } else { b"</style" };
+            let e = find_end_tag(t, i, tag).unwrap_or(n);
+            let inner = State { mode: 0, ..st };
+            let mut sub = o.at(i);
+            let s = if st.mode == SCRIPT {
+                code::code(code::syntax(Lang::JavaScript), &t[i..e], inner, &mut sub)
+            } else {
+                code::css(&t[i..e], inner, &mut sub)
+            };
+            if e == n {
+                return State { mode: st.mode, ..s };
+            }
+            st = State { kind: TEXT, a: 0, b: 0, mode: 0, ..s };
+            i = e;
+        }
+        if i >= n {
+            return st;
+        }
+        match st.kind {
+            TAG => {
+                // attributes, up to '>' or '/>'
+                while i < n {
+                    let c = t[i];
+                    if c == b'>' {
+                        o.put(i, i + 1, Tok::Punct);
+                        i += 1;
+                        st = State { kind: TEXT, a: 0, b: 0, mode: st.b as u8, ..st };
+                        break;
+                    }
+                    if c == b'/' && at(t, i + 1) == b'>' {
+                        o.put(i, i + 2, Tok::Punct);
+                        i += 2;
+                        st = State { kind: TEXT, a: 0, b: 0, ..st };
+                        break;
+                    }
+                    if c == b'"' || c == b'\'' {
+                        match value(t, i, i + 1, c, st, o) {
+                            Ok(e) => i = e,
+                            Err(s) => return s,
+                        }
+                        continue;
+                    }
+                    if c == b'=' {
+                        o.put(i, i + 1, Tok::Punct);
+                        i += 1;
+                        // HTML allows values without quotes
+                        let v = i + t[i..].iter().take_while(|&&b| b == b' ' || b == b'\t').count();
+                        if html && v < n && !matches!(t[v], b'"' | b'\'' | b'>' | b'\n' | b'\r') {
+                            let e = v + t[v..].iter().take_while(|&&b| !b.is_ascii_whitespace() && b != b'>').count();
+                            o.put(v, e, Tok::Str);
+                            i = e;
+                        }
+                        continue;
+                    }
+                    if name_start(c) {
+                        let e = name_end(t, i);
+                        o.put(i, e, Tok::Attr);
+                        i = e;
+                        continue;
+                    }
+                    i += 1;
+                }
+            }
+            VALUE => step!(value(t, i, i, st.a, st, o), TAG),
+            COMMENT => step!(until(t, i, i, b"-->", Tok::Comment, COMMENT, st, o), TEXT),
+            CDATA => step!(until(t, i, i, b"]]>", Tok::Str, CDATA, st, o), TEXT),
+            PI => step!(until(t, i, i, b"?>", Tok::Section, PI, st, o), TEXT),
+            DOCTYPE => step!(doctype(t, i, i, st.a, st, o), TEXT),
+            _ => {
+                // text: find the next tag or entity
+                let Some(p) = memchr::memchr2(b'<', b'&', &t[i..]) else { return st };
+                let j = i + p;
+                if t[j] == b'&' {
+                    match entity_end(t, j) {
+                        Some(e) => {
+                            o.put(j, e, Tok::Lit);
+                            i = e;
+                        }
+                        None => i = j + 1,
+                    }
+                    continue;
+                }
+                let rest = &t[j..];
+                if rest.starts_with(b"<!--") {
+                    step!(until(t, j, j + 4, b"-->", Tok::Comment, COMMENT, st, o), TEXT);
+                    continue;
+                }
+                if rest.starts_with(b"<![CDATA[") {
+                    step!(until(t, j, j + 9, b"]]>", Tok::Str, CDATA, st, o), TEXT);
+                    continue;
+                }
+                if rest.starts_with(b"<?") {
+                    step!(until(t, j, j + 2, b"?>", Tok::Section, PI, st, o), TEXT);
+                    continue;
+                }
+                if rest.starts_with(b"<!") {
+                    step!(doctype(t, j, j + 2, 0, st, o), TEXT);
+                    continue;
+                }
+                let close = at(t, j + 1) == b'/';
+                let ns = j + 1 + close as usize;
+                if !name_start(at(t, ns)) {
+                    i = j + 1;
+                    continue;
+                }
+                let ne = name_end(t, ns);
+                o.put(j, ns, Tok::Punct);
+                o.put(ns, ne, Tok::Tag);
+                let name = &t[ns..ne];
+                let content = if html && !close && name.eq_ignore_ascii_case(b"script") {
+                    SCRIPT
+                } else if html && !close && name.eq_ignore_ascii_case(b"style") {
+                    STYLE
+                } else {
+                    0
+                };
+                st = State { kind: TAG, a: 0, b: content as u16, ..st };
+                i = ne;
+            }
+        }
+    }
+}
+
+// ---- Markdown ----
+
+/// Inside a fenced code block; `a`: the fence character, `b`: the fence length.
+const FENCE: u8 = 1;
+const HTML_COMMENT: u8 = 2;
+
+fn indent(l: &[u8]) -> usize {
+    l.iter().take_while(|&&b| b == b' ' || b == b'\t').count()
+}
+
+pub(super) fn markdown(t: &[u8], mut st: State, o: &mut Out) -> State {
+    let mut start = 0;
+    let mut col0 = st.col0;
+    loop {
+        let end = line_end(t, start);
+        st = md_line(&t[start..end], col0, st, &mut o.at(start));
+        if end >= t.len() {
+            return st;
+        }
+        start = end + 1;
+        col0 = true;
+    }
+}
+
+fn md_line(l: &[u8], col0: bool, mut st: State, o: &mut Out) -> State {
+    let n = l.len();
+    if st.kind == FENCE {
+        if col0 {
+            let ind = indent(l);
+            let run = l[ind..].iter().take_while(|&&b| b == st.a).count();
+            if ind <= 3 && run >= st.b as usize && l[ind + run..].trim_ascii().is_empty() {
+                o.put(0, n, Tok::Punct);
+                return State { kind: 0, a: 0, b: 0, ..st };
+            }
+        }
+        o.put(0, n, Tok::Str);
+        return st;
+    }
+    let mut i = 0;
+    if st.kind == HTML_COMMENT {
+        match find(l, 0, b"-->") {
+            Some(p) => {
+                o.put(0, p + 3, Tok::Comment);
+                i = p + 3;
+                st.kind = 0;
+            }
+            None => {
+                o.put(0, n, Tok::Comment);
+                return st;
+            }
+        }
+    }
+    if col0 && i == 0 {
+        let ind = indent(l);
+        let rest = &l[ind..];
+        let c = at(rest, 0);
+        if ind <= 3 {
+            // ``` or ~~~ code fence
+            let run = rest.iter().take_while(|&&b| b == c).count();
+            if (c == b'`' || c == b'~') && run >= 3 && !(c == b'`' && rest[run..].contains(&b'`')) {
+                o.put(0, n, Tok::Punct);
+                return State { kind: FENCE, a: c, b: run as u16, ..st };
+            }
+            // # heading
+            if (1..=6).contains(&run) && c == b'#' && matches!(at(rest, run), 0 | b' ' | b'\t' | b'\r') {
+                o.put(ind, n, Tok::Heading);
+                return st;
+            }
+            // > quote
+            if c == b'>' {
+                o.put(ind, n, Tok::Comment);
+                return st;
+            }
+            // --- *** ___ rules, and table header lines like |---|:--:|
+            let only = |set: &[u8]| rest.iter().all(|b| set.contains(b) || *b == b' ' || *b == b'\t' || *b == b'\r');
+            if (matches!(c, b'-' | b'*' | b'_') && rest.iter().filter(|&&b| b == c).count() >= 3 && only(&[c]))
+                || (rest.contains(&b'|') && rest.contains(&b'-') && only(b"|-:"))
+            {
+                o.put(ind, n, Tok::Punct);
+                return st;
+            }
+        }
+        // list markers: - item, * item, 1. item
+        let m = if matches!(c, b'-' | b'*' | b'+') && matches!(at(rest, 1), b' ' | b'\t') {
+            1
+        } else {
+            let d = rest.iter().take_while(|b| b.is_ascii_digit()).count();
+            if (1..=9).contains(&d) && matches!(at(rest, d), b'.' | b')') && matches!(at(rest, d + 1), b' ' | b'\t') { d + 1 } else { 0 }
+        };
+        if m > 0 {
+            o.put(ind, ind + m, Tok::Keyword);
+            i = ind + m;
+        }
+    }
+    md_inline(l, i, o, &mut st);
+    st
+}
+
+/// The closing run of `k` `c` characters for emphasis opened before `from`.
+fn emphasis_close(l: &[u8], from: usize, c: u8, k: usize) -> Option<usize> {
+    let mut p = from;
+    while p + k <= l.len() {
+        if l[p..p + k].iter().all(|&b| b == c)
+            && p > from
+            && !l[p - 1].is_ascii_whitespace()
+            && !(c == b'_' && at(l, p + k).is_ascii_alphanumeric())
+        {
+            return Some(p);
+        }
+        p += 1;
+    }
+    None
+}
+
+fn md_inline(l: &[u8], mut i: usize, o: &mut Out, st: &mut State) {
+    let n = l.len();
+    while i < n {
+        let c = l[i];
+        match c {
+            b'\\' => i += 2,
+            b'`' => {
+                // `code`, ``co`de``
+                let run = l[i..].iter().take_while(|&&b| b == b'`').count();
+                let mut p = i + run;
+                let mut found = None;
+                while let Some(q) = memchr::memchr(b'`', &l[p.min(n)..]) {
+                    let s = p + q;
+                    let r = l[s..].iter().take_while(|&&b| b == b'`').count();
+                    if r == run {
+                        found = Some(s + r);
+                        break;
+                    }
+                    p = s + r;
+                }
+                match found {
+                    Some(e) => {
+                        o.put(i, e, Tok::Str);
+                        i = e;
+                    }
+                    None => i += run,
+                }
+            }
+            b'*' | b'_' => {
+                let run = l[i..].iter().take_while(|&&b| b == c).count();
+                let k = run.min(2);
+                let next = at(l, i + run);
+                let opens = next != 0 && !next.is_ascii_whitespace() && !(c == b'_' && i > 0 && l[i - 1].is_ascii_alphanumeric());
+                if opens {
+                    if let Some(p) = emphasis_close(l, i + k, c, k) {
+                        o.put(i, p + k, if k == 2 { Tok::Bold } else { Tok::Italic });
+                        i = p + k;
+                        continue;
+                    }
+                }
+                i += run;
+            }
+            b'[' | b'!' if c == b'[' || at(l, i + 1) == b'[' => {
+                // [text](url), ![image](src), [text][ref]
+                let s = if c == b'!' { i + 1 } else { i };
+                let mut depth = 0;
+                let mut close = None;
+                for (k, &b) in l[s..].iter().enumerate() {
+                    match b {
+                        b'[' => depth += 1,
+                        b']' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                close = Some(s + k);
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if let Some(cl) = close {
+                    let end = match at(l, cl + 1) {
+                        b'(' => memchr::memchr(b')', &l[cl + 1..]).map(|p| cl + 2 + p),
+                        b'[' => memchr::memchr(b']', &l[cl + 2..]).map(|p| cl + 3 + p),
+                        _ => None,
+                    };
+                    if let Some(e) = end {
+                        o.put(i, cl + 1, Tok::Link);
+                        o.put(cl + 1, e, Tok::Dim);
+                        i = e;
+                        continue;
+                    }
+                }
+                i += 1;
+            }
+            b'<' => {
+                if l[i..].starts_with(b"<!--") {
+                    match find(l, i + 4, b"-->") {
+                        Some(p) => {
+                            o.put(i, p + 3, Tok::Comment);
+                            i = p + 3;
+                        }
+                        None => {
+                            o.put(i, n, Tok::Comment);
+                            st.kind = HTML_COMMENT;
+                            return;
+                        }
+                    }
+                    continue;
+                }
+                match memchr::memchr(b'>', &l[i..]) {
+                    Some(p) if p > 1 => {
+                        let inner = &l[i + 1..i + p];
+                        let link = inner.starts_with(b"http") || inner.starts_with(b"mailto:") || (inner.contains(&b'@') && !inner.contains(&b' '));
+                        if link || inner[0].is_ascii_alphabetic() || inner[0] == b'/' {
+                            o.put(i, i + p + 1, if link { Tok::Link } else { Tok::Tag });
+                            i += p + 1;
+                            continue;
+                        }
+                        i += 1;
+                    }
+                    _ => i += 1,
+                }
+            }
+            b'h' if (l[i..].starts_with(b"http://") || l[i..].starts_with(b"https://")) && (i == 0 || !l[i - 1].is_ascii_alphanumeric()) => {
+                let e = i + l[i..].iter().take_while(|&&b| !b.is_ascii_whitespace() && !matches!(b, b')' | b'>' | b'"' | b'<')).count();
+                o.put(i, e, Tok::Link);
+                i = e;
+            }
+            b'|' => {
+                o.put(i, i + 1, Tok::Punct);
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+}
+
+// ---- YAML ----
+
+/// Inside a block scalar (`key: |` / `key: >`); `b`: the indentation of the line that started it.
+const BLOCK: u8 = 1;
+
+pub(super) fn yaml(t: &[u8], mut st: State, o: &mut Out) -> State {
+    let mut start = 0;
+    let mut col0 = st.col0;
+    loop {
+        let end = line_end(t, start);
+        st = yaml_line(&t[start..end], col0, st, &mut o.at(start));
+        if end >= t.len() {
+            return st;
+        }
+        start = end + 1;
+        col0 = true;
+    }
+}
+
+fn yaml_line(l: &[u8], col0: bool, mut st: State, o: &mut Out) -> State {
+    let n = l.len();
+    let ind = if col0 { l.iter().take_while(|&&b| b == b' ').count() } else { 0 };
+    if st.kind == BLOCK {
+        if !col0 || l.trim_ascii().is_empty() || ind > st.b as usize {
+            o.put(0, n, Tok::Str);
+            return st;
+        }
+        // less indented: the block scalar is over
+        st = State { kind: 0, a: 0, b: 0, ..st };
+    }
+    if !col0 {
+        yaml_value(l, 0, 0, o, &mut st);
+        return st;
+    }
+    let mut i = ind;
+    let rest = &l[i..];
+    if at(rest, 0) == b'#' {
+        o.put(i, n, Tok::Comment);
+        return st;
+    }
+    if i == 0 && (rest.starts_with(b"---") || rest.starts_with(b"...")) && matches!(at(rest, 3), 0 | b' ' | b'\t' | b'\r') {
+        o.put(0, 3, Tok::Punct);
+        yaml_value(l, 3, ind, o, &mut st);
+        return st;
+    }
+    if i == 0 && at(rest, 0) == b'%' {
+        o.put(0, n, Tok::Control);
+        return st;
+    }
+    // "- " list items (possibly "- - x")
+    while at(l, i) == b'-' && matches!(at(l, i + 1), 0 | b' ' | b'\t' | b'\r') {
+        o.put(i, i + 1, Tok::Punct);
+        i += 1;
+        i += l[i..].iter().take_while(|&&b| b == b' ' || b == b'\t').count();
+    }
+    if let Some(colon) = yaml_key_end(l, i) {
+        o.put(i, colon, Tok::Key);
+        o.put(colon, colon + 1, Tok::Punct);
+        i = colon + 1;
+    }
+    yaml_value(l, i, ind, o, &mut st);
+    st
+}
+
+/// The ':' ending a mapping key that starts at `i` (it must be followed by a space or the end of the line).
+fn yaml_key_end(l: &[u8], i: usize) -> Option<usize> {
+    let c = at(l, i);
+    let sep = |p: usize| matches!(at(l, p), 0 | b' ' | b'\t' | b'\r');
+    if c == b'"' || c == b'\'' {
+        let (e, closed, _) = scan_str(l, i + 1, c, if c == b'"' { b'\\' } else { 0 }, false, true);
+        return (closed && at(l, e) == b':' && sep(e + 1)).then_some(e);
+    }
+    if c == 0 || matches!(c, b'[' | b'{' | b'#' | b'|' | b'>' | b'&' | b'*' | b'!' | b'%' | b'@' | b'`') {
+        return None;
+    }
+    let mut j = i;
+    while j < l.len() {
+        match l[j] {
+            b':' if sep(j + 1) => return Some(j),
+            b'#' if matches!(l[j - 1], b' ' | b'\t') => return None,
+            _ => j += 1,
+        }
+    }
+    None
+}
+
+fn yaml_scalar_tok(v: &[u8]) -> Tok {
+    let lower = v.to_ascii_lowercase();
+    if is_num_word(v) || matches!(lower.as_slice(), b".inf" | b"-.inf" | b".nan") {
+        Tok::Num
+    } else if matches!(lower.as_slice(), b"true" | b"false" | b"yes" | b"no" | b"on" | b"off" | b"null" | b"~") {
+        Tok::Lit
+    } else {
+        Tok::Str
+    }
+}
+
+fn yaml_value(l: &[u8], mut i: usize, ind: usize, o: &mut Out, st: &mut State) {
+    let n = l.len();
+    i += l[i.min(n)..].iter().take_while(|&&b| b == b' ' || b == b'\t').count();
+    if i >= n {
+        return;
+    }
+    let c = l[i];
+    match c {
+        b'#' => o.put(i, n, Tok::Comment),
+        b'|' | b'>' => {
+            // block scalar header: |, >-, |+2 ...
+            let j = i + 1 + l[i + 1..].iter().take_while(|&&b| matches!(b, b'+' | b'-' | b'0'..=b'9')).count();
+            let after = l[j..].trim_ascii_start();
+            if after.is_empty() || after[0] == b'#' {
+                o.put(i, j, Tok::Punct);
+                o.put(n - after.len(), n, Tok::Comment);
+                *st = State { kind: BLOCK, a: 0, b: ind as u16, ..*st };
+            } else {
+                o.put(i, n, Tok::Str);
+            }
+        }
+        b'"' | b'\'' => {
+            let (e, _, _) = scan_str(l, i + 1, c, if c == b'"' { b'\\' } else { 0 }, false, true);
+            o.put(i, e, Tok::Str);
+            if let Some(p) = l[e..].iter().position(|&b| b == b'#') {
+                o.put(e + p, n, Tok::Comment);
+            }
+        }
+        b'&' | b'*' | b'!' => {
+            // &anchor, *alias, !tag
+            let e = i + l[i..].iter().take_while(|&&b| !matches!(b, b' ' | b'\t' | b',' | b']' | b'}')).count();
+            o.put(i, e, if c == b'!' { Tok::Type } else { Tok::Var });
+            yaml_value(l, e, ind, o, st);
+        }
+        b'[' | b'{' => {
+            // flow collections: [a, "b", 3], {k: v}
+            while i < n {
+                let b = l[i];
+                match b {
+                    b'[' | b']' | b'{' | b'}' | b',' | b':' => {
+                        o.put(i, i + 1, Tok::Punct);
+                        i += 1;
+                    }
+                    b'"' | b'\'' => {
+                        let (e, _, _) = scan_str(l, i + 1, b, if b == b'"' { b'\\' } else { 0 }, false, true);
+                        o.put(i, e, Tok::Str);
+                        i = e;
+                    }
+                    b'#' if i > 0 && matches!(l[i - 1], b' ' | b'\t') => {
+                        o.put(i, n, Tok::Comment);
+                        return;
+                    }
+                    b' ' | b'\t' => i += 1,
+                    _ => {
+                        let e = i + l[i..].iter().take_while(|&&b| !matches!(b, b',' | b']' | b'}' | b'[' | b'{')).count();
+                        let e = l[i..e].iter().position(|&b| b == b':').map_or(e, |p| i + p).max(i + 1);
+                        let v = l[i..e].trim_ascii_end();
+                        o.put(i, i + v.len(), yaml_scalar_tok(v));
+                        i = e;
+                    }
+                }
+            }
+        }
+        _ => {
+            // a plain scalar, to a " #" comment or the end of the line
+            let mut e = i;
+            while e < n && !(l[e] == b'#' && matches!(l[e - 1], b' ' | b'\t')) {
+                e += 1;
+            }
+            let v = l[i..e].trim_ascii_end();
+            o.put(i, i + v.len(), yaml_scalar_tok(v));
+            if e < n {
+                o.put(e, n, Tok::Comment);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::tests::{end_state, has, toks};
+    use super::super::{Lang, Tok};
+
+    #[test]
+    fn xml_and_html() {
+        has(Lang::Xml, r#"<?xml version="1.0"?><root a="1" b='x>y'><!-- note --><item/>&amp;<![CDATA[<raw>]]></root>"#, &[
+            (r#"<?xml version="1.0"?>"#, Tok::Section),
+            ("root", Tok::Tag),
+            ("a", Tok::Attr),
+            ("\"1\"", Tok::Str),
+            ("'x>y'", Tok::Str),
+            ("<!-- note -->", Tok::Comment),
+            ("&amp;", Tok::Lit),
+            ("<![CDATA[<raw>]]>", Tok::Str),
+        ]);
+        // a tag and a comment spread over lines
+        let st = end_state(Lang::Xml, "<config\n  name=\"a\n");
+        let t = toks(Lang::Xml, "b\" port='80'>text", st);
+        assert_eq!(t[0], ("b\"".into(), Tok::Str));
+        assert!(t.contains(&("port".into(), Tok::Attr)));
+        let st = end_state(Lang::Xml, "<a><!-- start\n");
+        assert_eq!(toks(Lang::Xml, "end --><b>", st)[0], ("end -->".into(), Tok::Comment));
+        // script and style inside HTML
+        has(Lang::Html, "<script>if (x) { y = \"<b>\"; }</script><style>p { color: red }</style>", &[
+            ("if", Tok::Control),
+            ("\"<b>\"", Tok::Str),
+            ("color", Tok::Attr),
+        ]);
+        let st = end_state(Lang::Html, "<SCRIPT type=module>\nlet a = 1;\n");
+        let t = toks(Lang::Html, "/* c */ </script> <p>", st);
+        assert_eq!(t[0], ("/* c */".into(), Tok::Comment));
+        assert!(t.contains(&("script".into(), Tok::Tag)));
+        assert!(t.contains(&("p".into(), Tok::Tag)));
+    }
+
+    #[test]
+    fn markdown_blocks_and_inline() {
+        has(Lang::Markdown, "# Title", &[("# Title", Tok::Heading)]);
+        has(Lang::Markdown, "- an **important** and *nice* `code` [link](http://x.y) item", &[
+            ("-", Tok::Keyword),
+            ("**important**", Tok::Bold),
+            ("*nice*", Tok::Italic),
+            ("`code`", Tok::Str),
+            ("[link]", Tok::Link),
+            ("(http://x.y)", Tok::Dim),
+        ]);
+        has(Lang::Markdown, "> quoted", &[("> quoted", Tok::Comment)]);
+        has(Lang::Markdown, "| a | b |", &[("|", Tok::Punct)]);
+        has(Lang::Markdown, "snake_case_name stays plain", &[]);
+        assert!(toks(Lang::Markdown, "snake_case_name", super::super::State::START).is_empty());
+        // fenced code blocks span lines
+        let st = end_state(Lang::Markdown, "Text\n```python\nx = 1  # *not* emphasis\n");
+        assert_eq!(toks(Lang::Markdown, "y = 2", st), vec![("y = 2".into(), Tok::Str)]);
+        let st = end_state(Lang::Markdown, "```\ncode\n```\n");
+        assert_eq!(toks(Lang::Markdown, "# After", st), vec![("# After".into(), Tok::Heading)]);
+    }
+
+    #[test]
+    fn yaml_documents() {
+        has(Lang::Yaml, "name: \"Slate\" # app", &[("name", Tok::Key), ("\"Slate\"", Tok::Str), ("# app", Tok::Comment)]);
+        has(Lang::Yaml, "  - port: 8080", &[("-", Tok::Punct), ("port", Tok::Key), ("8080", Tok::Num)]);
+        has(Lang::Yaml, "enabled: true", &[("true", Tok::Lit)]);
+        has(Lang::Yaml, "url: http://x.y:80/a", &[("url", Tok::Key), ("http://x.y:80/a", Tok::Str)]);
+        has(Lang::Yaml, "base: &b {a: 1, b: [x, \"y\"]}", &[("&b", Tok::Var), ("1", Tok::Num), ("\"y\"", Tok::Str)]);
+        // block scalars (Home Assistant templates) span lines until the indentation drops
+        let st = end_state(Lang::Yaml, "sensor:\n  value_template: >\n    {{ states('x') }}\n");
+        assert_eq!(toks(Lang::Yaml, "    and: more", st), vec![("    and: more".into(), Tok::Str)]);
+        assert!(toks(Lang::Yaml, "  next: 1", st).contains(&("next".into(), Tok::Key)));
+    }
+}

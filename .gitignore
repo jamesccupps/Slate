@@ -1,0 +1,6 @@
+/target
+/dist
+# Local deploy folder for this PC (see build.cmd)
+/.install-dir
+*.log
+/.claude/
