@@ -15,6 +15,9 @@ permissions:
 jobs:
   build:
     runs-on: windows-latest
+    env:
+      # link with the toolchain's own MinGW files (rust-mingw), whatever else the runner has on its PATH
+      RUSTFLAGS: -Clink-self-contained=yes
     steps:
       - uses: actions/checkout@v4
 
@@ -24,9 +27,6 @@ jobs:
           # rust-mingw brings the toolchain's own linker libraries (crt2.o, libkernel32.a...)
           rustup toolchain install stable-x86_64-pc-windows-gnu --profile minimal --component rust-mingw
           rustup default stable-x86_64-pc-windows-gnu
-          # the toolchain's own linker comes first (the runner has other MinGW installs on its PATH)
-          $sysroot = rustc --print sysroot
-          "$sysroot\lib\rustlib\x86_64-pc-windows-gnu\bin\self-contained" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
 
       - name: Test
         run: cargo test --lib
