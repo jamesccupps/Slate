@@ -13,6 +13,7 @@ pub mod settings;
 pub mod structure;
 pub mod testmode;
 pub mod theme;
+pub mod update;
 pub mod win;
 
 use std::cell::RefCell;
@@ -647,6 +648,14 @@ pub fn run(args: Vec<String>) -> i32 {
     if args.first().map(String::as_str) == Some("--test") {
         return testmode::run(&args[1..]);
     }
+    // Started by an update: let the old version finish closing first.
+    let mut args = args;
+    if let Some(i) = args.iter().position(|a| a == "--wait-for") {
+        if let Some(pid) = args.get(i + 1).and_then(|p| p.parse().ok()) {
+            update::wait_for(pid);
+        }
+        args.drain(i..(i + 2).min(args.len()));
+    }
     let paths: Vec<PathBuf> =
         args.iter().filter(|a| !a.starts_with("--")).map(|a| std::path::absolute(a).unwrap_or_else(|_| PathBuf::from(a))).collect();
     if forward_to_running(&paths) {
@@ -664,6 +673,7 @@ pub fn run(args: Vec<String>) -> i32 {
         a.layout();
         a.update_title();
         a.timer(TIMER_DISK, 2000);
+        a.timer(actions::TIMER_UPDATE, 8000);
         a.restart_caret();
     }
     unsafe {
@@ -682,8 +692,12 @@ pub fn run(args: Vec<String>) -> i32 {
         }
     }
     let code = message_loop(&cell, hwnd);
+    let restart = cell.borrow().restart_on_exit;
     drop(cell);
     release_app();
+    if restart {
+        update::restart();
+    }
     code
 }
 

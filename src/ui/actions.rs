@@ -37,6 +37,7 @@ use super::editor::{self, Ctx, DragMode, View};
 use super::findbar::{FindBar, Mode as BarMode, Part};
 use super::highlight::Lang;
 use super::session;
+use super::update::{self, Release, Version};
 use super::settings::{ThemeMode, data_dir};
 use super::win;
 
@@ -47,6 +48,8 @@ pub const TIMER_DISK: usize = 3;
 pub const TIMER_SCROLL: usize = 4;
 pub const TIMER_SEARCH: usize = 5;
 pub const TIMER_SESSION: usize = 6;
+/// A while after starting: look for a new version (at most once a day).
+pub const TIMER_UPDATE: usize = 7;
 
 /// Documents up to this size are searched on the UI thread (fast enough to feel instant).
 const SYNC_SEARCH: u64 = 32 << 20;
@@ -500,6 +503,7 @@ impl App {
                 any |= self.poll_tab(i);
             }
         }
+        any |= self.poll_update();
         if !any {
             self.kill_timer(TIMER_JOBS);
         }
@@ -518,6 +522,93 @@ impl App {
         for t in &mut self.tabs {
             t.discard = false;
         }
+        if std::mem::take(&mut self.restart_on_exit) {
+            self.flash("Slate is updated: the new version starts the next time you open it.", false);
+        }
+    }
+
+    // ---- updates ----
+
+    /// Asks GitHub for the latest release in the background. `manual`: from the Help menu.
+    pub fn check_for_update(&mut self, manual: bool) {
+        match self.update {
+            UpdateState::Checking { .. } | UpdateState::Downloading { .. } => return,
+            UpdateState::Available(_) if manual => {
+                self.pending.push(Deferred::UpdatePrompt);
+                return;
+            }
+            _ => {}
+        }
+        let job = Job::spawn(0, self.notify.clone(), |_| update::latest());
+        self.update = UpdateState::Checking { manual, job };
+        if manual {
+            self.flash("Checking for updates…", false);
+        }
+        self.timer(TIMER_JOBS, 100);
+    }
+
+    pub fn start_update(&mut self, release: Release) {
+        let r = release.clone();
+        let job = Job::spawn(release.exe_size, self.notify.clone(), move |ctx| update::download(&r, ctx));
+        self.update = UpdateState::Downloading { release, job };
+        self.timer(TIMER_JOBS, 100);
+        self.invalidate();
+    }
+
+    /// Picks up a finished update check or download; returns whether one is still running.
+    fn poll_update(&mut self) -> bool {
+        match std::mem::replace(&mut self.update, UpdateState::Idle) {
+            UpdateState::Checking { manual, mut job } => match job.take() {
+                None => {
+                    self.update = UpdateState::Checking { manual, job };
+                    return true;
+                }
+                Some(Ok(rel)) => {
+                    self.settings.last_update_check = unix_now();
+                    self.settings.save();
+                    if rel.version > Version::current() {
+                        self.update = UpdateState::Available(rel);
+                        if manual {
+                            self.pending.push(Deferred::UpdatePrompt);
+                        }
+                    } else if manual {
+                        self.flash(format!("Slate is up to date ({})", Version::current()), false);
+                    }
+                }
+                Some(Err(e)) => {
+                    if manual {
+                        self.flash(format!("Couldn't check for updates: {e}"), true);
+                    }
+                }
+            },
+            UpdateState::Downloading { release, mut job } => match job.take() {
+                None => {
+                    self.update = UpdateState::Downloading { release, job };
+                    return true;
+                }
+                Some(Ok(file)) => match update::install(&file) {
+                    Ok(()) => {
+                        // Close (keeping the tabs in the session) and start the new version.
+                        self.flash(format!("Restarting with Slate {}…", release.version), false);
+                        self.restart_on_exit = true;
+                        self.pending.push(Deferred::Cmd(Cmd::Exit));
+                    }
+                    Err(e) => {
+                        self.flash(format!("Couldn't update: {e}"), true);
+                        self.update = UpdateState::Available(release);
+                    }
+                },
+                Some(Err(e)) => {
+                    if e != "Cancelled" {
+                        self.flash(format!("Couldn't update: {e}"), true);
+                    }
+                    self.update = UpdateState::Available(release);
+                }
+            },
+            other => self.update = other,
+        }
+        self.invalidate();
+        false
     }
 
     /// Tabs whose unsaved changes closing now would lose: not kept in the session (too big, or the session
@@ -1897,6 +1988,7 @@ impl App {
             (0, Hit::Status(a), Hit::Status(b)) if a == b => match a {
                 StatusItem::Position => self.pending.push(Deferred::Cmd(Cmd::GoToLine)),
                 StatusItem::Zoom => self.pending.push(Deferred::Cmd(Cmd::ZoomReset)),
+                StatusItem::Update => self.pending.push(Deferred::UpdatePrompt),
                 other => self.pending.push(Deferred::StatusMenu(other)),
             },
             (1, _, Hit::Text) | (1, _, Hit::Gutter) => self.pending.push(Deferred::ContextMenu(x, y)),
@@ -1979,6 +2071,12 @@ impl App {
                 }
             }
             TIMER_SEARCH => self.start_count(),
+            TIMER_UPDATE => {
+                self.kill_timer(TIMER_UPDATE);
+                if self.settings.check_updates && unix_now().saturating_sub(self.settings.last_update_check) >= 20 * 3600 {
+                    self.check_for_update(false);
+                }
+            }
             TIMER_SCROLL => {
                 let Some(drag) = self.tabs.get(self.active).and_then(|t| t.view.drag) else {
                     self.kill_timer(TIMER_SCROLL);
@@ -2157,6 +2255,14 @@ impl App {
                 if busy {
                     self.timer(TIMER_JOBS, 100);
                 }
+            }
+            Cmd::CheckUpdates => self.check_for_update(true),
+            Cmd::Update => self.pending.push(Deferred::UpdatePrompt),
+            Cmd::ToggleAutoUpdate => {
+                self.settings.check_updates = !self.settings.check_updates;
+                self.settings.save();
+                let on = self.settings.check_updates;
+                self.flash(if on { "Slate looks for updates once a day" } else { "Slate won't look for updates by itself" }, false);
             }
             Cmd::ZoomIn | Cmd::ZoomOut | Cmd::ZoomReset => {
                 let z = self.settings.zoom;
@@ -2581,13 +2687,24 @@ impl App {
                 ]);
                 v
             }
-            _ => vec![
-                item(Cmd::Shortcuts, "&Keyboard shortcuts", ""),
-                item(Cmd::MakeDefault, "Open files with Slate…", ""),
-                item(Cmd::OpenDataFolder, "Open settings &folder", ""),
-                Item::Sep,
-                item(Cmd::About, "&About Slate", ""),
-            ],
+            _ => {
+                let update = match &self.update {
+                    UpdateState::Available(r) => item(Cmd::Update, &format!("&Update to {}…", r.version), ""),
+                    UpdateState::Checking { .. } => enabled(Cmd::CheckUpdates, "Checking for updates…", "", false),
+                    UpdateState::Downloading { .. } => enabled(Cmd::CheckUpdates, "Downloading the update…", "", false),
+                    UpdateState::Idle => item(Cmd::CheckUpdates, "Check for &updates…", ""),
+                };
+                vec![
+                    item(Cmd::Shortcuts, "&Keyboard shortcuts", ""),
+                    item(Cmd::MakeDefault, "Open files with Slate…", ""),
+                    item(Cmd::OpenDataFolder, "Open settings &folder", ""),
+                    Item::Sep,
+                    update,
+                    check(Cmd::ToggleAutoUpdate, "Check for updates a&utomatically", "", self.settings.check_updates),
+                    Item::Sep,
+                    item(Cmd::About, "&About Slate", ""),
+                ]
+            }
         }
     }
 
@@ -2654,6 +2771,10 @@ fn nothing_to_clean(op: LineOp) -> &'static str {
         LineOp::RemoveBlank => "No blank lines",
         _ => "No spaces at line ends",
     }
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
 fn plural(n: u64, one: &str, many: &str) -> String {
@@ -2861,6 +2982,25 @@ pub fn run(cell: &Cell, d: Deferred) {
                 if cell.borrow().tab().id == id {
                     run_cmd(cell, c);
                 }
+            }
+        }
+        Deferred::UpdatePrompt => {
+            let (rel, hwnd) = {
+                let a = cell.borrow();
+                match &a.update {
+                    UpdateState::Available(r) => (r.clone(), a.hwnd),
+                    _ => return,
+                }
+            };
+            let q = format!("Slate {} is available", rel.version);
+            let detail = format!(
+                "You have {}. Slate downloads the new version from GitHub and restarts; your tabs and unsaved changes come back.",
+                Version::current()
+            );
+            match win::ask(hwnd, "Slate", &q, &detail, &["Update and restart", "What's new", "Not now"]) {
+                Some(0) => cell.borrow_mut().start_update(rel),
+                Some(1) => update::show_page(&rel),
+                _ => {}
             }
         }
         Deferred::StatusMenu(item_kind) => {

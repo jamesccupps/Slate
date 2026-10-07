@@ -26,6 +26,7 @@ use crate::core::source::Source;
 use crate::core::text::{Encoding, Eol};
 
 use super::commands::{Cmd, MENU_TITLES};
+use super::update::Release;
 use super::editor::{Ctx, Geom, Style, View};
 use super::findbar::{self, FindBar};
 use super::gfx::{Align, Gfx, Rect, font_info, rgb};
@@ -198,6 +199,8 @@ pub enum Deferred {
     ContextMenu(f32, f32),
     TabMenu(usize, f32, f32),
     StatusMenu(StatusItem),
+    /// "Slate x.y.z is available — update?"
+    UpdatePrompt,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -207,6 +210,16 @@ pub enum StatusItem {
     Eol,
     Encoding,
     Lang,
+    Update,
+}
+
+/// Where updating Slate is at (see `update.rs`).
+pub enum UpdateState {
+    Idle,
+    /// Asking GitHub; `manual`: from the Help menu (so say what came out of it).
+    Checking { manual: bool, job: Job<Result<Release, String>> },
+    Available(Release),
+    Downloading { release: Release, job: Job<Result<std::path::PathBuf, String>> },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -283,6 +296,9 @@ pub struct App {
     pub menu_open: Option<usize>,
     pub mono_fonts: Option<Vec<String>>,
     pub closing: bool,
+    pub update: UpdateState,
+    /// Start Slate again once this one has closed (a new version was just put in place).
+    pub restart_on_exit: bool,
     pub untitled_counter: u32,
     pub session_dirty: bool,
     pub last_session_save: Instant,
@@ -354,6 +370,8 @@ impl App {
             menu_open: None,
             mono_fonts: None,
             closing: false,
+            update: UpdateState::Idle,
+            restart_on_exit: false,
             untitled_counter: 0,
             session_dirty: false,
             last_session_save: Instant::now(),
@@ -907,6 +925,9 @@ impl App {
         if self.settings.zoom != 1.0 {
             items.push((StatusItem::Zoom, format!("{:.0}%", self.settings.zoom * 100.0)));
         }
+        if let UpdateState::Available(r) = &self.update {
+            items.push((StatusItem::Update, format!("Update to {}", r.version)));
+        }
         items.push((StatusItem::Lang, tab.lang.label().to_string()));
         items.push((StatusItem::Eol, doc.eol.short().to_string()));
         items.push((StatusItem::Encoding, doc.encoding.label()));
@@ -923,7 +944,8 @@ impl App {
             if self.hover == Hit::Status(*item) {
                 self.g.fill_round(br, 4.0, t.hover);
             }
-            self.g.text(label, &fonts_ui, br, t.text_dim, Align::Center);
+            let color = if *item == StatusItem::Update { t.accent } else { t.text_dim };
+            self.g.text(label, &fonts_ui, br, color, Align::Center);
             rects.push((*item, br));
             x = br.x - 4.0;
         }
@@ -969,6 +991,9 @@ impl App {
         }
         if let Some(j) = &tab.index_job {
             return Some((format!("Reading lines… {:.0}%", j.fraction() * 100.0), false));
+        }
+        if let UpdateState::Downloading { release, job } = &self.update {
+            return Some((format!("Downloading Slate {}… {:.0}%", release.version, job.fraction() * 100.0), false));
         }
         if let Some(j) = &tab.search.job {
             if self.find.open {

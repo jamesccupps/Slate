@@ -1,0 +1,56 @@
+# Builds and tests Slate on every push. For a version tag (v1.2.3) it also drafts a GitHub release with Slate.exe
+# and Slate.exe.sha256 attached; publishing the draft is what makes Slate's built-in updater offer it.
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust (GNU toolchain, no Visual Studio needed)
+        shell: pwsh
+        run: |
+          rustup toolchain install stable-x86_64-pc-windows-gnu --profile minimal
+          rustup default stable-x86_64-pc-windows-gnu
+          # the toolchain's own linker comes first (the runner has other MinGW installs on its PATH)
+          $sysroot = rustc --print sysroot
+          "$sysroot\lib\rustlib\x86_64-pc-windows-gnu\bin\self-contained" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+      - name: Test
+        run: cargo test --lib
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force out | Out-Null
+          Copy-Item target\release\Slate.exe out\Slate.exe
+          $hash = (Get-FileHash out\Slate.exe -Algorithm SHA256).Hash.ToLower()
+          "$hash  Slate.exe" | Out-File -FilePath out\Slate.exe.sha256 -Encoding ascii -NoNewline
+          Get-Content out\Slate.exe.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Slate
+          path: out/
+
+      - name: Draft the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" out\Slate.exe out\Slate.exe.sha256 --draft --title "Slate ${{ github.ref_name }}" --generate-notes

@@ -102,10 +102,13 @@ fn install_exe() -> std::io::Result<PathBuf> {
 
 /// Removes leftovers of earlier updates (old copies that were still running then).
 pub fn clean_old_copies() {
-    if let Ok(rd) = std::fs::read_dir(install_dir()) {
+    // In the install folder and next to the running exe (a portable copy, or one an update replaced).
+    let dirs = [Some(install_dir()), super::settings::exe_dir()];
+    for dir in dirs.iter().flatten() {
+        let Ok(rd) = std::fs::read_dir(dir) else { continue };
         for e in rd.flatten() {
             let n = e.file_name().to_string_lossy().into_owned();
-            if n.starts_with("Slate.old-") && n.ends_with(".exe") {
+            if (n.starts_with("Slate.old-") || n.starts_with("Slate.update-")) && n.ends_with(".exe") {
                 let _ = std::fs::remove_file(e.path());
             }
         }

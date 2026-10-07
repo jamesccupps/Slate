@@ -81,6 +81,9 @@ pub enum Cmd {
     Shortcuts,
     MakeDefault,
     OpenDataFolder,
+    CheckUpdates,
+    Update,
+    ToggleAutoUpdate,
 }
 
 pub struct Mods {

@@ -29,6 +29,16 @@ cargo test --lib
 - Never start Slate (or anything long-running) from a Claude session expecting it to persist: Claude is an MSIX app,
   so children run in its container (private HKCU/AppData, killed when Claude restarts). Tests render offscreen.
 
+## Releasing
+
+1. Bump `version` in `Cargo.toml` (the updater compares it with the release tag).
+2. Commit and push to `main`; then `git tag vX.Y.Z` and `git push origin vX.Y.Z`.
+3. The Build workflow (`.github/workflows/build.yml`) tests, builds and drafts the release with `Slate.exe` and
+   `Slate.exe.sha256`. The user edits the notes and publishes it — Slate's updater (`src/ui/update.rs`) only sees
+   published releases.
+
+Commits use the GitHub no-reply address (repo-local git config); GitHub refuses pushes that would publish another one.
+
 ## Layout
 
 - `src/core/` — the engine, no UI. Unit-tested (`cargo test --lib`).
@@ -64,7 +74,8 @@ cargo test --lib
   - `app.rs` state, layout and painting; `actions.rs` input, commands, background jobs, saving and closing;
     `editor.rs` the text view; `structure.rs` path bar + structure panel; `findbar.rs`; `session.rs` (tabs and
     unsaved text kept between runs); `settings.rs` (data folder, portable mode); `install.rs` ("Open with" entries
-    in HKCU); `testmode.rs`.
+    in HKCU); `update.rs` (updates from GitHub releases: WinHTTP, SHA-256 check, swap the exe, restart with
+    `--wait-for <pid>`); `testmode.rs`.
   - `gfx.rs` — Direct2D drawing into a D3D11 **flip-model swap chain** (FLIP_DISCARD, then FLIP_SEQUENTIAL), with
     `ID2D1HwndRenderTarget` only as a fallback: on a PC with a Parsec virtual display adapter the HWND target reported
     "occluded" and drew nothing. Device loss → `discard_target()` and paint again.

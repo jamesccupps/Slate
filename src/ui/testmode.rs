@@ -69,7 +69,7 @@ fn busy(cell: &Cell) -> bool {
             || t.search.job.is_some()
             || t.find_job.is_some()
             || t.structure.busy()
-    })
+    }) || matches!(a.update, super::app::UpdateState::Checking { .. } | super::app::UpdateState::Downloading { .. })
 }
 
 fn vk_of(name: &str) -> Option<u16> {
@@ -106,6 +106,7 @@ fn cmd_of(name: &str) -> Option<Cmd> {
         "SaveAll" => Cmd::SaveAll,
         "CloseTab" => Cmd::CloseTab,
         "Exit" => Cmd::Exit,
+        "CheckUpdates" => Cmd::CheckUpdates,
         "Undo" => Cmd::Undo,
         "Redo" => Cmd::Redo,
         "Cut" => Cmd::Cut,
@@ -308,6 +309,13 @@ fn describe(cell: &Cell, what: &str) -> String {
         "len" => a.tab().doc.len().to_string(),
         "title" => a.tab().title(),
         "lang" => a.tab().lang.label().to_string(),
+        "update" => match &a.update {
+            super::app::UpdateState::Idle => "idle".into(),
+            super::app::UpdateState::Checking { .. } => "checking".into(),
+            super::app::UpdateState::Available(r) => format!("available {}", r.version),
+            super::app::UpdateState::Downloading { .. } => "downloading".into(),
+        },
+        "restart" => a.restart_on_exit.to_string(),
         "top" => a.tab().view.top.to_string(),
         "dirty" => a.tab().doc.is_dirty().to_string(),
         "tabs" => a.tabs.len().to_string(),

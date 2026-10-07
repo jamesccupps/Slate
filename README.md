@@ -22,11 +22,20 @@ smoothly, and can be searched, edited, formatted and saved.
   (handy for log files).
 - A single small `Slate.exe` with nothing to install. *Help → Open files with Slate…* adds it to "Open with" and
   the right-click menu.
+- Keeps itself up to date: it checks GitHub once a day, and when there's a new version an *Update* button appears
+  in the status bar. One click downloads it, checks it against the release's checksum and restarts Slate with your
+  tabs (and their unsaved text) back where they were. *Help → Check for updates* does it on demand.
+
+## Download
+
+Get `Slate.exe` from the [latest release](https://github.com/jamesccupps/Slate/releases/latest) and run it from
+any folder.
 
 ## Building
 
 Needs Rust (the GNU toolchain is enough; no Visual Studio). Run `build.cmd`, which produces `dist\Slate.exe`.
-`cargo test --lib` runs the engine's tests.
+`cargo test --lib` runs the engine's tests. GitHub Actions builds and tests every push; a version tag (`v1.2.3`)
+drafts a release with `Slate.exe` and `Slate.exe.sha256` attached.
 
 ## Portable mode
 

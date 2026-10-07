@@ -42,6 +42,9 @@ pub struct Settings {
     pub structure_width: f32,
     pub recent: Vec<PathBuf>,
     pub window: Option<Placement>,
+    /// Look for a new version on GitHub (at most once a day), and when that last happened (Unix seconds).
+    pub check_updates: bool,
+    pub last_update_check: u64,
 }
 
 impl Default for Settings {
@@ -62,6 +65,8 @@ impl Default for Settings {
             structure_width: 340.0,
             recent: Vec::new(),
             window: None,
+            check_updates: true,
+            last_update_check: 0,
         }
     }
 }
