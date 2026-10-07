@@ -343,24 +343,35 @@ fn md_line(l: &[u8], col0: bool, mut st: State, o: &mut Out) -> State {
     st
 }
 
+/// How far ahead the end of `code`, *emphasis*, a [link] or a <tag> is looked for.
+const MD_LOOK: usize = 2048;
+
 /// The closing run of `k` `c` characters for emphasis opened before `from`.
 fn emphasis_close(l: &[u8], from: usize, c: u8, k: usize) -> Option<usize> {
+    let end = l.len().min(from + MD_LOOK);
     let mut p = from;
-    while p + k <= l.len() {
-        if l[p..p + k].iter().all(|&b| b == c)
-            && p > from
-            && !l[p - 1].is_ascii_whitespace()
-            && !(c == b'_' && at(l, p + k).is_ascii_alphanumeric())
+    while let Some(q) = memchr::memchr(c, &l[p.min(end)..end]) {
+        let s = p + q;
+        if s + k <= l.len()
+            && l[s..s + k].iter().all(|&b| b == c)
+            && s > from
+            && !l[s - 1].is_ascii_whitespace()
+            && !(c == b'_' && at(l, s + k).is_ascii_alphanumeric())
         {
-            return Some(p);
+            return Some(s);
         }
-        p += 1;
+        p = s + 1;
     }
     None
 }
 
+/// Inline Markdown. Only code spans, HTML comments and tags hide what's inside them, so only they matter for the
+/// state; emphasis, links and URLs are just colored (and skipped when only the state is wanted).
 fn md_inline(l: &[u8], mut i: usize, o: &mut Out, st: &mut State) {
     let n = l.len();
+    let full = o.on();
+    // a link's own (url) isn't colored again as a bare URL
+    let mut url_from = 0;
     while i < n {
         let c = l[i];
         match c {
@@ -368,9 +379,10 @@ fn md_inline(l: &[u8], mut i: usize, o: &mut Out, st: &mut State) {
             b'`' => {
                 // `code`, ``co`de``
                 let run = l[i..].iter().take_while(|&&b| b == b'`').count();
+                let look = n.min(i + run + MD_LOOK);
                 let mut p = i + run;
                 let mut found = None;
-                while let Some(q) = memchr::memchr(b'`', &l[p.min(n)..]) {
+                while let Some(q) = memchr::memchr(b'`', &l[p.min(look)..look]) {
                     let s = p + q;
                     let r = l[s..].iter().take_while(|&&b| b == b'`').count();
                     if r == run {
@@ -387,53 +399,6 @@ fn md_inline(l: &[u8], mut i: usize, o: &mut Out, st: &mut State) {
                     None => i += run,
                 }
             }
-            b'*' | b'_' => {
-                let run = l[i..].iter().take_while(|&&b| b == c).count();
-                let k = run.min(2);
-                let next = at(l, i + run);
-                let opens = next != 0 && !next.is_ascii_whitespace() && !(c == b'_' && i > 0 && l[i - 1].is_ascii_alphanumeric());
-                if opens {
-                    if let Some(p) = emphasis_close(l, i + k, c, k) {
-                        o.put(i, p + k, if k == 2 { Tok::Bold } else { Tok::Italic });
-                        i = p + k;
-                        continue;
-                    }
-                }
-                i += run;
-            }
-            b'[' | b'!' if c == b'[' || at(l, i + 1) == b'[' => {
-                // [text](url), ![image](src), [text][ref]
-                let s = if c == b'!' { i + 1 } else { i };
-                let mut depth = 0;
-                let mut close = None;
-                for (k, &b) in l[s..].iter().enumerate() {
-                    match b {
-                        b'[' => depth += 1,
-                        b']' => {
-                            depth -= 1;
-                            if depth == 0 {
-                                close = Some(s + k);
-                                break;
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                if let Some(cl) = close {
-                    let end = match at(l, cl + 1) {
-                        b'(' => memchr::memchr(b')', &l[cl + 1..]).map(|p| cl + 2 + p),
-                        b'[' => memchr::memchr(b']', &l[cl + 2..]).map(|p| cl + 3 + p),
-                        _ => None,
-                    };
-                    if let Some(e) = end {
-                        o.put(i, cl + 1, Tok::Link);
-                        o.put(cl + 1, e, Tok::Dim);
-                        i = e;
-                        continue;
-                    }
-                }
-                i += 1;
-            }
             b'<' => {
                 if l[i..].starts_with(b"<!--") {
                     match find(l, i + 4, b"-->") {
@@ -449,7 +414,8 @@ fn md_inline(l: &[u8], mut i: usize, o: &mut Out, st: &mut State) {
                     }
                     continue;
                 }
-                match memchr::memchr(b'>', &l[i..]) {
+                // <tag> or <https://autolink>
+                match memchr::memchr(b'>', &l[i..n.min(i + MD_LOOK)]) {
                     Some(p) if p > 1 => {
                         let inner = &l[i + 1..i + p];
                         let link = inner.starts_with(b"http") || inner.starts_with(b"mailto:") || (inner.contains(&b'@') && !inner.contains(&b' '));
@@ -463,8 +429,62 @@ fn md_inline(l: &[u8], mut i: usize, o: &mut Out, st: &mut State) {
                     _ => i += 1,
                 }
             }
-            b'h' if (l[i..].starts_with(b"http://") || l[i..].starts_with(b"https://")) && (i == 0 || !l[i - 1].is_ascii_alphanumeric()) => {
-                let e = i + l[i..].iter().take_while(|&&b| !b.is_ascii_whitespace() && !matches!(b, b')' | b'>' | b'"' | b'<')).count();
+            _ if !full => i += 1,
+            b'*' | b'_' => {
+                let run = l[i..].iter().take_while(|&&b| b == c).count();
+                let k = run.min(2);
+                let next = at(l, i + run);
+                let opens = next != 0 && !next.is_ascii_whitespace() && !(c == b'_' && i > 0 && l[i - 1].is_ascii_alphanumeric());
+                if opens {
+                    if let Some(p) = emphasis_close(l, i + k, c, k) {
+                        o.put(i, p + k, if k == 2 { Tok::Bold } else { Tok::Italic });
+                    }
+                }
+                // what's inside is still looked at (code, comments)
+                i += run;
+            }
+            b'[' | b'!' if c == b'[' || at(l, i + 1) == b'[' => {
+                // [text](url), ![image](src), [text][ref]
+                let s = if c == b'!' { i + 1 } else { i };
+                let look = n.min(s + MD_LOOK);
+                let mut depth = 0;
+                let mut close = None;
+                for (k, &b) in l[s..look].iter().enumerate() {
+                    match b {
+                        b'[' => depth += 1,
+                        b']' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                close = Some(s + k);
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if let Some(cl) = close {
+                    let look = n.min(cl + 1 + MD_LOOK);
+                    let end = match at(l, cl + 1) {
+                        b'(' => memchr::memchr(b')', &l[cl + 1..look]).map(|p| cl + 2 + p),
+                        b'[' => memchr::memchr(b']', &l[(cl + 2).min(look)..look]).map(|p| cl + 3 + p),
+                        _ => None,
+                    };
+                    if let Some(e) = end {
+                        o.put(i, cl + 1, Tok::Link);
+                        o.put(cl + 1, e, Tok::Dim);
+                        url_from = e;
+                    }
+                }
+                i += 1;
+            }
+            b'h' if i >= url_from
+                && (l[i..].starts_with(b"http://") || l[i..].starts_with(b"https://"))
+                && (i == 0 || !l[i - 1].is_ascii_alphanumeric()) =>
+            {
+                let e = i + l[i..]
+                    .iter()
+                    .take_while(|&&b| !b.is_ascii_whitespace() && !matches!(b, b')' | b'>' | b'"' | b'<' | b'`' | b'\\'))
+                    .count();
                 o.put(i, e, Tok::Link);
                 i = e;
             }
@@ -509,9 +529,15 @@ fn yaml_line(l: &[u8], col0: bool, mut st: State, o: &mut Out) -> State {
     }
     if !col0 {
         yaml_value(l, 0, 0, o, &mut st);
+        // (where its key is isn't known here)
+        if st.kind == BLOCK {
+            st.kind = 0;
+        }
         return st;
     }
     let mut i = ind;
+    // what a block scalar on this line belongs to: the key, or the list item
+    let mut parent = ind;
     let rest = &l[i..];
     if at(rest, 0) == b'#' {
         o.put(i, n, Tok::Comment);
@@ -529,15 +555,17 @@ fn yaml_line(l: &[u8], col0: bool, mut st: State, o: &mut Out) -> State {
     // "- " list items (possibly "- - x")
     while at(l, i) == b'-' && matches!(at(l, i + 1), 0 | b' ' | b'\t' | b'\r') {
         o.put(i, i + 1, Tok::Punct);
+        parent = i;
         i += 1;
         i += l[i..].iter().take_while(|&&b| b == b' ' || b == b'\t').count();
     }
     if let Some(colon) = yaml_key_end(l, i) {
         o.put(i, colon, Tok::Key);
         o.put(colon, colon + 1, Tok::Punct);
+        parent = i;
         i = colon + 1;
     }
-    yaml_value(l, i, ind, o, &mut st);
+    yaml_value(l, i, parent, o, &mut st);
     st
 }
 
@@ -722,5 +750,9 @@ mod tests {
         let st = end_state(Lang::Yaml, "sensor:\n  value_template: >\n    {{ states('x') }}\n");
         assert_eq!(toks(Lang::Yaml, "    and: more", st), vec![("    and: more".into(), Tok::Str)]);
         assert!(toks(Lang::Yaml, "  next: 1", st).contains(&("next".into(), Tok::Key)));
+        // in a list item the block belongs to the key: the item's next key ends it
+        let st = end_state(Lang::Yaml, "steps:\n  - run: |\n      cargo test\n");
+        assert_eq!(toks(Lang::Yaml, "      more", st), vec![("      more".into(), Tok::Str)]);
+        assert!(toks(Lang::Yaml, "    env:", st).contains(&("env".into(), Tok::Key)));
     }
 }

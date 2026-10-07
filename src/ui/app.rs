@@ -128,6 +128,8 @@ pub struct Tab {
     pub doc: Document,
     pub view: View,
     pub lang: Lang,
+    /// The user picked `lang` (so it isn't guessed again).
+    pub lang_picked: bool,
     pub untitled: u32,
     pub index_job: Option<Job<bool>>,
     pub load_job: Option<Job<std::io::Result<Document>>>,
@@ -157,6 +159,7 @@ impl Tab {
             doc,
             view: View::new(),
             lang: Lang::Plain,
+            lang_picked: false,
             untitled: 0,
             index_job: None,
             load_job: None,

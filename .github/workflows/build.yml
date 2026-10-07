@@ -21,7 +21,8 @@ jobs:
       - name: Rust (GNU toolchain, no Visual Studio needed)
         shell: pwsh
         run: |
-          rustup toolchain install stable-x86_64-pc-windows-gnu --profile minimal
+          # rust-mingw brings the toolchain's own linker libraries (crt2.o, libkernel32.a...)
+          rustup toolchain install stable-x86_64-pc-windows-gnu --profile minimal --component rust-mingw
           rustup default stable-x86_64-pc-windows-gnu
           # the toolchain's own linker comes first (the runner has other MinGW installs on its PATH)
           $sysroot = rustc --print sysroot

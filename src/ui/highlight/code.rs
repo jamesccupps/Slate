@@ -300,6 +300,7 @@ static PHP: Syntax = Syntax {
     ],
     types: &["bool", "float", "int", "iterable", "mixed", "never", "object", "string", "void"],
     lits: &["false", "null", "true"],
+    multi: b"\"'",
     sigils: b"$",
     nocase: true,
     cap_types: true,
@@ -317,6 +318,7 @@ static RUBY: Syntax = Syntax {
     ],
     lits: &["false", "nil", "true"],
     quotes: b"\"'`",
+    multi: b"\"'`",
     sigils: b"@$",
     cap_types: true,
     ..BASE
@@ -367,6 +369,7 @@ static POWERSHELL: Syntax = Syntax {
     flavor: Flavor::PowerShell,
     line: &[b"#"],
     block: Some((b"<#", b"#>")),
+    multi: b"\"'",
     raw: b"'",
     esc: b'`',
     nocase: true,
@@ -409,6 +412,7 @@ static SHELL: Syntax = Syntax {
     line: &[b"#"],
     block: None,
     quotes: b"\"'`",
+    multi: b"\"'`",
     raw: b"'",
     kw: &[
         "alias", "declare", "eval", "exec", "export", "function", "let", "local", "readonly", "set", "shift", "source",
@@ -659,6 +663,11 @@ fn long_rest(t: &[u8], s: usize, mut i: usize, level: u8, comment: bool, st: Sta
     Err(State { kind: LONG, a: level, b: comment as u16, ..st })
 }
 
+/// C#'s """raw strings""" have no escapes; other languages' triple-quoted strings do.
+fn triple_esc(sx: &Syntax) -> u8 {
+    if sx.flavor == Flavor::CSharp { 0 } else { sx.esc }
+}
+
 /// Continues the token the text starts inside.
 fn resume(sx: &Syntax, t: &[u8], st: State, o: &mut Out) -> Step {
     match st.kind {
@@ -669,7 +678,7 @@ fn resume(sx: &Syntax, t: &[u8], st: State, o: &mut Out) -> Step {
         }
         BLOCK_COMMENT => block_rest(sx, t, 0, 0, st.a.max(1), st, o),
         STR => string_rest(sx, t, 0, 0, st.a, st.b == 1, st, o),
-        TRIPLE => triple_rest(t, 0, 0, st.a, sx.esc, st.b == 1, st, o),
+        TRIPLE => triple_rest(t, 0, 0, st.a, triple_esc(sx), st.b == 1, st, o),
         RAW => raw_rest(t, 0, 0, st.a, st, o),
         VERBATIM => verbatim_rest(t, 0, 0, st, o),
         HERE => here_rest(t, 0, 0, st.a, st.col0, st, o),
@@ -682,7 +691,7 @@ fn line_comment(sx: &Syntax, t: &[u8], i: usize) -> bool {
     sx.line.iter().any(|lc| {
         t[i..].starts_with(lc)
             // shells: `#` starts a comment only at the start of a word (not in `a#b` or `${#x}`)
-            && !(sx.flavor == Flavor::Shell && i > 0 && !matches!(t[i - 1], b' ' | b'\t' | b';' | b'|' | b'&' | b'('))
+            && !(sx.flavor == Flavor::Shell && i > 0 && !matches!(t[i - 1], b' ' | b'\t' | b'\n' | b'\r' | b';' | b'|' | b'&' | b'('))
     })
 }
 
@@ -761,7 +770,14 @@ fn extras(sx: &Syntax, t: &[u8], i: usize, st: State, o: &mut Out) -> Option<Ste
             if c == b'\'' {
                 // a char literal ('a', '\n', '日') or a lifetime ('a, 'static)
                 if at(t, i + 1) == b'\\' {
-                    let e = t[i + 2..].iter().take(12).position(|&b| b == b'\'').map_or(i + 2, |p| i + 3 + p);
+                    // '\n', '\'', '\u{1F600}'
+                    let from = (i + 3).min(n);
+                    let e = t[from..]
+                        .iter()
+                        .take(10)
+                        .position(|&b| b == b'\'' || b == b'\n')
+                        .filter(|&p| t[from + p] == b'\'')
+                        .map_or(from, |p| from + p + 1);
                     o.put(i, e, Tok::Str);
                     return Some(Ok(e));
                 }
@@ -1024,7 +1040,7 @@ pub(super) fn code(sx: &Syntax, t: &[u8], st: State, o: &mut Out) -> State {
             }
         }
         if sx.triple.contains(&c) && at(t, i + 1) == c && at(t, i + 2) == c {
-            step!(triple_rest(t, i, i + 3, c, sx.esc, false, mid, o));
+            step!(triple_rest(t, i, i + 3, c, triple_esc(sx), false, mid, o));
         }
         if sx.quotes.contains(&c) {
             step!(string_rest(sx, t, i, i + 1, c, false, mid, o));
@@ -1155,7 +1171,7 @@ pub(super) fn css(t: &[u8], st: State, o: &mut Out) -> State {
                 }
             },
             // SCSS / LESS line comments (not the `//` of a URL)
-            b'/' if next == b'/' && (i == 0 || matches!(t[i - 1], b' ' | b'\t' | b';' | b'{' | b'}')) => {
+            b'/' if next == b'/' && (i == 0 || matches!(t[i - 1], b' ' | b'\t' | b'\n' | b'\r' | b';' | b'{' | b'}')) => {
                 let e = line_end(t, i);
                 o.put(i, e, Tok::Comment);
                 i = e;
@@ -1393,6 +1409,9 @@ mod tests {
             ("//x.png", Tok::Str),
             ("/* c */", Tok::Comment),
         ]);
+        // a line comment at the start of a line, lexed together with the lines before it
+        let st = end_state(Lang::Css, ".a {\n// closing } here\ncolor: red;\n");
+        assert_eq!(st.b, 1);
         let st = end_state(Lang::Css, "@media print {\n  body {\n");
         assert!(toks(Lang::Css, "    color: red;", st).contains(&("color".into(), Tok::Attr)));
         assert!(toks(Lang::Css, "    color: red;", State::START).contains(&("color".into(), Tok::Tag)));

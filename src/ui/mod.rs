@@ -630,7 +630,12 @@ fn restore_tab(app: &mut App, st: &session::SessionTab) {
         tab.untitled = st.untitled;
         app.untitled_counter = app.untitled_counter.max(st.untitled);
     }
-    tab.lang = st.lang;
+    // Picked by the user: keep it. Otherwise it was worked out from the file (again now, so a newer Slate's
+    // detection applies to tabs from an older one).
+    if st.lang_picked {
+        tab.lang = st.lang;
+        tab.lang_picked = true;
+    }
     let len = tab.doc.len();
     tab.view.sel = Sel::new(st.anchor.min(len), st.caret.min(len));
     tab.view.top = st.top.min(len);

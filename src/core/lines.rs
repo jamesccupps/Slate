@@ -68,11 +68,12 @@ pub fn apply(op: LineOp, text: &[u8]) -> (Vec<u8>, u64) {
     let mut count = 0;
     match op {
         LineOp::SortAsc | LineOp::SortDesc => {
+            let was = lines.clone();
             lines.sort_by(|a, b| natural_cmp(a, b).then_with(|| a.cmp(b)));
             if op == LineOp::SortDesc {
                 lines.reverse();
             }
-            count = before;
+            count = if lines == was { 0 } else { before };
         }
         LineOp::Dedupe => {
             let mut seen = HashSet::with_capacity(lines.len());
@@ -113,7 +114,25 @@ pub fn change_case(text: &[u8], op: CaseOp) -> Vec<u8> {
         // not valid UTF-8: only ASCII letters change
         return match op {
             CaseOp::Lower => text.to_ascii_lowercase(),
-            _ => text.to_ascii_uppercase(),
+            CaseOp::Upper => text.to_ascii_uppercase(),
+            CaseOp::Title => {
+                let mut start = true;
+                text.iter()
+                    .map(|&b| {
+                        let c = if b.is_ascii_alphanumeric() {
+                            if start { b.to_ascii_uppercase() } else { b.to_ascii_lowercase() }
+                        } else {
+                            b
+                        };
+                        if b.is_ascii_alphanumeric() || b >= 0x80 {
+                            start = false;
+                        } else if b.is_ascii_whitespace() || b"-_/([{\"".contains(&b) {
+                            start = true;
+                        }
+                        c
+                    })
+                    .collect()
+            }
         };
     };
     match op {
@@ -156,6 +175,7 @@ mod tests {
     fn sorting_is_natural_and_ignores_case() {
         assert_eq!(run(LineOp::SortAsc, "file10\nFile2\nfile1\nbanana\nApple\n"), ("Apple\nbanana\nfile1\nFile2\nfile10\n".into(), 5));
         assert_eq!(run(LineOp::SortDesc, "b\na\nc").0, "c\nb\na");
+        assert_eq!(run(LineOp::SortAsc, "a\nb\n").1, 0);
         // CRLF text stays CRLF, also for a last line without a line break
         assert_eq!(run(LineOp::SortAsc, "b\r\nc\r\na").0, "a\r\nb\r\nc");
         assert_eq!(natural_cmp(b"x007", b"x7"), Ordering::Equal);
@@ -177,5 +197,6 @@ mod tests {
         assert_eq!(change_case(b"MiXeD", CaseOp::Lower), b"mixed");
         assert_eq!(change_case(b"don't stop-me now", CaseOp::Title), b"Don't Stop-Me Now");
         assert_eq!(change_case(&[b'a', 0xFF, b'b'], CaseOp::Upper), vec![b'A', 0xFF, b'B']);
+        assert_eq!(change_case(&[b'h', b'I', b' ', b'y', 0xFF, b'O'], CaseOp::Title), vec![b'H', b'i', b' ', b'Y', 0xFF, b'o']);
     }
 }

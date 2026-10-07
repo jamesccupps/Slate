@@ -760,6 +760,7 @@ impl App {
                     let head = tab.doc.read(0, 4096);
                     let name = st.path.file_name().map(|n| n.to_string_lossy().into_owned());
                     tab.lang = Lang::detect(name.as_deref(), &head);
+                    tab.lang_picked = false;
                 }
                 if matches!(tab.notice.as_ref().map(|n| n.kind), Some(NoticeKind::Error) | Some(NoticeKind::Warn)) {
                     tab.notice = None;
@@ -827,7 +828,7 @@ impl App {
                     return;
                 }
                 if let TaskKind::Lines(op) = task.kind {
-                    if count == 0 && !matches!(op, LineOp::SortAsc | LineOp::SortDesc) {
+                    if count == 0 {
                         self.flash(nothing_to_clean(op), false);
                         return;
                     }
@@ -1370,7 +1371,7 @@ impl App {
         let tab = self.tab_mut();
         let text = editor::normalize_eols(&text, tab.doc.eol.as_bytes());
         // Pasted into an empty new tab: color it like what it looks like (JSON, XML, a script...).
-        let guess = tab.doc.is_empty() && tab.doc.path.is_none() && tab.lang == Lang::Plain;
+        let guess = tab.doc.is_empty() && tab.doc.path.is_none() && tab.lang == Lang::Plain && !tab.lang_picked;
         tab.doc.seal();
         tab.view.sel = editor::replace_selection(&mut tab.doc, tab.view.sel, &text, EditKind::Other);
         tab.doc.seal();
@@ -2305,10 +2306,14 @@ impl App {
                 });
             }
             Cmd::ToggleComment => {
-                let Some(style) = self.tab().lang.comment() else {
+                let Some(mut style) = self.tab().lang.comment() else {
                     self.flash(format!("{} has no comments", self.tab().lang.label()), true);
                     return;
                 };
+                let ext = self.tab().doc.path.as_ref().and_then(|p| p.extension()).map(|e| e.to_ascii_lowercase());
+                if self.tab().lang == Lang::Ini && ext.as_ref().is_some_and(|e| e == "ini" || e == "inf" || e == "reg") {
+                    style = super::highlight::CommentStyle::Line(";");
+                }
                 if !self.editable() {
                     return;
                 }
@@ -2318,11 +2323,11 @@ impl App {
                 let r = editor::toggle_comment(&mut tab.doc, sel, style);
                 tab.doc.seal();
                 match r {
-                    Some(s) => {
+                    Ok(s) => {
                         tab.view.sel = s;
                         self.after_edit();
                     }
-                    None => self.flash("Too many lines selected for that.", true),
+                    Err(m) => self.flash(m, true),
                 }
             }
             Cmd::Lines(op) => {
@@ -2346,7 +2351,7 @@ impl App {
                 }
                 let text = tab.doc.read(a, b);
                 let (out, count) = lines::apply(op, &text);
-                if count == 0 && !matches!(op, LineOp::SortAsc | LineOp::SortDesc) {
+                if count == 0 {
                     self.flash(nothing_to_clean(op), false);
                     return;
                 }
@@ -2412,6 +2417,7 @@ impl App {
             Cmd::SetLang(l) => {
                 let tab = self.tab_mut();
                 tab.lang = l;
+                tab.lang_picked = true;
                 tab.view.clear_cache();
                 self.session_dirty = true;
                 self.invalidate();
@@ -2767,9 +2773,10 @@ fn lines_done(op: LineOp, n: u64) -> String {
 
 fn nothing_to_clean(op: LineOp) -> &'static str {
     match op {
+        LineOp::SortAsc | LineOp::SortDesc => "The lines are already in that order",
         LineOp::Dedupe => "No duplicate lines",
         LineOp::RemoveBlank => "No blank lines",
-        _ => "No spaces at line ends",
+        LineOp::TrimTrailing => "No spaces at line ends",
     }
 }
 

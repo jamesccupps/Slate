@@ -29,6 +29,8 @@ pub struct SessionTab {
     pub bom: bool,
     pub eol: Eol,
     pub lang: Lang,
+    #[serde(default)]
+    pub lang_picked: bool,
     pub anchor: u64,
     pub caret: u64,
     pub top: u64,
@@ -119,6 +121,7 @@ pub fn save(tabs: &mut [Tab], active: usize) -> bool {
             bom: doc.bom,
             eol: doc.eol,
             lang: tab.lang,
+            lang_picked: tab.lang_picked,
             anchor: tab.view.sel.anchor,
             caret: tab.view.sel.caret,
             top: tab.view.top,

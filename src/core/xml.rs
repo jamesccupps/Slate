@@ -233,10 +233,15 @@ impl<'w> Formatter<'w> {
     /// (in Pretty mode) starts a new line, unless text comes right before it or `glue` is set.
     fn markup(&mut self, depth: usize, glue: bool) {
         if !self.text {
-            self.ws.clear();
-            if self.any && !glue && self.stack.len() < self.mixed {
+            if self.stack.len() >= self.mixed {
+                // Inside text, the whitespace between tags belongs to it (`<b>big</b> <i>world</i>`).
+                let ws = std::mem::take(&mut self.ws);
+                self.emit(&ws);
+                self.ws = ws;
+            } else if self.any && !glue {
                 self.newline(depth);
             }
+            self.ws.clear();
         }
         self.text = false;
         self.open = false;
@@ -729,6 +734,8 @@ mod tests {
         assert_eq!(pretty("<p>Hello <b>world</b>!</p>"), "<p>Hello <b>world</b>!</p>\n");
         // once an element has text, nothing is added inside it
         assert_eq!(pretty("<p>Hello <b>x</b></p>"), "<p>Hello <b>x</b></p>\n");
+        assert_eq!(pretty("<doc><p>Hello <b>big</b> <i>world</i></p></doc>"), "<doc>\n  <p>Hello <b>big</b> <i>world</i></p>\n</doc>\n");
+        assert_eq!(fmt(Mode::Minify, "<p>Some <b>bold</b>\n  <i>italic</i> text</p>").unwrap(), "<p>Some <b>bold</b>\n  <i>italic</i> text</p>");
         assert_eq!(pretty("<d><p>Hi <b>a</b><i>b</i></p><q/></d>"), "<d>\n  <p>Hi <b>a</b><i>b</i></p>\n  <q/>\n</d>\n");
         assert_eq!(
             pretty("<doc><p>Hello <b>world</b>!</p>  <p> x </p></doc>"),

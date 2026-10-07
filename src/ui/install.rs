@@ -174,8 +174,8 @@ pub fn make_default(cell: &Cell) {
         "Slate gets installed for your account (no admin rights needed),".to_string()
     };
     let detail = format!(
-        "{place} added to the Start menu, to \"Open with\" for text, log, JSON and config files, and as \"Edit with \
-         Slate\" when you right-click a file.\n\nThen Windows' Default apps page opens, where you can choose Slate \
+        "{place} added to the Start menu, to \"Open with\" for text, data, config, script, web and code files, and as \
+         \"Edit with Slate\" when you right-click a file.\n\nThen Windows' Default apps page opens, where you can choose Slate \
          for the file types you want (Windows only lets you do that step yourself)."
     );
     if win::ask(hwnd, "Slate", "Open your text files with Slate?", &detail, &["Set up", "Cancel"]) != Some(0) {

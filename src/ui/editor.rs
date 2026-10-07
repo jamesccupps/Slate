@@ -229,7 +229,12 @@ impl HlIndex {
             while off - cp > HL_CHECK {
                 self.buf.clear();
                 doc.read_into(cp, cp + HL_CHECK, &mut self.buf);
-                let cut = memchr::memrchr(b'\n', &self.buf).map_or(self.buf.len(), |p| p + 1);
+                // after a line break, or (in a very long line) after a space, comma, ';' or '>' near the end, where
+                // no token like "*/" or "-->" can be cut in two
+                let cut = match memchr::memrchr(b'\n', &self.buf) {
+                    Some(p) => p + 1,
+                    None => self.buf.iter().rev().take(512).position(|&b| matches!(b, b' ' | b',' | b';' | b'>')).map_or(self.buf.len(), |p| self.buf.len() - p),
+                };
                 cs = highlight::lex(lang, &self.buf[..cut], cs, None);
                 cp += cut as u64;
                 self.checkpoints.push((cp, cs));
@@ -539,6 +544,7 @@ impl View {
 
     /// Lays out the rows that fill the view (into `self.rows`).
     pub fn layout_rows(&mut self, cx: &Ctx) {
+        self.hl_guess = false;
         self.rows.clear();
         let len = cx.doc.len();
         let row_h = cx.style.row_h;
@@ -1219,10 +1225,10 @@ pub fn replace_range(doc: &mut Document, before: Sel, a: u64, b: u64, text: &[u8
     new
 }
 
-/// Comments out the selected lines (or the caret's), or uncomments them when they all are. Returns None if the
-/// selection covers too many lines.
-pub fn toggle_comment(doc: &mut Document, sel: Sel, style: CommentStyle) -> Option<Sel> {
-    let lines = selected_lines(doc, sel)?;
+/// Comments out the selected lines (or the caret's), or uncomments them when they all are. Says why not when it
+/// can't (too many lines; a block comment can't go around text that has a comment end in it).
+pub fn toggle_comment(doc: &mut Document, sel: Sel, style: CommentStyle) -> Result<Sel, String> {
+    let lines = selected_lines(doc, sel).ok_or("Too many lines selected for that.")?;
     let (mut anchor, mut caret) = (sel.anchor, sel.caret);
     let start = sel.start();
     let ranged = !sel.is_empty();
@@ -1257,7 +1263,7 @@ pub fn toggle_comment(doc: &mut Document, sel: Sel, style: CommentStyle) -> Opti
                 info.push((ls, ind as u64, commented));
             }
             if info.is_empty() {
-                return Some(sel);
+                return Ok(sel);
             }
             let remove = info.iter().all(|x| x.2);
             let col = info.iter().map(|x| x.1).min().unwrap_or(0);
@@ -1286,29 +1292,32 @@ pub fn toggle_comment(doc: &mut Document, sel: Sel, style: CommentStyle) -> Opti
             let a = lines[0];
             let b = doc.line_end_of(*lines.last().unwrap_or(&a));
             if b - a > 16 << 20 {
-                return None;
+                return Err("Too much text selected for that.".into());
             }
             let text = doc.read(a, b);
             let s = text.iter().position(|c| !c.is_ascii_whitespace());
-            let Some(s) = s else { return Some(sel) };
+            let Some(s) = s else { return Ok(sel) };
             let e = text.len() - text.iter().rev().position(|c| !c.is_ascii_whitespace()).unwrap_or(0);
             let body = &text[s..e];
+            let commented = body.len() >= open.len() + close.len() && body.starts_with(open) && body.ends_with(close);
+            let inner = if commented { &body[open.len()..body.len() - close.len()] } else { body };
+            if memchr::memmem::find(inner, close).is_some() {
+                // `<!-- a --> x <!-- b -->`: these comments don't nest, so neither removing nor adding one works
+                let close = String::from_utf8_lossy(close);
+                return Err(format!("These lines already have a comment end ({close}) in them, so they can't be commented as one block."));
+            }
             doc.begin(EditKind::Other, sel);
-            if body.len() >= open.len() + close.len() && body.starts_with(open) && body.ends_with(close) {
+            if commented {
                 // remove the markers (and the space just inside each)
+                let lead = inner.first() == Some(&b' ');
+                let trail = inner.len() > lead as usize && inner.last() == Some(&b' ');
                 let ce = a + e as u64;
-                let mut cn = close.len() as u64;
-                if body.len() > open.len() + close.len() && body[body.len() - close.len() - 1] == b' ' {
-                    cn += 1;
-                }
+                let cn = close.len() as u64 + trail as u64;
                 doc.delete(ce - cn, ce);
                 del(&mut anchor, ce - cn, cn);
                 del(&mut caret, ce - cn, cn);
                 let os = a + s as u64;
-                let mut on = open.len() as u64;
-                if body.get(open.len()) == Some(&b' ') && body.len() > open.len() + close.len() {
-                    on += 1;
-                }
+                let on = open.len() as u64 + lead as u64;
                 doc.delete(os, os + on);
                 del(&mut anchor, os, on);
                 del(&mut caret, os, on);
@@ -1332,7 +1341,7 @@ pub fn toggle_comment(doc: &mut Document, sel: Sel, style: CommentStyle) -> Opti
     }
     let new = Sel::new(anchor, caret);
     doc.end(new);
-    Some(new)
+    Ok(new)
 }
 
 /// Indents (or outdents) the selected lines. Returns None if the selection covers too many lines.
