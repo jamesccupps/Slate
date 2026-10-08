@@ -254,11 +254,14 @@ impl Lang {
         let ext = name.rsplit_once('.').map(|(_, e)| e);
         let site = folders.first().is_some_and(|f| matches!(*f, "sites-available" | "sites-enabled" | "conf.d" | "snippets"));
         // its configuration files (`nginx.conf`, `mime.types`, `fastcgi_params`, sites named after their domain); a
-        // page or a log in there stays what it is, and a script says so in its `#!` line
+        // page or a log in there stays what it is, a script says so in its `#!` line, and a file without an
+        // extension outside the sites' folders (`docs/LICENSE`, a README) only when it reads like nginx's
         let conf = match by_name {
             Some(Lang::Ini) => ext == Some("conf"),
             Some(_) => false,
-            None if server == Lang::Nginx => (ext.is_none() || ext == Some("types") || site) && Lang::sniff(head) == Lang::Plain,
+            None if server == Lang::Nginx => {
+                Lang::sniff(head) == Lang::Plain && (site || ((ext.is_none() || ext == Some("types")) && nginx_like(head)))
+            }
             None => (site || ext == Some("load")) && Lang::sniff(head) == Lang::Plain,
         };
         if conf { Some(server) } else { by_name }
@@ -480,6 +483,25 @@ fn server_conf(head: &[u8], lines: usize) -> Option<Lang> {
         }
     }
     None
+}
+
+/// Whether text reads like nginx's configuration: its first lines that aren't comments start with a directive's
+/// name (or close a block), and most end like directives or blocks do (`;`, `{`, `}`) — not a README's sentences.
+fn nginx_like(head: &[u8]) -> bool {
+    let lines: Vec<&[u8]> = head
+        .split(|&b| b == b'\n')
+        .map(|l| {
+            // without a comment at its end
+            let l = l.trim_ascii();
+            let code = l.windows(2).position(|w| w[0].is_ascii_whitespace() && w[1] == b'#').map_or(l, |p| &l[..p]);
+            code.trim_ascii_end()
+        })
+        .filter(|l| !l.is_empty() && l[0] != b'#')
+        .take(8)
+        .collect();
+    let starts = lines.first().is_some_and(|l| l[0].is_ascii_lowercase() || l[0] == b'_' || l[0] == b'}');
+    let ends = lines.iter().filter(|l| matches!(l.last(), Some(b';' | b'{' | b'}'))).count();
+    starts && ends * 2 >= lines.len()
 }
 
 /// An SRT file: a cue number, then a `00:00:01,000 --> 00:00:04,000` line.
@@ -1331,6 +1353,12 @@ mod tests {
         assert_eq!(d(Some("C:\\nginx\\logs\\error.log"), b""), Lang::Log);
         assert_eq!(d(Some("/etc/nginx/reload"), b"#!/bin/sh\n"), Lang::Shell);
         assert_eq!(d(Some("C:\\work\\nginx-proxy-manager\\NOTES"), b"Some notes.\n"), Lang::Plain);
+        // ... its files without an extension only when they read like it (not docs\LICENSE or a README)
+        let license = b"Copyright (C) 2002-2021 Igor Sysoev\nAll rights reserved.\n";
+        assert_eq!(d(Some("C:\\nginx-1.25.3\\docs\\LICENSE"), license), Lang::Plain);
+        assert_eq!(d(Some("/etc/nginx/README"), b"these are the server's settings.\nsee the docs\n"), Lang::Plain);
+        assert_eq!(d(Some("/etc/nginx/koi-utf"), b"charset_map  koi8-r  utf-8 {\n    C0  D18E ; # small yu\n"), Lang::Nginx);
+        assert_eq!(d(Some("C:\\nginx\\conf\\mime.types"), b"types {\n    text/html  html htm shtml;\n"), Lang::Nginx);
         assert_eq!(d(Some("/etc/apache2/sites-available/000-default.conf"), b"# x\n"), Lang::Apache);
         assert_eq!(d(Some("/opt/apache-maven/bin/mvn"), b"#!/bin/sh\n"), Lang::Shell);
         // ... or by what they hold
