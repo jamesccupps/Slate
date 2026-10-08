@@ -62,6 +62,8 @@ The details are in the [0.3.0 release notes](release-notes-0.3.0.md). In short:
 
 ## Later
 
+- **Maybe: a Markdown preview** (a rendered view next to the text, off by default) (M). Only if people ask for
+  it: Slate is meant to stay quick and open anything, so it must cost nothing while it isn't used.
 - Several windows; drag a tab out into its own window (L).
 - A hex view for binary files (M). Files with only CR line endings converted on open (S).
 - Smooth scrolling (M). Right-to-left text (S–M). Any font and size (S).
