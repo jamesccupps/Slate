@@ -2930,6 +2930,12 @@ impl App {
                 self.settings.recent.clear();
                 self.settings.save();
             }
+            Cmd::ReportProblem => {
+                // GitHub's issue form, filled in: the user sees it all, and sends it (or doesn't) themselves.
+                unsafe {
+                    ShellExecuteW(self.hwnd, w!("open"), &HSTRING::from(super::crash::report_url()), None, None, SW_SHOWNORMAL);
+                }
+            }
             Cmd::OpenDataFolder => {
                 let d = data_dir();
                 let _ = std::fs::create_dir_all(&d);
@@ -3196,6 +3202,7 @@ impl App {
                     item(Cmd::Shortcuts, "&Keyboard shortcuts", ""),
                     item(Cmd::MakeDefault, "Open files &with Slate…", ""),
                     item(Cmd::OpenDataFolder, "Open settings &folder", ""),
+                    item(Cmd::ReportProblem, "&Report a problem…", ""),
                     Item::Sep,
                     update,
                     check(Cmd::ToggleAutoUpdate, "Check for updates auto&matically", "", self.settings.check_updates),
@@ -3656,8 +3663,8 @@ pub fn run_cmd(cell: &Cell, cmd: Cmd) {
         Cmd::About => {
             let hwnd = cell.borrow().hwnd;
             let text = format!(
-                "Slate {}\n\nA fast, simple text editor that opens files of any size.\n\nSettings and unsaved work are kept in\n{}",
-                env!("CARGO_PKG_VERSION"),
+                "Slate {}\n\nA fast, simple text editor that opens files of any size. MIT license.\n\nSettings and unsaved work are kept in\n{}",
+                super::crash::version(),
                 data_dir().display()
             );
             win::info(hwnd, "About Slate", &text);

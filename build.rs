@@ -18,6 +18,23 @@ fn main() {
     println!("cargo:rerun-if-changed=res/slate.manifest");
     println!("cargo:rerun-if-changed=res/slate.ico");
     println!("cargo:rerun-if-changed=Cargo.toml");
+    // The commit it's built from (crash reports, About): empty outside a git checkout.
+    let commit = std::process::Command::new("git")
+        .args(["rev-parse", "--short=7", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    println!("cargo:rustc-env=SLATE_COMMIT={commit}");
+    if let Ok(head) = fs::read_to_string(".git/HEAD") {
+        println!("cargo:rerun-if-changed=.git/HEAD");
+        if let Some(r) = head.trim().strip_prefix("ref: ") {
+            if std::path::Path::new(".git").join(r).exists() {
+                println!("cargo:rerun-if-changed=.git/{r}");
+            }
+        }
+    }
 
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;

@@ -47,7 +47,9 @@ check the download.
 
 The update check is one request to `api.github.com` for the latest release of this repository; it sends nothing
 about you or your files. Turn it off with *Help → Check for updates automatically*. Slate doesn't send anything
-else anywhere.
+else anywhere. If it crashes, it writes `crash.log` (and a small crash dump) in its settings folder, and only
+there; *Help → Report a problem…* opens a GitHub issue form with the version filled in, which you can edit and send
+yourself, attaching those files if you like.
 
 ## Uninstalling
 

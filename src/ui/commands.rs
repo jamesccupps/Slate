@@ -81,6 +81,7 @@ pub enum Cmd {
     Shortcuts,
     MakeDefault,
     OpenDataFolder,
+    ReportProblem,
     CheckUpdates,
     Update,
     ToggleAutoUpdate,

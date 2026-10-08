@@ -101,7 +101,9 @@ Commits use the GitHub no-reply address (repo-local git config); GitHub refuses 
     `editor.rs` the text view; `structure.rs` path bar + structure panel; `findbar.rs`; `session.rs` (tabs and
     unsaved text kept between runs); `settings.rs` (data folder, portable mode); `install.rs` ("Open with" entries
     in HKCU); `update.rs` (updates from GitHub releases: WinHTTP, SHA-256 check, swap the exe, restart with
-    `--wait-for <pid>`); `testmode.rs`.
+    `--updated`, undone if the new one doesn't start); `crash.rs` (a minidump next to crash.log on a native crash,
+    written by a thread waiting for it from the start; Help → Report a problem opens a filled-in GitHub issue form
+    the user sends themselves; the version string with the commit, which build.rs passes in); `testmode.rs`.
   - `gfx.rs` — Direct2D drawing into a D3D11 **flip-model swap chain** (FLIP_DISCARD, then FLIP_SEQUENTIAL), with
     `ID2D1HwndRenderTarget` only as a fallback: on a PC with a Parsec virtual display adapter the HWND target reported
     "occluded" and drew nothing. Device loss → `discard_target()` and paint again.

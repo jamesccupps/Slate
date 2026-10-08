@@ -3,6 +3,7 @@
 pub mod actions;
 pub mod app;
 pub mod commands;
+pub mod crash;
 pub mod editor;
 pub mod findbar;
 pub mod gfx;
@@ -83,7 +84,17 @@ fn xy(lp: LPARAM) -> (i32, i32) {
 fn log_crash(what: &str) {
     let dir = settings::data_dir();
     let _ = std::fs::create_dir_all(&dir);
-    let line = format!("[{:?}] {what}\n", std::time::SystemTime::now());
+    let t = unsafe { windows::Win32::System::SystemInformation::GetLocalTime() };
+    let line = format!(
+        "[{:04}-{:02}-{:02} {:02}:{:02}:{:02}] Slate {}: {what}\n",
+        t.wYear,
+        t.wMonth,
+        t.wDay,
+        t.wHour,
+        t.wMinute,
+        t.wSecond,
+        crash::version()
+    );
     use std::io::Write;
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("crash.log")) {
         let _ = f.write_all(line.as_bytes());
@@ -956,6 +967,7 @@ fn char_start(doc: &crate::core::document::Document, pos: u64) -> u64 {
 
 pub fn run(args: Vec<String>) -> i32 {
     std::panic::set_hook(Box::new(|info| log_crash(&info.to_string())));
+    crash::install();
     unsafe {
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
     }

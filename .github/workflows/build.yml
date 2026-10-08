@@ -38,10 +38,10 @@ jobs:
           rustup default stable-x86_64-pc-windows-gnu
 
       - name: Test
-        run: cargo test --lib
+        run: cargo test --lib --locked
 
       - name: Build
-        run: cargo build --release
+        run: cargo build --release --locked
 
       - name: Smoke test (the built Slate.exe, in its test mode)
         shell: pwsh

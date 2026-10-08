@@ -29,7 +29,8 @@
 //! there), `scrollto:<0..1>`, `endsession` (what a Windows shutdown asks), `t:<label>` (a timing mark), `temp:<dir>`,
 //! `persist` (write settings and the session; only with `SLATE_DATA_DIR` set, never into the real data folder),
 //! `session:save|soon|restore` (write the session now / on another thread as the timer does / restore it), `guest`
-//! (as if another Slate was running but didn't answer: nothing is kept for next time).
+//! (as if another Slate was running but didn't answer: nothing is kept for next time), `crash` (a native crash, to
+//! try the minidump; the run ends there).
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -661,6 +662,8 @@ pub fn run(args: &[String]) -> i32 {
                     failures += 1;
                 }
             }
+            // A native crash (to try the minidump): the process ends here.
+            "crash" => unsafe { std::ptr::null_mut::<u8>().write_volatile(1) },
             // As if another Slate was running but didn't answer: this window keeps nothing for next time.
             "guest" => super::settings::GUEST.store(true, std::sync::atomic::Ordering::Relaxed),
             "session" => {
