@@ -3,8 +3,8 @@
 A fast, simple Notepad replacement for Windows that opens huge files (800 MB+ JSON) instantly. Native Win32 +
 Direct2D/DirectWrite, written in Rust. Single portable `Slate.exe`, nothing to install at runtime.
 
-It is a general text editor first ("a better Notepad"); the JSON and XML extras (format/minify/check, and for JSON the
-path bar and structure panel) only show for those files. It should be quick, easy to use, with only the features
+It is a general text editor first ("a better Notepad"); the JSON and XML extras (format/minify/check, the path bar and
+the structure panel) only show for those files. It should be quick, easy to use, with only the features
 people actually need, and as seamless as Steam/Claude-level apps. Keep this file and `docs/IDEAS.md` up to date as
 work happens. The repo is on GitHub (`jamesccupps/Slate`): keep personal paths and machine settings out of
 tracked files (the deploy folder lives in the git-ignored `.install-dir`). The user wants the repo kept current: push
@@ -87,19 +87,31 @@ Commits use the GitHub no-reply address (repo-local git config); GitHub refuses 
   - `jsonnav.rs` — lazy JSON structure: the children of one container (lists over 100,000 keep every 64th child
     and rescan between them; lists of containers inside a scanned one already over 1024), the path at an offset
     (`data[1203].name`), previews. Comments are skipped; in a file cut short, open containers end at its end.
+  - `xmlnav.rs` — the same for XML, filling in jsonnav's lists: the elements inside one element (names hashed as
+    they're read, ~270 MB/s), the path (`catalog › book[3] › title`, the index among siblings of that name; XPath
+    to copy), previews (attributes, and the text of an element without elements inside). Comments, CDATA, PIs and
+    the DOCTYPE are skipped; an end tag closes the element it names (among the 1024 innermost), a stray one is
+    ignored; in a file cut short, what's open ends at its end.
   - `text.rs` — encoding/EOL detection (mostly-UTF-8 with a few bad bytes stays UTF-8), UTF-16/ANSI codecs (ANSI
     = the system code page, Windows-1252 under the UTF-8 code page option), display decoding (control chars →
     symbols), char classes.
   - `job.rs` — background jobs with progress/cancel, notify the UI by posting a window message.
 - `src/ui/` — the Win32 app (see the module docs at the top of each file).
-  - `highlight.rs` (+ `highlight/code.rs`, `highlight/markup.rs`) — syntax coloring for ~30 languages: hand-written
-    lexers that color one segment and return the `State` they end in (inside a block comment, a multi-line string, an
-    XML tag, a Markdown code block...). `code.rs` is one configurable lexer for programming/scripting languages
-    (keyword tables + per-language extras: Rust raw strings, PowerShell here-strings, Batch labels, heredocs, JS
-    regexes...); PHP files are HTML with PHP inside. Where a quote is easily a stray one (shell, SQL, PHP...), a
-    string left open gives up at a blank line or after 40 lines. Language is picked by file name, then by content
-    (`#!` lines, `<?xml`, JSON that reads as JSON, log timestamps). A test checks that lexing a text in two pieces
-    ends in the same state as lexing it whole.
+  - `highlight.rs` (+ `highlight/code.rs`, `highlight/markup.rs`, `highlight/config.rs`) — syntax coloring for ~45
+    languages: hand-written lexers that color one segment and return the `State` they end in (inside a block
+    comment, a multi-line string, an XML tag, a Markdown code block...). `code.rs` is one configurable lexer for
+    programming/scripting languages (keyword tables + per-language extras: Rust and C++ raw strings, PowerShell
+    here-strings, Batch labels, heredocs, JS and Perl regexes, Perl's `qw(…)`/`s{…}{…}` and POD, C#/HCL strings in
+    interpolation holes, AutoHotkey hotkeys, VB's `Rem`...); `config.rs` the line-based formats (TOML, nginx,
+    Apache, `.properties`, SRT/WebVTT, iCalendar/vCard, `.sln`); PHP files are HTML with PHP inside. A Markdown
+    ``` block is colored as the language it names, that lexer's state kept in the Markdown state (`mode` holds the
+    language; where its state doesn't fit, each line is colored from its line start). Where a quote is easily a
+    stray one (shell, SQL, PHP...), a string left open gives up at a blank line or after 40 lines. Language is
+    picked by file name (templates like `x.yaml.j2` by the name inside; nginx/Apache configuration also by its
+    folder, so detection gets the whole path), then by content (`#!` lines, `<?xml`, `server {`, `<VirtualHost`,
+    `WEBVTT`, JSON that reads as JSON, log timestamps — not IP addresses). A test checks that lexing a text in two
+    pieces ends in the same state as lexing it whole (cut after a line break for every language, mid-line too for
+    those listed in it); for deeper runs raise its counts for a while.
   - `app.rs` state, layout and painting; `actions.rs` input, commands, background jobs, saving and closing;
     `editor.rs` the text view; `structure.rs` path bar + structure panel; `findbar.rs`; `session.rs` (tabs and
     unsaved text kept between runs); `settings.rs` (data folder, portable mode); `install.rs` ("Open with" entries

@@ -7,6 +7,7 @@
 //! doesn't span lines. Lexers never fail: any bytes are fine, what isn't understood just stays uncolored.
 
 mod code;
+mod config;
 mod markup;
 
 use serde::{Deserialize, Serialize};
@@ -45,6 +46,25 @@ pub enum Lang {
     Dockerfile,
     Css,
     Diff,
+    /// VBScript, VBA and Visual Basic.
+    Vb,
+    AutoHotkey,
+    Toml,
+    Nginx,
+    Apache,
+    Perl,
+    R,
+    /// Terraform and other HCL files.
+    Hcl,
+    CMake,
+    /// Java `.properties` files.
+    Properties,
+    /// SRT and WebVTT subtitles.
+    Subtitles,
+    /// iCalendar (`.ics`) and vCard (`.vcf`).
+    Calendar,
+    /// Visual Studio solutions (`.sln`).
+    Sln,
 }
 
 /// How a language writes comments (for "Toggle comment").
@@ -89,16 +109,32 @@ impl Lang {
             Lang::Dockerfile => "Dockerfile",
             Lang::Css => "CSS",
             Lang::Diff => "Diff",
+            Lang::Vb => "VBScript / VBA",
+            Lang::AutoHotkey => "AutoHotkey",
+            Lang::Toml => "TOML",
+            Lang::Nginx => "nginx",
+            Lang::Apache => "Apache config",
+            Lang::Perl => "Perl",
+            Lang::R => "R",
+            Lang::Hcl => "Terraform / HCL",
+            Lang::CMake => "CMake",
+            Lang::Properties => "Properties",
+            Lang::Subtitles => "Subtitles (SRT / VTT)",
+            Lang::Calendar => "iCalendar / vCard",
+            Lang::Sln => "VS solution",
         }
     }
 
     /// Menu order: plain text, then by name.
-    pub const ALL: [Lang; 32] = [
+    pub const ALL: [Lang; 45] = [
         Lang::Plain,
+        Lang::Apache,
+        Lang::AutoHotkey,
         Lang::Batch,
         Lang::C,
         Lang::CSharp,
         Lang::Cpp,
+        Lang::CMake,
         Lang::Css,
         Lang::Csv,
         Lang::CsvSemi,
@@ -106,6 +142,7 @@ impl Lang {
         Lang::Dockerfile,
         Lang::Go,
         Lang::Html,
+        Lang::Calendar,
         Lang::Ini,
         Lang::Java,
         Lang::JavaScript,
@@ -114,16 +151,25 @@ impl Lang {
         Lang::Log,
         Lang::Lua,
         Lang::Markdown,
+        Lang::Nginx,
+        Lang::Perl,
         Lang::Php,
         Lang::PowerShell,
+        Lang::Properties,
         Lang::Python,
+        Lang::R,
         Lang::Ruby,
         Lang::Rust,
         Lang::Shell,
         Lang::Sql,
+        Lang::Subtitles,
         Lang::Swift,
+        Lang::Hcl,
+        Lang::Toml,
         Lang::Tsv,
         Lang::TypeScript,
+        Lang::Vb,
+        Lang::Sln,
         Lang::Xml,
         Lang::Yaml,
     ];
@@ -142,43 +188,120 @@ impl Lang {
             | Lang::JavaScript
             | Lang::TypeScript
             | Lang::Php => Line("//"),
-            Lang::Python | Lang::Ruby | Lang::Shell | Lang::PowerShell | Lang::Yaml | Lang::Dockerfile | Lang::Ini => {
-                Line("#")
-            }
+            Lang::Python
+            | Lang::Ruby
+            | Lang::Shell
+            | Lang::PowerShell
+            | Lang::Yaml
+            | Lang::Dockerfile
+            | Lang::Ini
+            | Lang::Toml
+            | Lang::Nginx
+            | Lang::Apache
+            | Lang::Perl
+            | Lang::R
+            | Lang::Hcl
+            | Lang::CMake
+            | Lang::Properties
+            | Lang::Sln => Line("#"),
             Lang::Sql | Lang::Lua => Line("--"),
             Lang::Batch => Line("REM "),
+            Lang::Vb => Line("'"),
+            Lang::AutoHotkey => Line(";"),
             Lang::Xml | Lang::Html | Lang::Markdown => Block("<!--", "-->"),
             Lang::Css => Block("/*", "*/"),
-            Lang::Plain | Lang::Json | Lang::Log | Lang::Csv | Lang::CsvSemi | Lang::Tsv | Lang::Diff => return None,
+            Lang::Plain
+            | Lang::Json
+            | Lang::Log
+            | Lang::Csv
+            | Lang::CsvSemi
+            | Lang::Tsv
+            | Lang::Diff
+            | Lang::Subtitles
+            | Lang::Calendar => return None,
         })
     }
 
-    /// Picks a language from the file name, then from the first bytes.
-    pub fn detect(name: Option<&str>, head: &[u8]) -> Lang {
-        name.and_then(|n| Lang::from_name(n, head)).unwrap_or_else(|| Lang::sniff(head))
+    /// Whether the path bar and the structure panel are offered for this language.
+    pub fn has_structure(self) -> bool {
+        matches!(self, Lang::Json | Lang::Xml)
     }
 
-    fn from_name(name: &str, head: &[u8]) -> Option<Lang> {
-        let lower = name.to_ascii_lowercase();
-        match lower.as_str() {
+    /// Picks a language from the file's path (or just its name), then from the first bytes.
+    pub fn detect(path: Option<&str>, head: &[u8]) -> Lang {
+        path.and_then(|p| Lang::from_path(p, head)).unwrap_or_else(|| Lang::sniff(head))
+    }
+
+    /// By the file name, and for server configuration also by the folder it's in (`/etc/nginx/sites-available/x`,
+    /// `C:\Apache24\conf\extra\httpd-ssl.conf`).
+    fn from_path(path: &str, head: &[u8]) -> Option<Lang> {
+        let lower = path.to_ascii_lowercase();
+        let mut parts = lower.rsplit(['\\', '/']);
+        let name = parts.next().unwrap_or("");
+        let folders: Vec<&str> = parts.take(6).collect();
+        let by_name = Lang::from_name(name, head);
+        let server = folders.iter().find_map(|f| {
+            // (`nginx-1.25.3`, not `nginx-proxy-manager`)
+            if *f == "nginx" || f.strip_prefix("nginx-").is_some_and(|v| v.starts_with(|c: char| c.is_ascii_digit())) {
+                Some(Lang::Nginx)
+            } else if matches!(*f, "apache" | "apache2" | "apache22" | "apache24" | "httpd") {
+                Some(Lang::Apache)
+            } else {
+                None
+            }
+        });
+        let Some(server) = server else { return by_name };
+        let ext = name.rsplit_once('.').map(|(_, e)| e);
+        let site = folders.first().is_some_and(|f| matches!(*f, "sites-available" | "sites-enabled" | "conf.d" | "snippets"));
+        // its configuration files (`nginx.conf`, `mime.types`, `fastcgi_params`, sites named after their domain); a
+        // page or a log in there stays what it is, and a script says so in its `#!` line
+        let conf = match by_name {
+            Some(Lang::Ini) => ext == Some("conf"),
+            Some(_) => false,
+            None if server == Lang::Nginx => (ext.is_none() || ext == Some("types") || site) && Lang::sniff(head) == Lang::Plain,
+            None => (site || ext == Some("load")) && Lang::sniff(head) == Lang::Plain,
+        };
+        if conf { Some(server) } else { by_name }
+    }
+
+    fn from_name(lower: &str, head: &[u8]) -> Option<Lang> {
+        match lower {
             "dockerfile" | "containerfile" => return Some(Lang::Dockerfile),
             "makefile" | "gnumakefile" | ".bashrc" | ".bash_profile" | ".profile" | ".zshrc" | ".zprofile"
             | ".gitignore" | ".gitattributes" | ".dockerignore" | ".npmignore" => return Some(Lang::Shell),
             "gemfile" | "rakefile" | "podfile" | "vagrantfile" => return Some(Lang::Ruby),
+            "cmakelists.txt" => return Some(Lang::CMake),
+            // Groovy, which the Java colors suit
+            "jenkinsfile" => return Some(Lang::Java),
+            "hosts" => return Some(Lang::Ini),
+            "cargo.lock" | "pipfile" | "poetry.lock" | "uv.lock" | "pdm.lock" => return Some(Lang::Toml),
+            "nginx.conf" => return Some(Lang::Nginx),
+            "httpd.conf" | "apache2.conf" | "apache.conf" => return Some(Lang::Apache),
             _ => {}
         }
         if lower.starts_with("dockerfile.") {
             return Some(Lang::Dockerfile);
         }
-        let ext = lower.rsplit_once('.')?.1;
+        // .env.local, .env.production
+        if lower.starts_with(".env.") {
+            return Some(Lang::Ini);
+        }
+        let (stem, ext) = lower.rsplit_once('.')?;
         Some(match ext {
-            "json" | "jsonl" | "ndjson" | "geojson" | "jsonc" | "json5" | "har" | "webmanifest" | "ipynb" => Lang::Json,
+            // templates: colored as what they make (`values.yaml.j2`)
+            "j2" | "jinja" | "jinja2" => return Lang::from_name(stem, head),
+            "json" | "jsonl" | "ndjson" | "geojson" | "jsonc" | "json5" | "har" | "webmanifest" | "ipynb" | "tfstate" => {
+                Lang::Json
+            }
             "log" | "out" => Lang::Log,
-            "ini" | "cfg" | "conf" | "toml" | "properties" | "env" | "inf" | "reg" | "desktop" | "editorconfig"
-            | "gitconfig" | "service" | "socket" | "timer" | "mount" => Lang::Ini,
+            "conf" => conf_kind(head),
+            "ini" | "cfg" | "env" | "inf" | "reg" | "desktop" | "editorconfig" | "gitconfig" | "gitmodules" | "npmrc"
+            | "pypirc" | "cnf" | "wslconfig" | "service" | "socket" | "timer" | "mount" => Lang::Ini,
+            "toml" => Lang::Toml,
+            "properties" => Lang::Properties,
             "xml" | "xsd" | "xsl" | "xslt" | "svg" | "xaml" | "csproj" | "vbproj" | "fsproj" | "vcxproj" | "proj"
             | "props" | "targets" | "nuspec" | "resx" | "config" | "plist" | "kml" | "gpx" | "rss" | "atom" | "wsdl"
-            | "xlf" | "xliff" | "manifest" | "ps1xml" | "storyboard" | "xib" | "fxml" | "dtd" => Lang::Xml,
+            | "xlf" | "xliff" | "manifest" | "ps1xml" | "storyboard" | "xib" | "fxml" | "dtd" | "slnx" => Lang::Xml,
             "html" | "htm" | "xhtml" | "shtml" | "vue" | "svelte" | "cshtml" | "razor" | "jsp" | "asp" | "aspx" => {
                 Lang::Html
             }
@@ -207,6 +330,18 @@ impl Lang {
             "dockerfile" => Lang::Dockerfile,
             "css" | "scss" | "sass" | "less" => Lang::Css,
             "diff" | "patch" | "rej" => Lang::Diff,
+            "vbs" | "vba" | "bas" | "vb" => Lang::Vb,
+            // a VBA class module, or a LaTeX class (left plain)
+            "cls" => return (!matches!(head.trim_ascii_start().first(), Some(b'%' | b'\\'))).then_some(Lang::Vb),
+            "ahk" | "ah2" => Lang::AutoHotkey,
+            "pl" | "pm" | "pod" | "psgi" => Lang::Perl,
+            "r" | "rprofile" => Lang::R,
+            "tf" | "tfvars" | "hcl" | "nomad" => Lang::Hcl,
+            "cmake" => Lang::CMake,
+            "srt" | "vtt" => Lang::Subtitles,
+            "ics" | "ical" | "ifb" | "vcs" | "vcf" | "vcard" => Lang::Calendar,
+            "sln" => Lang::Sln,
+            "htaccess" => Lang::Apache,
             // rotated logs: app.log.1, app.log.2026-10-07
             _ if lower.contains(".log.") => Lang::Log,
             _ => return None,
@@ -231,6 +366,10 @@ impl Lang {
                 Lang::Lua
             } else if has(b"php") {
                 Lang::Php
+            } else if has(b"perl") {
+                Lang::Perl
+            } else if has(b"rscript") {
+                Lang::R
             } else {
                 Lang::Shell
             };
@@ -244,6 +383,19 @@ impl Lang {
         }
         if starts_ci(b"<!doctype html") || starts_ci(b"<html") {
             return Lang::Html;
+        }
+        if starts_ci(b"webvtt") || is_srt(t) {
+            return Lang::Subtitles;
+        }
+        if starts_ci(b"begin:vcalendar") || starts_ci(b"begin:vcard") {
+            return Lang::Calendar;
+        }
+        if t.starts_with(b"Microsoft Visual Studio Solution File") {
+            return Lang::Sln;
+        }
+        // `<VirtualHost *:80>` isn't XML
+        if let Some(l) = server_conf(t, 1) {
+            return l;
         }
         if t.starts_with(b"<!--") || (t.first() == Some(&b'<') && t.get(1).is_some_and(|c| c.is_ascii_alphabetic())) {
             return Lang::Xml;
@@ -273,6 +425,68 @@ impl Lang {
         }
         Lang::Plain
     }
+}
+
+/// A `.conf` file: XML, nginx's or Apache's configuration, or else INI-like.
+fn conf_kind(head: &[u8]) -> Lang {
+    if head.trim_ascii_start().starts_with(b"<?xml") {
+        return Lang::Xml;
+    }
+    server_conf(head, 200).unwrap_or(Lang::Ini)
+}
+
+/// nginx or Apache configuration, as told by the first `lines` lines that aren't comments or blank: an nginx block
+/// (`server {`, `location / {`) or directive (`worker_processes 4;`), an Apache section (`<VirtualHost *:80>`) or
+/// directive (`LoadModule …`, `DocumentRoot …`).
+fn server_conf(head: &[u8], lines: usize) -> Option<Lang> {
+    const NGINX_BLOCKS: [&[u8]; 6] = [b"events", b"http", b"location", b"server", b"stream", b"upstream"];
+    const NGINX_DIRECTIVES: [&[u8]; 12] = [
+        b"access_log", b"error_log", b"keepalive_timeout", b"listen", b"proxy_pass", b"proxy_set_header", b"root",
+        b"sendfile", b"server_name", b"user", b"worker_connections", b"worker_processes",
+    ];
+    const APACHE_SECTIONS: [&[u8]; 12] = [
+        b"directory", b"directorymatch", b"files", b"filesmatch", b"ifdefine", b"ifmodule", b"ifversion", b"location",
+        b"locationmatch", b"proxy", b"virtualhost", b"macro",
+    ];
+    const APACHE_DIRECTIVES: [&[u8]; 14] = [
+        b"AddHandler", b"AddType", b"AllowOverride", b"CustomLog", b"DirectoryIndex", b"DocumentRoot", b"ErrorDocument",
+        b"ErrorLog", b"LoadModule", b"RewriteCond", b"RewriteEngine", b"RewriteRule", b"ServerName", b"ServerRoot",
+    ];
+    let word_end = |l: &[u8]| l.iter().position(|&b| !(b.is_ascii_alphanumeric() || b == b'_')).unwrap_or(l.len());
+    for l in head.split(|&b| b == b'\n').map(|l| l.trim_ascii()).filter(|l| !l.is_empty() && l[0] != b'#').take(lines) {
+        let w = &l[..word_end(l)];
+        let spaced = matches!(l.get(w.len()), Some(b' ' | b'\t'));
+        if let Some(sec) = l.strip_prefix(b"<") {
+            // (an XML element has attributes with `=`: `<location lat="1">`)
+            let w = &sec[..word_end(sec)];
+            let args = &sec[w.len()..sec.iter().position(|&b| b == b'>').unwrap_or(sec.len())];
+            if APACHE_SECTIONS.iter().any(|s| s.eq_ignore_ascii_case(w))
+                && matches!(args.first(), Some(b' ' | b'\t'))
+                && !args.contains(&b'=')
+            {
+                return Some(Lang::Apache);
+            }
+            continue;
+        }
+        let rest = l[w.len()..].trim_ascii_start();
+        if NGINX_BLOCKS.contains(&w) && (rest.starts_with(b"{") || (spaced && l.ends_with(b"{"))) {
+            return Some(Lang::Nginx);
+        }
+        if NGINX_DIRECTIVES.contains(&w) && spaced && l.ends_with(b";") {
+            return Some(Lang::Nginx);
+        }
+        if APACHE_DIRECTIVES.contains(&w) && spaced && !l.ends_with(b";") {
+            return Some(Lang::Apache);
+        }
+    }
+    None
+}
+
+/// An SRT file: a cue number, then a `00:00:01,000 --> 00:00:04,000` line.
+fn is_srt(t: &[u8]) -> bool {
+    let mut lines = t.split(|&b| b == b'\n').map(|l| l.trim_ascii());
+    let num = lines.next().is_some_and(|l| !l.is_empty() && l.len() < 10 && l.iter().all(u8::is_ascii_digit));
+    num && lines.next().is_some_and(|l| l.len() < 80 && l.windows(3).any(|w| w == b"-->") && l.first().is_some_and(u8::is_ascii_digit))
 }
 
 /// Whether the start of a file reads as JSON (or JSON with comments) as far as it goes.
@@ -305,12 +519,16 @@ fn csv_kind(head: &[u8]) -> Lang {
     }
 }
 
-/// Whether most of the first lines start with a date or time, like log files do.
+/// Whether most of the first lines start with a date or time, like log files do. (An IP address isn't a time: a
+/// hosts file isn't a log, but a web server's access log, `10.0.0.1 - - [07/Oct/2026:12:00:01 …`, is.)
 fn looks_like_log(head: &[u8]) -> bool {
     let lines: Vec<&[u8]> = head.split(|&b| b == b'\n').filter(|l| !l.trim_ascii().is_empty()).take(5).collect();
     let stamped = lines
         .iter()
         .filter(|l| {
+            if let Some(e) = ipv4_end(l) {
+                return l[e..].iter().take(48).zip(l[e..].iter().skip(1)).any(|(&a, b)| a == b'[' && b.is_ascii_digit());
+            }
             let l = l.strip_prefix(b"[").unwrap_or(l);
             let p = &l[..l.len().min(12)];
             l.first().is_some_and(|c| c.is_ascii_digit())
@@ -319,6 +537,25 @@ fn looks_like_log(head: &[u8]) -> bool {
         })
         .count();
     !lines.is_empty() && stamped * 2 > lines.len()
+}
+
+/// Where an IPv4 address that starts `l` ends (it is followed by a space or a tab).
+fn ipv4_end(l: &[u8]) -> Option<usize> {
+    let mut i = 0;
+    for part in 0..4 {
+        let d = l[i..].iter().take(4).take_while(|b| b.is_ascii_digit()).count();
+        if !(1..=3).contains(&d) {
+            return None;
+        }
+        i += d;
+        if part < 3 {
+            if l.get(i) != Some(&b'.') {
+                return None;
+            }
+            i += 1;
+        }
+    }
+    matches!(l.get(i), Some(b' ' | b'\t')).then_some(i)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -412,24 +649,36 @@ pub fn lex(lang: Lang, text: &[u8], st: State, out: Option<&mut Vec<Span>>) -> S
     if let Some(v) = o.v.as_mut() {
         v.clear();
     }
-    let mut end = match lang {
-        Lang::Plain => st,
-        Lang::Json => json(text, st, &mut o),
-        Lang::Log => by_line(text, st, &mut o, log_line),
-        Lang::Ini => by_line(text, st, &mut o, ini_line),
-        Lang::Diff => diff(text, st, &mut o),
-        Lang::Csv => csv(text, st, b',', &mut o),
-        Lang::CsvSemi => csv(text, st, b';', &mut o),
-        Lang::Tsv => csv(text, st, b'\t', &mut o),
-        Lang::Xml | Lang::Html => markup::markup(lang == Lang::Html, text, st, &mut o),
-        Lang::Php => markup::php(text, st, &mut o),
-        Lang::Markdown => markup::markdown(text, st, &mut o),
-        Lang::Yaml => markup::yaml(text, st, &mut o),
-        Lang::Css => code::css(text, st, &mut o),
-        _ => code::code(code::syntax(lang), text, st, &mut o),
-    };
+    let mut end = lex_in(lang, text, st, &mut o);
     line_flags(text, st, &mut end);
     end
+}
+
+/// `lex` without the line flags, adding to what `o` has.
+fn lex_in(lang: Lang, text: &[u8], st: State, o: &mut Out) -> State {
+    match lang {
+        Lang::Plain => st,
+        Lang::Json => json(text, st, o),
+        Lang::Log => by_line(text, st, o, log_line),
+        Lang::Ini => by_line(text, st, o, ini_line),
+        Lang::Diff => diff(text, st, o),
+        Lang::Csv => csv(text, st, b',', o),
+        Lang::CsvSemi => csv(text, st, b';', o),
+        Lang::Tsv => csv(text, st, b'\t', o),
+        Lang::Xml | Lang::Html => markup::markup(lang == Lang::Html, text, st, o),
+        Lang::Php => markup::php(text, st, o),
+        Lang::Markdown => markup::markdown(text, st, o),
+        Lang::Yaml => markup::yaml(text, st, o),
+        Lang::Css => code::css(text, st, o),
+        Lang::Toml => config::toml(text, st, o),
+        Lang::Nginx => config::nginx(text, st, o),
+        Lang::Apache => config::apache(text, st, o),
+        Lang::Properties => config::properties(text, st, o),
+        Lang::Subtitles => config::subtitles(text, st, o),
+        Lang::Calendar => by_line(text, st, o, config::calendar_line),
+        Lang::Sln => by_line(text, st, o, config::sln_line),
+        _ => code::code(code::syntax(lang), text, st, o),
+    }
 }
 
 /// The state a segment of a huge file starts in when it doesn't start its line: worked out from up to a few KB
@@ -762,12 +1011,25 @@ fn ini_line(t: &[u8], _col0: bool, bol: bool, o: &mut Out) {
         b';' | b'#' | b'!' => o.put(s, n, Tok::Comment),
         b'[' => o.put(s, n, Tok::Section),
         _ => {
-            // `key = value`, or `key: value` with a one-word key (not `proxy_pass http://…` in nginx.conf)
+            // `key = value`, or `key: value` with a one-word key (not `proxy_pass http://…` in nginx.conf, nor an
+            // IPv6 address)
             let eq = t[s..].iter().position(|&b| b == b'=').map(|p| s + p);
             let colon = t[s..eq.unwrap_or(n)].iter().position(|&b| b == b':').map(|p| s + p).filter(|&c| {
-                !t[s..c].trim_ascii_end().iter().any(|b| b.is_ascii_whitespace()) && !matches!(at(t, c + 1), b'/' | b'\\')
+                c > s
+                    && !t[s..c].trim_ascii_end().iter().any(|b| b.is_ascii_whitespace())
+                    && !matches!(at(t, c + 1), b'/' | b'\\' | b':')
             });
-            let Some(eq) = colon.or(eq) else { return };
+            let Some(eq) = colon.or(eq) else {
+                // a line of words, like a hosts file's `127.0.0.1  localhost  # note`
+                let w = s + t[s..].iter().take_while(|b| !b.is_ascii_whitespace()).count();
+                if is_num_word(&t[s..w]) {
+                    o.put(s, w, Tok::Num);
+                }
+                if let Some(p) = t[w..].windows(2).position(|x| matches!(x[0], b' ' | b'\t') && matches!(x[1], b'#' | b';')) {
+                    o.put(w + p + 1, n, Tok::Comment);
+                }
+                return;
+            };
             o.put(s, eq, Tok::Key);
             o.put(eq, eq + 1, Tok::Punct);
             ini_value(t, eq + 1, o);
@@ -1030,6 +1292,67 @@ mod tests {
     }
 
     #[test]
+    fn detection_of_the_newer_languages() {
+        let d = Lang::detect;
+        for (name, lang) in [
+            ("Module1.bas", Lang::Vb),
+            ("script.ahk", Lang::AutoHotkey),
+            ("Cargo.toml", Lang::Toml),
+            ("Cargo.lock", Lang::Toml),
+            ("nginx.conf", Lang::Nginx),
+            (".htaccess", Lang::Apache),
+            ("httpd.conf", Lang::Apache),
+            ("lib.pm", Lang::Perl),
+            ("analysis.R", Lang::R),
+            ("main.tf", Lang::Hcl),
+            ("CMakeLists.txt", Lang::CMake),
+            ("app.properties", Lang::Properties),
+            ("movie.srt", Lang::Subtitles),
+            ("invite.ics", Lang::Calendar),
+            ("App.sln", Lang::Sln),
+            // names that said little before
+            (".env.local", Lang::Ini),
+            ("Jenkinsfile", Lang::Java),
+            (".npmrc", Lang::Ini),
+            ("values.yaml.j2", Lang::Yaml),
+            ("nginx.conf.j2", Lang::Nginx),
+            ("page.html.jinja", Lang::Html),
+            ("hosts", Lang::Ini),
+        ] {
+            assert_eq!(d(Some(name), b""), lang, "{name}");
+        }
+        // a VBA class module, a LaTeX class
+        assert_eq!(d(Some("Sheet1.cls"), b"VERSION 1.0 CLASS\r\n"), Lang::Vb);
+        assert_eq!(d(Some("article.cls"), b"\\NeedsTeXFormat{LaTeX2e}"), Lang::Plain);
+        // nginx and Apache configuration by their folders
+        assert_eq!(d(Some("/etc/nginx/sites-available/default"), b"# comment\n"), Lang::Nginx);
+        assert_eq!(d(Some("C:\\nginx-1.25.3\\conf\\fastcgi_params"), b"fastcgi_param QUERY_STRING $query_string;\n"), Lang::Nginx);
+        assert_eq!(d(Some("C:\\nginx\\html\\index.html"), b""), Lang::Html);
+        assert_eq!(d(Some("C:\\nginx\\logs\\error.log"), b""), Lang::Log);
+        assert_eq!(d(Some("/etc/nginx/reload"), b"#!/bin/sh\n"), Lang::Shell);
+        assert_eq!(d(Some("C:\\work\\nginx-proxy-manager\\NOTES"), b"Some notes.\n"), Lang::Plain);
+        assert_eq!(d(Some("/etc/apache2/sites-available/000-default.conf"), b"# x\n"), Lang::Apache);
+        assert_eq!(d(Some("/opt/apache-maven/bin/mvn"), b"#!/bin/sh\n"), Lang::Shell);
+        // ... or by what they hold
+        assert_eq!(d(Some("site.conf"), b"server {\n  listen 80;\n}\n"), Lang::Nginx);
+        assert_eq!(d(Some("vhost.conf"), b"<VirtualHost *:80>\n  ServerName x\n</VirtualHost>\n"), Lang::Apache);
+        assert_eq!(d(Some("fonts.conf"), b"<?xml version=\"1.0\"?>\n<fontconfig/>"), Lang::Xml);
+        assert_eq!(d(Some("sysctl.conf"), b"net.ipv4.ip_forward = 1\n"), Lang::Ini);
+        assert_eq!(d(None, b"<VirtualHost *:443>\n"), Lang::Apache);
+        assert_eq!(d(None, b"<location lat=\"1\"/>"), Lang::Xml);
+        assert_eq!(d(Some("run"), b"#!/usr/bin/env perl\n"), Lang::Perl);
+        assert_eq!(d(None, b"1\n00:00:01,000 --> 00:00:04,000\nHello\n"), Lang::Subtitles);
+        assert_eq!(d(None, b"WEBVTT\n\n00:01.000 --> 00:04.000\nHi\n"), Lang::Subtitles);
+        assert_eq!(d(None, b"BEGIN:VCARD\r\nVERSION:3.0\r\n"), Lang::Calendar);
+        // a hosts file's addresses aren't log times, but an access log's times are
+        assert_eq!(d(Some("list.txt"), b"127.0.0.1 localhost\n10.0.0.2 nas\n"), Lang::Plain);
+        let access = b"10.0.0.1 - - [07/Oct/2026:12:00:01 +0000] \"GET / HTTP/1.1\" 200\n10.0.0.2 - - [07/Oct/2026:12:00:02 +0000] \"GET /x\" 404\n";
+        assert_eq!(d(Some("access.txt"), access), Lang::Log);
+        has(Lang::Ini, "127.0.0.1   localhost  # loopback", &[("127.0.0.1", Tok::Num), ("# loopback", Tok::Comment)]);
+        assert!(toks(Lang::Ini, "ff02::1 ip6-allnodes", State::START).is_empty());
+    }
+
+    #[test]
     fn logs_configs_and_diffs() {
         has(Lang::Log, "2026/10/07 12:00:01 [error] 123#0: open() failed", &[("2026/10/07 12:00:01", Tok::Dim), ("error", Tok::Error)]);
         has(Lang::Log, "time=x level=warn msg=slow", &[("warn", Tok::Warn)]);
@@ -1125,12 +1448,15 @@ mod tests {
             Lang::Json => &["//", "/*", "*/", "true"],
             Lang::Xml | Lang::Html => &["<!--", "-->", "<![CDATA[", "]]>", "<?", "?>", "<a", "</a>", "<script>", "</script>", "<style>", "&amp;"],
             Lang::Php => &["<?php", "<?=", "?>", "<a href=\"", "<script>", "</script>", "<!--", "//", "/*", "*/", "$x"],
-            Lang::Markdown => &["```", "`", "<!--", "-->", "# ", "> ", "- ", "**", "_", "[", "](", "    "],
-            Lang::Yaml => &["key: ", "- ", "  ", "|", ">-", "# ", "&a", "!t", "{{ "],
+            Lang::Markdown => &[
+                "```", "`", "<!--", "-->", "# ", "> ", "- ", "**", "_", "[", "](", "    ", "\n```rust\n", "\n```html\n", "\n~~~sql\n",
+                "\n````py\n", "\n```php\n", "<script>", "/*", "*/",
+            ],
+            Lang::Yaml => &["key: ", "- ", "  ", "|", ">-", "# ", "&a", "!t", "{{ ", "\"", "'", "''", "\\"],
             Lang::Css => &["/*", "*/", "//", "url(", "@media", "#fff", ".c", ":hover"],
             Lang::Python => &["\"\"\"", "'''", "def ", "r\""],
             Lang::Rust => &["r#\"", "\"#", "/*", "*/", "//", "'a", "'\\''", "#["],
-            Lang::CSharp => &["@\"", "$\"", "\"\"\"", "/*", "*/", "//", "new ", "X("],
+            Lang::CSharp => &["@\"", "$\"", "\"\"\"", "/*", "*/", "//", "new ", "X(", "{{", "$\"{"],
             Lang::Lua => &["--[[", "]]", "[==[", "]==]", "--"],
             Lang::PowerShell => &["@\"", "\"@", "@'", "'@", "<#", "#>", "$x"],
             Lang::Batch => &["REM ", "::", ":l", "%%i", "%X%", "echo "],
@@ -1138,7 +1464,24 @@ mod tests {
             Lang::Ruby => &["<<~EOS", "\nEOS\n", " << ", ":s"],
             Lang::Sql => &["--", "/*", "*/", "''", "[x]", "E'", "-- mysql\n", "/*!"],
             Lang::JavaScript | Lang::TypeScript | Lang::Go => &["${", "/*", "*/", "//", "return ", "/a/", "[/]", "</"],
-            Lang::Kotlin | Lang::Swift | Lang::Java | Lang::C | Lang::Cpp => &["\"\"\"", "/*", "*/", "//", "#include <x>"],
+            Lang::Kotlin | Lang::Swift | Lang::Java | Lang::C => &["\"\"\"", "/*", "*/", "//", "#include <x>"],
+            Lang::Cpp => &["R\"(", "R\"x(", ")\"", ")x\"", "1'000", "u8R\"", "/*", "*/", "//", "'a'"],
+            Lang::Vb => &["'", "Rem ", "\"\"", "&HFF", "#1/2/2026#", ":", " _", "#If "],
+            Lang::AutoHotkey => &["/*", "*/", ";", "::", "^!s::", ":*:btw::", "%x%", "#Requires AutoHotkey v2\n", "`", "Label:"],
+            Lang::Toml => &["\"\"\"", "'''", "[a]", "[[b]]", "x = ", "{", "}", "[1, ", "# ", "\\", "1979-05-27 07:32:00", "\"k\" = "],
+            Lang::Nginx => &["server {", "location / {", "}", ";", "$host", "${x}", "# c", "a#b", "listen 80;"],
+            Lang::Apache => &["<VirtualHost *:80>", "</VirtualHost>", "\\\n", "# c", "%{X}", "[L,R=301]", "${D}", "On"],
+            Lang::Perl => &[
+                "q(", "qw{", "s/a/b/", "s{", "}{", "tr/", "=~ /", "$#a", "$'", "<<EOF", "\nEOF\n", "\n=head1 x\n", "\n=cut\n",
+                "__END__", "m#",
+            ],
+            Lang::R => &["%in%", "`x y`", "<-", "#'", "is.na(", "...", "\"\n"],
+            Lang::Hcl => &["${", "%{", "$${", "<<EOF", "<<-EOT", "\nEOF\n", "/*", "*/", "//", "x = ", "\"a\""],
+            Lang::CMake => &["#[[", "]]", "[=[", "]=]", "${X}", "$<A:$<B>>", "$ENV{P}", "if(", "\"\n"],
+            Lang::Properties => &["key=", "\\\n", "\\u00e9", "! c", "# c", " : ", "${a}", "\\"],
+            Lang::Subtitles => &["WEBVTT\n", "NOTE x\n", "STYLE\n", "::cue { color: red }", "00:00:01.000 --> 00:00:02.000", "<i>", "{\\an8}", "\n\n", "  \n"],
+            Lang::Calendar => &["BEGIN:VEVENT", ";TZID=", ":", "\n ", "DTSTART", "\"a:b\""],
+            Lang::Sln => &["Project(\"{", "}\") = \"", "GlobalSection(", " = ", "# ", "EndProject"],
             Lang::Diff => &["@@ -1,2 +1,2 @@", "---", "+++", " "],
             _ => &["[s]", "k=v", "ERROR"],
         };
@@ -1160,7 +1503,10 @@ mod tests {
     #[test]
     fn states_dont_depend_on_where_text_is_cut() {
         use Lang::*;
-        let exact_mid_line = [Json, Log, Ini, Xml, Html, Csv, CsvSemi, Tsv, Python, JavaScript, TypeScript, C, Cpp, CSharp, Java, Kotlin, Swift, Go, Php, Lua];
+        let exact_mid_line = [
+            Json, Log, Ini, Xml, Html, Csv, CsvSemi, Tsv, Python, JavaScript, TypeScript, C, Cpp, CSharp, Java, Kotlin, Swift, Go,
+            Php, Lua, Nginx, Apache, Properties, Calendar, Sln, R,
+        ];
         let mut r = 0x2545_F491_4F6C_DD1Du64;
         for lang in Lang::ALL {
             for _ in 0..150 {

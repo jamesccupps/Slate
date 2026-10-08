@@ -1,0 +1,1008 @@
+//! Configuration and other line-based formats: TOML, nginx and Apache configuration, Java `.properties`, subtitles
+//! (SRT, WebVTT), calendars and contacts (iCalendar, vCard) and Visual Studio solutions.
+
+use super::code;
+use super::{Out, State, Tok, at, is_num_word, line_end, scan_str};
+
+fn is_ws(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\r' | 0x0C)
+}
+
+// ---- TOML ----
+
+// What `State::kind` means here; `a` is 1 when an escape is pending.
+/// `"""…"""`
+const T_ML_BASIC: u8 = 1;
+/// `'''…'''`
+const T_ML_LITERAL: u8 = 2;
+/// `"…"` cut off by the end of a text (they end at their line's end).
+const T_BASIC: u8 = 3;
+/// `'…'` cut off by the end of a text.
+const T_LITERAL: u8 = 4;
+/// A comment cut off by the end of a text.
+const T_COMMENT: u8 = 5;
+
+/// `b` holds the arrays and inline tables a value has open across lines: how many (bits 0-3), and whether each of the
+/// first 12 is an inline table (bit 3 + its depth).
+fn toml_push(b: u16, table: bool) -> u16 {
+    let d = b & 15;
+    if d == 15 {
+        return b;
+    }
+    let bit = if d < 12 { 1 << (4 + d) } else { 0 };
+    let r = (b & !15) | (d + 1);
+    if table { r | bit } else { r & !bit }
+}
+
+fn toml_pop(b: u16) -> u16 {
+    let d = b & 15;
+    if d == 0 {
+        return b;
+    }
+    let bit = if d <= 12 { 1 << (3 + d) } else { 0 };
+    ((b & !15) | (d - 1)) & !bit
+}
+
+fn toml_in_table(b: u16) -> bool {
+    let d = b & 15;
+    d > 0 && d <= 12 && b & (1 << (3 + d)) != 0
+}
+
+/// A string from `s`, scanned from `i`, of the given kind: Ok(end), or the state to go on in.
+fn toml_str(t: &[u8], s: usize, mut i: usize, kind: u8, mut esc: bool, o: &mut Out) -> Result<usize, (u8, bool)> {
+    let (q, escapes, multi) = match kind {
+        T_ML_BASIC => (b'"', true, true),
+        T_ML_LITERAL => (b'\'', false, true),
+        T_BASIC => (b'"', true, false),
+        _ => (b'\'', false, false),
+    };
+    while i < t.len() {
+        let c = t[i];
+        if esc {
+            esc = false;
+        } else if c == b'\\' && escapes {
+            esc = true;
+        } else if c == b'\n' && !multi {
+            o.put(s, i, Tok::Str);
+            return Ok(i);
+        } else if c == q && (!multi || (at(t, i + 1) == q && at(t, i + 2) == q)) {
+            // """ ends it; up to two more quotes are part of the text (`""""a""""`)
+            let e = if multi { i + t[i..].iter().take(5).take_while(|&&b| b == q).count() } else { i + 1 };
+            o.put(s, e, Tok::Str);
+            return Ok(e);
+        }
+        i += 1;
+    }
+    o.put(s, t.len(), Tok::Str);
+    Err((kind, esc))
+}
+
+/// A `[table]` or `[[array.of.tables]]` header from `i`: its end (after the brackets, or the line's end).
+fn toml_header_end(t: &[u8], i: usize) -> usize {
+    let le = line_end(t, i);
+    let double = at(t, i + 1) == b'[';
+    let mut j = i + 1 + double as usize;
+    while j < le {
+        match t[j] {
+            b'"' | b'\'' => {
+                let q = t[j];
+                let (e, _, _) = scan_str(&t[..le], j + 1, q, if q == b'"' { b'\\' } else { 0 }, false, true);
+                j = e;
+            }
+            b']' => return (j + 1 + (double && at(t, j + 1) == b']') as usize).min(le),
+            _ => j += 1,
+        }
+    }
+    le
+}
+
+/// Inside an array left open (by mistake, as arrays don't hold tables): a `[name]` or `[[name]]` header from the
+/// line's very start, which ends it. Only the header itself is looked at (no space in it), so it reads the same
+/// wherever the text is cut.
+fn toml_resync(t: &[u8], i: usize) -> bool {
+    let d = 1 + (at(t, i + 1) == b'[') as usize;
+    let first = at(t, i + d);
+    if !(first.is_ascii_alphabetic() || first == b'_') {
+        return false;
+    }
+    let e = i + d + t[i + d..].iter().take_while(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.')).count();
+    t[e..].iter().take(d).all(|&b| b == b']') && matches!(at(t, e + d), 0 | b' ' | b'\t' | b'\r' | b'\n' | b'#')
+}
+
+/// A key starting at `i` (`name`, `a.b`, `"quoted"`, `site."google.com"`) that an `=` follows on its line: where the
+/// `=` is. (Keys are short: it looks 1 KB ahead at most.)
+fn toml_key_eq(t: &[u8], mut i: usize) -> Option<usize> {
+    let le = t.len().min(i + 1024);
+    let spaces = |i: usize| i + t[i.min(le)..le].iter().take_while(|&&b| b == b' ' || b == b'\t').count();
+    loop {
+        match t.get(i).filter(|_| i < le) {
+            Some(&q @ (b'"' | b'\'')) => {
+                let mut j = i + 1;
+                while j < le && t[j] != q && t[j] != b'\n' {
+                    j += if t[j] == b'\\' && q == b'"' { 2 } else { 1 };
+                }
+                if j >= le || t[j] != q {
+                    return None;
+                }
+                i = j + 1;
+            }
+            Some(&c) if c.is_ascii_alphanumeric() || c == b'_' || c == b'-' => {
+                i += t[i..le].iter().take_while(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-')).count();
+            }
+            _ => return None,
+        }
+        i = spaces(i);
+        match t.get(i).filter(|_| i < le) {
+            Some(b'.') => i = spaces(i + 1),
+            Some(b'=') => return Some(i),
+            _ => return None,
+        }
+    }
+}
+
+pub(super) fn toml(t: &[u8], st: State, o: &mut Out) -> State {
+    let n = t.len();
+    let mut stack = st.b;
+    let mut i = 0;
+    match st.kind {
+        T_ML_BASIC | T_ML_LITERAL | T_BASIC | T_LITERAL => match toml_str(t, 0, 0, st.kind, st.a & 1 != 0, o) {
+            Ok(e) => i = e,
+            Err((kind, esc)) => return State { kind, a: esc as u8, ..st },
+        },
+        T_COMMENT => {
+            i = line_end(t, 0);
+            o.put(0, i, Tok::Comment);
+            if i == n {
+                return st;
+            }
+        }
+        _ => {}
+    }
+    let (mut bol, mut col0) = (st.bol && i == 0, st.col0 && i == 0);
+    // after `{` or `,` in an inline table, where a key comes
+    let mut key_pos = false;
+    while i < n {
+        let c = t[i];
+        match c {
+            b'\n' => {
+                (bol, col0) = (true, true);
+                i += 1;
+                continue;
+            }
+            b' ' | b'\t' | b'\r' => {
+                col0 = false;
+                i += 1;
+                continue;
+            }
+            _ => {}
+        }
+        let (line_start, at_col0, can_key) = (bol, col0, (bol && stack & 15 == 0) || key_pos);
+        (bol, col0, key_pos) = (false, false, false);
+        if c == b'[' && line_start && (stack & 15 == 0 || (at_col0 && toml_resync(t, i))) {
+            stack = 0;
+            let e = toml_header_end(t, i);
+            o.put(i, e, Tok::Section);
+            i = e;
+            continue;
+        }
+        if c == b'#' {
+            let e = line_end(t, i);
+            o.put(i, e, Tok::Comment);
+            if e == n {
+                return State { kind: T_COMMENT, a: 0, b: stack, ..st };
+            }
+            i = e;
+            continue;
+        }
+        if can_key {
+            if let Some(eq) = toml_key_eq(t, i) {
+                o.put(i, t[i..eq].trim_ascii_end().len() + i, Tok::Key);
+                o.put(eq, eq + 1, Tok::Punct);
+                i = eq + 1;
+                continue;
+            }
+        }
+        match c {
+            b'"' | b'\'' => {
+                let triple = at(t, i + 1) == c && at(t, i + 2) == c;
+                let kind = match (c, triple) {
+                    (b'"', true) => T_ML_BASIC,
+                    (b'"', false) => T_BASIC,
+                    (_, true) => T_ML_LITERAL,
+                    _ => T_LITERAL,
+                };
+                match toml_str(t, i, i + if triple { 3 } else { 1 }, kind, false, o) {
+                    Ok(e) => i = e,
+                    Err((kind, esc)) => return State { kind, a: esc as u8, b: stack, ..st },
+                }
+            }
+            b'[' | b'{' => {
+                o.put(i, i + 1, Tok::Punct);
+                stack = toml_push(stack, c == b'{');
+                key_pos = c == b'{';
+                i += 1;
+            }
+            b']' | b'}' => {
+                o.put(i, i + 1, Tok::Punct);
+                stack = toml_pop(stack);
+                i += 1;
+            }
+            b',' | b'=' => {
+                o.put(i, i + 1, Tok::Punct);
+                key_pos = c == b',' && toml_in_table(stack);
+                i += 1;
+            }
+            c if c.is_ascii_alphanumeric() || matches!(c, b'+' | b'-' | b'_' | b'.') => {
+                let word = |i: usize| i + t[i..].iter().take_while(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b':' | b'+' | b'-')).count();
+                let mut e = word(i);
+                let w = &t[i..e];
+                let tok = match w {
+                    b"true" | b"false" => Some(Tok::Lit),
+                    b"inf" | b"+inf" | b"-inf" | b"nan" | b"+nan" | b"-nan" => Some(Tok::Num),
+                    _ if is_num_word(w) => {
+                        // a date and a time with a space between: 1979-05-27 07:32:00
+                        if w.len() == 10 && w[4] == b'-' && at(t, e) == b' ' && at(t, e + 1).is_ascii_digit() && at(t, e + 3) == b':' {
+                            e = word(e + 1);
+                        }
+                        Some(Tok::Num)
+                    }
+                    _ => None,
+                };
+                if let Some(tok) = tok {
+                    o.put(i, e, tok);
+                }
+                i = e.max(i + 1);
+            }
+            _ => i += 1,
+        }
+    }
+    State { kind: 0, a: 0, b: stack, ..st }
+}
+
+// ---- nginx ----
+
+/// A quoted string cut off by the end of a text; `b` is its quote, and `a` bit 2 an escape pending.
+const N_STR: u8 = 1;
+/// A comment cut off by the end of a text.
+const N_COMMENT: u8 = 2;
+
+/// nginx's blocks (the others are directives).
+const NGINX_BLOCKS: [&[u8]; 13] = [
+    b"events", b"geo", b"http", b"if", b"limit_except", b"location", b"mail", b"map", b"server", b"split_clients",
+    b"stream", b"types", b"upstream",
+];
+
+/// nginx: `name args;` and `name args { … }`. `a`: bit 0 inside a statement (its name is behind), bit 1 the last
+/// byte was part of a word (where `#` doesn't start a comment).
+pub(super) fn nginx(t: &[u8], st: State, o: &mut Out) -> State {
+    let n = t.len();
+    let mut i = 0;
+    let (mut in_stmt, mut in_word) = (st.a & 1 != 0, st.a & 2 != 0);
+    match st.kind {
+        N_STR => {
+            let q = st.b as u8;
+            let (e, closed, esc) = scan_str(t, 0, q, b'\\', st.a & 4 != 0, true);
+            o.put(0, e, Tok::Str);
+            if !closed {
+                return State { kind: N_STR, a: (st.a & 3) | (esc as u8) << 2, ..st };
+            }
+            i = e;
+        }
+        N_COMMENT => {
+            i = line_end(t, 0);
+            o.put(0, i, Tok::Comment);
+            if i == n {
+                return st;
+            }
+        }
+        _ => {}
+    }
+    while i < n {
+        let c = t[i];
+        match c {
+            b' ' | b'\t' | b'\r' | b'\n' => {
+                in_word = false;
+                i += 1;
+            }
+            b';' | b'{' | b'}' => {
+                o.put(i, i + 1, Tok::Punct);
+                (in_stmt, in_word) = (false, false);
+                i += 1;
+            }
+            b'#' if !in_word => {
+                let e = line_end(t, i);
+                o.put(i, e, Tok::Comment);
+                if e == n {
+                    return State { kind: N_COMMENT, a: in_stmt as u8, b: 0, ..st };
+                }
+                i = e;
+            }
+            b'"' | b'\'' => {
+                let (e, closed, esc) = scan_str(t, i + 1, c, b'\\', false, true);
+                o.put(i, e, Tok::Str);
+                (in_stmt, in_word) = (true, true);
+                if !closed {
+                    return State { kind: N_STR, a: 3 | (esc as u8) << 2, b: c as u16, ..st };
+                }
+                i = e;
+            }
+            b'$' if at(t, i + 1) == b'{' || at(t, i + 1).is_ascii_alphanumeric() || at(t, i + 1) == b'_' => {
+                // $host, ${name}
+                let braced = at(t, i + 1) == b'{';
+                let from = i + 1 + braced as usize;
+                let mut e = from + t[from..].iter().take_while(|b| b.is_ascii_alphanumeric() || **b == b'_').count();
+                if braced && at(t, e) == b'}' {
+                    e += 1;
+                }
+                o.put(i, e, Tok::Var);
+                (in_stmt, in_word) = (true, true);
+                i = e;
+            }
+            _ => {
+                let e = i + t[i..].iter().take_while(|&&b| !matches!(b, b' ' | b'\t' | b'\r' | b'\n' | b';' | b'{' | b'}' | b'"' | b'\'' | b'$')).count();
+                let e = e.max(i + 1);
+                let w = &t[i..e];
+                let tok = if !in_stmt && !in_word {
+                    in_stmt = true;
+                    Some(if NGINX_BLOCKS.contains(&w) { Tok::Control } else { Tok::Keyword })
+                } else if in_word {
+                    None
+                } else if w == b"on" || w == b"off" {
+                    Some(Tok::Lit)
+                } else if w[0].is_ascii_digit() && is_num_word(w) {
+                    Some(Tok::Num)
+                } else {
+                    None
+                };
+                if let Some(tok) = tok {
+                    o.put(i, e, tok);
+                }
+                in_word = true;
+                i = e;
+            }
+        }
+    }
+    State { kind: 0, a: in_stmt as u8 | (in_word as u8) << 1, b: 0, ..st }
+}
+
+// ---- Apache ----
+
+/// A `"string"` cut off by the end of a text; `a` bit 1: an escape pending.
+const A_STR: u8 = 1;
+/// A comment cut off by the end of a text.
+const A_COMMENT: u8 = 2;
+
+/// Apache's configuration and `.htaccess` files: a directive per line (`a` bit 0: this line goes on from the one
+/// before, which ended with `\`), `<Section args>` … `</Section>`, `#` comments on their own lines.
+pub(super) fn apache(t: &[u8], st: State, o: &mut Out) -> State {
+    let n = t.len();
+    let mut i = 0;
+    let mut cont = st.a & 1 != 0;
+    if st.kind == A_STR {
+        let (e, closed, esc) = scan_str(t, 0, b'"', b'\\', st.a & 2 != 0, true);
+        o.put(0, e, Tok::Str);
+        if !closed {
+            return State { kind: A_STR, a: cont as u8 | (esc as u8) << 1, ..st };
+        }
+        i = e;
+    } else if st.kind == A_COMMENT {
+        i = line_end(t, 0);
+        o.put(0, i, Tok::Comment);
+        if i == n {
+            return st;
+        }
+    }
+    let mut bol = st.bol && i == 0;
+    // inside `<Section …>` (colored up to its `>`)
+    let mut section = false;
+    while i < n {
+        let c = t[i];
+        match c {
+            b'\n' => {
+                let k = if i > 0 && t[i - 1] == b'\r' { i - 1 } else { i };
+                cont = k > 0 && t[k - 1] == b'\\';
+                (bol, section) = (true, false);
+                i += 1;
+                continue;
+            }
+            b' ' | b'\t' | b'\r' => {
+                i += 1;
+                continue;
+            }
+            _ => {}
+        }
+        let first = bol && !cont;
+        bol = false;
+        if first && c == b'#' {
+            let e = line_end(t, i);
+            o.put(i, e, Tok::Comment);
+            if e == n {
+                return State { kind: A_COMMENT, a: cont as u8, b: 0, ..st };
+            }
+            i = e;
+            continue;
+        }
+        if first && c == b'<' {
+            let ns = i + 1 + (at(t, i + 1) == b'/') as usize;
+            let ne = ns + t[ns..].iter().take_while(|b| b.is_ascii_alphanumeric() || **b == b'_').count();
+            o.put(i, ns, Tok::Punct);
+            o.put(ns, ne, Tok::Tag);
+            section = true;
+            i = ne;
+            continue;
+        }
+        match c {
+            b'>' if section => {
+                o.put(i, i + 1, Tok::Punct);
+                section = false;
+                i += 1;
+            }
+            b'"' => {
+                let (e, closed, esc) = scan_str(t, i + 1, b'"', b'\\', false, true);
+                o.put(i, e, Tok::Str);
+                if !closed {
+                    return State { kind: A_STR, a: cont as u8 | (esc as u8) << 1, b: 0, ..st };
+                }
+                i = e;
+            }
+            // %{HTTP_HOST}, ${APACHE_LOG_DIR}, $1, %1
+            b'%' | b'$' if at(t, i + 1) == b'{' || at(t, i + 1).is_ascii_digit() => {
+                let e = if at(t, i + 1) == b'{' {
+                    let k = t[i + 2..].iter().take(128).take_while(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b':' | b'-' | b'.')).count();
+                    if at(t, i + 2 + k) == b'}' { i + 3 + k } else { i + 1 }
+                } else {
+                    i + 2
+                };
+                if e > i + 1 {
+                    o.put(i, e, Tok::Var);
+                }
+                i = e;
+            }
+            // RewriteRule flags: [L,R=301,NC]
+            b'[' if i > 0 && is_ws(t[i - 1]) => {
+                let k = t[i + 1..].iter().take(128).take_while(|&&b| !matches!(b, b']' | b' ' | b'\t' | b'\r' | b'\n' | b'"')).count();
+                if at(t, i + 1 + k) == b']' {
+                    o.put(i, i + k + 2, Tok::Attr);
+                    i += k + 2;
+                } else {
+                    i += 1;
+                }
+            }
+            _ => {
+                let e = i + t[i..]
+                    .iter()
+                    .take_while(|&&b| !matches!(b, b' ' | b'\t' | b'\r' | b'\n' | b'"' | b'%' | b'$') && !(section && b == b'>'))
+                    .count();
+                let e = e.max(i + 1);
+                let w = &t[i..e];
+                let tok = if first {
+                    Some(Tok::Keyword)
+                } else if section {
+                    Some(Tok::Attr)
+                } else if w.eq_ignore_ascii_case(b"on") || w.eq_ignore_ascii_case(b"off") {
+                    Some(Tok::Lit)
+                } else if w[0].is_ascii_digit() && is_num_word(w) {
+                    Some(Tok::Num)
+                } else {
+                    None
+                };
+                if let Some(tok) = tok {
+                    o.put(i, e, tok);
+                }
+                i = e;
+            }
+        }
+    }
+    State { kind: 0, a: cont as u8, b: 0, ..st }
+}
+
+// ---- Java properties ----
+
+// Where a `key = value` line is, in `a` (bits 0-2); bit 6: a continued line's leading whitespace is being skipped,
+// bit 7: an escape is pending.
+const P_START: u8 = 0;
+const P_KEY: u8 = 1;
+/// After the key: whitespace, then one `=` or `:`.
+const P_SEP: u8 = 2;
+const P_VALUE: u8 = 3;
+const P_COMMENT: u8 = 4;
+
+/// `.properties` files: `key=value`, `key: value` or `key value`; `#` and `!` comment lines; a line ending in an odd
+/// number of backslashes goes on in the next one (which isn't a new key, nor a comment).
+pub(super) fn properties(t: &[u8], st: State, o: &mut Out) -> State {
+    let n = t.len();
+    let mut phase = st.a & 7;
+    let (mut skip, mut esc) = (st.a & 0x40 != 0, st.a & 0x80 != 0);
+    let mut i = 0;
+    let mut key_start = 0;
+    while i < n {
+        let c = t[i];
+        if c == b'\n' {
+            if phase == P_KEY {
+                o.put(key_start, i, Tok::Key);
+            }
+            if esc && phase != P_COMMENT {
+                skip = true;
+            } else {
+                (phase, skip) = (P_START, false);
+            }
+            esc = false;
+            i += 1;
+            continue;
+        }
+        if skip {
+            if is_ws(c) {
+                i += 1;
+                continue;
+            }
+            skip = false;
+            if phase == P_KEY {
+                key_start = i;
+            }
+        }
+        if esc {
+            // \uXXXX, \n, \=, `\` + CRLF
+            esc = c == b'\r';
+            let e = if c == b'u' { i + 1 + t[i + 1..].iter().take(4).take_while(|b| b.is_ascii_hexdigit()).count() } else { i + 1 };
+            if !esc && phase != P_KEY {
+                o.put(i.saturating_sub(1), e, Tok::Lit);
+            }
+            i = e;
+            continue;
+        }
+        match phase {
+            P_START => {
+                if is_ws(c) {
+                    i += 1;
+                } else if c == b'#' || c == b'!' {
+                    phase = P_COMMENT;
+                } else {
+                    (phase, key_start) = (P_KEY, i);
+                }
+            }
+            P_KEY => {
+                if c == b'\\' {
+                    esc = true;
+                    i += 1;
+                } else if c == b'=' || c == b':' || is_ws(c) {
+                    o.put(key_start, i, Tok::Key);
+                    phase = P_SEP;
+                } else {
+                    i += 1;
+                }
+            }
+            P_SEP => {
+                if c == b'=' || c == b':' {
+                    o.put(i, i + 1, Tok::Punct);
+                    phase = P_VALUE;
+                    i += 1;
+                } else if is_ws(c) {
+                    i += 1;
+                } else {
+                    phase = P_VALUE;
+                }
+            }
+            P_COMMENT => {
+                let e = line_end(t, i);
+                o.put(i, e, Tok::Comment);
+                i = e;
+            }
+            _ => {
+                if c == b'\\' {
+                    esc = true;
+                } else if c == b'$' && at(t, i + 1) == b'{' {
+                    // ${placeholder} (Spring and others)
+                    let k = t[i + 2..].iter().take(128).take_while(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-' | b':')).count();
+                    if at(t, i + 2 + k) == b'}' {
+                        o.put(i, i + k + 3, Tok::Var);
+                        i += k + 3;
+                        continue;
+                    }
+                }
+                i += 1;
+            }
+        }
+    }
+    if phase == P_KEY && !skip {
+        o.put(key_start, n, Tok::Key);
+    }
+    State { kind: 0, a: phase | (skip as u8) << 6 | (esc as u8) << 7, b: 0, ..st }
+}
+
+// ---- subtitles ----
+
+/// Inside a WebVTT `NOTE`: a comment up to a blank line.
+const S_NOTE: u8 = 1;
+/// In `State::mode`: inside a WebVTT `STYLE` block (CSS up to a blank line), whose CSS state `kind`, `a` and `b` are.
+const S_STYLE: u8 = 1;
+
+/// SRT and WebVTT: cue numbers, `00:00:01,000 --> 00:00:04,000` timings (with WebVTT's settings after them), tags in
+/// the text (`<i>`, `<v Bob>`, `<c.yellow>`), WebVTT's header, `NOTE` comments and `STYLE` blocks.
+pub(super) fn subtitles(t: &[u8], mut st: State, o: &mut Out) -> State {
+    let mut start = 0;
+    let mut col0 = st.col0;
+    let mut bol = st.bol;
+    loop {
+        let end = line_end(t, start);
+        let nl = end < t.len();
+        let line = &t[start..end];
+        let blank = (col0 || bol) && line.iter().all(|&b| is_ws(b));
+        let mut sub = o.at(start);
+        if st.mode == S_STYLE {
+            if blank && nl {
+                st = State { kind: 0, a: 0, b: 0, mode: 0, ..st };
+            } else {
+                let s = code::css(&t[start..end + nl as usize], State { mode: 0, ..st }, &mut sub);
+                st = State { mode: S_STYLE, ..s };
+            }
+        } else if st.kind == S_NOTE {
+            if blank && nl {
+                st.kind = 0;
+            } else {
+                sub.put(0, line.len(), Tok::Comment);
+            }
+        } else {
+            st = sub_line(line, col0, st, &mut sub);
+        }
+        if !nl {
+            return st;
+        }
+        start = end + 1;
+        (col0, bol) = (true, true);
+    }
+}
+
+fn sub_line(l: &[u8], col0: bool, mut st: State, o: &mut Out) -> State {
+    let n = l.len();
+    let tl = l.trim_ascii_end();
+    if col0 {
+        let word = |w: &[u8]| tl.starts_with(w) && matches!(at(tl, w.len()), 0 | b' ' | b'\t');
+        if word(b"WEBVTT") {
+            o.put(0, 6, Tok::Keyword);
+            o.put(6, n, Tok::Dim);
+            return st;
+        }
+        if word(b"NOTE") {
+            o.put(0, n, Tok::Comment);
+            st.kind = S_NOTE;
+            return st;
+        }
+        if tl == b"STYLE" {
+            o.put(0, n, Tok::Keyword);
+            return State { kind: 0, a: 0, b: 0, mode: S_STYLE, ..st };
+        }
+        if tl == b"REGION" {
+            o.put(0, n, Tok::Keyword);
+            return st;
+        }
+        if !tl.is_empty() && tl.len() < 10 && tl.iter().all(u8::is_ascii_digit) {
+            o.put(0, tl.len(), Tok::Num);
+            return st;
+        }
+        if let Some(p) = tl.windows(3).position(|w| w == b"-->") {
+            // 00:00:01,000 --> 00:00:04,000 align:start position:10%
+            let stamp = |o: &mut Out, a: usize, b: usize| {
+                let s = a + l[a..b].iter().take_while(|&&b| b == b' ').count();
+                o.put(s, b, Tok::Num);
+            };
+            stamp(o, 0, l[..p].trim_ascii_end().len());
+            o.put(p, p + 3, Tok::Punct);
+            let s = p + 3 + l[p + 3..].iter().take_while(|&&b| b == b' ' || b == b'\t').count();
+            let e = s + l[s..].iter().take_while(|&&b| !is_ws(b)).count();
+            stamp(o, s, e);
+            let mut i = e;
+            while i < n {
+                let w = i + l[i..].iter().take_while(|&&b| !is_ws(b)).count();
+                if let Some(c) = l[i..w].iter().position(|&b| b == b':') {
+                    o.put(i, i + c, Tok::Attr);
+                }
+                i = w + 1;
+            }
+            return st;
+        }
+    }
+    // cue text: <i>, </b>, <font color="…">, <v Bob>, <00:00:01.500>, {\an8}, &amp;
+    let mut i = 0;
+    while i < n {
+        match l[i] {
+            b'<' => match memchr::memchr2(b'>', b'<', &l[i + 1..n.min(i + 257)]) {
+                Some(p) if p > 0 && l[i + 1 + p] == b'>' => {
+                    o.put(i, i + p + 2, Tok::Tag);
+                    i += p + 2;
+                }
+                _ => i += 1,
+            },
+            b'{' if at(l, i + 1) == b'\\' => match l[i..].iter().take(64).position(|&b| b == b'}') {
+                Some(p) => {
+                    o.put(i, i + p + 1, Tok::Dim);
+                    i += p + 1;
+                }
+                None => i += 1,
+            },
+            b'&' => {
+                let k = l[i + 1..].iter().take(10).take_while(|b| b.is_ascii_alphanumeric() || **b == b'#').count();
+                if k > 0 && at(l, i + 1 + k) == b';' {
+                    o.put(i, i + k + 2, Tok::Lit);
+                    i += k + 2;
+                } else {
+                    i += 1;
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    st
+}
+
+// ---- iCalendar and vCard ----
+
+/// `NAME;PARAM=value;PARAM="quoted":value` lines; `BEGIN:VEVENT` / `END:VEVENT` as sections. A line starting with a
+/// space or a tab goes on with the value of the line before (folding), so it stays plain.
+pub(super) fn calendar_line(l: &[u8], col0: bool, _bol: bool, o: &mut Out) {
+    if !col0 || l.is_empty() || is_ws(l[0]) {
+        return;
+    }
+    let n = l.len();
+    let name_end = l.iter().position(|&b| b == b';' || b == b':').unwrap_or(n);
+    let name = &l[..name_end];
+    if name.eq_ignore_ascii_case(b"BEGIN") || name.eq_ignore_ascii_case(b"END") {
+        o.put(0, l.trim_ascii_end().len(), Tok::Section);
+        return;
+    }
+    o.put(0, name_end, Tok::Key);
+    let mut i = name_end;
+    while at(l, i) == b';' {
+        o.put(i, i + 1, Tok::Punct);
+        i += 1;
+        let e = i + l[i..].iter().take_while(|&&b| !matches!(b, b'=' | b';' | b':')).count();
+        o.put(i, e, Tok::Attr);
+        i = e;
+        if at(l, i) != b'=' {
+            continue;
+        }
+        o.put(i, i + 1, Tok::Punct);
+        i += 1;
+        loop {
+            if at(l, i) == b'"' {
+                let e = l[i + 1..].iter().position(|&b| b == b'"').map_or(n, |p| i + p + 2);
+                o.put(i, e, Tok::Str);
+                i = e;
+            } else {
+                i += l[i..].iter().take_while(|&&b| !matches!(b, b',' | b';' | b':')).count();
+            }
+            if at(l, i) != b',' {
+                break;
+            }
+            i += 1;
+        }
+    }
+    if at(l, i) == b':' {
+        o.put(i, i + 1, Tok::Punct);
+        let v = l[i + 1..].trim_ascii_end();
+        let e = i + 1 + v.len();
+        if is_num_word(v) {
+            o.put(i + 1, e, Tok::Num);
+        } else if v.eq_ignore_ascii_case(b"TRUE") || v.eq_ignore_ascii_case(b"FALSE") {
+            o.put(i + 1, e, Tok::Lit);
+        } else if v.len() > 7 && (v[..7].eq_ignore_ascii_case(b"mailto:") || v.starts_with(b"http")) {
+            o.put(i + 1, e, Tok::Link);
+        }
+    }
+}
+
+// ---- Visual Studio solutions ----
+
+const SLN_WORDS: [&[u8]; 8] = [
+    b"EndGlobal", b"EndGlobalSection", b"EndProject", b"EndProjectSection", b"Global", b"GlobalSection", b"Project",
+    b"ProjectSection",
+];
+
+/// A `.sln` line: `Project("{…}") = "Name", "Name\Name.csproj", "{…}"`, `GlobalSection(…) = preSolution`,
+/// `{…}.Debug|Any CPU.ActiveCfg = Debug|Any CPU`, `VisualStudioVersion = 17.0.31903.59`.
+pub(super) fn sln_line(l: &[u8], _col0: bool, bol: bool, o: &mut Out) {
+    if !bol {
+        return;
+    }
+    let n = l.len();
+    let s = l.iter().position(|&b| !is_ws(b)).unwrap_or(n);
+    let rest = &l[s..];
+    if rest.starts_with(b"#") {
+        o.put(s, n, Tok::Comment);
+        return;
+    }
+    if rest.starts_with(b"Microsoft Visual Studio Solution File") {
+        o.put(s, n, Tok::Heading);
+        return;
+    }
+    let w = s + rest.iter().take_while(|b| b.is_ascii_alphanumeric()).count();
+    let keyword = SLN_WORDS.contains(&&l[s..w]);
+    let mut i = s;
+    if keyword {
+        o.put(s, w, Tok::Keyword);
+        i = w;
+    }
+    let eq = l[i..].windows(3).position(|x| x == b" = ").map(|p| i + p);
+    let guid = |o: &mut Out, a: usize, b: usize, other: Option<Tok>| {
+        // `{…}` GUIDs as numbers, the rest as `other`
+        let mut k = a;
+        while k < b {
+            match l[k..b].iter().position(|&c| c == b'{') {
+                Some(p) => {
+                    if let Some(tok) = other {
+                        o.put(k, k + p, tok);
+                    }
+                    let close = l[k + p..b].iter().take(64).position(|&c| c == b'}').map_or(k + p + 1, |q| k + p + q + 1);
+                    o.put(k + p, close, Tok::Num);
+                    k = close;
+                }
+                None => {
+                    if let Some(tok) = other {
+                        o.put(k, b, tok);
+                    }
+                    k = b;
+                }
+            }
+        }
+    };
+    if !keyword {
+        // `key = value` inside a section
+        if let Some(eq) = eq {
+            guid(o, i, eq, Some(Tok::Key));
+            o.put(eq + 1, eq + 2, Tok::Punct);
+            let v = l[eq + 3..].trim_ascii_end();
+            if is_num_word(v) {
+                o.put(eq + 3, eq + 3 + v.len(), Tok::Num);
+            } else {
+                guid(o, eq + 3, eq + 3 + v.len(), None);
+            }
+        }
+        return;
+    }
+    // Project("{…}") = "Name", "path", "{…}"   GlobalSection(Name) = preSolution
+    while i < n {
+        match l[i] {
+            b'"' => {
+                let e = l[i + 1..].iter().position(|&b| b == b'"').map_or(n, |p| i + p + 2);
+                if at(l, i + 1) == b'{' {
+                    o.put(i, e, Tok::Num);
+                } else {
+                    o.put(i, e, Tok::Str);
+                }
+                i = e;
+            }
+            b'(' => {
+                let e = l[i..].iter().take(256).position(|&b| b == b')').map_or(i + 1, |p| i + p);
+                if at(l, i + 1) != b'"' {
+                    o.put(i + 1, e, Tok::Type);
+                    i = e.max(i + 1);
+                } else {
+                    i += 1;
+                }
+            }
+            b'=' => {
+                o.put(i, i + 1, Tok::Punct);
+                i += 1;
+            }
+            c if c.is_ascii_alphabetic() => {
+                let e = i + l[i..].iter().take_while(|b| b.is_ascii_alphanumeric()).count();
+                if matches!(&l[i..e], b"preSolution" | b"postSolution" | b"preProject" | b"postProject") {
+                    o.put(i, e, Tok::Lit);
+                }
+                i = e;
+            }
+            _ => i += 1,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::tests::{end_state, has, toks, view};
+    use super::super::{Lang, State, Tok};
+
+    fn line_has(line: &[(String, Tok)], s: &str, tok: Tok) -> bool {
+        line.contains(&(s.to_string(), tok))
+    }
+
+    #[test]
+    fn toml_documents() {
+        let src = "# config\n[package]\nname = \"slate\"\nversion.major = 1_000\n\"quoted key\" = 'lit'\n[[bin]]\nwhen = 1979-05-27 07:32:00Z\nok = true\nmax = inf\n";
+        let v = view(Lang::Toml, src);
+        assert!(line_has(&v[0], "# config", Tok::Comment) && line_has(&v[1], "[package]", Tok::Section));
+        assert!(line_has(&v[2], "name", Tok::Key) && line_has(&v[2], "\"slate\"", Tok::Str));
+        assert!(line_has(&v[3], "version.major", Tok::Key) && line_has(&v[3], "1_000", Tok::Num));
+        assert!(line_has(&v[4], "\"quoted key\"", Tok::Key) && line_has(&v[4], "'lit'", Tok::Str));
+        assert!(line_has(&v[5], "[[bin]]", Tok::Section));
+        assert!(line_has(&v[6], "1979-05-27 07:32:00Z", Tok::Num) && line_has(&v[7], "true", Tok::Lit) && line_has(&v[8], "inf", Tok::Num));
+        // multi-line strings, and arrays over several lines (whose `[1, 2]` lines aren't tables)
+        let src = "s = \"\"\"\nline [x] = 1 # not a comment\n\"\"\"\"\nm = [\n  [1, 2],\n  { a = 1, b = \"x\" },\n]\n[after]\n";
+        let v = view(Lang::Toml, src);
+        assert_eq!(v[1], vec![("line [x] = 1 # not a comment".into(), Tok::Str)]);
+        assert_eq!(v[2], vec![("\"\"\"\"".into(), Tok::Str)]);
+        assert!(!v[4].iter().any(|t| t.1 == Tok::Section) && line_has(&v[4], "1", Tok::Num));
+        assert!(line_has(&v[5], "a", Tok::Key) && line_has(&v[5], "b", Tok::Key) && line_has(&v[5], "\"x\"", Tok::Str));
+        assert!(line_has(&v[7], "[after]", Tok::Section));
+        assert_eq!(end_state(Lang::Toml, src).b, 0);
+        // an array left open ends at a header at the start of a line
+        let v = view(Lang::Toml, "a = [1,\n[server]\nport = 80\n");
+        assert!(line_has(&v[1], "[server]", Tok::Section) && line_has(&v[2], "port", Tok::Key));
+    }
+
+    #[test]
+    fn nginx_configuration() {
+        let src = "http {\n    server {\n        listen 80;\n        server_name example.com; # main\n        location ~* \\.php$ {\n            proxy_pass http://127.0.0.1:9000;\n            set $x \"a;b\";\n            gzip on;\n        }\n    }\n}\n";
+        let v = view(Lang::Nginx, src);
+        assert!(line_has(&v[0], "http", Tok::Control) && line_has(&v[1], "server", Tok::Control));
+        assert!(line_has(&v[2], "listen", Tok::Keyword) && line_has(&v[2], "80", Tok::Num));
+        assert!(line_has(&v[3], "server_name", Tok::Keyword) && line_has(&v[3], "# main", Tok::Comment));
+        assert!(line_has(&v[4], "location", Tok::Control) && !line_has(&v[4], "\\.php", Tok::Keyword));
+        assert!(line_has(&v[5], "proxy_pass", Tok::Keyword) && !v[5].iter().any(|t| t.1 == Tok::Num));
+        assert!(line_has(&v[6], "$x", Tok::Var) && line_has(&v[6], "\"a;b\"", Tok::Str));
+        assert!(line_has(&v[7], "on", Tok::Lit));
+        // a log format over several lines: its later lines aren't directives
+        let v = view(Lang::Nginx, "log_format main '$remote_addr'\n    '$status';\n");
+        assert!(line_has(&v[1], "'$status'", Tok::Str));
+        // `#` inside a word isn't a comment
+        assert!(!toks(Lang::Nginx, "rewrite ^/a#b /c;", State::START).iter().any(|t| t.1 == Tok::Comment));
+    }
+
+    #[test]
+    fn apache_configuration() {
+        let src = "# main\nServerName example.com\n<VirtualHost *:80>\n    DocumentRoot \"/var/www\"\n    RewriteEngine On\n    RewriteRule ^(.*)$ https://%{HTTP_HOST}$1 [R=301,L]\n    ErrorLog ${APACHE_LOG_DIR}/error.log \\\n        # not a comment\n</VirtualHost>\n";
+        let v = view(Lang::Apache, src);
+        assert!(line_has(&v[0], "# main", Tok::Comment) && line_has(&v[1], "ServerName", Tok::Keyword));
+        assert!(line_has(&v[2], "VirtualHost", Tok::Tag) && line_has(&v[2], "*:80", Tok::Attr) && line_has(&v[2], ">", Tok::Punct));
+        assert!(line_has(&v[3], "\"/var/www\"", Tok::Str) && line_has(&v[4], "On", Tok::Lit));
+        assert!(line_has(&v[5], "%{HTTP_HOST}", Tok::Var) && line_has(&v[5], "$1", Tok::Var) && line_has(&v[5], "[R=301,L]", Tok::Attr));
+        assert!(line_has(&v[6], "${APACHE_LOG_DIR}", Tok::Var));
+        assert!(!v[7].iter().any(|t| t.1 == Tok::Comment || t.1 == Tok::Keyword), "a continued line: {:?}", v[7]);
+        assert!(line_has(&v[8], "VirtualHost", Tok::Tag));
+    }
+
+    #[test]
+    fn properties_files() {
+        let src = "# comment\n! also\nkey = value\nother:value\nspaced value here\nlong = one \\\n    two\nname=caf\\u00e9 ${user.home}\n";
+        let v = view(Lang::Properties, src);
+        assert!(line_has(&v[0], "# comment", Tok::Comment) && line_has(&v[1], "! also", Tok::Comment));
+        assert!(line_has(&v[2], "key", Tok::Key) && line_has(&v[2], "=", Tok::Punct) && line_has(&v[3], "other", Tok::Key));
+        assert!(line_has(&v[4], "spaced", Tok::Key) && !line_has(&v[4], "value", Tok::Key));
+        assert!(v[6].iter().all(|t| t.1 != Tok::Key), "a continued value: {:?}", v[6]);
+        assert!(line_has(&v[7], "\\u00e9", Tok::Lit) && line_has(&v[7], "${user.home}", Tok::Var));
+        // a backslash at the end of a comment doesn't continue it
+        let v = view(Lang::Properties, "# note \\\nkey=1\n");
+        assert!(line_has(&v[1], "key", Tok::Key));
+    }
+
+    #[test]
+    fn subtitles_srt_and_vtt() {
+        let v = view(Lang::Subtitles, "1\n00:00:01,000 --> 00:00:04,000\n<i>Hello</i> {\\an8}there &amp; you\n\n");
+        assert!(line_has(&v[0], "1", Tok::Num) && line_has(&v[1], "00:00:01,000", Tok::Num) && line_has(&v[1], "-->", Tok::Punct));
+        assert!(line_has(&v[1], "00:00:04,000", Tok::Num) && line_has(&v[2], "<i>", Tok::Tag) && line_has(&v[2], "{\\an8}", Tok::Dim));
+        let src = "WEBVTT - Title\n\nNOTE a comment\nover lines\n\nSTYLE\n::cue {\n  color: yellow;\n}\n\n00:01.000 --> 00:04.000 align:start\n<v Bob>Hi\n";
+        let v = view(Lang::Subtitles, src);
+        assert!(line_has(&v[0], "WEBVTT", Tok::Keyword) && line_has(&v[3], "over lines", Tok::Comment));
+        assert!(line_has(&v[5], "STYLE", Tok::Keyword) && line_has(&v[7], "color", Tok::Attr));
+        assert!(line_has(&v[10], "00:01.000", Tok::Num) && line_has(&v[10], "align", Tok::Attr) && line_has(&v[11], "<v Bob>", Tok::Tag));
+        assert_eq!(end_state(Lang::Subtitles, src), State::START);
+    }
+
+    #[test]
+    fn calendars_and_solutions() {
+        has(Lang::Calendar, "DTSTART;TZID=\"Europe/Paris\":20261008T120000", &[
+            ("DTSTART", Tok::Key),
+            ("TZID", Tok::Attr),
+            ("\"Europe/Paris\"", Tok::Str),
+            ("20261008T120000", Tok::Num),
+        ]);
+        has(Lang::Calendar, "BEGIN:VEVENT", &[("BEGIN:VEVENT", Tok::Section)]);
+        assert!(toks(Lang::Calendar, " folded:text", State::START).is_empty());
+        let sln = "Microsoft Visual Studio Solution File, Format Version 12.00\n# Visual Studio Version 17\nVisualStudioVersion = 17.0.31903.59\nProject(\"{FAE04EC0-301F}\") = \"App\", \"App\\App.csproj\", \"{1234}\"\nEndProject\nGlobal\n\tGlobalSection(SolutionConfigurationPlatforms) = preSolution\n\t\t{1234}.Debug|Any CPU.ActiveCfg = Debug|Any CPU\n";
+        let v = view(Lang::Sln, sln);
+        assert!(line_has(&v[0], "Microsoft Visual Studio Solution File, Format Version 12.00", Tok::Heading));
+        assert!(line_has(&v[1], "# Visual Studio Version 17", Tok::Comment));
+        assert!(line_has(&v[2], "VisualStudioVersion", Tok::Key) && line_has(&v[2], "17.0.31903.59", Tok::Num));
+        assert!(line_has(&v[3], "Project", Tok::Keyword) && line_has(&v[3], "\"{FAE04EC0-301F}\"", Tok::Num) && line_has(&v[3], "\"App\"", Tok::Str));
+        assert!(line_has(&v[6], "SolutionConfigurationPlatforms", Tok::Type) && line_has(&v[6], "preSolution", Tok::Lit));
+        assert!(line_has(&v[7], "{1234}", Tok::Num) && line_has(&v[7], ".Debug|Any CPU.ActiveCfg", Tok::Key));
+    }
+}

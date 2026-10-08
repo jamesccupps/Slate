@@ -12,3 +12,4 @@ pub mod search;
 pub mod source;
 pub mod text;
 pub mod xml;
+pub mod xmlnav;

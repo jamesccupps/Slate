@@ -7,14 +7,17 @@ smoothly, and can be searched, edited, formatted and saved.
 - Tabs that come back after a restart, including unsaved changes (like Windows 11 Notepad). Work is never lost
   silently: anything that can't be kept is asked about, and Windows won't shut down over it without asking.
 - Find and replace with match case, whole word and regular expressions; fast on huge files.
-- Syntax colors for about 30 kinds of files: Python, PowerShell, Batch, Shell, C, C++, C#, Java, Kotlin, Swift, Go,
-  Rust, JavaScript, TypeScript, PHP, Ruby, Lua, SQL, HTML (with its CSS and scripts), CSS, XML, Markdown, YAML,
-  JSON, INI/TOML, CSV/TSV (each column its own color), logs, diffs and Dockerfiles. Block comments and multi-line
-  strings are followed correctly.
+- Syntax colors for about 45 kinds of files: Python, PowerShell, Batch, Shell, VBScript/VBA, AutoHotkey, Perl, R,
+  C, C++, C#, Java, Kotlin, Swift, Go, Rust, JavaScript, TypeScript, PHP, Ruby, Lua, SQL, HTML (with its CSS and
+  scripts), CSS, XML, Markdown (code blocks in their language), YAML, JSON, TOML, INI, Java properties, nginx and
+  Apache configuration, Terraform/HCL, CMake, Dockerfiles, CSV/TSV (each column its own color), logs, diffs,
+  subtitles (SRT, WebVTT), calendars and contacts (iCalendar, vCard) and Visual Studio solutions. Block comments
+  and multi-line strings are followed correctly.
 - Line tools: sort lines (`file2` before `file10`), remove duplicate or blank lines, trim spaces at line ends;
   UPPERCASE / lowercase / Title Case; comment or uncomment lines with Ctrl+/.
-- JSON and XML: format (pretty-print), minify and check, also for JSON Lines; for JSON a path bar showing where
-  the caret is (`data › [1203] › name`) and a structure panel to browse objects and arrays, fast on huge files.
+- JSON and XML: format (pretty-print), minify and check, also for JSON Lines; a path bar showing where the caret
+  is (`data › [1203] › name`, `catalog › book[3] › title`; copy it as a JSON path or XPath) and a structure panel to
+  browse objects, arrays and elements, fast on huge files.
 - Go to line, word wrap, line numbers, zoom, dark and light themes (follows Windows, or switch with the sun/moon
   button).
 - Detects and keeps the encoding (UTF-8, UTF-8 BOM, UTF-16, ANSI) and line endings (CRLF / LF).

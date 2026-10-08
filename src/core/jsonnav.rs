@@ -52,6 +52,10 @@ pub enum Kind {
     Bool,
     Null,
     Other,
+    /// An XML element with elements inside (`core::xmlnav`).
+    Element,
+    /// An XML element with only text (or nothing) inside.
+    Leaf,
 }
 
 impl Kind {
@@ -67,11 +71,13 @@ impl Kind {
         }
     }
     pub fn is_container(self) -> bool {
-        matches!(self, Kind::Object | Kind::Array)
+        matches!(self, Kind::Object | Kind::Array | Kind::Element)
     }
 }
 
-/// One child of a container: its value's byte range, and where its key is (objects only).
+/// One child of a container: its value's byte range, and where its key is (objects only). In an XML list
+/// (`Children::xml`) a child is an element from its `<` to the end of its end tag, `key_back` is 0 and `key_len`
+/// holds its start tag's length and whether it has elements inside (`xmlnav::tag_len`, `xmlnav::has_elements`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Child {
     pub start: u64,
@@ -120,6 +126,11 @@ pub struct Children {
     pub end: u64,
     /// The scan stopped early (cancelled, or the JSON is broken).
     pub partial: bool,
+    /// The children of an XML element (`core::xmlnav`), with a hash of each kept child's name in `names`, and
+    /// whether all its children have the same name.
+    pub xml: bool,
+    pub names: Vec<u32>,
+    pub same_names: bool,
 }
 
 impl Children {
@@ -128,6 +139,11 @@ impl Children {
     }
     pub fn is_empty(&self) -> bool {
         self.count == 0
+    }
+
+    /// Up to `count` children from `from` (where a child begins), scanned again.
+    fn rescan(&self, src: &dyn Chunked, from: u64, count: u64) -> Vec<Child> {
+        if self.xml { super::xmlnav::rescan(src, from, count) } else { rescan(src, from, self.is_object, count) }
     }
 
     /// Children `a..b`.
@@ -142,7 +158,7 @@ impl Children {
         let k = a / self.stride;
         let Some(cp) = self.items.get(k as usize) else { return Vec::new() };
         let base = k * self.stride;
-        rescan(src, cp.first(), self.is_object, b - base).into_iter().skip((a - base) as usize).collect()
+        self.rescan(src, cp.first(), b - base).into_iter().skip((a - base) as usize).collect()
     }
 
     pub fn get(&self, src: &dyn Chunked, i: u64) -> Option<Child> {
@@ -158,7 +174,7 @@ impl Children {
         }
         let base = k as u64 * self.stride;
         let n = self.stride.min(self.count - base);
-        let block = rescan(src, self.items[k].first(), self.is_object, n);
+        let block = self.rescan(src, self.items[k].first(), n);
         let j = block.partition_point(|c| c.first() <= offset).checked_sub(1)?;
         let c = block[j];
         (offset <= c.end).then_some((base + j as u64, c))
@@ -252,6 +268,7 @@ impl Level {
             is_object: self.is_object,
             end,
             partial,
+            ..Default::default()
         }
     }
 }
@@ -565,7 +582,7 @@ fn children_simple(src: &dyn Chunked, open: Option<u64>, limit: u64, ctx: Option
         None => (0, false),
     };
     let top = open.is_none();
-    let mut out = Children { items: Vec::new(), count: 0, stride: 1, is_object, end: total, partial: false };
+    let mut out = Children { items: Vec::new(), count: 0, stride: 1, is_object, end: total, partial: false, ..Default::default() };
     let mut depth: u32 = 0;
     let mut in_str = false;
     let mut esc = false;
@@ -726,7 +743,8 @@ fn children_simple(src: &dyn Chunked, open: Option<u64>, limit: u64, ctx: Option
     out
 }
 
-/// One step of a path: the child's index and its key (if in an object), with its value range.
+/// One step of a path: the child's index and its key (if in an object; for XML the element's name), with its value
+/// range.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Step {
     pub index: u64,
@@ -735,12 +753,18 @@ pub struct Step {
     pub end: u64,
     /// The container this step is a child of (None = top level).
     pub parent: Option<u64>,
+    /// XML: which of the elements of its name it is among its siblings, from 1 (`book[3]`); 0 when no sibling has
+    /// that name, `ORD_UNKNOWN` in a huge list of mixed names. Always 0 for JSON.
+    pub ord: u64,
 }
+
+pub const ORD_UNKNOWN: u64 = u64::MAX;
 
 impl Step {
     /// The step as the path bar shows it.
     pub fn label(&self) -> String {
         match &self.key {
+            Some(k) if self.ord > 0 && self.ord != ORD_UNKNOWN => format!("{}[{}]", key_label(k), self.ord),
             Some(k) => key_label(k),
             None => format!("[{}]", self.index),
         }
@@ -829,7 +853,7 @@ pub fn path_at(
         // A single top-level value (normal JSON, also when the file is cut short) isn't shown as "[0]".
         let single_root = open.is_none() && ch.count == 1;
         if !single_root {
-            path.push(Step { index: i, key, start: c.start, end: c.end, parent: open });
+            path.push(Step { index: i, key, start: c.start, end: c.end, parent: open, ord: 0 });
         }
         let first = src.bytes(c.start, c.start + 1);
         let kind = first.first().map_or(Kind::Other, |&b| Kind::of(b));

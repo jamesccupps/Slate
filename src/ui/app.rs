@@ -641,7 +641,7 @@ impl App {
         let nh = if self.tabs.get(self.active).is_some_and(|t| t.notice.is_some()) { metrics::NOTICE_H } else { 0.0 };
         self.r_notice = Rect::new(0.0, y, w, nh);
         y += nh;
-        let json = self.tabs.get(self.active).is_some_and(|t| t.lang == Lang::Json);
+        let json = self.tabs.get(self.active).is_some_and(|t| t.lang.has_structure());
         let ph = if json && self.settings.path_bar { super::structure::PATH_H } else { 0.0 };
         self.r_path = Rect::new(0.0, y, w, ph);
         y += ph;
@@ -1091,9 +1091,9 @@ impl App {
         }
     }
 
-    /// Keeps the JSON path (and the panel's rows) up to date with the caret.
+    /// Keeps the JSON or XML path (and the panel's rows) up to date with the caret.
     pub fn update_structure(&mut self) {
-        let json = self.tabs.get(self.active).is_some_and(|t| t.lang == Lang::Json);
+        let json = self.tabs.get(self.active).is_some_and(|t| t.lang.has_structure());
         if !json || (self.r_path.h <= 0.0 && self.r_struct.w <= 0.0) {
             return;
         }
@@ -1101,6 +1101,7 @@ impl App {
         let notify = self.notify.clone();
         let tab = &mut self.tabs[self.active];
         let caret = tab.view.sel.caret;
+        tab.structure.set_lang(tab.lang);
         tab.structure.follow = panel;
         let before = tab.structure.selected;
         tab.structure.update_path(&mut tab.doc, caret, &notify);
