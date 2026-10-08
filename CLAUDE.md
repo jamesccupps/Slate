@@ -7,7 +7,8 @@ It is a general text editor first ("a better Notepad"); the JSON and XML extras 
 path bar and structure panel) only show for those files. It should be quick, easy to use, with only the features
 people actually need, and as seamless as Steam/Claude-level apps. Keep this file and `docs/IDEAS.md` up to date as
 work happens. The repo is on GitHub (`jamesccupps/Slate`): keep personal paths and machine settings out of
-tracked files (the deploy folder lives in the git-ignored `.install-dir`), and push only when the user says so.
+tracked files (the deploy folder lives in the git-ignored `.install-dir`). The user wants the repo kept current: push
+finished work, and keep the README and the repo's description and topics up to date.
 
 ## Build
 
@@ -31,11 +32,19 @@ cargo test --lib
 
 ## Releasing
 
-1. Bump `version` in `Cargo.toml` (the updater compares it with the release tag).
+1. Bump `version` in `Cargo.toml` (the updater compares it with the release tag; CI refuses a tag that doesn't
+   match). Write the notes in `docs/release-notes-<version>.md`; CI puts them in the draft.
 2. Commit and push to `main`; then `git tag vX.Y.Z` and `git push origin vX.Y.Z`.
-3. The Build workflow (`.github/workflows/build.yml`) tests, builds and drafts the release with `Slate.exe` and
-   `Slate.exe.sha256`. The user edits the notes and publishes it — Slate's updater (`src/ui/update.rs`) only sees
-   published releases.
+3. The Build workflow (`.github/workflows/build.yml`) tests, builds, runs the exe through `tests/smoke.txt` and
+   drafts the release with `Slate.exe` and `Slate.exe.sha256`. The user publishes it — Slate's updater
+   (`src/ui/update.rs`) only sees published releases.
+
+What the updater reads from a release can never change, as every version out there reads it: the tag `vX.Y.Z` (no
+pre-release suffix), assets named exactly `Slate.exe` and `Slate.exe.sha256` (`<64 hex digits>  Slate.exe`), this
+repository, `/releases/latest`. Slate.exe stays the x64 build. The updater never goes back to a lower version, so a
+bad release is fixed by publishing a higher one; a new version that doesn't start is undone on the user's PC by the
+version before it (see update.rs). A copy deployed from a local build also updates itself from GitHub once a higher
+version is published (unless its automatic check is off).
 
 Commits use the GitHub no-reply address (repo-local git config); GitHub refuses pushes that would publish another one.
 
@@ -96,13 +105,25 @@ Commits use the GitHub no-reply address (repo-local git config); GitHub refuses 
   menus for those files; everything else gets the general tools (line tools, toggle comment, change case).
 - The App lives in `Rc<RefCell<App>>`. Anything that shows a dialog or menu runs from the `Deferred` queue outside
   the borrow. Dialogs run a modal loop in which timers and job messages still arrive (tabs can close, open or move),
-  so code that shows one finds its tab again **by id** afterwards, never by an index taken before.
+  so code that shows one finds its tab again **by id** afterwards, never by an index taken before. The queue isn't
+  drained again from inside such a loop: what was queued meanwhile (an Exit, another prompt) waits until it's closed.
 - Never lose work: closing the window keeps unsaved documents ≤64 MiB in the session (like Windows 11 Notepad);
   only bigger ones (or all, if the session can't be written) are asked about. A tab closed while it is saving closes
   once the save is done — unless the text changed meanwhile. On shutdown, unsaved work that can't be kept blocks it
   with a reason (`ShutdownBlockReasonCreate`), so Windows asks the user.
+- The session (session.rs) holds that unsaved text, so: files are flushed to disk before they replace the old ones;
+  reading is lenient (one bad tab or a value from a newer version loses nothing else; settings too); Slate deletes
+  only backups it wrote or read itself, and backups no tab refers to come back as new tabs; restoring that crashes is
+  caught and the session set aside. While editing it's written on another thread; closing writes it in place.
+- One Slate per user session: a second start hands its files to the running one. A Slate running as administrator
+  is separate (its own lock, window class and session), as Windows doesn't let the two talk.
+- Updates: the version being replaced starts the new one with `--updated` and waits ~15 s; if it can't start or ends
+  with an error, it puts itself back and starts again with `--update-failed <version>` (that version isn't offered
+  by the daily check again). Old copies are deleted by the next normal start. 0.2.0 starts the new one with
+  `--wait-for <pid>` instead (still understood).
 - Panics in message handling are caught, logged to `crash.log` in the data folder, the session is saved and a
-  message shown. A panic while painting is only logged (showing a message would paint, and fail, again).
+  message shown. A panic while painting is only logged (showing a message would paint, and fail, again). A panic in
+  a background job comes back as that job's failure (`job::Failure`), never as a job that runs forever.
 - The keyboard focus is read with `GetFocus()` when painting, not tracked from WM_SETFOCUS (which can't reach the
   App while it is borrowed).
 
@@ -113,8 +134,11 @@ Commits use the GitHub no-reply address (repo-local git config); GitHub refuses 
   commands are listed at the top of `src/ui/testmode.rs` (`open:`, `type:`, `key:`, `cmd:`, `jobs`, `shot:`,
   `print:`, `expect:`, `answer:`, `lang:<name>` …; `print:menu0`…`menu4` lists a menu's items). In this mode
   prompts are never shown (they take answers from `answer:` lines and are listed by `print:asked`), the clipboard
-  is a private one, and settings/session aren't written (unless `persist`). `SLATE_DATA_DIR` sets the data folder,
-  `SLATE_TEST_LOG` the log file.
+  is a private one, and settings/session aren't written (unless `persist`, which needs `SLATE_DATA_DIR`).
+  `SLATE_DATA_DIR` sets the data folder, `SLATE_TEST_LOG` the log file; `session:save|soon|restore` writes the
+  session now, writes it the way the timer does, or restores it. `SLATE_UPDATE_TEST_VERSION=0.1.0` makes Slate
+  believe it's that version (to try the updater against the real latest release, in a scratch folder).
+- `tests/smoke.txt` is the smoke test CI runs on the built exe (paths in it are relative to the working folder).
 - `SLATE_TEST_VISIBLE=1` runs the same scripts in the real window (on top, without taking the focus), drawing
   through the real swap chain; `shot:` then captures the screen.
 - Don't drive the user's desktop with real mouse/keyboard input.

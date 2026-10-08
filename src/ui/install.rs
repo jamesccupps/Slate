@@ -212,7 +212,8 @@ pub fn make_default(cell: &Cell) {
     cell.borrow_mut().flash("Slate is set up. Pick it in Default apps for the file types you want.", false);
 }
 
-/// `Slate.exe --uninstall`: removes what `make_default` added (the program folder is removed at the next sign-in).
+/// `Slate.exe --uninstall` (Settings → Apps → Slate → Uninstall): removes what `make_default` added. Slate's folder
+/// and its data folder stay; the message says where they are.
 pub fn uninstall() {
     use windows::Win32::System::Registry::RegDeleteTreeW;
     unsafe {
@@ -244,6 +245,15 @@ pub fn uninstall() {
             let _ = std::fs::remove_file(PathBuf::from(appdata).join(r"Microsoft\Windows\Start Menu\Programs\Slate.lnk"));
         }
         SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, None, None);
-        win::info(windows::Win32::Foundation::HWND::default(), "Slate", "Slate was removed from your account's settings. You can now delete Slate's folder.");
+        let folder = super::settings::exe_dir().map(|d| d.display().to_string()).unwrap_or_default();
+        let data = super::settings::data_dir().display().to_string();
+        win::info(
+            windows::Win32::Foundation::HWND::default(),
+            "Slate",
+            &format!(
+                "Slate was removed from your account's settings. You can now delete its folder ({folder}).\n\nYour settings \
+                 and unsaved text are in {data}; delete that folder too if you don't need them."
+            ),
+        );
     }
 }
