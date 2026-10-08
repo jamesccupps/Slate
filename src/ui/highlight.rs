@@ -65,12 +65,16 @@ pub enum Lang {
     Calendar,
     /// Visual Studio solutions (`.sln`).
     Sln,
+    /// Siemens PPCL, the programs of APOGEE and Desigo field panels.
+    Ppcl,
 }
 
 /// How a language writes comments (for "Toggle comment").
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CommentStyle {
     Line(&'static str),
+    /// A line comment that goes after the number each line starts with (PPCL: `00010     C …`).
+    AfterNumber(&'static str),
     Block(&'static str, &'static str),
 }
 
@@ -122,11 +126,12 @@ impl Lang {
             Lang::Subtitles => "Subtitles (SRT / VTT)",
             Lang::Calendar => "iCalendar / vCard",
             Lang::Sln => "VS solution",
+            Lang::Ppcl => "PPCL",
         }
     }
 
     /// Menu order: plain text, then by name.
-    pub const ALL: [Lang; 45] = [
+    pub const ALL: [Lang; 46] = [
         Lang::Plain,
         Lang::Apache,
         Lang::AutoHotkey,
@@ -155,6 +160,7 @@ impl Lang {
         Lang::Perl,
         Lang::Php,
         Lang::PowerShell,
+        Lang::Ppcl,
         Lang::Properties,
         Lang::Python,
         Lang::R,
@@ -208,6 +214,7 @@ impl Lang {
             Lang::Batch => Line("REM "),
             Lang::Vb => Line("'"),
             Lang::AutoHotkey => Line(";"),
+            Lang::Ppcl => AfterNumber("C "),
             Lang::Xml | Lang::Html | Lang::Markdown => Block("<!--", "-->"),
             Lang::Css => Block("/*", "*/"),
             Lang::Plain
@@ -344,6 +351,8 @@ impl Lang {
             "srt" | "vtt" => Lang::Subtitles,
             "ics" | "ical" | "ifb" | "vcs" | "vcf" | "vcard" => Lang::Calendar,
             "sln" => Lang::Sln,
+            // (a `.pcl` file is PPCL only when it reads like it: it's also HP's printer language)
+            "ppcl" => Lang::Ppcl,
             "htaccess" => Lang::Apache,
             // rotated logs: app.log.1, app.log.2026-10-07
             _ if lower.contains(".log.") => Lang::Log,
@@ -423,11 +432,69 @@ impl Lang {
                 return Lang::Json;
             }
         }
+        if looks_like_ppcl(t) {
+            return Lang::Ppcl;
+        }
         if looks_like_log(head) {
             return Lang::Log;
         }
         Lang::Plain
     }
+}
+
+/// A PPCL program as Desigo and APOGEE export it: every line starts with its number (`00010     C comment`,
+/// `20    IF(…) THEN …`, `# ` before it on a line turned off), at least half of them are comments, commands (right
+/// before their `(`), jumps or assignments, and one is a command or an assignment. When the numbers aren't the five
+/// digits exports write, something only PPCL has must be there too: a dotted operator (`.EQ.`), a command on a point
+/// (`ON("FAN")`) or a point given a value (`"FAN" = 1`). A numbered list or a BASIC program doesn't read like that.
+fn looks_like_ppcl(t: &[u8]) -> bool {
+    let (mut lines, mut ppcl, mut commands, mut comments) = (0, 0, 0, 0);
+    let (mut padded, mut sure) = (true, false);
+    let mut rest = t.split(|&b| b == b'\n').peekable();
+    while let Some(l) = rest.next() {
+        let l = l.trim_ascii_end();
+        if l.is_empty() {
+            continue;
+        }
+        // (the sample's last line can be cut short, its number too)
+        let cut = rest.peek().is_none() && !t.ends_with(b"\n");
+        let l = l.strip_prefix(b"#").map_or(l, |r| r.trim_ascii_start());
+        let d = l.iter().take_while(|b| b.is_ascii_digit()).count();
+        if !(1..=5).contains(&d) || !matches!(l.get(d), None | Some(b' ' | b'\t')) {
+            if cut {
+                break;
+            }
+            return false;
+        }
+        padded &= d == 5 || cut;
+        let s = l[d..].trim_ascii_start();
+        let (word, after) = s.split_at(s.iter().take_while(|b| b.is_ascii_alphanumeric()).count());
+        let comment = word.eq_ignore_ascii_case(b"C") && matches!(after.first(), None | Some(b' ' | b'\t'));
+        let command =
+            after.starts_with(b"(") && (word.eq_ignore_ascii_case(b"IF") || config::ppcl_in(&config::PPCL_COMMANDS, word));
+        let jump = [&b"GOTO"[..], b"GOSUB", b"RETURN"].iter().any(|j| j.eq_ignore_ascii_case(word));
+        // `"POINT" = …`, `$LOC1 = …`
+        let name = match s.first() {
+            Some(b'"') => s[1..].iter().position(|&b| b == b'"').map_or(0, |p| p + 2),
+            Some(b'$') => 1 + s[1..].iter().take_while(|b| b.is_ascii_alphanumeric()).count(),
+            _ => 0,
+        };
+        let assignment = name > 0 && s[name..].trim_ascii_start().starts_with(b"=");
+        lines += 1;
+        ppcl += (comment || command || jump || assignment) as usize;
+        commands += (command || assignment) as usize;
+        comments += comment as usize;
+        if !comment {
+            sure |= (command && after.starts_with(b"(\""))
+                || (assignment && s[0] == b'"')
+                || config::ppcl_has_operator(s);
+        }
+        if lines == 64 {
+            break;
+        }
+    }
+    // (or a long header of comments, all the sample has)
+    lines >= 2 && (padded || sure) && ((commands > 0 && ppcl * 2 >= lines) || (padded && comments == lines))
 }
 
 /// A `.conf` file: XML, nginx's or Apache's configuration, or else INI-like.
@@ -699,6 +766,7 @@ fn lex_in(lang: Lang, text: &[u8], st: State, o: &mut Out) -> State {
         Lang::Subtitles => config::subtitles(text, st, o),
         Lang::Calendar => by_line(text, st, o, config::calendar_line),
         Lang::Sln => by_line(text, st, o, config::sln_line),
+        Lang::Ppcl => config::ppcl(text, st, o),
         _ => code::code(code::syntax(lang), text, st, o),
     }
 }
@@ -1378,6 +1446,35 @@ mod tests {
         assert_eq!(d(Some("access.txt"), access), Lang::Log);
         has(Lang::Ini, "127.0.0.1   localhost  # loopback", &[("127.0.0.1", Tok::Num), ("# loopback", Tok::Comment)]);
         assert!(toks(Lang::Ini, "ff02::1 ip6-allnodes", State::START).is_empty());
+        // PPCL by its extension, or by its numbered lines (Desigo exports it as .txt), also cut short
+        assert_eq!(d(Some("AHU1.ppcl"), b""), Lang::Ppcl);
+        let prog = b"00010     C AIR HANDLER 1\r\n00020     DEFINE(A,\"AHU1.\")\r\n00030     IF(\"%A%SAT\" .GT. 55) THEN GOTO 50\r\n00040     \"%A%SP\" = 55\r\n";
+        assert_eq!(d(Some("AHU1_PGM.txt"), prog), Lang::Ppcl);
+        assert_eq!(d(Some("AHU1.pcl"), prog), Lang::Ppcl);
+        assert_eq!(d(None, &prog[..prog.len() - 7]), Lang::Ppcl);
+        assert_eq!(d(None, &prog[..prog.len() - 21]), Lang::Ppcl);
+        assert_eq!(d(None, b"00010     C X\n00020     DEFINE(X,\"A.\")\n00030     LOCAL(A)\n000"), Lang::Ppcl);
+        // ... also when the first 4 KB are all a header of comments
+        let header = "00010     C ---------------------------------------------------------------\n".repeat(70);
+        assert_eq!(d(Some("AHU1.txt"), &header.as_bytes()[..4096]), Lang::Ppcl);
+        // ... also one that starts with assignments and jumps, short numbers with tabs, lines turned off
+        let prog = b"00010     \"A\" = 1\n00020     $LOC1 = \"A\" + 1\n00030     MAX(\"D\",\"A\",$LOC1)\n00040     GOTO 10\n";
+        assert_eq!(d(None, prog), Lang::Ppcl);
+        let prog = b"10\tC AHU-1 SUPPLY FAN\n20\tIF(TIME .GT. 6.00) THEN ON(\"SFAN\") ELSE OFF(\"SFAN\")\n# 30\tGOTO 10\n";
+        assert_eq!(d(Some("x.txt"), prog), Lang::Ppcl);
+        // ... but not a numbered list, BASIC, a numbered log, spreadsheet formulas, or a `.pcl` for a printer
+        for text in [
+            &b"1 C is a language\n2 Rust is too\n3 C\n"[..],
+            b"10 PRINT \"HI\"\n20 GOTO 10\n",
+            b"10 C = 0\n20 IF (C > 50) THEN PRINT \"BIG\"\n30 GOTO 10\n",
+            b"10 IF(X > 5) THEN PRINT \"BIG\"\n20 GOTO 10\n",
+            b"1 Set (oven) to 350\n2 Wait (10 min)\n3 Serve\n",
+            b"00001 INFO started\n00002 ON (startup) ok\n",
+            b"1 IF(A1>5,\"Yes\",\"No\")\n2 SUM(A1:A10)\n",
+            b"\x1bE\x1b&l0O text",
+        ] {
+            assert_eq!(d(Some("x.pcl"), text), Lang::Plain, "{:?}", String::from_utf8_lossy(text));
+        }
     }
 
     #[test]
@@ -1512,6 +1609,10 @@ mod tests {
             Lang::Subtitles => &["WEBVTT\n", "NOTE x\n", "STYLE\n", "::cue { color: red }", "00:00:01.000 --> 00:00:02.000", "<i>", "{\\an8}", "\n\n", "  \n"],
             Lang::Calendar => &["BEGIN:VEVENT", ";TZID=", ":", "\n ", "DTSTART", "\"a:b\""],
             Lang::Sln => &["Project(\"{", "}\") = \"", "GlobalSection(", " = ", "# ", "EndProject"],
+            Lang::Ppcl => &[
+                "\n00010     ", "\n20\t", "C ", "\"A.B\"", ".EQ.", "IF(", "$LOC1", "@OPER", "01:00", "5.5", "\"$X\"", "\n# 00030 ",
+                "UNKNOWN (", "%X%", "\"%X%A\"", ".NOT.", "GOTO ", "OIP(", "DEFINE(", "LOCAL(", "A.ROOT.B",
+            ],
             Lang::Diff => &["@@ -1,2 +1,2 @@", "---", "+++", " "],
             _ => &["[s]", "k=v", "ERROR"],
         };
@@ -1535,7 +1636,7 @@ mod tests {
         use Lang::*;
         let exact_mid_line = [
             Json, Log, Ini, Xml, Html, Csv, CsvSemi, Tsv, Python, JavaScript, TypeScript, C, Cpp, CSharp, Java, Kotlin, Swift, Go,
-            Php, Lua, Nginx, Apache, Properties, Calendar, Sln, R,
+            Php, Lua, Nginx, Apache, Properties, Calendar, Sln, R, Ppcl,
         ];
         let mut r = 0x2545_F491_4F6C_DD1Du64;
         for lang in Lang::ALL {

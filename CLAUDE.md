@@ -109,13 +109,19 @@ Commits use the GitHub no-reply address (repo-local git config); GitHub refuses 
     programming/scripting languages (keyword tables + per-language extras: Rust and C++ raw strings, PowerShell
     here-strings, Batch labels, heredocs, JS and Perl regexes, Perl's `qw(…)`/`s{…}{…}` and POD, C#/HCL strings in
     interpolation holes, AutoHotkey hotkeys, VB's `Rem`...); `config.rs` the line-based formats (TOML, nginx,
-    Apache, `.properties`, SRT/WebVTT, iCalendar/vCard, `.sln`); PHP files are HTML with PHP inside. A Markdown
+    Apache, `.properties`, SRT/WebVTT, iCalendar/vCard, `.sln`, and PPCL: Siemens APOGEE/Desigo programs, colored
+    much as Desigo shows them, from the full command list of Siemens' manual; the line number dimmed, `C` comment
+    lines, `# ` lines turned off and `UNKNOWN (…)` statements dimmed, `%X%` abbreviations marked, and in red what
+    can't be right (a line number out of order, which the state's `b` carries; a string left open, a `GOTO` without
+    a line number, `.NOT.` and other operators PPCL hasn't got, a name over 6 characters without quotes). Only the
+    eleven dotted operators split a word (`ROOM.MIN.TEMP` is one name); Toggle comment puts the `C` after each line's
+    number); PHP files are HTML with PHP inside. A Markdown
     ``` block is colored as the language it names, that lexer's state kept in the Markdown state (`mode` holds the
     language; where its state doesn't fit, each line is colored from its line start). Where a quote is easily a
     stray one (shell, SQL, PHP...), a string left open gives up at a blank line or after 40 lines. Language is
     picked by file name (templates like `x.yaml.j2` by the name inside; nginx/Apache configuration also by its
     folder, so detection gets the whole path), then by content (`#!` lines, `<?xml`, `server {`, `<VirtualHost`,
-    `WEBVTT`, JSON that reads as JSON, log timestamps — not IP addresses). A test checks that lexing a text in two
+    `WEBVTT`, JSON that reads as JSON, PPCL's numbered lines, log timestamps — not IP addresses). A test checks that lexing a text in two
     pieces ends in the same state as lexing it whole (cut after a line break for every language, mid-line too for
     those listed in it); for deeper runs raise its counts for a while.
   - `app.rs` state, layout and painting; `actions.rs` input, commands, background jobs, saving and closing;
@@ -124,7 +130,10 @@ Commits use the GitHub no-reply address (repo-local git config); GitHub refuses 
     in HKCU); `update.rs` (updates from GitHub releases: WinHTTP, SHA-256 check, swap the exe, restart with
     `--updated`, undone if the new one doesn't start); `crash.rs` (a minidump next to crash.log on a native crash,
     written by a thread waiting for it from the start; Help → Report a problem opens a filled-in GitHub issue form
-    the user sends themselves; the version string with the commit, which build.rs passes in); `testmode.rs`.
+    the user sends themselves; the version string with the commit, which build.rs passes in); `prompt.rs` (prompts
+    in the theme's colors, as Windows' task dialogs and message boxes stay light: a real dialog of Windows' own
+    controls, push buttons themed `DarkMode_Explorer` when dark, so the keyboard, screen readers and Ctrl+C work as in
+    any dialog; `win::ask` falls back to a task dialog if it can't be made); `testmode.rs`.
   - `gfx.rs` — Direct2D drawing into a D3D11 **flip-model swap chain** (FLIP_DISCARD, then FLIP_SEQUENTIAL), with
     `ID2D1HwndRenderTarget` only as a fallback: on a PC with a Parsec virtual display adapter the HWND target reported
     "occluded" and drew nothing. Device loss → `discard_target()` and paint again.
@@ -160,6 +169,8 @@ Commits use the GitHub no-reply address (repo-local git config); GitHub refuses 
   WM_THEMECHANGED. A hidden system caret (`win::follow_caret`, never shown) is moved to the drawn caret after each
   paint while the text has the keyboard, with EVENT_OBJECT_LOCATIONCHANGE for OBJID_CARET; WM_KILLFOCUS destroys it
   (the find box's edit control makes its own), and so does the caret scrolling out of view. UI Automation is designed in the roadmap, not built.
+- Dark mode reaches everything Slate draws, its menus (uxtheme's dark menus) and its prompts (`prompt.rs`). The Open
+  and Save As dialogs are Windows' own: they follow Windows' light/dark setting, not Slate's switch.
 - Status bar counts: a selection up to 4 MiB is counted at once; a document up to 1 MiB at once, up to 64 MiB on
   another thread (after an edit only once the typing pauses: the count's snapshot ends the piece typing goes into),
   a bigger one not at all. Words are runs of non-space characters, like `wc -w`.
@@ -232,6 +243,7 @@ Commits use the GitHub no-reply address (repo-local git config); GitHub refuses 
   `persist`, which needs `SLATE_DATA_DIR`). Mouse drags, raw wheel deltas, Alt, AltGr and window activation have
   their own commands (`down:`/`move:`/`up:`, `wheelraw:`, `altkey`, `altgr:on`, `activate`…), and `contrast:on`
   pretends Windows' high contrast is on (`print:theme`, `print:syscaret`, `print:statusbar` check the results).
+  Prompts are never shown, but `prompt:<file.png>|save` (or `update`, `info`) draws one into a picture.
   `SLATE_DATA_DIR` sets the data folder, `SLATE_TEST_LOG` the log file; `session:save|soon|restore` writes the
   session now, writes it the way the timer does, or restores it. `SLATE_UPDATE_TEST_VERSION=0.1.0` makes Slate
   believe it's that version (to try the updater against the real latest release, in a scratch folder);

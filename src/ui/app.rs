@@ -590,6 +590,14 @@ impl App {
             win::style_title_bar(self.hwnd, self.theme.dark, self.theme.frame, self.theme.text);
         }
         win::set_menu_dark(self.theme.dark && !self.theme.hc);
+        let t = &self.theme;
+        super::prompt::set_colors((!t.hc).then_some(super::prompt::Colors {
+            dark: t.dark,
+            surface: t.surface,
+            frame: t.frame,
+            text: t.text,
+            border: t.border,
+        }));
         self.find.style_edits(self.dpi, &self.theme);
         self.rebuild_style();
     }

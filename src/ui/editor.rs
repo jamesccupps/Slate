@@ -1805,13 +1805,14 @@ fn toggle_comment_with(doc: &mut Document, sel: Sel, style: CommentStyle, at_onc
         }
     };
     match style {
-        CommentStyle::Line(tok) => {
+        CommentStyle::Line(tok) | CommentStyle::AfterNumber(tok) => {
             let core = tok.trim_end().as_bytes();
+            let numbered = matches!(style, CommentStyle::AfterNumber(_));
             let a = lines[0];
             let b = doc.line_end_of(*lines.last().unwrap_or(&a)).max(a);
             if b - a <= at_once_max {
                 // one replacement: quick even for 200,000 lines (and so is its undo)
-                return Ok(line_comment_at_once(doc, sel, a, b, core));
+                return Ok(line_comment_at_once(doc, sel, a, b, core, numbered));
             }
             let wordy = core.last().is_some_and(|c| c.is_ascii_alphanumeric());
             // (line start, indentation, already commented) for each line that isn't blank
@@ -1819,7 +1820,7 @@ fn toggle_comment_with(doc: &mut Document, sel: Sel, style: CommentStyle, at_onc
             for &ls in &lines {
                 let le = doc.line_end_of(ls);
                 let head = doc.read(ls, le.min(ls + 4096));
-                let ind = head.iter().take_while(|&&b| b == b' ' || b == b'\t').count();
+                let ind = text_start(&head, numbered);
                 if ind == head.len() {
                     continue;
                 }
@@ -1846,7 +1847,7 @@ fn toggle_comment_with(doc: &mut Document, sel: Sel, style: CommentStyle, at_onc
                     del(&mut anchor, at, n);
                     del(&mut caret, at, n);
                 } else {
-                    let at = ls + col;
+                    let at = ls + if numbered { ind } else { col };
                     let text = [core, b" "].concat();
                     doc.insert(at, &text);
                     ins(&mut anchor, at, text.len() as u64);
@@ -1911,9 +1912,19 @@ fn toggle_comment_with(doc: &mut Document, sel: Sel, style: CommentStyle, at_onc
     Ok(new)
 }
 
+/// Where a line's text starts: after its indentation, and when `numbered` also after the line number before it and
+/// the spaces after that (PPCL's `00010     SET(…)`, and `# 00010     SET(…)` for a line that's turned off).
+fn text_start(line: &[u8], numbered: bool) -> usize {
+    let ws = |i: usize| i + line[i..].iter().take_while(|&&c| c == b' ' || c == b'\t').count();
+    let s = ws(0);
+    let n = if line.get(s) == Some(&b'#') { ws(s + 1) } else { s };
+    let d = n + line[n..].iter().take_while(|c| c.is_ascii_digit()).count();
+    if numbered && d > n && matches!(line.get(d), None | Some(b' ' | b'\t')) { ws(d) } else { s }
+}
+
 /// Line comments added to (or taken from) the whole lines in `[a, b)`, as one replacement of their text (see
 /// `toggle_comment`).
-fn line_comment_at_once(doc: &mut Document, sel: Sel, a: u64, b: u64, core: &[u8]) -> Sel {
+fn line_comment_at_once(doc: &mut Document, sel: Sel, a: u64, b: u64, core: &[u8], numbered: bool) -> Sel {
     let text = doc.read(a, b);
     let wordy = core.last().is_some_and(|c| c.is_ascii_alphanumeric());
     // (offset in `text`, indentation, already commented) for each line that isn't blank
@@ -1922,7 +1933,7 @@ fn line_comment_at_once(doc: &mut Document, sel: Sel, a: u64, b: u64, core: &[u8
     for line in text.split(|&c| c == b'\n') {
         let content = line.strip_suffix(b"\r").unwrap_or(line);
         let head = &content[..content.len().min(4096)];
-        let ind = head.iter().take_while(|&&c| c == b' ' || c == b'\t').count();
+        let ind = text_start(head, numbered);
         if ind < head.len() {
             let rest = &head[ind..];
             let commented = rest.len() >= core.len()
@@ -1949,7 +1960,7 @@ fn line_comment_at_once(doc: &mut Document, sel: Sel, a: u64, b: u64, core: &[u8
             copied = at + n;
             edits.push((a + at as u64, -(n as i64)));
         } else {
-            let at = off + col;
+            let at = off + if numbered { ind } else { col };
             out.extend_from_slice(&text[copied..at]);
             out.extend_from_slice(core);
             out.push(b' ');
@@ -2368,9 +2379,12 @@ mod tests {
 
     #[test]
     fn commenting_at_once_matches_line_by_line() {
-        let text = b"a\n  b // x\n\n\t// c\r\n     d\r\n  \r\n//e  \n    \n// f";
-        let len = text.len() as u64;
-        for style in [CommentStyle::Line("// "), CommentStyle::Line("REM ")] {
+        let text: &[u8] = b"a\n  b // x\n\n\t// c\r\n     d\r\n  \r\n//e  \n    \n// f";
+        let ppcl: &[u8] = b"00010     SET(1)\n00020     C x\n\n  30\tGOTO 10\r\n00040 \r\nC top\n9 C\n# 00045 ON(\"A\")\n00050     c lower";
+        for (text, style) in
+            [(text, CommentStyle::Line("// ")), (text, CommentStyle::Line("REM ")), (ppcl, CommentStyle::AfterNumber("C "))]
+        {
+            let len = text.len() as u64;
             for anchor in 0..=len {
                 for caret in [0, 1, 3, 7, 12, 20, len - 1, len] {
                     let sel = Sel::new(anchor, caret.min(len));
@@ -2388,6 +2402,24 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn ppcl_comments_go_after_each_line_number() {
+        let style = CommentStyle::AfterNumber("C ");
+        let text: &[u8] = b"00010     SET(1,\"A\")\r\n100 ON(\"B\")\r\n00030     \r\nGOTO 10\r\n# 00040\tOFF(\"B\")\r\n";
+        let commented: &[u8] = b"00010     C SET(1,\"A\")\r\n100 C ON(\"B\")\r\n00030     \r\nC GOTO 10\r\n# 00040\tC OFF(\"B\")\r\n";
+        let mut d = Document::from_text(text);
+        let all = Sel::new(0, d.len());
+        let s = toggle_comment(&mut d, all, style).unwrap();
+        assert_eq!(d.read(0, d.len()), commented);
+        toggle_comment(&mut d, s, style).unwrap();
+        assert_eq!(d.read(0, d.len()), text);
+        // a comment line's `C` is taken off (a tab after it stays)
+        let mut d = Document::from_text(b"01096     C\tNOTE\n01098     C");
+        let all = Sel::new(0, d.len());
+        toggle_comment(&mut d, all, style).unwrap();
+        assert_eq!(d.read(0, d.len()), b"01096     \tNOTE\n01098     ");
     }
 
     #[test]

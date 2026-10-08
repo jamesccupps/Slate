@@ -9,6 +9,7 @@ pub mod findbar;
 pub mod gfx;
 pub mod highlight;
 pub mod install;
+pub mod prompt;
 pub mod session;
 pub mod settings;
 pub mod structure;

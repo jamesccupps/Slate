@@ -404,6 +404,7 @@ fn fence_lang(info: &[u8]) -> Option<Lang> {
         b"srt" | b"vtt" | b"webvtt" => Subtitles,
         b"ics" | b"ical" | b"icalendar" | b"vcard" | b"vcf" => Calendar,
         b"sln" => Sln,
+        b"ppcl" | b"pcl" => Ppcl,
         b"md" | b"markdown" => Markdown,
         _ => return None,
     })

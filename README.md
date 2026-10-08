@@ -11,8 +11,8 @@ smoothly, and can be searched, edited, formatted and saved.
   C, C++, C#, Java, Kotlin, Swift, Go, Rust, JavaScript, TypeScript, PHP, Ruby, Lua, SQL, HTML (with its CSS and
   scripts), CSS, XML, Markdown (code blocks in their language), YAML, JSON, TOML, INI, Java properties, nginx and
   Apache configuration, Terraform/HCL, CMake, Dockerfiles, CSV/TSV (each column its own color), logs, diffs,
-  subtitles (SRT, WebVTT), calendars and contacts (iCalendar, vCard) and Visual Studio solutions. Block comments
-  and multi-line strings are followed correctly.
+  subtitles (SRT, WebVTT), calendars and contacts (iCalendar, vCard), Visual Studio solutions and PPCL programs
+  (Siemens APOGEE and Desigo). Block comments and multi-line strings are followed correctly.
 - Line tools: sort lines (`file2` before `file10`), remove duplicate or blank lines, trim spaces at line ends;
   UPPERCASE / lowercase / Title Case; comment or uncomment lines with Ctrl+/.
 - JSON and XML: format (pretty-print), minify and check, also for JSON Lines; a path bar showing where the caret

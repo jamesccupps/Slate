@@ -1,5 +1,5 @@
 //! Configuration and other line-based formats: TOML, nginx and Apache configuration, Java `.properties`, subtitles
-//! (SRT, WebVTT), calendars and contacts (iCalendar, vCard) and Visual Studio solutions.
+//! (SRT, WebVTT), calendars and contacts (iCalendar, vCard), Visual Studio solutions and PPCL programs.
 
 use super::code;
 use super::{Out, State, Tok, at, is_num_word, line_end, scan_str};
@@ -895,6 +895,347 @@ pub(super) fn sln_line(l: &[u8], _col0: bool, bol: bool, o: &mut Out) {
     }
 }
 
+// ---- PPCL ----
+
+// What `State::kind` means here, before a line's statement starts (in a statement it's 0); `b` holds the line number
+// before (0: none), so a number out of order shows.
+/// After the `#` that turns a line off, before its number.
+const PC_HASH: u8 = 1;
+/// After the line number, before the statement: where a `C` makes the line a comment.
+const PC_LEAD: u8 = 2;
+const PC_COMMENT: u8 = 3;
+/// The rest of a line that's turned off.
+const PC_OFF: u8 = 4;
+
+/// PPCL's commands and functions, and four that panels' firmware has but no manual does (`DIM`, `ENTHAL`, `ONERR`,
+/// `RELTCU`). Sorted.
+pub(super) const PPCL_COMMANDS: [&[u8]; 81] = [
+    b"ACT", b"ADAPTM", b"ADAPTS", b"ALARM", b"ALMPRI", b"ATN", b"AUTO", b"COM", b"COS", b"DAY", b"DBSWIT", b"DC", b"DCR",
+    b"DEACT", b"DEFINE", b"DIM", b"DISABL", b"DISALM", b"DISCOV", b"DPHONE", b"EMAUTO", b"EMFAST", b"EMOFF", b"EMON",
+    b"EMSET", b"EMSLOW", b"ENABLE", b"ENALM", b"ENCOV", b"ENTHAL", b"EPHONE", b"EXP", b"FAST", b"GETVAL", b"GOSUB",
+    b"GOTO", b"HLIMIT", b"HOLIDA", b"INITTO", b"LLIMIT", b"LN", b"LOCAL", b"LOG", b"LOOP", b"LSQ2", b"LSQDAT", b"LSTSQR",
+    b"MAX", b"MIN", b"NIGHT", b"NORMAL", b"OFF", b"OIP", b"ON", b"ONERR", b"ONPWRT", b"PDL", b"PDLDAT", b"PDLDPG",
+    b"PDLMTR", b"PDLSET", b"RELEAS", b"RELTCU", b"RETURN", b"SAMPLE", b"SET", b"SETVAL", b"SIN", b"SLOW", b"SQRT",
+    b"SSTO", b"SSTOCO", b"STATE", b"TABLE", b"TAN", b"TIMAVG", b"TOD", b"TODMOD", b"TODSET", b"TOTAL", b"WAIT",
+];
+
+/// The words statements are made of (besides `C`, which starts a comment). Sorted.
+const PPCL_WORDS: [&[u8]; 7] = [b"ELSE", b"GOSUB", b"GOTO", b"IF", b"PARAMETER", b"RETURN", b"THEN"];
+
+/// Values: the states points are compared with, and the resident points (the time, the day, alarm counts...); also
+/// `NODE0`…`NODE99`, `SECND1`…`SECND7` and every `$` name (`$LOC1`, `$ARG1`, `$BATT`...). Sorted.
+const PPCL_VALUES: [&[u8]; 25] = [
+    b"ALARM", b"ALMACK", b"ALMCNT", b"ALMCT2", b"AUTO", b"CRTIME", b"DAY", b"DAYMOD", b"DAYOFM", b"DEAD", b"FAILED",
+    b"FAST", b"HAND", b"LINK", b"LOW", b"MONTH", b"NGTMOD", b"OFF", b"OK", b"ON", b"PRFON", b"SECNDS", b"SLOW", b"TIME",
+    b"TROUBL",
+];
+
+/// The five priorities a program can name (`@OPER`...). Sorted.
+const PPCL_PRIORITIES: [&[u8]; 5] = [b"EMER", b"NONE", b"OPER", b"PDL", b"SMOKE"];
+
+/// The dotted operators, all there are (`.NOT.` isn't one). Sorted.
+const PPCL_OPERATORS: [&[u8]; 11] =
+    [b"AND", b"EQ", b"GE", b"GT", b"LE", b"LT", b"NAND", b"NE", b"OR", b"ROOT", b"XOR"];
+
+/// Whether `w` is in `list` (sorted, in capitals), in any case.
+pub(super) fn ppcl_in(list: &[&[u8]], w: &[u8]) -> bool {
+    let mut up = [0u8; 12];
+    if w.is_empty() || w.len() > up.len() {
+        return false;
+    }
+    for (u, c) in up.iter_mut().zip(w) {
+        *u = c.to_ascii_uppercase();
+    }
+    list.binary_search(&&up[..w.len()]).is_ok()
+}
+
+fn ppcl_value(w: &[u8]) -> bool {
+    let numbered = |p: &[u8]| {
+        w.len() > p.len() && w[..p.len()].eq_ignore_ascii_case(p) && w[p.len()..].iter().all(u8::is_ascii_digit)
+    };
+    ppcl_in(&PPCL_VALUES, w) || numbered(b"NODE") || numbered(b"SECND")
+}
+
+/// The dotted operator at `i` (its `.`), if one is there: its length.
+fn ppcl_operator(l: &[u8], i: usize) -> Option<usize> {
+    let w = l.get(i + 1..)?.iter().take_while(|b| b.is_ascii_alphabetic()).count();
+    (at(l, i + 1 + w) == b'.' && ppcl_in(&PPCL_OPERATORS, &l[i + 1..i + 1 + w])).then_some(w + 2)
+}
+
+/// Whether a statement has a dotted operator in it.
+pub(super) fn ppcl_has_operator(s: &[u8]) -> bool {
+    (0..s.len()).any(|i| s[i] == b'.' && ppcl_operator(s, i).is_some())
+}
+
+/// PPCL programs (Siemens APOGEE and Desigo field panels): a number and one statement on each line, `00020     IF(
+/// "AHU1.SAT" .GT. 55.0) THEN ON("AHU1.CLG")`. Colored much as Desigo shows them: the line number dimmed; a `C` as
+/// the first word makes the line a comment; commands and `IF`, `THEN`, `ELSE`, `GOTO` as keywords; points by name
+/// (`%X%` abbreviations marked); states, priorities, `$` locals and resident points (`ON`, `FAILED`, `@OPER`, `$LOC1`,
+/// `TIME`) as values; the dotted operators plain; a line turned off (`# 00100 …`) dimmed. In red, what can't be right:
+/// a line number out of order, a string left open, a `GOTO` without a line number, an operator or a priority PPCL
+/// doesn't have, a name that needs quotes, and a statement the compiler couldn't read (`UNKNOWN (…)`).
+pub(super) fn ppcl(t: &[u8], st: State, o: &mut Out) -> State {
+    let (mut kind, mut prev, mut bol) = (st.kind, st.b, st.bol);
+    let mut start = 0;
+    loop {
+        let end = line_end(t, start);
+        let line = &t[start..end];
+        let blank = kind == 0 && bol && line.iter().all(|&b| is_ws(b));
+        (kind, prev) = ppcl_line(line, kind, prev, bol, &mut o.at(start));
+        if end >= t.len() {
+            break;
+        }
+        // (a blank line ends a program: the next one's numbers start over)
+        if blank {
+            prev = 0;
+        }
+        start = end + 1;
+        (kind, bol) = (0, true);
+    }
+    State { kind, a: 0, b: prev, ..st }
+}
+
+/// One line, or what a text has of it: its start (which a text can end in anywhere a space is), then the statement.
+/// Returns `kind` and the last line number at its end.
+fn ppcl_line(l: &[u8], mut kind: u8, mut prev: u16, bol: bool, o: &mut Out) -> (u8, u16) {
+    let n = l.len();
+    let ws = |i: usize| i + l[i..].iter().take_while(|&&b| is_ws(b)).count();
+    let mut i = 0;
+    // Only a program's own lines get red marks, not a heading between programs or a line a statement goes on to
+    // (with no number). (A text that starts after the number had one.)
+    let mut numbered = true;
+    if kind == 0 && bol {
+        i = ws(0);
+        if i == n {
+            return (0, prev);
+        }
+        if l[i] == b'#' {
+            o.put(i, i + 1, Tok::Dim);
+            (kind, i) = (PC_HASH, i + 1);
+        } else {
+            kind = PC_LEAD;
+            let s = i;
+            (i, prev) = ppcl_number(l, i, prev, o);
+            numbered = i > s;
+        }
+    }
+    if kind == PC_HASH {
+        i = ws(i);
+        if i == n {
+            return (kind, prev);
+        }
+        (i, prev) = ppcl_number(l, i, prev, o);
+        o.put(i, n, Tok::Dim);
+        return (PC_OFF, prev);
+    }
+    if kind == PC_LEAD {
+        i = ws(i);
+        if i == n {
+            return (kind, prev);
+        }
+        kind = if matches!(l[i], b'C' | b'c') && (i + 1 == n || is_ws(l[i + 1])) { PC_COMMENT } else { 0 };
+    }
+    match kind {
+        PC_COMMENT => o.put(i, n, Tok::Comment),
+        PC_OFF => o.put(i, n, Tok::Dim),
+        _ if o.on() => ppcl_statement(l, i, numbered, o),
+        _ => {}
+    }
+    (kind, prev)
+}
+
+/// The line number at `i`, if there's one: dimmed, or red when it isn't 1…32767 or doesn't come after `prev` (the
+/// line before's). Returns where it ends and the number to compare the next one with (`i` and 0 when there's none).
+fn ppcl_number(l: &[u8], i: usize, prev: u16, o: &mut Out) -> (usize, u16) {
+    let d = i + l[i..].iter().take_while(|b| b.is_ascii_digit()).count();
+    if d == i || !(d == l.len() || is_ws(l[d])) {
+        return (i, 0);
+    }
+    let num = l[i..d].iter().fold(0u32, |v, &c| (v * 10 + (c - b'0') as u32).min(99_999));
+    let valid = (1..=32767).contains(&num);
+    o.put(i, d, if valid && num > prev as u32 { Tok::Dim } else { Tok::Error });
+    (d, if valid { num as u16 } else { prev })
+}
+
+/// Where a number from `i` ends: `20`, `7.5`, `.5`, and times (`01:00`); a dot before a letter is an operator's.
+fn ppcl_number_end(l: &[u8], i: usize) -> usize {
+    let mut e = i + 1;
+    while e < l.len() && (l[e].is_ascii_digit() || (matches!(l[e], b'.' | b':') && !at(l, e + 1).is_ascii_alphabetic())) {
+        e += 1;
+    }
+    e
+}
+
+/// Where a word from `i` ends: letters and digits (its first character can be `$` or `@`), and dots too unless one
+/// starts an operator: `ROOM.MIN.TEMP` is one word (a name that needs quotes), `A.ROOT.B` three.
+fn ppcl_word_end(l: &[u8], i: usize) -> usize {
+    let mut e = i + 1;
+    loop {
+        e += l[e..].iter().take_while(|b| b.is_ascii_alphanumeric()).count();
+        if at(l, e) != b'.' || !at(l, e + 1).is_ascii_alphanumeric() || ppcl_operator(l, e).is_some() {
+            return e;
+        }
+        e += 1;
+    }
+}
+
+/// A point's name in quotes, from `s` to `e`, with its `%X%` abbreviations (from DEFINE) marked.
+fn ppcl_name(l: &[u8], s: usize, e: usize, o: &mut Out) {
+    let (mut from, mut j) = (s, s + 1);
+    while j < e {
+        if l[j] == b'%' {
+            let w = l[j + 1..e].iter().take_while(|b| b.is_ascii_alphanumeric()).count();
+            if w > 0 && j + 1 + w < e && l[j + 1 + w] == b'%' {
+                o.put(from, j, Tok::Var);
+                o.put(j, j + w + 2, Tok::Type);
+                j += w + 2;
+                from = j;
+                continue;
+            }
+        }
+        j += 1;
+    }
+    o.put(from, e, Tok::Var);
+}
+
+/// Colors a statement from `i` to the line's end; with `checked`, what can't be right in red.
+fn ppcl_statement(l: &[u8], mut i: usize, checked: bool, o: &mut Out) {
+    #[derive(Clone, Copy, PartialEq)]
+    enum Call {
+        Define,
+        Local,
+        Oip,
+    }
+    let n = l.len();
+    // inside DEFINE(…), LOCAL(…) or OIP(…), whose arguments aren't points: which, the depth of its `(`, the argument
+    let mut call: Option<(Call, u32, u32)> = None;
+    let mut depth = 0u32;
+    let mut first = true;
+    // (a mistake, or what it is on a line that isn't checked)
+    let bad = |otherwise: Option<Tok>| if checked { Some(Tok::Error) } else { otherwise };
+    while i < n {
+        let (c, s) = (l[i], i);
+        if is_ws(c) {
+            i += 1;
+            continue;
+        }
+        if c == b'"' {
+            // (quoted text first: what's inside is one name, or OIP's keystrokes, whatever words it has)
+            let close = l[i + 1..].iter().position(|&b| b == b'"');
+            i = close.map_or(n, |p| i + p + 2);
+            match call {
+                _ if close.is_none() => {
+                    if let Some(tok) = bad(None) {
+                        o.put(s, i, tok);
+                    }
+                }
+                // DEFINE's text and OIP's keystrokes, and the program's own locals (`"$TMR"`), stay plain
+                Some((Call::Define | Call::Oip, ..)) => {}
+                _ if at(l, s + 1) == b'$' => {}
+                _ => ppcl_name(l, s, i, o),
+            }
+        } else if c.is_ascii_digit() || (c == b'.' && at(l, i + 1).is_ascii_digit()) {
+            i = ppcl_number_end(l, i);
+            o.put(s, i, Tok::Num);
+        } else if c == b'.' {
+            // `.EQ.` and the others stay plain; a word between dots that isn't one is a mistake (`.NOT.`, `.EQ`)
+            let w = l[i + 1..].iter().take_while(|b| b.is_ascii_alphabetic()).count();
+            match ppcl_operator(l, i) {
+                Some(len) => i += len,
+                None if w > 0 => {
+                    i += 1 + w + (at(l, i + 1 + w) == b'.') as usize;
+                    if let Some(tok) = bad(None) {
+                        o.put(s, i, tok);
+                    }
+                }
+                None => i += 1,
+            }
+        } else if c == b'%' && l[i + 1..].iter().take_while(|b| b.is_ascii_alphanumeric()).count() > 0 {
+            // an abbreviation (`%X%`)
+            let w = l[i + 1..].iter().take_while(|b| b.is_ascii_alphanumeric()).count();
+            i += 1 + w + (at(l, i + 1 + w) == b'%') as usize;
+            o.put(s, i, Tok::Type);
+        } else if c.is_ascii_alphabetic() || (matches!(c, b'$' | b'@') && at(l, i + 1).is_ascii_alphanumeric()) {
+            i = ppcl_word_end(l, i);
+            let w = &l[s..i];
+            let next = i + l[i..].iter().take_while(|&&b| is_ws(b)).count();
+            let paren = at(l, next) == b'(';
+            if first && checked && w.eq_ignore_ascii_case(b"UNKNOWN") {
+                // a statement the compiler couldn't read, which the panel skips
+                o.put(s, i, Tok::Error);
+                o.put(i, n, Tok::Dim);
+                return;
+            }
+            let is = |k: &[u8]| w.eq_ignore_ascii_case(k);
+            let tok = if c == b'@' {
+                if ppcl_in(&PPCL_PRIORITIES, &w[1..]) { Some(Tok::Str) } else { bad(Some(Tok::Str)) }
+            } else if c == b'$' {
+                Some(Tok::Str)
+            } else if w.contains(&b'.') {
+                bad(Some(Tok::Var))
+            } else if paren {
+                let known = ppcl_in(&PPCL_COMMANDS, w) || ppcl_in(&PPCL_WORDS, w);
+                if call.is_none() {
+                    let which = [(Call::Define, &b"DEFINE"[..]), (Call::Local, b"LOCAL"), (Call::Oip, b"OIP")];
+                    call = which.iter().find(|x| is(x.1)).map(|x| (x.0, depth + 1, 0));
+                }
+                // (a command PPCL doesn't have stays plain)
+                known.then_some(Tok::Keyword)
+            } else if is(b"GOTO") || is(b"GOSUB") {
+                // a line number has to follow
+                let d = next + l[next..].iter().take_while(|b| b.is_ascii_digit()).count();
+                let num = l[next..d].iter().fold(0u32, |v, &b| (v * 10 + (b - b'0') as u32).min(99_999));
+                let ok = d > next && !(at(l, d).is_ascii_alphanumeric() || at(l, d) == b'.') && (1..=32767).contains(&num);
+                o.put(s, i, if ok { Tok::Keyword } else { bad(Some(Tok::Keyword)).unwrap_or(Tok::Keyword) });
+                if ok {
+                    o.put(next, d, Tok::Num);
+                    i = d;
+                }
+                first = false;
+                continue;
+            } else if ppcl_in(&PPCL_WORDS, w) {
+                Some(Tok::Keyword)
+            } else if ppcl_value(w) {
+                Some(Tok::Str)
+            } else if ppcl_in(&PPCL_COMMANDS, w) {
+                Some(Tok::Keyword)
+            } else {
+                match call {
+                    // the locals LOCAL declares, the abbreviation DEFINE gives a name
+                    Some((Call::Local, ..)) => None,
+                    Some((Call::Define, d, 0)) if depth == d => Some(Tok::Type),
+                    // a point named without quotes, which only fit names of up to 6 letters and digits
+                    _ if w.len() > 6 => bad(Some(Tok::Var)),
+                    _ => Some(Tok::Var),
+                }
+            };
+            if let Some(tok) = tok {
+                o.put(s, i, tok);
+            }
+        } else {
+            match c {
+                b'(' => depth += 1,
+                b')' => {
+                    depth = depth.saturating_sub(1);
+                    if call.is_some_and(|(_, d, _)| depth < d) {
+                        call = None;
+                    }
+                }
+                b',' => {
+                    if let Some((_, d, arg)) = call.as_mut() {
+                        if depth == *d {
+                            *arg += 1;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        first = false;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::tests::{end_state, has, toks, view};
@@ -1004,5 +1345,102 @@ mod tests {
         assert!(line_has(&v[3], "Project", Tok::Keyword) && line_has(&v[3], "\"{FAE04EC0-301F}\"", Tok::Num) && line_has(&v[3], "\"App\"", Tok::Str));
         assert!(line_has(&v[6], "SolutionConfigurationPlatforms", Tok::Type) && line_has(&v[6], "preSolution", Tok::Lit));
         assert!(line_has(&v[7], "{1234}", Tok::Num) && line_has(&v[7], ".Debug|Any CPU.ActiveCfg", Tok::Key));
+    }
+
+    #[test]
+    fn ppcl_programs() {
+        let src = "00010     C\tAIR HANDLER 1\r\n00020     DEFINE(A,\"AHU1.\")\r\n00030     LOCAL(TMR)\r\n00040     SAMPLE(5) $LOC1 = \"$TMR\" + 5\r\n00050     IF(\"%A%SAT\" .GT. 55.0 .AND. DAY .EQ. 1 .AND. TIME .EQ. 07:30) THEN ON(\"%A%CLG\") ELSE OFF(\"%A%CLG\")\r\n00060     IF(\"%A%SF\" .EQ. FAILED) THEN SET(@OPER,0,\"%A%VLV\") ELSE RELEAS(@OPER,\"%A%VLV\")\r\n00070     IF(TOTAL(\"%A%SF\") .GT. 8784) THEN GOTO 10\r\n00080     C IF(\"%A%SF\" .EQ. ON) THEN GOTO 10\r\n00090     IF(\"%A%SF\" .EQ. ON) THEN ON(\"%A%LT\")\r\n";
+        let v = view(Lang::Ppcl, src);
+        assert_eq!(v[0], vec![("00010".into(), Tok::Dim), ("C\tAIR HANDLER 1\r".into(), Tok::Comment)]);
+        // DEFINE names an abbreviation (`%A%` later) for a text that isn't a point; LOCAL's names are declarations
+        assert_eq!(v[1], vec![("00020".into(), Tok::Dim), ("DEFINE".into(), Tok::Keyword), ("A".into(), Tok::Type)]);
+        assert_eq!(v[2], vec![("00030".into(), Tok::Dim), ("LOCAL".into(), Tok::Keyword)]);
+        // a resident local, and one of the program's own in quotes (plain, as it's no point)
+        assert!(line_has(&v[3], "SAMPLE", Tok::Keyword) && line_has(&v[3], "$LOC1", Tok::Str) && line_has(&v[3], "5", Tok::Num));
+        assert!(!v[3].iter().any(|t| t.0.contains("$TMR")), "{:?}", v[3]);
+        // points (and the abbreviations in them), numbers and times; resident points as values; operators plain
+        assert!(line_has(&v[4], "IF", Tok::Keyword) && line_has(&v[4], "%A%", Tok::Type) && line_has(&v[4], "SAT\"", Tok::Var));
+        assert!(line_has(&v[4], "55.0", Tok::Num) && line_has(&v[4], "07:30", Tok::Num));
+        assert!(line_has(&v[4], "DAY", Tok::Str) && line_has(&v[4], "TIME", Tok::Str));
+        assert!(line_has(&v[4], "THEN", Tok::Keyword) && line_has(&v[4], "ON", Tok::Keyword) && line_has(&v[4], "ELSE", Tok::Keyword));
+        assert!(!v[4].iter().any(|t| t.0.contains('.') && t.1 != Tok::Var && t.1 != Tok::Num), "{:?}", v[4]);
+        assert!(line_has(&v[5], "FAILED", Tok::Str) && line_has(&v[5], "@OPER", Tok::Str) && line_has(&v[5], "RELEAS", Tok::Keyword));
+        assert!(line_has(&v[6], "TOTAL", Tok::Keyword) && line_has(&v[6], "GOTO", Tok::Keyword) && line_has(&v[6], "10", Tok::Num));
+        // a statement commented out is all comment
+        assert_eq!(v[7].len(), 2);
+        assert_eq!(v[7][1].1, Tok::Comment);
+        // `ON` compared with is a value, `ON(…)` a command
+        let ons: Vec<Tok> = v[8].iter().filter(|t| t.0 == "ON").map(|t| t.1).collect();
+        assert_eq!(ons, [Tok::Str, Tok::Keyword]);
+        assert!(!v.iter().flatten().any(|t| t.1 == Tok::Error), "{v:?}");
+        let end = end_state(Lang::Ppcl, src);
+        assert_eq!((end.kind, end.b), (0, 90));
+        // without line numbers, in lower case
+        has(Lang::Ppcl, "c a comment", &[("c a comment", Tok::Comment)]);
+        has(Lang::Ppcl, "if(\"x\" .eq. on) then goto 20", &[("if", Tok::Keyword), ("on", Tok::Str), ("goto", Tok::Keyword)]);
+        // `C` is a word, not a column: `CLG = 1` is an assignment
+        has(Lang::Ppcl, "00100     CLG = 1", &[("CLG", Tok::Var), ("1", Tok::Num)]);
+        // a number stops at an operator without spaces
+        has(Lang::Ppcl, "IF($LOC1 .GT.5.AND.NODE5 .EQ. FAILED .OR. SECND3 .GT. 60)", &[
+            ("5", Tok::Num),
+            ("NODE5", Tok::Str),
+            ("SECND3", Tok::Str),
+        ]);
+    }
+
+    #[test]
+    fn ppcl_as_other_exports_write_it() {
+        // short numbers and tabs, a line turned off, a statement the compiler couldn't read, an OIP keystroke string
+        let src = "10\tC AHU-1 SUPPLY FAN\n20\tIF(TIME .GT. 6.00 .AND. TIME .LT. 18.00) THEN ON(\"SFAN\") ELSE OFF(\"SFAN\")\n# 30\tSET(1,\"X\")\n40\tUNKNOWN (SET(1,\"Y\"))\n50\tOIP(TRIG,\"P/T/D/H///SITE.TOWER.AHU01.SFAN/1/\")\n60\tONERR(70)\n70\tGOTO 10\n";
+        let v = view(Lang::Ppcl, src);
+        assert!(line_has(&v[0], "10", Tok::Dim) && line_has(&v[0], "C AHU-1 SUPPLY FAN", Tok::Comment));
+        assert!(line_has(&v[1], "6.00", Tok::Num) && line_has(&v[1], "\"SFAN\"", Tok::Var));
+        assert_eq!(v[2], vec![("#".into(), Tok::Dim), ("30".into(), Tok::Dim), ("\tSET(1,\"X\")".into(), Tok::Dim)]);
+        assert!(line_has(&v[3], "UNKNOWN", Tok::Error) && line_has(&v[3], " (SET(1,\"Y\"))", Tok::Dim));
+        assert!(line_has(&v[4], "OIP", Tok::Keyword) && line_has(&v[4], "TRIG", Tok::Var));
+        assert!(!v[4].iter().any(|t| t.0.contains("SFAN")), "keystrokes aren't a point: {:?}", v[4]);
+        assert!(line_has(&v[5], "ONERR", Tok::Keyword));
+        assert!(!v.iter().flatten().any(|t| t.1 == Tok::Error && t.0 != "UNKNOWN"), "{v:?}");
+        // the dot: only the eleven operators split a word
+        has(Lang::Ppcl, "\"ROOM.MIN.TEMP\" = A.ROOT.B", &[("\"ROOM.MIN.TEMP\"", Tok::Var), ("A", Tok::Var), ("B", Tok::Var)]);
+        has(Lang::Ppcl, "00010     X = ROOM.MIN.TEMP", &[("ROOM.MIN.TEMP", Tok::Error)]);
+        // a command PPCL doesn't have stays plain
+        assert!(toks(Lang::Ppcl, "00010     FOO(1)", State::START).iter().all(|t| t.0 != "FOO"));
+    }
+
+    #[test]
+    fn ppcl_mistakes_in_red() {
+        let err = |text: &str, want: &str| has(Lang::Ppcl, text, &[(want, Tok::Error)]);
+        err("00010     SET(1,\"OPEN", "\"OPEN");
+        err("00010     GOTO END", "GOTO");
+        err("00010     IF(X .EQ. 1) THEN GOSUB", "GOSUB");
+        err("00010     GOTO 40000", "GOTO");
+        err("00010     IF(X .NOT. 1) THEN ON(\"A\")", ".NOT.");
+        err("00010     IF(X .EQ 1) THEN ON(\"A\")", ".EQ");
+        err("00010     SET(@HIGH,1,\"A\")", "@HIGH");
+        err("00010     ON(SUPPLYFAN)", "SUPPLYFAN");
+        // line numbers out of order, the same twice, or too big; the next one is compared with the one before it
+        let v = view(Lang::Ppcl, "00020     C\n00010     C\n00010     C\n00030     C\n40000     C\n00040     C\n");
+        let nums: Vec<Tok> = v.iter().map(|l| l[0].1).collect();
+        assert_eq!(nums, [Tok::Dim, Tok::Error, Tok::Error, Tok::Dim, Tok::Error, Tok::Dim]);
+        // a heading between programs, or a blank line, starts the count over; a heading gets no red
+        let v = view(Lang::Ppcl, "00020     C\nPROGRAM 2 Panel: PXCPANEL0001 \"open\n00010     C\n00020     C\n\r\n00010     C\n");
+        assert_eq!(v[2][0], ("00010".into(), Tok::Dim));
+        assert_eq!(v[5][0], ("00010".into(), Tok::Dim));
+        assert!(!v[1].iter().any(|t| t.1 == Tok::Error), "{:?}", v[1]);
+        // (a long name in quotes is quick)
+        let long = format!("00010     ON(\"{}%X%\")", "A".repeat(200_000));
+        assert!(toks(Lang::Ppcl, &long, State::START).iter().any(|t| t.1 == Tok::Type));
+    }
+
+    #[test]
+    fn ppcl_word_lists_are_sorted() {
+        use super::{PPCL_COMMANDS, PPCL_OPERATORS, PPCL_PRIORITIES, PPCL_VALUES, PPCL_WORDS};
+        for list in [&PPCL_COMMANDS[..], &PPCL_WORDS, &PPCL_VALUES, &PPCL_PRIORITIES, &PPCL_OPERATORS] {
+            for w in list.windows(2) {
+                assert!(w[0] < w[1], "{:?} before {:?}", String::from_utf8_lossy(w[0]), String::from_utf8_lossy(w[1]));
+            }
+            assert!(list.iter().all(|w| w.len() <= 12 && !w.iter().any(u8::is_ascii_lowercase)));
+        }
     }
 }

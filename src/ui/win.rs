@@ -1,4 +1,5 @@
-//! Small Windows helpers: dark title bar and menus, clipboard, file dialogs, prompts, Explorer.
+//! Small Windows helpers: dark title bar and menus, clipboard, file dialogs, prompts (`prompt.rs` draws them),
+//! Explorer.
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -148,6 +149,18 @@ pub fn caret_pos() -> Option<(i32, i32)> {
     let mut p = windows::Win32::Foundation::POINT::default();
     unsafe { windows::Win32::UI::WindowsAndMessaging::GetCaretPos(&mut p) }.ok()?;
     Some((p.x, p.y))
+}
+
+/// Lets a control take dark colors from its theme (uxtheme's unnamed export 133, AllowDarkModeForWindow, kept
+/// since 1809 like the ones below); nothing if it's missing.
+pub fn allow_dark(hwnd: HWND) {
+    unsafe {
+        let Ok(lib) = LoadLibraryW(w!("uxtheme.dll")) else { return };
+        if let Some(f) = GetProcAddress(lib, PCSTR(133usize as *const u8)) {
+            let f: extern "system" fn(HWND, BOOL) -> BOOL = std::mem::transmute(f);
+            let _ = f(hwnd, BOOL(1));
+        }
+    }
 }
 
 /// Dark popup menus. Uses uxtheme's unnamed exports (ordinals 135 and 136), which Windows has kept stable since
@@ -335,7 +348,7 @@ pub fn save_dialog(hwnd: HWND, name: &str, folder: Option<&Path>) -> Option<Path
 
 // ---- prompts ----
 
-/// A task dialog with custom buttons; returns the index of the chosen button, or None if dismissed.
+/// A prompt with custom buttons, in Slate's colors; returns the index of the chosen button, or None if dismissed.
 pub fn ask(hwnd: HWND, title: &str, main: &str, detail: &str, buttons: &[&str]) -> Option<usize> {
     if let Some(a) = scripted(|s| {
         s.asked.push(main.to_string());
@@ -343,6 +356,10 @@ pub fn ask(hwnd: HWND, title: &str, main: &str, detail: &str, buttons: &[&str]) 
     }) {
         return a;
     }
+    if let Ok(a) = super::prompt::ask(hwnd, title, main, detail, buttons) {
+        return a;
+    }
+    // (Windows' own, should Slate's not open)
     let title_w = HSTRING::from(title);
     let main_w = HSTRING::from(main);
     let detail_w = HSTRING::from(detail);
@@ -377,6 +394,9 @@ pub fn ask(hwnd: HWND, title: &str, main: &str, detail: &str, buttons: &[&str]) 
 
 pub fn info(hwnd: HWND, title: &str, text: &str) {
     if scripted(|s| s.asked.push(title.to_string())).is_some() {
+        return;
+    }
+    if super::prompt::ask(hwnd, title, "", text, &["OK"]).is_ok() {
         return;
     }
     unsafe {

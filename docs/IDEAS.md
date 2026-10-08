@@ -4,7 +4,7 @@ New ideas go here first. Once one is planned it moves to [ROADMAP.md](ROADMAP.md
 sizes of everything that's coming.
 
 ## Not planned yet
-- (empty: everything so far is in the roadmap)
+- PPCL: go to the line a `GOTO` or `GOSUB` names (F12 or Ctrl+click), and mark a `GOTO` whose line isn't there (S).
 
 ## Done
 - JSON structure panel and path bar (lazy, fine with 800 MB files).
@@ -17,3 +17,5 @@ sizes of everything that's coming.
 - XML path bar and structure panel; colors for ~45 file types (VBScript/VBA, AutoHotkey, TOML, nginx, Apache, Perl,
   R, Terraform/HCL, CMake, properties, subtitles, calendars, VS solutions), Markdown code blocks in their language,
   better detection by name, folder and content (0.4.0).
+- PPCL (Siemens APOGEE and Desigo): colored much as Desigo shows it, simple mistakes in red, its exports recognized,
+  Toggle comment after the line numbers; prompts in dark mode (0.5.0).

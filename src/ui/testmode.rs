@@ -34,7 +34,8 @@
 //! `persist` (write settings and the session; only with `SLATE_DATA_DIR` set, never into the real data folder),
 //! `session:save|soon|restore` (write the session now / on another thread as the timer does / restore it), `guest`
 //! (as if another Slate was running but didn't answer: nothing is kept for next time), `crash` (a native crash, to
-//! try the minidump; the run ends there).
+//! try the minidump; the run ends there), `prompt:<file.png>|save|update|info` (draws that prompt into a PNG, in the
+//! theme's colors, without showing it).
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -267,6 +268,71 @@ fn screen_shot(cell: &Cell, path: &Path) -> Result<(), String> {
         r.map_err(|e| e.to_string())?;
         write_png(path, w as u32, h as u32, &px).map_err(|e| e.to_string())
     }
+}
+
+/// Draws a prompt (`save`, `update` or `info`, as Slate would show it) into a PNG, without showing it: the dialog's
+/// background, then each of its controls where it is.
+fn prompt_shot(owner: HWND, path: &Path, kind: &str) -> Result<(), String> {
+    use windows::Win32::Foundation::{LPARAM, POINT, RECT, WPARAM};
+    use windows::Win32::Graphics::Gdi::*;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GW_CHILD, GW_HWNDNEXT, GetClientRect, GetWindow, GetWindowRect, PRF_CLIENT, PRF_ERASEBKGND, PRF_NONCLIENT,
+        SendMessageW, WM_PRINT,
+    };
+    let (title, main, detail, buttons): (&str, &str, &str, &[&str]) = match kind {
+        "info" => ("About Slate", "", "Slate 0.5.0\n\nA fast, simple text editor that opens files of any size. MIT license.", &["OK"]),
+        "update" => (
+            "Slate",
+            "Slate 0.5.0 is available",
+            "You have 0.4.0. Slate downloads the new version from GitHub and restarts; your tabs and unsaved changes come back.",
+            &["Update and restart", "What's new", "Not now"],
+        ),
+        _ => ("Slate", "Do you want to save changes to notes.txt?", "", &["&Save", "Do&n't save", "Cancel"]),
+    };
+    let mut result = Err("the prompt wasn't made".to_string());
+    super::prompt::render(owner, title, main, detail, buttons, |dlg, _| unsafe {
+        let mut rc = RECT::default();
+        let _ = GetClientRect(dlg, &mut rc);
+        let (w, h) = (rc.right.max(1), rc.bottom.max(1));
+        let mut origin = POINT { x: 0, y: 0 };
+        let _ = ClientToScreen(dlg, &mut origin);
+        let screen = GetDC(None);
+        let mem = CreateCompatibleDC(screen);
+        let bmi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: w,
+                biHeight: -h,
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut bits = std::ptr::null_mut();
+        result = (|| {
+            let dib = CreateDIBSection(mem, &bmi, DIB_RGB_COLORS, &mut bits, None, 0).map_err(|e| e.to_string())?;
+            let old = SelectObject(mem, dib);
+            SendMessageW(dlg, WM_PRINT, WPARAM(mem.0 as usize), LPARAM((PRF_CLIENT | PRF_ERASEBKGND) as isize));
+            let mut child = GetWindow(dlg, GW_CHILD).ok();
+            while let Some(c) = child {
+                let mut r = RECT::default();
+                let _ = GetWindowRect(c, &mut r);
+                let _ = SetViewportOrgEx(mem, r.left - origin.x, r.top - origin.y, None);
+                SendMessageW(c, WM_PRINT, WPARAM(mem.0 as usize), LPARAM((PRF_CLIENT | PRF_ERASEBKGND | PRF_NONCLIENT) as isize));
+                child = GetWindow(c, GW_HWNDNEXT).ok();
+            }
+            let _ = SetViewportOrgEx(mem, 0, 0, None);
+            let px = std::slice::from_raw_parts(bits as *const u8, (w * h * 4) as usize).to_vec();
+            SelectObject(mem, old);
+            let _ = DeleteObject(dib);
+            write_png(path, w as u32, h as u32, &px).map_err(|e| e.to_string())
+        })();
+        let _ = DeleteDC(mem);
+        ReleaseDC(None, screen);
+    });
+    result
 }
 
 /// Renders the window offscreen and writes a PNG.
@@ -682,6 +748,14 @@ pub fn run(args: &[String]) -> i32 {
                 let r = if visible { screen_shot(&cell, Path::new(arg)) } else { shot(&cell, Path::new(arg)) };
                 if let Err(e) = r {
                     out.push_str(&format!("shot failed: {e}\n"));
+                    failures += 1;
+                }
+            }
+            "prompt" => {
+                let (file, kind) = arg.split_once('|').unwrap_or((arg, "save"));
+                let hwnd = cell.borrow().hwnd;
+                if let Err(e) = prompt_shot(hwnd, Path::new(file), kind) {
+                    out.push_str(&format!("prompt failed: {e}\n"));
                     failures += 1;
                 }
             }
