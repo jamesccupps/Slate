@@ -19,7 +19,16 @@ jobs:
       # link with the toolchain's own MinGW files (rust-mingw), whatever else the runner has on its PATH
       RUSTFLAGS: -Clink-self-contained=yes
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
+
+      - name: The tag matches Cargo.toml's version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          # Slate's updater compares the release tag with the version built into Slate.exe: if they differ, every
+          # Slate would download this release again every day.
+          $v = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          if ("v$v" -ne "${{ github.ref_name }}") { throw "The tag ${{ github.ref_name }} doesn't match Cargo.toml's version ($v)" }
 
       - name: Rust (GNU toolchain, no Visual Studio needed)
         shell: pwsh
@@ -34,6 +43,18 @@ jobs:
       - name: Build
         run: cargo build --release
 
+      - name: Smoke test (the built Slate.exe, in its test mode)
+        shell: pwsh
+        run: |
+          # Starts the exe users get, types, formats, saves and renders offscreen (tests\smoke.txt).
+          $dir = Join-Path $env:RUNNER_TEMP smoke
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          $env:SLATE_DATA_DIR = Join-Path $dir data
+          $env:SLATE_TEST_LOG = Join-Path $dir log.txt
+          $p = Start-Process -FilePath target\release\Slate.exe -ArgumentList '--test', "$PWD\tests\smoke.txt" -WorkingDirectory $dir -Wait -PassThru -NoNewWindow
+          if (Test-Path $env:SLATE_TEST_LOG) { Get-Content $env:SLATE_TEST_LOG }
+          if ($p.ExitCode -ne 0) { throw "The smoke test failed (exit code $($p.ExitCode))" }
+
       - name: Package
         shell: pwsh
         run: |
@@ -43,7 +64,7 @@ jobs:
           "$hash  Slate.exe" | Out-File -FilePath out\Slate.exe.sha256 -Encoding ascii -NoNewline
           Get-Content out\Slate.exe.sha256
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: Slate
           path: out/
@@ -54,4 +75,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${{ github.ref_name }}" out\Slate.exe out\Slate.exe.sha256 --draft --title "Slate ${{ github.ref_name }}" --generate-notes
+          $tag = "${{ github.ref_name }}"
+          # The notes come from docs/release-notes-<version>.md when there is one.
+          $notes = "docs/release-notes-$($tag.TrimStart('v')).md"
+          $opts = if (Test-Path $notes) { @('--notes-file', $notes) } else { @('--generate-notes') }
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            # Run again (the release is there already): replace its files.
+            gh release upload $tag out\Slate.exe out\Slate.exe.sha256 --clobber
+          } else {
+            gh release create $tag out\Slate.exe out\Slate.exe.sha256 --draft --title "Slate $tag" @opts
+          }

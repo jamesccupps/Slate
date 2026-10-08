@@ -20,24 +20,44 @@ smoothly, and can be searched, edited, formatted and saved.
 - Detects and keeps the encoding (UTF-8, UTF-8 BOM, UTF-16, ANSI) and line endings (CRLF / LF).
 - Notices when another program changes an open file; reloads it automatically when you have no unsaved changes
   (handy for log files).
-- A single small `Slate.exe` with nothing to install. *Help → Open files with Slate…* adds it to "Open with" and
-  the right-click menu.
-- Keeps itself up to date: it checks GitHub once a day, and when there's a new version an *Update* button appears
-  in the status bar. One click downloads it, checks it against the release's checksum and restarts Slate with your
-  tabs (and their unsaved text) back where they were. *Help → Check for updates* does it on demand.
+- A single small `Slate.exe` that runs from any folder. *Help → Open files with Slate…* adds it to "Open with",
+  the Start menu and the right-click menu.
+- Keeps itself up to date: at most once a day it asks GitHub for the latest release, and when there's a newer one
+  an *Update* button appears in the status bar. One click downloads it, checks it against the release's checksum
+  and restarts Slate with your tabs (and their unsaved text) back where they were. If the new version can't start,
+  the old one comes back by itself. *Help → Check for updates* does it on demand.
 
 ## Download
 
 Get `Slate.exe` from the [latest release](https://github.com/jamesccupps/Slate/releases/latest) and run it from
-any folder.
+any folder. It needs 64-bit Windows 10 or 11.
+
+Slate isn't code-signed yet, so the first time you run it Windows may show "Windows protected your PC"; choose
+*More info* → *Run anyway*. Each release lists the SHA-256 of `Slate.exe` (in `Slate.exe.sha256`) if you want to
+check the download.
+
+## Where Slate keeps things
+
+- Settings, the session (open tabs and unsaved text) and `crash.log` are in `%LOCALAPPDATA%\Slate`.
+- **Portable mode:** put an empty file named `Slate.portable` next to `Slate.exe`, and Slate keeps all of that, and
+  its temporary files, in a `data` folder beside it instead (handy on a USB stick or a fast drive).
+- Slate running as administrator keeps its own session, apart from the normal one.
+
+## Updates and privacy
+
+The update check is one request to `api.github.com` for the latest release of this repository; it sends nothing
+about you or your files. Turn it off with *Help → Check for updates automatically*. Slate doesn't send anything
+else anywhere.
+
+## Uninstalling
+
+If you used *Open files with Slate…*: Windows Settings → Apps → Installed apps → Slate → Uninstall. Then delete
+Slate's folder, and `%LOCALAPPDATA%\Slate` (or the portable `data` folder) if you don't need your settings and
+unsaved text any more. Otherwise just delete `Slate.exe`.
 
 ## Building
 
 Needs Rust (the GNU toolchain is enough; no Visual Studio). Run `build.cmd`, which produces `dist\Slate.exe`.
-`cargo test --lib` runs the engine's tests. GitHub Actions builds and tests every push; a version tag (`v1.2.3`)
-drafts a release with `Slate.exe` and `Slate.exe.sha256` attached.
-
-## Portable mode
-
-Put an empty file named `Slate.portable` next to `Slate.exe`, and Slate keeps its settings, session and temporary
-files in a `data` folder beside it instead of `%LOCALAPPDATA%\Slate` and `%TEMP%`.
+`cargo test --lib` runs the engine's tests, and `Slate.exe --test tests\smoke.txt` drives the real app offscreen.
+GitHub Actions builds and tests every push; a version tag (`v1.2.3`) drafts a release with `Slate.exe` and
+`Slate.exe.sha256` attached. What's planned is in [docs/ROADMAP.md](docs/ROADMAP.md).

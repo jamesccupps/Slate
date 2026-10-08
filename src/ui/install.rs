@@ -91,12 +91,26 @@ fn install_exe() -> std::io::Result<PathBuf> {
     if dest.exists() && crate::core::io::same_file(&me, &dest) {
         return Ok(dest);
     }
+    // Copied under another name first: if that fails, the installed Slate is still as it was.
+    let tmp = dir.join(format!("Slate.update-{}.exe", std::process::id()));
+    if let Err(e) = std::fs::copy(&me, &tmp) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
     if dest.exists() {
         // Windows lets a running exe be renamed but not overwritten.
         let old = dir.join(format!("Slate.old-{}.exe", std::process::id()));
-        std::fs::rename(&dest, &old)?;
+        if let Err(e) = std::fs::rename(&dest, &old) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+        if let Err(e) = std::fs::rename(&tmp, &dest) {
+            let _ = std::fs::rename(&old, &dest);
+            return Err(e);
+        }
+    } else {
+        std::fs::rename(&tmp, &dest)?;
     }
-    std::fs::copy(&me, &dest)?;
     Ok(dest)
 }
 
@@ -198,7 +212,8 @@ pub fn make_default(cell: &Cell) {
     cell.borrow_mut().flash("Slate is set up. Pick it in Default apps for the file types you want.", false);
 }
 
-/// `Slate.exe --uninstall`: removes what `make_default` added (the program folder is removed at the next sign-in).
+/// `Slate.exe --uninstall` (Settings → Apps → Slate → Uninstall): removes what `make_default` added. Slate's folder
+/// and its data folder stay; the message says where they are.
 pub fn uninstall() {
     use windows::Win32::System::Registry::RegDeleteTreeW;
     unsafe {
@@ -230,6 +245,15 @@ pub fn uninstall() {
             let _ = std::fs::remove_file(PathBuf::from(appdata).join(r"Microsoft\Windows\Start Menu\Programs\Slate.lnk"));
         }
         SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, None, None);
-        win::info(windows::Win32::Foundation::HWND::default(), "Slate", "Slate was removed from your account's settings. You can now delete Slate's folder.");
+        let folder = super::settings::exe_dir().map(|d| d.display().to_string()).unwrap_or_default();
+        let data = super::settings::data_dir().display().to_string();
+        win::info(
+            windows::Win32::Foundation::HWND::default(),
+            "Slate",
+            &format!(
+                "Slate was removed from your account's settings. You can now delete its folder ({folder}).\n\nYour settings \
+                 and unsaved text are in {data}; delete that folder too if you don't need them."
+            ),
+        );
     }
 }

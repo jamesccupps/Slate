@@ -7,6 +7,51 @@ use std::thread::JoinHandle;
 /// Wakes the UI thread (posts a window message); called when a job finishes.
 pub type Notify = Arc<dyn Fn() + Send + Sync>;
 
+/// What a job gives back when its work panicked (the panic hook has logged it), so the UI handles it like any
+/// other failure instead of waiting forever.
+pub trait Failure {
+    fn failure(msg: &str) -> Self;
+}
+
+/// The message for a job that panicked.
+pub const FAILED: &str = "Something went wrong (details in crash.log in the settings folder)";
+
+impl Failure for bool {
+    fn failure(_: &str) -> bool {
+        false
+    }
+}
+impl<T> Failure for Option<T> {
+    fn failure(_: &str) -> Self {
+        None
+    }
+}
+impl<T> Failure for Vec<T> {
+    fn failure(_: &str) -> Self {
+        Vec::new()
+    }
+}
+impl<T> Failure for Result<T, String> {
+    fn failure(msg: &str) -> Self {
+        Err(msg.to_string())
+    }
+}
+impl<T> Failure for std::io::Result<T> {
+    fn failure(msg: &str) -> Self {
+        Err(std::io::Error::other(msg.to_string()))
+    }
+}
+impl<T> Failure for Result<T, super::io::SaveError> {
+    fn failure(msg: &str) -> Self {
+        Err(super::io::SaveError::Io(msg.to_string()))
+    }
+}
+impl Failure for super::search::Found {
+    fn failure(_: &str) -> Self {
+        super::search::Found { count: 0, positions: Vec::new(), complete: false }
+    }
+}
+
 pub struct Ctx {
     pub cancel: Arc<AtomicBool>,
     pub progress: Arc<AtomicU64>,
@@ -29,7 +74,7 @@ pub struct Job<T> {
     handle: Option<JoinHandle<()>>,
 }
 
-impl<T: Send + 'static> Job<T> {
+impl<T: Failure + Send + 'static> Job<T> {
     pub fn spawn(total: u64, notify: Notify, f: impl FnOnce(&Ctx) -> T + Send + 'static) -> Job<T> {
         let progress = Arc::new(AtomicU64::new(0));
         let cancel = Arc::new(AtomicBool::new(false));
@@ -39,7 +84,7 @@ impl<T: Send + 'static> Job<T> {
         let handle = std::thread::Builder::new()
             .name("slate-job".into())
             .spawn(move || {
-                let r = f(&ctx);
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&ctx))).unwrap_or_else(|_| T::failure(FAILED));
                 *slot.lock().unwrap() = Some(r);
                 notify();
             })
@@ -70,6 +115,14 @@ impl<T: Send + 'static> Job<T> {
         r
     }
 
+    /// Waits for the job to finish and returns its result.
+    pub fn wait(&mut self) -> Option<T> {
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+        self.result.lock().unwrap().take()
+    }
+
     pub fn cancel(&self) {
         self.cancel.store(true, Ordering::Relaxed);
     }
@@ -79,5 +132,16 @@ impl<T> Drop for Job<T> {
     fn drop(&mut self) {
         // Dropping a job cancels it; the thread finishes on its own.
         self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_job_that_panics_reports_a_failure() {
+        let mut j = Job::spawn(0, Arc::new(|| {}), |_| -> Result<u32, String> { panic!("boom") });
+        assert_eq!(j.wait(), Some(Err(FAILED.to_string())));
     }
 }

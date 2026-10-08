@@ -225,6 +225,17 @@ impl Document {
         self.pending.as_ref().map(|(s, _)| s.clone())
     }
 
+    /// Why the index of a pending document couldn't be finished (see `Source::build_index`). It then stays
+    /// pending (readable, not editable) until it is opened again.
+    pub fn index_error(&self) -> Option<String> {
+        self.pending.as_ref().and_then(|(s, _)| s.index_error())
+    }
+
+    /// The files (not memory) the current text is read from: a big file, or the file it was last saved to.
+    pub fn file_sources(&self) -> Vec<Arc<Source>> {
+        self.buf.file_sources()
+    }
+
     pub fn is_dirty(&self) -> bool {
         self.saved != Some(self.state)
     }

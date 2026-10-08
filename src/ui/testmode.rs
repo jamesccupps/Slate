@@ -8,7 +8,8 @@
 //! Commands: `size:1200x800`, `theme:dark|light`, `open:<path>`, `type:<text>` (`\n`, `\r` and `\t` allowed),
 //! `key:<combo>` (e.g. `ctrl+shift+k`, `enter`, `pagedown`, `apps`), `cmd:<Name>` (a menu command, e.g. `JsonFormat`),
 //! `find:<text>`, `replace:<text>`, `goto:<line>`, `saveas:<path>`, `click:<x>,<y>`, `dblclick:<x>,<y>`,
-//! `wheel:<rows>`, `wait:<ms>`, `jobs` (wait for background work), `shot:<file.png>`, `print:<what>`
+//! `wheel:<rows>`, `wait:<ms>`, `jobs` (wait for background work), `checkdisk` (look for files changed on disk,
+//! as the window does every 2 s; then `jobs`), `shot:<file.png>`, `print:<what>`
 //! (`text`, `sel`, `status`, `lines`, `title`, `top`, `find`, `tabs`, `dirty`, `asked`, `clipboard`, `window`,
 //! `saving`), `expect:<what>=<value>`, `answer:save,dont,cancel` (answers for the next prompts, which are never
 //! shown in this mode; `asked` lists the prompts so far), `set:restore_session=true`.
@@ -79,7 +80,9 @@ fn busy(cell: &Cell) -> bool {
             || t.search.job.is_some()
             || t.find_job.is_some()
             || t.structure.busy()
-    }) || matches!(a.update, super::app::UpdateState::Checking { .. } | super::app::UpdateState::Downloading { .. })
+    }) || a.disk_job.is_some()
+        || matches!(a.update, super::app::UpdateState::Checking { .. } | super::app::UpdateState::Downloading { .. })
+        || a.session_job.is_some()
 }
 
 fn vk_of(name: &str) -> Option<u16> {
@@ -579,6 +582,8 @@ pub fn run(args: &[String]) -> i32 {
                 a.hover = Hit::None;
             }
             "wait" => pump(&cell, arg.parse().unwrap_or(100)),
+            // What the timer does every 2 s in the real window (follow with `jobs`).
+            "checkdisk" => cell.borrow_mut().check_disk(),
             "endsession" => {
                 // What a shutdown asks: may the session end? Then "it isn't ending after all".
                 use windows::Win32::Foundation::{LPARAM, WPARAM};
@@ -638,13 +643,25 @@ pub fn run(args: &[String]) -> i32 {
                 mark = now;
             }
             "temp" => crate::core::source::set_temp_dir(PathBuf::from(arg)),
-            "persist" => super::settings::NO_PERSIST.store(false, std::sync::atomic::Ordering::Relaxed),
+            "persist" => {
+                // Only into a data folder of the test's own: never the real settings and session.
+                if std::env::var_os("SLATE_DATA_DIR").is_some() {
+                    super::settings::NO_PERSIST.store(false, std::sync::atomic::Ordering::Relaxed);
+                } else {
+                    out.push_str("persist needs SLATE_DATA_DIR\n");
+                    failures += 1;
+                }
+            }
             "session" => {
                 let mut a = cell.borrow_mut();
                 match arg {
                     "save" => {
                         a.settings.restore_session = true;
                         a.save_session();
+                    }
+                    "soon" => {
+                        a.settings.restore_session = true;
+                        a.save_session_soon();
                     }
                     _ => {
                         a.settings.restore_session = true;

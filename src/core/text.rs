@@ -43,8 +43,15 @@ impl Encoding {
     }
 }
 
+/// The code page "ANSI" stands for: the system's, except with the "Use Unicode UTF-8 for worldwide language
+/// support" option (code page 65001), where files that aren't UTF-8 are taken as Windows-1252, the code page most
+/// of them were written in (and one in which every byte converts back to itself).
 pub fn ansi_codepage() -> u32 {
-    unsafe { GetACP() }
+    effective_codepage(unsafe { GetACP() })
+}
+
+fn effective_codepage(acp: u32) -> u32 {
+    if acp == 65001 { 1252 } else { acp }
 }
 
 fn ansi_name() -> String {
@@ -118,7 +125,138 @@ pub fn detect_encoding(sample: &[u8], truncated: bool) -> (Encoding, usize) {
         Ok(_) => (Encoding::Utf8, 0),
         // A sequence cut off by the end of the sample is fine.
         Err(e) if e.error_len().is_none() && truncated => (Encoding::Utf8, 0),
+        // Mostly UTF-8 with a few bad bytes (a damaged file, a line pasted in from elsewhere): as UTF-8 every byte
+        // stays as it is (the bad ones show as symbols), where reading it all as ANSI would garble each character.
+        Err(_) if mostly_utf8(sample, truncated) => (Encoding::Utf8, 0),
         Err(_) => (Encoding::Ansi, 0),
+    }
+}
+
+/// Whether `bytes` has some multi-byte UTF-8 characters, and at least as many of them as invalid sequences.
+fn mostly_utf8(bytes: &[u8], truncated: bool) -> bool {
+    let (mut good, mut bad) = (0usize, 0usize);
+    let mut rest = bytes;
+    loop {
+        match std::str::from_utf8(rest) {
+            Ok(s) => {
+                good += s.bytes().filter(|&b| b >= 0xC0).count();
+                break;
+            }
+            Err(e) => {
+                let valid = e.valid_up_to();
+                good += rest[..valid].iter().filter(|&&b| b >= 0xC0).count();
+                match e.error_len() {
+                    Some(n) => {
+                        bad += 1;
+                        rest = &rest[valid + n..];
+                    }
+                    None => {
+                        bad += !truncated as usize;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    good > 0 && good >= bad
+}
+
+/// Whether `text` (decoded from `bytes` in the ANSI code page) converts back to exactly `bytes`. Only then can a
+/// file be read as ANSI without saving it changing bytes nobody edited: in Windows-1252 every byte does, but in
+/// the double-byte code pages (Japanese, Chinese, Korean) not every byte sequence is text.
+pub fn ansi_round_trips(text: &[u8], bytes: &[u8]) -> bool {
+    round_trips_cp(text, bytes, ansi_codepage())
+}
+
+fn round_trips_cp(text: &[u8], bytes: &[u8], cp: u32) -> bool {
+    let mut enc = AnsiEncoder::with_codepage(cp);
+    let mut back = Vec::new();
+    let mut at = 0;
+    for chunk in text.chunks(1 << 20) {
+        back.clear();
+        enc.push(chunk, &mut back);
+        if bytes.get(at..at + back.len()) != Some(&back[..]) {
+            return false;
+        }
+        at += back.len();
+    }
+    back.clear();
+    enc.finish(&mut back);
+    !enc.lossy && bytes.get(at..) == Some(&back[..])
+}
+
+/// Whether the start of a file (`truncated`: more follows) reads as ANSI and converts back to the same bytes.
+pub fn ansi_fits(sample: &[u8], truncated: bool) -> bool {
+    fits_cp(sample, truncated, ansi_codepage())
+}
+
+fn fits_cp(sample: &[u8], truncated: bool, cp: u32) -> bool {
+    let mut dec = AnsiDecoder::with_codepage(cp);
+    let mut text = Vec::with_capacity(sample.len() + sample.len() / 2);
+    dec.push(sample, &mut text);
+    // (a double-byte character cut off by the end of the sample waits in the decoder: leave it out)
+    let held = if truncated {
+        dec.pending.take().is_some() as usize
+    } else {
+        dec.finish(&mut text);
+        0
+    };
+    round_trips_cp(&text, &sample[..sample.len() - held], cp)
+}
+
+/// While a file is converted from the ANSI code page (in chunks): checks that the text converts back to exactly
+/// the file's bytes.
+pub struct AnsiCheck {
+    enc: AnsiEncoder,
+    /// File bytes that converted-back text hasn't matched yet.
+    ahead: Vec<u8>,
+    ok: bool,
+}
+
+impl Default for AnsiCheck {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AnsiCheck {
+    pub fn new() -> Self {
+        AnsiCheck { enc: AnsiEncoder::new(), ahead: Vec::new(), ok: true }
+    }
+
+    /// `input`: bytes given to the decoder; `text`: what it made of them.
+    pub fn push(&mut self, input: &[u8], text: &[u8]) {
+        if !self.ok {
+            return;
+        }
+        self.ahead.extend_from_slice(input);
+        let mut back = Vec::with_capacity(text.len());
+        self.enc.push(text, &mut back);
+        self.eat(&back);
+    }
+
+    /// Whether everything so far converted back exactly.
+    pub fn ok(&self) -> bool {
+        self.ok
+    }
+
+    /// After the decoder's last output (`text`): whether everything converted back exactly.
+    pub fn finish(mut self, text: &[u8]) -> bool {
+        if self.ok {
+            let mut back = Vec::new();
+            self.enc.push(text, &mut back);
+            self.enc.finish(&mut back);
+            self.eat(&back);
+        }
+        self.ok && self.ahead.is_empty() && !self.enc.lossy
+    }
+
+    fn eat(&mut self, back: &[u8]) {
+        if self.ahead.starts_with(back) {
+            self.ahead.drain(..back.len());
+        } else {
+            self.ok = false;
+        }
     }
 }
 
@@ -277,7 +415,10 @@ impl Default for AnsiDecoder {
 
 impl AnsiDecoder {
     pub fn new() -> Self {
-        let cp = ansi_codepage();
+        Self::with_codepage(ansi_codepage())
+    }
+
+    fn with_codepage(cp: u32) -> Self {
         let mut lead = [false; 256];
         let mut info = CPINFO::default();
         let mut dbcs = false;
@@ -357,11 +498,14 @@ fn ansi_to_utf8_cp(bytes: &[u8], cp: u32) -> Vec<u8> {
 /// Converts UTF-8 text to the system code page. Returns the bytes and whether some characters couldn't be
 /// represented (they become `?`).
 pub fn utf8_to_ansi(text: &[u8]) -> (Vec<u8>, bool) {
+    utf8_to_cp(text, ansi_codepage())
+}
+
+fn utf8_to_cp(text: &[u8], cp: u32) -> (Vec<u8>, bool) {
     if text.is_ascii() {
         return (text.to_vec(), false);
     }
     let wide: Vec<u16> = String::from_utf8_lossy(text).encode_utf16().collect();
-    let cp = ansi_codepage();
     let mut lossy = windows::Win32::Foundation::BOOL(0);
     let n = unsafe {
         WideCharToMultiByte(cp, WC_NO_BEST_FIT_CHARS, &wide, None, PCSTR::null(), Some(&mut lossy as *mut _))
@@ -373,6 +517,7 @@ pub fn utf8_to_ansi(text: &[u8]) -> (Vec<u8>, bool) {
 
 /// Splits UTF-8 into chunks at character boundaries for the ANSI encoder (streaming).
 pub struct AnsiEncoder {
+    cp: u32,
     pending: Vec<u8>,
     pub lossy: bool,
 }
@@ -385,7 +530,11 @@ impl Default for AnsiEncoder {
 
 impl AnsiEncoder {
     pub fn new() -> Self {
-        AnsiEncoder { pending: Vec::new(), lossy: false }
+        Self::with_codepage(ansi_codepage())
+    }
+
+    fn with_codepage(cp: u32) -> Self {
+        AnsiEncoder { cp, pending: Vec::new(), lossy: false }
     }
     pub fn push(&mut self, input: &[u8], out: &mut Vec<u8>) {
         self.pending.extend_from_slice(input);
@@ -403,13 +552,13 @@ impl AnsiEncoder {
             }
         }
         let rest = self.pending.split_off(cut);
-        let (bytes, lossy) = utf8_to_ansi(&self.pending);
+        let (bytes, lossy) = utf8_to_cp(&self.pending, self.cp);
         self.lossy |= lossy;
         out.extend_from_slice(&bytes);
         self.pending = rest;
     }
     pub fn finish(&mut self, out: &mut Vec<u8>) {
-        let (bytes, lossy) = utf8_to_ansi(&self.pending);
+        let (bytes, lossy) = utf8_to_cp(&self.pending, self.cp);
         self.lossy |= lossy;
         out.extend_from_slice(&bytes);
         self.pending.clear();
@@ -680,6 +829,44 @@ mod tests {
         assert_eq!(detect_eol(b"a\r\nb\r\nc\n"), Eol::Crlf);
         assert_eq!(detect_eol(b"a\nb\nc\r\n"), Eol::Lf);
         assert_eq!(detect_eol(b"abc"), Eol::Crlf);
+    }
+
+    #[test]
+    fn ansi_only_when_it_converts_back() {
+        // UTF-8 with one bad byte stays UTF-8; text with only Windows-1252 accents is ANSI
+        let mut damaged = "Grüße – naïve café ✓ 日本語\r\n".repeat(10).into_bytes();
+        damaged.push(0xFF);
+        assert_eq!(detect_encoding(&damaged, false), (Encoding::Utf8, 0));
+        let latin1 = b"caf\xE9 cr\xE8me br\xFBl\xE9e\r\n".repeat(10);
+        assert_eq!(detect_encoding(&latin1, false), (Encoding::Ansi, 0));
+        // every Windows-1252 byte converts back to itself...
+        let all: Vec<u8> = (0..=255).collect();
+        assert!(fits_cp(&all, false, 1252));
+        assert!(fits_cp(&latin1, false, 1252));
+        // ...but in a double-byte code page (Japanese) not every byte sequence is text: not taken as ANSI there
+        let mut not_sjis = "naïve café ✓\r\n".repeat(10).into_bytes();
+        not_sjis.push(0xFF);
+        assert!(!fits_cp(&not_sjis, false, 932));
+        let (sjis, lossy) = utf8_to_cp("日本語のテキスト\r\n".repeat(10).as_bytes(), 932);
+        assert!(!lossy && fits_cp(&sjis, false, 932));
+        // (cut in the middle of a double-byte character at the end of a sample: fine)
+        assert!(fits_cp(&sjis[..sjis.len() - 3], true, 932));
+        // the "UTF-8 for worldwide language support" option: ANSI means Windows-1252 then
+        assert_eq!(effective_codepage(65001), 1252);
+        assert_eq!(effective_codepage(932), 932);
+        // the streaming check used while converting big files, fed in pieces
+        if ansi_codepage() == 1252 {
+            let mut check = AnsiCheck::new();
+            let mut dec = AnsiDecoder::new();
+            for part in latin1.chunks(7) {
+                let mut text = Vec::new();
+                dec.push(part, &mut text);
+                check.push(part, &text);
+            }
+            let mut text = Vec::new();
+            dec.finish(&mut text);
+            assert!(check.finish(&text));
+        }
     }
 
     #[test]

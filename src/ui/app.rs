@@ -51,6 +51,16 @@ pub struct SaveTask {
     pub again: bool,
 }
 
+/// What a background look at a tab's file found (see `App::check_disk`).
+pub struct DiskCheck {
+    pub id: u64,
+    /// The document's `disk` when the check started.
+    pub old: crate::core::document::DiskInfo,
+    pub now: Option<crate::core::document::DiskInfo>,
+    /// Another program wrote into a file the (unsaved) text is read from: the text isn't the user's any more.
+    pub in_place: bool,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TaskKind {
     Format(Fmt),
@@ -86,6 +96,12 @@ pub enum TaskResult {
     FormatError { offset: u64, msg: String },
     Failed(String),
     Cancelled,
+}
+
+impl crate::core::job::Failure for TaskResult {
+    fn failure(msg: &str) -> Self {
+        TaskResult::Failed(msg.to_string())
+    }
 }
 
 pub struct Task {
@@ -158,6 +174,11 @@ pub struct Tab {
     pub indent_picked: bool,
     /// A name for a tab that isn't a file (the keyboard shortcuts).
     pub title_override: Option<String>,
+    /// A save stopped because ANSI can't hold some characters: (path, close after, closing the window), for the
+    /// question that follows (`Deferred::AskLossy`).
+    pub ask_lossy: Option<(PathBuf, bool, bool)>,
+    /// The document's path and its canonical form, worked out once (for "is this file open already?").
+    pub canon: Option<(PathBuf, Option<PathBuf>)>,
 }
 
 impl Tab {
@@ -185,6 +206,8 @@ impl Tab {
             indent: None,
             indent_picked: false,
             title_override: None,
+            ask_lossy: None,
+            canon: None,
         }
     }
 
@@ -218,6 +241,8 @@ pub enum Deferred {
     StatusMenu(StatusItem),
     /// "Slate x.y.z is available — update?"
     UpdatePrompt,
+    /// Saving tab (id) as ANSI would turn some characters into "?": save as UTF-8, as ANSI anyway, or not.
+    AskLossy(u64),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -236,7 +261,7 @@ pub enum UpdateState {
     /// Asking GitHub; `manual`: from the Help menu (so say what came out of it).
     Checking { manual: bool, job: Job<Result<Release, String>> },
     Available(Release),
-    Downloading { release: Release, job: Job<Result<std::path::PathBuf, String>> },
+    Downloading { release: Release, job: Job<Result<(), String>> },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -319,6 +344,8 @@ pub struct App {
     pub untitled_counter: u32,
     pub session_dirty: bool,
     pub last_session_save: Instant,
+    /// The session being written on another thread (while editing).
+    pub session_job: Option<Job<super::session::Outcome>>,
     pub mouse_tracking: bool,
     /// `g.generation` the cached layouts were made for.
     pub gfx_generation: u64,
@@ -333,6 +360,8 @@ pub struct App {
     pub line_clip: Option<u32>,
     /// The flash message came from searching (cleared when the search changes).
     pub flash_search: bool,
+    /// Looking at the open files on disk (a network drive that went away can take long to answer).
+    pub disk_job: Option<Job<Vec<DiskCheck>>>,
 }
 
 pub const ZOOM_STEPS: [f32; 15] = [0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0, 4.0, 5.0];
@@ -403,6 +432,7 @@ impl App {
             untitled_counter: 0,
             session_dirty: false,
             last_session_save: Instant::now(),
+            session_job: None,
             mouse_tracking: false,
             gfx_generation: 0,
             menu_armed: None,
@@ -410,6 +440,7 @@ impl App {
             wheel_zoom: 0,
             line_clip: None,
             flash_search: false,
+            disk_job: None,
         };
         app.apply_theme();
         app

@@ -1,0 +1,38 @@
+size:1000x600
+theme:light
+type:{"name": "Slate", "list": [1, 2, 3]}
+lang:JSON
+cmd:Format
+jobs
+expect:text={\r\n  "name": "Slate",\r\n  "list": [\r\n    1,\r\n    2,\r\n    3\r\n  ]\r\n}\r\n
+cmd:Undo
+expect:text={"name": "Slate", "list": [1, 2, 3]}
+cmd:Redo
+saveas:smoke.json
+jobs
+expect:dirty=false
+expect:title=smoke.json
+find:Slate
+jobs
+expect:find=1 of 1
+key:ctrl+end
+type:\n
+expect:dirty=true
+cmd:Save
+jobs
+expect:dirty=false
+shot:smoke-json.png
+cmd:NewTab
+type:<a><b>x</b></a>
+lang:XML
+cmd:Format
+jobs
+print:text
+cmd:NewTab
+type:fn main() {\n    println!("hi"); // done\n}
+lang:Rust
+cmd:SelectAll
+cmd:ToggleComment
+print:text
+shot:smoke-rust.png
+expect:tabs=3
