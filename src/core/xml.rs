@@ -4,9 +4,13 @@
 //!
 //! Formatting never changes text: markup that only whitespace separates from the markup before it goes on its own
 //! line (that whitespace is dropped), while text with content and CDATA are written exactly as they are with
-//! nothing added next to them, so `<p>Hello <b>world</b>!</p>` stays as it is. Tags are tidied up (`<a  x = "1" />`
-//! becomes `<a x="1"/>`); comments, CDATA, processing instructions and the DOCTYPE are copied as they are. Several
-//! top-level elements are accepted when formatting, not when checking.
+//! nothing added next to them, so `<p>Hello <b>world</b>!</p>` stays as it is. Whitespace is kept where it may
+//! mean something: an element holding only whitespace (`<w:t> </w:t>`), a space between elements on one line
+//! (`<b>big</b> <i>world</i>`), and everything inside `xml:space="preserve"`. Tags are tidied up
+//! (`<a  x = "1" />` becomes `<a x="1"/>`); comments, CDATA, processing instructions and the DOCTYPE are copied
+//! as they are. Several top-level elements are accepted when formatting, not when checking. Besides the tags
+//! matching, the check catches `]]>` in text, `--` in comments and entities nothing defines (without a DOCTYPE
+//! only the five predefined ones exist).
 
 use std::io::{self, Write};
 
@@ -94,15 +98,31 @@ pub struct Formatter<'w> {
     text: bool,
     /// The last markup was a start tag (so an end tag right after it stays next to it: `<a></a>`).
     open: bool,
+    /// The last markup was an end tag or an empty-element tag (`</b> <i>`: the space between belongs to the text).
+    closed: bool,
     /// Something was written (the first markup needs no line break before it).
     any: bool,
     /// The depth of the outermost open element that has text in it: no line breaks are added inside it, so mixed
-    /// content like `<p>Hello <b>x</b></p>` stays as it is (usize::MAX: none).
+    /// content like `<p>Hello <b>x</b></p>` stays as it is (usize::MAX: none). Elements with
+    /// `xml:space="preserve"` count as having text.
     mixed: usize,
-    /// Offsets of the `<` of the current markup, of the current attribute name and of the current `&`.
+    /// The current start tag has `xml:space="preserve"`; `space`: the current attribute is `xml:space` and `value`
+    /// collects its value.
+    preserve: bool,
+    space: bool,
+    value: Vec<u8>,
+    /// The name in the current entity reference (it must be one of the five predefined ones without a DOCTYPE).
+    ref_name: Vec<u8>,
+    /// A DOCTYPE came first (it may declare other entities).
+    doctype: bool,
+    /// How many `]` the text seen last ended with (`]]>` is not allowed in text).
+    brackets: u8,
+    /// Offsets of the `<` of the current markup, of the current attribute name, of the current `&` and of the `--`
+    /// that must end the current comment.
     mark: u64,
     name_at: u64,
     ref_at: u64,
+    dash_at: u64,
     indent: Vec<u8>,
     eol: Vec<u8>,
     out: Vec<u8>,
@@ -115,6 +135,8 @@ pub struct Formatter<'w> {
 
 const BAD_BANG: &str = "Expected <!--, <![CDATA[ or <!DOCTYPE";
 const MAX_WS: usize = 1 << 20;
+/// Deeper elements aren't indented any further, so absurdly deep input can't turn into gigabytes of spaces.
+const MAX_INDENT: usize = 100;
 
 fn err(offset: u64, msg: impl Into<String>) -> XmlError {
     XmlError { offset, msg: msg.into() }
@@ -140,6 +162,26 @@ fn show(name: &[u8]) -> String {
 
 fn is_space(b: u8) -> bool {
     matches!(b, b' ' | b'\t' | b'\r' | b'\n')
+}
+
+/// Where `]]>` ends in the text `s` (the position of its `>`); `carry` is how many `]` ended the text before it.
+fn cdata_end_in(s: &[u8], carry: u8) -> Option<usize> {
+    let mut from = 0;
+    while let Some(p) = memchr::memchr(b'>', &s[from..]) {
+        let q = from + p;
+        let run = s[..q].iter().rev().take_while(|&&c| c == b']').count();
+        if run >= 2 || (run == q && run + carry as usize >= 2) {
+            return Some(q);
+        }
+        from = q + 1;
+    }
+    None
+}
+
+/// How many `]` (up to 2) the text ends with after `s`, which follows text that ended with `carry` of them.
+fn trailing_brackets(s: &[u8], carry: u8) -> u8 {
+    let run = s.iter().rev().take_while(|&&c| c == b']').count();
+    (if run == s.len() { carry as usize + run } else { run }).min(2) as u8
 }
 
 /// Non-ASCII bytes count as name characters (letters of other scripts).
@@ -171,11 +213,19 @@ impl<'w> Formatter<'w> {
             ws: Vec::new(),
             text: false,
             open: false,
+            closed: false,
             any: false,
             mixed: usize::MAX,
+            preserve: false,
+            space: false,
+            value: Vec::new(),
+            ref_name: Vec::new(),
+            doctype: false,
+            brackets: 0,
             mark: 0,
             name_at: 0,
             ref_at: 0,
+            dash_at: 0,
             indent: indent.to_vec(),
             eol: eol.to_vec(),
             out: Vec::with_capacity(1 << 20),
@@ -217,7 +267,7 @@ impl<'w> Formatter<'w> {
             self.emit(&eol);
             self.eol = eol;
             let ind = std::mem::take(&mut self.indent);
-            for _ in 0..depth {
+            for _ in 0..depth.min(MAX_INDENT) {
                 self.emit(&ind);
             }
             self.indent = ind;
@@ -230,21 +280,24 @@ impl<'w> Formatter<'w> {
     }
 
     /// Before a tag, comment, processing instruction or DOCTYPE at `depth`: drops the whitespace before it and
-    /// (in Pretty mode) starts a new line, unless text comes right before it or `glue` is set.
+    /// (in Pretty mode) starts a new line, unless text comes right before it or `glue` is set (an end tag right
+    /// after its start tag, which keeps the whitespace between them).
     fn markup(&mut self, depth: usize, glue: bool) {
         if !self.text {
-            if self.stack.len() >= self.mixed {
-                // Inside text, the whitespace between tags belongs to it (`<b>big</b> <i>world</i>`).
+            if self.stack.len() >= self.mixed || glue {
+                // Inside text, the whitespace between tags belongs to it (`<b>big</b> <i>world</i>`), and an element
+                // that holds only whitespace keeps it (`<w:t xml:space="preserve"> </w:t>`).
                 let ws = std::mem::take(&mut self.ws);
                 self.emit(&ws);
                 self.ws = ws;
-            } else if self.any && !glue {
+            } else if self.any {
                 self.newline(depth);
             }
             self.ws.clear();
         }
         self.text = false;
         self.open = false;
+        self.closed = false;
         self.any = true;
     }
 
@@ -272,7 +325,12 @@ impl<'w> Formatter<'w> {
             if self.stats.roots > 1 && self.mode == Mode::Validate {
                 return Err(err(self.mark, "Only one top-level element is allowed"));
             }
+        } else if self.closed && !self.text && !self.ws.is_empty() && !self.ws.iter().any(|&c| c == b'\n' || c == b'\r') {
+            // A space between elements on one line (`<b>big</b> <i>world</i>`) is part of the text around them.
+            self.content(self.mark)?;
         }
+        self.preserve = false;
+        self.space = false;
         self.markup(self.stack.len(), false);
         self.emit(&[b'<', b]);
         self.stack.push((self.names.len(), self.mark));
@@ -285,12 +343,14 @@ impl<'w> Formatter<'w> {
     }
 
     /// The name of an attribute is complete: it must not repeat an earlier one in the tag.
-    fn attr_name(&self) -> Result<(), XmlError> {
+    fn attr_name(&mut self) -> Result<(), XmlError> {
         let (seen, name) = self.attrs.split_at(self.attr);
         if seen.split(|&c| c == 0).any(|n| n == name) {
             let msg = format!("Attribute {} appears twice in <{}>", show(name), show(self.top()));
             return Err(err(self.name_at, msg));
         }
+        self.space = name == b"xml:space";
+        self.value.clear();
         Ok(())
     }
 
@@ -329,6 +389,10 @@ impl<'w> Formatter<'w> {
                     let rest = &data[i..];
                     let j = memchr::memchr2(b'<', b'&', rest).unwrap_or(rest.len());
                     let mut s = &rest[..j];
+                    if let Some(p) = cdata_end_in(s, self.brackets) {
+                        return Err(err((at + p as u64).saturating_sub(2), "\"]]>\" isn't allowed in text (write ]]&gt;)"));
+                    }
+                    self.brackets = trailing_brackets(s, self.brackets);
                     if !self.text {
                         // Whitespace is held back until we know what follows it (outside the root element it is
                         // always dropped).
@@ -347,9 +411,11 @@ impl<'w> Formatter<'w> {
                     i += j;
                     if i < data.len() {
                         let at = base + i as u64;
+                        self.brackets = 0;
                         if data[i] == b'&' {
                             self.content(at)?;
                             self.ref_at = at;
+                            self.ref_name.clear();
                             self.emit(b"&");
                             self.st = St::Ref { quote: 0, r: Ref::Start };
                         } else {
@@ -363,6 +429,9 @@ impl<'w> Formatter<'w> {
                 St::Value { quote } => {
                     let rest = &data[i..];
                     let j = memchr::memchr3(quote, b'<', b'&', rest).unwrap_or(rest.len());
+                    if self.space && self.value.len() < 16 {
+                        self.value.extend_from_slice(&rest[..j.min(16)]);
+                    }
                     self.emit(&rest[..j]);
                     i += j;
                     if i < data.len() {
@@ -371,11 +440,16 @@ impl<'w> Formatter<'w> {
                             b'<' => return Err(err(at, "Unexpected \"<\" inside an attribute value")),
                             b'&' => {
                                 self.ref_at = at;
+                                self.ref_name.clear();
                                 self.emit(b"&");
                                 self.st = St::Ref { quote, r: Ref::Start };
                             }
                             _ => {
                                 self.emit(&[quote]);
+                                if self.space {
+                                    self.preserve = self.value == b"preserve";
+                                    self.space = false;
+                                }
                                 self.st = St::InTag { space: false };
                             }
                         }
@@ -383,9 +457,54 @@ impl<'w> Formatter<'w> {
                     }
                     continue;
                 }
+                St::Body { end: b"-->", run, dtd } => {
+                    // A comment: `--` may only end it (`-->`); `run` = how many `-` were just seen.
+                    let rest = &data[i..];
+                    let mut run = run;
+                    let mut k = 0;
+                    let mut close = None;
+                    while k < rest.len() {
+                        if run >= 2 {
+                            if rest[k] != b'>' {
+                                return Err(err(self.dash_at, "\"--\" can only end a comment (as \"-->\")"));
+                            }
+                            close = Some(k);
+                            break;
+                        }
+                        match memchr::memchr(b'-', &rest[k..]) {
+                            None => {
+                                run = 0;
+                                k = rest.len();
+                            }
+                            Some(p) => {
+                                if p > 0 {
+                                    run = 0;
+                                }
+                                if run == 0 {
+                                    self.dash_at = base + (i + k + p) as u64;
+                                }
+                                run += 1;
+                                k += p + 1;
+                            }
+                        }
+                    }
+                    match close {
+                        Some(k) => {
+                            self.emit(&rest[..=k]);
+                            i += k + 1;
+                            self.st = if dtd { St::Doctype { subset: true, quote: 0, lt: 0 } } else { St::Text };
+                        }
+                        None => {
+                            self.emit(rest);
+                            i = data.len();
+                            self.st = St::Body { end: b"-->", run, dtd };
+                        }
+                    }
+                    continue;
+                }
                 St::Body { end, run, dtd } => {
-                    // Ends at a `>` right after `--`, `]]` or `?` (`end` without its `>`); `run` carries how many of
-                    // those ended the previous chunk.
+                    // CDATA or a processing instruction: ends at a `>` right after `]]` or `?` (`end` without its
+                    // `>`); `run` carries how many of those ended the previous chunk.
                     let rest = &data[i..];
                     let (c, need) = (end[0], end.len() - 1);
                     let j = memchr::memchr(b'>', rest).unwrap_or(rest.len());
@@ -449,6 +568,20 @@ impl<'w> Formatter<'w> {
                         (Ref::Start | Ref::Name, _) => return Err(err(self.ref_at, "\"&\" must be written as &amp;")),
                         _ => return Err(err(self.ref_at, "Invalid character code (use &#169; or &#xA9;)")),
                     };
+                    if next == Some(Ref::Name) && self.ref_name.len() < 64 {
+                        self.ref_name.push(b);
+                    }
+                    if next.is_none()
+                        && r == Ref::Name
+                        && !self.doctype
+                        && !matches!(self.ref_name.as_slice(), b"lt" | b"gt" | b"amp" | b"quot" | b"apos")
+                    {
+                        let msg = format!(
+                            "&{}; isn't defined (without a DOCTYPE only &lt; &gt; &amp; &quot; &apos; are)",
+                            show(&self.ref_name)
+                        );
+                        return Err(err(self.ref_at, msg));
+                    }
                     self.emit(&[b]);
                     self.st = match next {
                         Some(r) => St::Ref { quote, r },
@@ -497,6 +630,7 @@ impl<'w> Formatter<'w> {
                         if self.stats.roots > 0 {
                             return Err(err(self.mark, "The DOCTYPE must come before the root element"));
                         }
+                        self.doctype = true;
                         self.markup(0, false);
                         self.emit(word);
                         self.st = St::Doctype { subset: false, quote: 0, lt: 0 };
@@ -525,6 +659,11 @@ impl<'w> Formatter<'w> {
                     b'>' => {
                         self.emit(b">");
                         self.open = true;
+                        if self.preserve {
+                            // xml:space="preserve": its whitespace is kept like text's
+                            self.mixed = self.mixed.min(self.stack.len());
+                            self.preserve = false;
+                        }
                         self.st = St::Text;
                     }
                     b'/' => self.st = St::Slash,
@@ -545,6 +684,8 @@ impl<'w> Formatter<'w> {
                     }
                     self.emit(b"/>");
                     self.pop();
+                    self.preserve = false;
+                    self.closed = true;
                     self.st = St::Text;
                 }
                 St::Eq => match b {
@@ -574,6 +715,7 @@ impl<'w> Formatter<'w> {
                         self.emit(b">");
                         self.end = name;
                         self.pop();
+                        self.closed = true;
                         self.st = St::Text;
                     }
                     _ => return Err(err(at, format!("Unexpected {} in </{}>", describe(b), show(&self.end)))),
@@ -696,7 +838,7 @@ mod tests {
                 "<config version=\"2\" mode='a > b \"c\" /' note=\"two\n lines\">\n",
                 "  <item id=\"1\"/>\n  <item id=\"2\"/>\n",
                 "  <name>Slate &amp; co &#169; &#x1F600;</name>\n",
-                "  <empty></empty>\n",
+                "  <empty>  \n  </empty>\n",
                 "  <script><![CDATA[if (a < b && c) x = \"]]\";]]></script>\n",
                 "  <ns:list xmlns:ns=\"urn:x\">\n    <ns:i-1.x_y/>\n    <élément/>\n",
                 "    <!-- a <b> c -->\n  </ns:list>\n",
@@ -710,7 +852,7 @@ mod tests {
                 "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
                 "<!DOCTYPE config [\n  <!ENTITY co \"Acme ]> Inc\">\n  <!-- it's [ok] > -->\n]>",
                 "<!-- settings --><config version=\"2\" mode='a > b \"c\" /' note=\"two\n lines\">",
-                "<item id=\"1\"/><item id=\"2\"/><name>Slate &amp; co &#169; &#x1F600;</name><empty></empty>",
+                "<item id=\"1\"/><item id=\"2\"/><name>Slate &amp; co &#169; &#x1F600;</name><empty>  \n  </empty>",
                 "<script><![CDATA[if (a < b && c) x = \"]]\";]]></script>",
                 "<ns:list xmlns:ns=\"urn:x\"><ns:i-1.x_y/><élément/><!-- a <b> c --></ns:list></config>",
             )
@@ -737,19 +879,75 @@ mod tests {
         assert_eq!(pretty("<doc><p>Hello <b>big</b> <i>world</i></p></doc>"), "<doc>\n  <p>Hello <b>big</b> <i>world</i></p>\n</doc>\n");
         assert_eq!(fmt(Mode::Minify, "<p>Some <b>bold</b>\n  <i>italic</i> text</p>").unwrap(), "<p>Some <b>bold</b>\n  <i>italic</i> text</p>");
         assert_eq!(pretty("<d><p>Hi <b>a</b><i>b</i></p><q/></d>"), "<d>\n  <p>Hi <b>a</b><i>b</i></p>\n  <q/>\n</d>\n");
+        // spaces without a line break between elements may matter, so they stay (and nothing is added next to them)
         assert_eq!(
             pretty("<doc><p>Hello <b>world</b>!</p>  <p> x </p></doc>"),
+            "<doc>\n  <p>Hello <b>world</b>!</p>  <p> x </p></doc>\n"
+        );
+        assert_eq!(
+            pretty("<doc><p>Hello <b>world</b>!</p>\n  <p> x </p></doc>"),
             "<doc>\n  <p>Hello <b>world</b>!</p>\n  <p> x </p>\n</doc>\n"
         );
         assert_eq!(pretty("<a>\n  text\n</a>"), "<a>\n  text\n</a>\n");
         assert_eq!(pretty("<a>x <!--c--> y<?pi?>&lt;</a>"), "<a>x <!--c--> y<?pi?>&lt;</a>\n");
         assert_eq!(pretty("<a>\n <![CDATA[ ]]>\n</a>"), "<a>\n <![CDATA[ ]]>\n</a>\n");
         assert_eq!(pretty("<a  x = '1'\n/>"), "<a x='1'/>\n");
-        assert_eq!(pretty("<a><b>\n</b ></a\n>"), "<a>\n  <b></b>\n</a>\n");
         assert_eq!(fmt(Mode::Minify, "<a> <b> x </b> </a>\n").unwrap(), "<a><b> x </b></a>");
         // whitespace too long to hold back is kept as text (outside the root element it is still dropped)
         let ws = " ".repeat(MAX_WS + 1);
         assert_eq!(fmt(Mode::Pretty, &format!("{ws}<a>{ws}</a>{ws}")).unwrap(), format!("<a>{ws}</a>\n"));
+    }
+
+    #[test]
+    fn whitespace_that_may_mean_something_is_kept() {
+        let both = |s: &str| (fmt(Mode::Pretty, s).unwrap(), fmt(Mode::Minify, s).unwrap());
+        // an element holding only whitespace (a space in a Word document, XSLT's <xsl:text>)
+        let w = "<w:r><w:t xml:space=\"preserve\"> </w:t></w:r>";
+        assert_eq!(both(w), ("<w:r>\n  <w:t xml:space=\"preserve\"> </w:t>\n</w:r>\n".into(), w.into()));
+        let x = "<t><xsl:value-of select=\"a\"/><xsl:text> </xsl:text><b>\n</b ></t>";
+        assert_eq!(
+            both(x),
+            (
+                "<t>\n  <xsl:value-of select=\"a\"/>\n  <xsl:text> </xsl:text>\n  <b>\n</b>\n</t>\n".into(),
+                "<t><xsl:value-of select=\"a\"/><xsl:text> </xsl:text><b>\n</b></t>".into()
+            )
+        );
+        // a space between elements on one line is text, and nothing more is added in that element
+        assert_eq!(
+            both("<doc><p><b>big</b> <i>world</i></p><p><img/> <b>x</b></p></doc>"),
+            (
+                "<doc>\n  <p>\n    <b>big</b> <i>world</i></p>\n  <p>\n    <img/> <b>x</b></p>\n</doc>\n".into(),
+                "<doc><p><b>big</b> <i>world</i></p><p><img/> <b>x</b></p></doc>".into()
+            )
+        );
+        // ...but layout whitespace (with a line break) between elements still goes
+        assert_eq!(both("<a>\n  <b>1</b>\n  <c>2</c>\n</a>").1, "<a><b>1</b><c>2</c></a>");
+        // xml:space="preserve" keeps everything inside as it is
+        let svg = "<svg><text xml:space=\"preserve\"><tspan>a</tspan> <tspan>b</tspan>\n  </text><g/></svg>";
+        assert_eq!(
+            both(svg),
+            (
+                "<svg>\n  <text xml:space=\"preserve\"><tspan>a</tspan> <tspan>b</tspan>\n  </text>\n  <g/>\n</svg>\n".into(),
+                "<svg><text xml:space=\"preserve\"><tspan>a</tspan> <tspan>b</tspan>\n  </text><g/></svg>".into()
+            )
+        );
+        let pre = "<pre xml:space='preserve'>\n  <b>x</b>\n</pre>";
+        assert_eq!(both(pre), (format!("{pre}\n"), pre.into()));
+        for s in [w, x, svg, pre, "<doc><p><b>big</b> <i>world</i></p></doc>"] {
+            let (p, m) = both(s);
+            assert_eq!(fmt(Mode::Pretty, &p).unwrap(), p, "{s}");
+            assert_eq!(fmt(Mode::Pretty, &m).unwrap(), p, "{s}");
+            assert_eq!(fmt(Mode::Minify, &p).unwrap(), m, "{s}");
+        }
+    }
+
+    #[test]
+    fn deep_nesting_stops_indenting() {
+        let s = format!("{}{}", "<a>".repeat(150), "</a>".repeat(150));
+        let p = fmt(Mode::Pretty, &s).unwrap();
+        let widest = p.lines().map(|l| l.len() - l.trim_start().len()).max().unwrap();
+        assert_eq!(widest, MAX_INDENT * 2);
+        assert_eq!(fmt(Mode::Minify, &p).unwrap(), s);
     }
 
     #[test]
@@ -791,7 +989,13 @@ mod tests {
             ("<a/>&amp;", 4, "Text outside the root element"),
             ("<![CDATA[x]]><a/>", 0, "Text outside the root element"),
             ("<a/><!DOCTYPE a>", 4, "The DOCTYPE must come before the root element"),
-            ("<a><!-- x --</a>", 3, "The comment is never closed"),
+            ("<a><!-- x --</a>", 10, "\"--\" can only end a comment (as \"-->\")"),
+            ("<a><!-- a -- b --></a>", 10, "\"--\" can only end a comment (as \"-->\")"),
+            ("<a><!-- a ---></a>", 10, "\"--\" can only end a comment (as \"-->\")"),
+            ("<a><!-- x -</a>", 3, "The comment is never closed"),
+            ("<a>x ]]> y</a>", 5, "\"]]>\" isn't allowed in text (write ]]&gt;)"),
+            ("<a>&nbsp;</a>", 3, "&nbsp; isn't defined (without a DOCTYPE only &lt; &gt; &amp; &quot; &apos; are)"),
+            ("<a x='&copy;'/>", 6, "&copy; isn't defined (without a DOCTYPE only &lt; &gt; &amp; &quot; &apos; are)"),
             ("<a><![CDATA[x]]</a>", 3, "The CDATA section is never closed"),
             ("<?xml version=\"1.0\"", 0, "The <?...?> tag is never closed"),
             ("<!DOCTYPE a [ <!-- ]> -->", 0, "The DOCTYPE is never closed"),
@@ -805,7 +1009,10 @@ mod tests {
                 assert_eq!(fmt(mode, src).unwrap_err(), e, "{src}");
             }
         }
-        assert!(fmt(Mode::Validate, "<a b=\"&amp;&#60;&#x3C;&ns:x-1;\">&lt;&#0123;&#xaF;</a>").is_ok());
+        // with a DOCTYPE, other entities may be declared (here or in an external DTD)
+        assert!(fmt(Mode::Validate, "<!DOCTYPE a><a b=\"&amp;&#60;&#x3C;&ns:x-1;\">&lt;&#0123;&#xaF;</a>").is_ok());
+        assert!(fmt(Mode::Validate, "<a>&lt;&gt;&amp;&quot;&apos; ]] > ]>]</a>").is_ok());
+        assert!(fmt(Mode::Validate, "<a><!----><!-- a - b --></a>").is_ok());
     }
 
     #[test]
