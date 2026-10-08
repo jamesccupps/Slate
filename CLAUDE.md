@@ -103,27 +103,31 @@ Commits use the GitHub no-reply address (repo-local git config); GitHub refuses 
     symbols), char classes.
   - `job.rs` — background jobs with progress/cancel, notify the UI by posting a window message.
 - `src/ui/` — the Win32 app (see the module docs at the top of each file).
-  - `highlight.rs` (+ `highlight/code.rs`, `highlight/markup.rs`, `highlight/config.rs`) — syntax coloring for ~45
+  - `highlight.rs` (+ `highlight/code.rs`, `highlight/markup.rs`, `highlight/config.rs`) — syntax coloring for ~50
     languages: hand-written lexers that color one segment and return the `State` they end in (inside a block
     comment, a multi-line string, an XML tag, a Markdown code block...). `code.rs` is one configurable lexer for
     programming/scripting languages (keyword tables + per-language extras: Rust and C++ raw strings, PowerShell
     here-strings, Batch labels, heredocs, JS and Perl regexes, Perl's `qw(…)`/`s{…}{…}` and POD, C#/HCL strings in
-    interpolation holes, AutoHotkey hotkeys, VB's `Rem`...); `config.rs` the line-based formats (TOML, nginx,
-    Apache, `.properties`, SRT/WebVTT, iCalendar/vCard, `.sln`, and PPCL: Siemens APOGEE/Desigo programs, colored
+    interpolation holes, Dart/Scala `$x`/`${…}` in strings, Objective-C's `@` words, NSIS commands/variables/`\`
+    continued lines, AutoHotkey hotkeys, VB's `Rem`...); `config.rs` the line-based formats (TOML, nginx, Apache,
+    `.properties`, SRT/WebVTT, iCalendar/vCard, `.sln`, G-code, Inno Setup — whose `[Code]` section goes to
+    `code.rs`'s Pascal, its state kept in the low bits of `kind` — and PPCL: Siemens APOGEE/Desigo programs, colored
     much as Desigo shows them, from the full command list of Siemens' manual; the line number dimmed, `C` comment
     lines, `# ` lines turned off and `UNKNOWN (…)` statements dimmed, `%X%` abbreviations marked, and in red what
     can't be right (a line number out of order, which the state's `b` carries; a string left open, a `GOTO` without
-    a line number, `.NOT.` and other operators PPCL hasn't got, a name over 6 characters without quotes). Only the
-    eleven dotted operators split a word (`ROOM.MIN.TEMP` is one name); Toggle comment puts the `C` after each line's
-    number); PHP files are HTML with PHP inside. A Markdown
+    a line number, `.NOT.` and other operators PPCL hasn't got, a name over 6 characters without quotes), only on
+    numbered lines. Only the eleven dotted operators split a word (`ROOM.MIN.TEMP` is one name); Toggle comment puts
+    the `C` after each line's number); PHP files are HTML with PHP inside. A Markdown
     ``` block is colored as the language it names, that lexer's state kept in the Markdown state (`mode` holds the
     language; where its state doesn't fit, each line is colored from its line start). Where a quote is easily a
     stray one (shell, SQL, PHP...), a string left open gives up at a blank line or after 40 lines. Language is
     picked by file name (templates like `x.yaml.j2` by the name inside; nginx/Apache configuration also by its
-    folder, so detection gets the whole path), then by content (`#!` lines, `<?xml`, `server {`, `<VirtualHost`,
-    `WEBVTT`, JSON that reads as JSON, PPCL's numbered lines, log timestamps — not IP addresses). A test checks that lexing a text in two
-    pieces ends in the same state as lexing it whole (cut after a line break for every language, mid-line too for
-    those listed in it); for deeper runs raise its counts for a while.
+    folder, so detection gets the whole path; `.m`/`.h` are Objective-C only with `#import`/`@interface`-style lines,
+    `.m` is MATLAB too), then by content (`#!` lines, `<?xml`, `server {`, `<VirtualHost`, `WEBVTT`, JSON that reads
+    as JSON, PPCL's numbered lines, log timestamps — not IP addresses —, G-code by a slicer's header or lines of
+    G-code words). A test checks that lexing a text in two pieces ends in the same state as lexing it whole (cut
+    after a line break for every language, mid-line too for those listed in it — not Inno Setup, whose `[Section]`
+    needs its line to itself); for deeper runs raise its counts for a while.
   - `app.rs` state, layout and painting; `actions.rs` input, commands, background jobs, saving and closing;
     `editor.rs` the text view; `structure.rs` path bar + structure panel; `findbar.rs`; `session.rs` (tabs and
     unsaved text kept between runs); `settings.rs` (data folder, portable mode); `install.rs` ("Open with" entries

@@ -67,6 +67,18 @@ pub enum Lang {
     Sln,
     /// Siemens PPCL, the programs of APOGEE and Desigo field panels.
     Ppcl,
+    Dart,
+    Scala,
+    /// Objective-C (`.m` and `.h` files that read like it).
+    ObjC,
+    /// Objective-C++ (`.mm`).
+    ObjCpp,
+    /// G-code for 3D printers and CNC machines.
+    GCode,
+    /// Inno Setup scripts, with Pascal Script in their `[Code]` section.
+    InnoSetup,
+    /// NSIS installer scripts.
+    Nsis,
 }
 
 /// How a language writes comments (for "Toggle comment").
@@ -127,11 +139,18 @@ impl Lang {
             Lang::Calendar => "iCalendar / vCard",
             Lang::Sln => "VS solution",
             Lang::Ppcl => "PPCL",
+            Lang::Dart => "Dart",
+            Lang::Scala => "Scala",
+            Lang::ObjC => "Objective-C",
+            Lang::ObjCpp => "Objective-C++",
+            Lang::GCode => "G-code",
+            Lang::InnoSetup => "Inno Setup",
+            Lang::Nsis => "NSIS",
         }
     }
 
     /// Menu order: plain text, then by name.
-    pub const ALL: [Lang; 46] = [
+    pub const ALL: [Lang; 53] = [
         Lang::Plain,
         Lang::Apache,
         Lang::AutoHotkey,
@@ -143,12 +162,15 @@ impl Lang {
         Lang::Css,
         Lang::Csv,
         Lang::CsvSemi,
+        Lang::Dart,
         Lang::Diff,
         Lang::Dockerfile,
+        Lang::GCode,
         Lang::Go,
         Lang::Html,
         Lang::Calendar,
         Lang::Ini,
+        Lang::InnoSetup,
         Lang::Java,
         Lang::JavaScript,
         Lang::Json,
@@ -157,6 +179,9 @@ impl Lang {
         Lang::Lua,
         Lang::Markdown,
         Lang::Nginx,
+        Lang::Nsis,
+        Lang::ObjC,
+        Lang::ObjCpp,
         Lang::Perl,
         Lang::Php,
         Lang::PowerShell,
@@ -166,6 +191,7 @@ impl Lang {
         Lang::R,
         Lang::Ruby,
         Lang::Rust,
+        Lang::Scala,
         Lang::Shell,
         Lang::Sql,
         Lang::Subtitles,
@@ -193,7 +219,11 @@ impl Lang {
             | Lang::Rust
             | Lang::JavaScript
             | Lang::TypeScript
-            | Lang::Php => Line("//"),
+            | Lang::Php
+            | Lang::Dart
+            | Lang::Scala
+            | Lang::ObjC
+            | Lang::ObjCpp => Line("//"),
             Lang::Python
             | Lang::Ruby
             | Lang::Shell
@@ -213,7 +243,8 @@ impl Lang {
             Lang::Sql | Lang::Lua => Line("--"),
             Lang::Batch => Line("REM "),
             Lang::Vb => Line("'"),
-            Lang::AutoHotkey => Line(";"),
+            // (Inno Setup's `[Code]` section is Pascal, commented with `//`: see `inno_code_line`)
+            Lang::AutoHotkey | Lang::GCode | Lang::InnoSetup | Lang::Nsis => Line(";"),
             Lang::Ppcl => AfterNumber("C "),
             Lang::Xml | Lang::Html | Lang::Markdown => Block("<!--", "-->"),
             Lang::Css => Block("/*", "*/"),
@@ -322,7 +353,13 @@ impl Lang {
             "py" | "pyw" | "pyi" | "pyx" => Lang::Python,
             "js" | "mjs" | "cjs" | "jsx" => Lang::JavaScript,
             "ts" | "tsx" | "mts" | "cts" => Lang::TypeScript,
-            "c" | "h" => Lang::C,
+            "c" => Lang::C,
+            "h" if objc_like(head) => Lang::ObjC,
+            "h" => Lang::C,
+            // Objective-C, or MATLAB (left to what the content says)
+            "m" => return objc_like(head).then_some(Lang::ObjC),
+            // (FreeMind and Freeplane mind maps are `.mm` files too: XML, which the content tells)
+            "mm" => return (!head.trim_ascii_start().starts_with(b"<")).then_some(Lang::ObjCpp),
             "cpp" | "cc" | "cxx" | "c++" | "hpp" | "hh" | "hxx" | "h++" | "ino" | "inl" | "ipp" | "tpp" => Lang::Cpp,
             "cs" | "csx" => Lang::CSharp,
             "java" | "gradle" | "groovy" => Lang::Java,
@@ -354,6 +391,13 @@ impl Lang {
             // (a `.pcl` file is PPCL only when it reads like it: it's also HP's printer language)
             "ppcl" => Lang::Ppcl,
             "htaccess" => Lang::Apache,
+            "dart" => Lang::Dart,
+            "scala" | "sc" | "sbt" => Lang::Scala,
+            "gcode" | "gco" | "ngc" | "cnc" => Lang::GCode,
+            // G-code, or NetCDF data (binary: "CDF\x01", or HDF5's header, with zero bytes)
+            "nc" => return (!head.starts_with(b"CDF") && !head.contains(&0)).then_some(Lang::GCode),
+            "iss" | "isl" => Lang::InnoSetup,
+            "nsi" | "nsh" => Lang::Nsis,
             // rotated logs: app.log.1, app.log.2026-10-07
             _ if lower.contains(".log.") => Lang::Log,
             _ => return None,
@@ -438,6 +482,9 @@ impl Lang {
         if looks_like_log(head) {
             return Lang::Log;
         }
+        if looks_like_gcode(head) {
+            return Lang::GCode;
+        }
         Lang::Plain
     }
 }
@@ -495,6 +542,103 @@ fn looks_like_ppcl(t: &[u8]) -> bool {
     }
     // (or a long header of comments, all the sample has)
     lines >= 2 && (padded || sure) && ((commands > 0 && ppcl * 2 >= lines) || (padded && comments == lines))
+}
+
+/// Whether a `.m` or `.h` file reads like Objective-C: a line starts with `#import`, `@import`, `@interface`,
+/// `@implementation`, `@protocol` or `@class`.
+fn objc_like(head: &[u8]) -> bool {
+    const WORDS: [&[u8]; 5] = [b"@import", b"@interface", b"@implementation", b"@protocol", b"@class"];
+    // (lines inside a `/* */` comment don't count: Doxygen writes `@class` there)
+    let mut comment = false;
+    for l in head.split(|&b| b == b'\n').map(|l| l.trim_ascii()) {
+        if comment {
+            comment = memchr::memmem::find(l, b"*/").is_none();
+            continue;
+        }
+        if let Some(rest) = l.strip_prefix(b"#import") {
+            // `#import <Foundation/Foundation.h>`, `#import "View.h"`; not a type library (`#import "msxml6.dll"`,
+            // Visual C++) nor Octave's `#import data`
+            let rest = rest.trim_ascii_start();
+            let close = match rest.first() {
+                Some(b'<') => b'>',
+                Some(b'"') => b'"',
+                _ => 0,
+            };
+            if close != 0 {
+                let name = &rest[1..rest[1..].iter().position(|&b| b == close).map_or(rest.len(), |p| p + 1)];
+                let name = name.to_ascii_lowercase();
+                let library = [&b".dll"[..], b".tlb", b".olb", b".ocx", b".exe"].iter().any(|e| name.ends_with(e))
+                    || name.starts_with(b"progid:")
+                    || name.starts_with(b"libid:");
+                if !library {
+                    return true;
+                }
+            }
+        } else if WORDS.iter().any(|w| l.starts_with(w) && matches!(l.get(w.len()), Some(b' ' | b'\t' | b'<' | b';') | None)) {
+            return true;
+        }
+        if let Some(p) = memchr::memmem::find(l, b"/*") {
+            comment = memchr::memmem::find(&l[p + 2..], b"*/").is_none();
+        }
+    }
+    false
+}
+
+/// Whether text reads like G-code: a slicer's header comment (`;FLAVOR:Marlin`, `; generated by PrusaSlicer …`), or
+/// mostly lines of words like `G1 X10.5 F1200` (at least three, the comments aside).
+fn looks_like_gcode(head: &[u8]) -> bool {
+    const SLICERS: [&[u8]; 11] = [
+        b"prusaslicer", b"superslicer", b"orcaslicer", b"bambustudio", b"slic3r", b"cura_steamengine", b"simplify3d",
+        b"kisslicer", b"ideamaker", b"craftware", b"flashprint",
+    ];
+    let (mut code, mut other, mut g) = (0, 0, false);
+    for l in head.split(|&b| b == b'\n').map(|l| l.trim_ascii()).filter(|l| !l.is_empty()).take(40) {
+        if l[0] == b';' {
+            let low = l.to_ascii_lowercase();
+            if low.starts_with(b";flavor:") || SLICERS.iter().any(|s| low.windows(s.len()).any(|w| w == *s)) {
+                return true;
+            }
+        } else if l[0] != b'(' && l != b"%" {
+            if gcode_words(l) {
+                code += 1;
+                g |= l.iter().enumerate().any(|(i, &c)| {
+                    matches!(c, b'G' | b'g') && at(l, i + 1).is_ascii_digit() && (i == 0 || !l[i - 1].is_ascii_alphabetic())
+                });
+            } else {
+                other += 1;
+            }
+            if code + other >= 12 {
+                break;
+            }
+        }
+    }
+    // (with a `G` word: `M3x10`, `T100` or `N40.7128 W74.0060` lists aren't G-code)
+    code >= 3 && other * 5 <= code && g
+}
+
+/// Whether a line (up to a comment) is G-code words only: a letter and a number each (`N10 G1 X-1.5 Y.5`,
+/// `G1X10Y20`), the first one a `G`, `M`, `N`, `T` or `O`.
+fn gcode_words(l: &[u8]) -> bool {
+    let l = &l[..memchr::memchr2(b';', b'(', l).unwrap_or(l.len())];
+    let (mut i, mut words) = (0, 0);
+    while i < l.len() {
+        if matches!(l[i], b' ' | b'\t' | b'\r') {
+            i += 1;
+            continue;
+        }
+        let c = l[i].to_ascii_uppercase();
+        if !c.is_ascii_uppercase() || (words == 0 && !b"GMNTO".contains(&c)) {
+            return false;
+        }
+        i += 1 + matches!(at(l, i + 1), b'+' | b'-') as usize;
+        let d = l[i..].iter().take_while(|b| b.is_ascii_digit() || **b == b'.').count();
+        if !l[i..i + d].iter().any(u8::is_ascii_digit) {
+            return false;
+        }
+        i += d;
+        words += 1;
+    }
+    words > 0
 }
 
 /// A `.conf` file: XML, nginx's or Apache's configuration, or else INI-like.
@@ -767,8 +911,18 @@ fn lex_in(lang: Lang, text: &[u8], st: State, o: &mut Out) -> State {
         Lang::Calendar => by_line(text, st, o, config::calendar_line),
         Lang::Sln => by_line(text, st, o, config::sln_line),
         Lang::Ppcl => config::ppcl(text, st, o),
+        Lang::GCode => by_line(text, st, o, config::gcode_line),
+        Lang::InnoSetup => config::inno(text, st, o),
         _ => code::code(code::syntax(lang), text, st, o),
     }
+}
+
+/// Whether a line of an Inno Setup script, after `before` (the text before it), is in its `[Code]` section — Pascal,
+/// commented with `//` — and isn't a section's header itself (for "Toggle comment").
+pub fn inno_code_line(before: &[u8], line: &[u8]) -> bool {
+    let l = line.trim_ascii();
+    let header = l.len() > 2 && l[0] == b'[' && l[l.len() - 1] == b']' && l[1..l.len() - 1].iter().all(u8::is_ascii_alphabetic);
+    !header && lex(Lang::InnoSetup, before, State::START, None).kind & config::I_CODE != 0
 }
 
 /// The state a segment of a huge file starts in when it doesn't start its line: worked out from up to a few KB
@@ -1478,6 +1632,96 @@ mod tests {
     }
 
     #[test]
+    fn detection_of_the_060_languages() {
+        let d = Lang::detect;
+        for (name, lang) in [
+            ("main.dart", Lang::Dart),
+            ("App.scala", Lang::Scala),
+            ("build.sbt", Lang::Scala),
+            ("script.sc", Lang::Scala),
+            ("View.mm", Lang::ObjCpp),
+            ("part.gcode", Lang::GCode),
+            ("part.gco", Lang::GCode),
+            ("mill.ngc", Lang::GCode),
+            ("mill.cnc", Lang::GCode),
+            ("setup.iss", Lang::InnoSetup),
+            ("Default.isl", Lang::InnoSetup),
+            ("installer.nsi", Lang::Nsis),
+            ("macros.nsh", Lang::Nsis),
+        ] {
+            assert_eq!(d(Some(name), b""), lang, "{name}");
+        }
+        // .m is Objective-C or MATLAB, .h C or Objective-C, by what they hold
+        assert_eq!(d(Some("View.m"), b"//\n//  View.m\n//\n\n#import <UIKit/UIKit.h>\n"), Lang::ObjC);
+        assert_eq!(d(Some("plot.m"), b"% plot it\nx = linspace(0, 1);\nfunction y = f(x)\n"), Lang::Plain);
+        assert_eq!(d(Some("Greeter.h"), b"@interface Greeter : NSObject\n@end\n"), Lang::ObjC);
+        assert_eq!(d(Some("util.h"), b"#include <stdio.h>\nint f(void);\n"), Lang::C);
+        assert_eq!(d(Some("util.h"), b"/* @interface in a comment */\n"), Lang::C);
+        // .nc is G-code, or NetCDF data
+        assert_eq!(d(Some("part.nc"), b"G21\nG90\n"), Lang::GCode);
+        assert_ne!(d(Some("ocean.nc"), b"CDF\x01\x00\x00\x00\x00"), Lang::GCode);
+        assert_ne!(d(Some("ocean.nc"), "\u{2030}HDF\r\n\u{1a}\n\0\0\0\0\0\u{8}\u{8}\0".as_bytes()), Lang::GCode);
+        // G-code by its content: a slicer's header, or lines of G-code words
+        assert_eq!(d(Some("print.txt"), b";FLAVOR:Marlin\n;Generated with Cura_SteamEngine 5.4.0\nM140 S60\n"), Lang::GCode);
+        assert_eq!(d(None, b"; generated by PrusaSlicer 2.7.1+win64 on 2026-10-08 at 10:02:04 UTC\n\n; external perimeters extrusion width = 0.45mm\n"), Lang::GCode);
+        assert_eq!(d(None, b"%\nO1001 (PART)\n(T1 D=6.)\nN10 G90 G94 G17\nN20 G21\nN30 T1 M6\n"), Lang::GCode);
+        assert_eq!(d(Some("job"), b"G28\nG1 Z5 F5000\ng1x10y10\nM104 S200\n"), Lang::GCode);
+        // ... and not text that only looks a little like it
+        assert_eq!(d(Some("roads.txt"), b"M3 is a motorway.\nM4 too\nG7 summit notes\nN1 item\n"), Lang::Plain);
+        assert_eq!(d(Some("short.txt"), b"M1\nM2\n"), Lang::Plain);
+        assert_eq!(d(Some("x.txt"), b"; settings\n[main]\nkey=1\n"), Lang::Plain);
+        assert_eq!(d(Some("list.csv"), b"G1,X,Y\nG2,1,2\nG3,4,5\n"), Lang::Csv);
+        assert_eq!(d(None, b"N1,G1,X1\nN2,G1,X2\nN3,G1,X3\n"), Lang::Plain);
+    }
+
+    #[test]
+    fn comments_in_the_new_languages() {
+        use CommentStyle::Line;
+        for lang in [Lang::Dart, Lang::Scala, Lang::ObjC, Lang::ObjCpp] {
+            assert_eq!(lang.comment(), Some(Line("//")), "{lang:?}");
+        }
+        for lang in [Lang::GCode, Lang::InnoSetup, Lang::Nsis] {
+            assert_eq!(lang.comment(), Some(Line(";")), "{lang:?}");
+        }
+        // Inno Setup's [Code] is Pascal, commented with `//` (but not its own header, nor the next section's)
+        let src = b"[Setup]\nAppName=x\n[Code]\nprocedure A;\n";
+        assert!(!inno_code_line(b"[Setup]\n", b"AppName=x"));
+        assert!(inno_code_line(&src[..], b"begin"));
+        assert!(!inno_code_line(b"[Setup]\n", b"[Code]") && !inno_code_line(&src[..], b"  [Files] "));
+    }
+
+    #[test]
+    fn the_menu_lists_every_language_once_by_name() {
+        let names: Vec<String> = Lang::ALL[1..].iter().map(|l| l.label().to_lowercase()).collect();
+        assert_eq!(Lang::ALL[0], Lang::Plain);
+        for w in names.windows(2) {
+            assert!(w[0] < w[1], "{} before {}", w[0], w[1]);
+        }
+        // (a language the menu lacks can't be picked, nor colored in a Markdown block)
+        for (i, l) in Lang::ALL.iter().enumerate() {
+            assert!(!Lang::ALL[..i].contains(l), "{l:?} twice");
+        }
+    }
+
+    #[test]
+    fn new_languages_leave_other_files_alone() {
+        let d = Lang::detect;
+        // a mind map is XML; Objective-C++ when it reads like code
+        assert_eq!(d(Some("ideas.mm"), b"<map version=\"1.0.1\">\n<node TEXT=\"Root\"/>\n</map>\n"), Lang::Xml);
+        assert_eq!(d(Some("View.mm"), b"#import <UIKit/UIKit.h>\n"), Lang::ObjCpp);
+        // lists of sizes, part numbers or coordinates aren't G-code
+        for text in [&b"M3x10\nM3x12\nM4x16\n"[..], b"T100\nT200\nT300\n", b"N40.7128 W74.0060\nN40.7130 W74.0061\nN40.7140 W74.0070\n"] {
+            assert_eq!(d(Some("list.txt"), text), Lang::Plain, "{:?}", String::from_utf8_lossy(text));
+        }
+        assert_eq!(d(Some("part.txt"), b"G21\nG90\nG1 X10 Y10 F1200\nM5\n"), Lang::GCode);
+        // a C header with `@class` in a comment, a type library's #import, Octave's #import
+        assert_eq!(d(Some("widget.h"), b"/*!\n @class Widget\n */\nclass Widget {};\n"), Lang::C);
+        assert_eq!(d(Some("com.h"), b"#import \"msxml6.dll\" rename_namespace(\"x\")\n"), Lang::C);
+        assert_eq!(d(Some("data.m"), b"#import data\nx = 1;\n"), Lang::Plain);
+        assert_eq!(d(Some("View.h"), b"// a header\n#import <Foundation/Foundation.h>\n@interface View : NSObject\n"), Lang::ObjC);
+    }
+
+    #[test]
     fn logs_configs_and_diffs() {
         has(Lang::Log, "2026/10/07 12:00:01 [error] 123#0: open() failed", &[("2026/10/07 12:00:01", Tok::Dim), ("error", Tok::Error)]);
         has(Lang::Log, "time=x level=warn msg=slow", &[("warn", Tok::Warn)]);
@@ -1614,6 +1858,15 @@ mod tests {
                 "UNKNOWN (", "%X%", "\"%X%A\"", ".NOT.", "GOTO ", "OIP(", "DEFINE(", "LOCAL(", "A.ROOT.B",
             ],
             Lang::Diff => &["@@ -1,2 +1,2 @@", "---", "+++", " "],
+            Lang::Dart => &["'''", "\"\"\"", "r'", "r\"", "${", "$x", "}", "/*", "*/", "//", "\\"],
+            Lang::Scala => &["\"\"\"", "s\"", "raw\"", "${", "$x", "$$", "$\"", "}", "/*", "*/", "'a'", "@main", "\"\"\"\""],
+            Lang::ObjC | Lang::ObjCpp => &["@\"", "@interface ", "@end", "#import <x>", "/*", "*/", "//", "@1", "@[", "R\"(", ")\"", "# "],
+            Lang::GCode => &["G1 ", "M117 ", "X10.5", "; ", "(", ")", "%", "N10", "#1", "*12", "o100 ", "A=1", "[", "]"],
+            Lang::InnoSetup => &[
+                "[Code]\n", "[Setup]\n", "[Files]\n", "Name: ", "; ", "{app}", "{#", "#define X ", "{", "}", "(*", "*)", "//", "'", "#13",
+                "$FF", "\"\"", "[x] ",
+            ],
+            Lang::Nsis => &["!include ", "!define ", "$INSTDIR", "${X}", "$(L)", "$\\\"", "$$", "\\\n", "/*", "*/", "/r ", "l:", "Section ", "$"],
             _ => &["[s]", "k=v", "ERROR"],
         };
         let mut s = Vec::new();
@@ -1636,7 +1889,8 @@ mod tests {
         use Lang::*;
         let exact_mid_line = [
             Json, Log, Ini, Xml, Html, Csv, CsvSemi, Tsv, Python, JavaScript, TypeScript, C, Cpp, CSharp, Java, Kotlin, Swift, Go,
-            Php, Lua, Nginx, Apache, Properties, Calendar, Sln, R, Ppcl,
+            Php, Lua, Nginx, Apache, Properties, Calendar, Sln, R, Ppcl, Dart, Scala, ObjC, ObjCpp, GCode,
+            Nsis,
         ];
         let mut r = 0x2545_F491_4F6C_DD1Du64;
         for lang in Lang::ALL {

@@ -32,7 +32,8 @@ const EXTENSIONS: &[&str] = &[
     // code and project files
     ".c", ".h", ".cpp", ".hpp", ".cc", ".cxx", ".ino", ".cs", ".csproj", ".sln", ".props", ".targets", ".xaml",
     ".resx", ".java", ".kt", ".kts", ".gradle", ".groovy", ".swift", ".go", ".rs", ".dart", ".vb", ".tf",
-    ".tfvars", ".hcl", ".cmake",
+    ".tfvars", ".hcl", ".cmake", ".scala", ".sbt", ".m", ".mm", ".gcode", ".gco", ".ngc", ".cnc", ".iss", ".isl",
+    ".nsi", ".nsh", ".ppcl",
 ];
 
 fn set(path: &str, name: Option<&str>, value: &str) -> bool {

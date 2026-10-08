@@ -3342,6 +3342,15 @@ impl App {
                 if self.tab().lang == Lang::Ini && ext.as_ref().is_some_and(|e| e == "ini" || e == "inf" || e == "reg") {
                     style = super::highlight::CommentStyle::Line(";");
                 }
+                if self.tab().lang == Lang::InnoSetup {
+                    // its [Code] section is Pascal, where a `;` would only be an empty statement
+                    let doc = &self.tab().doc;
+                    let a = doc.line_start_of(self.tab().view.sel.start());
+                    let before = doc.read(a.saturating_sub(4 << 20), a);
+                    if super::highlight::inno_code_line(&before, &doc.read(a, doc.line_end_of(a))) {
+                        style = super::highlight::CommentStyle::Line("//");
+                    }
+                }
                 if !self.editable() {
                     return;
                 }
@@ -3835,7 +3844,7 @@ impl App {
         let cur = self.tab().lang;
         let mut v = Vec::new();
         for (k, &l) in Lang::ALL.iter().enumerate() {
-            if k > 0 && k % 16 == 0 {
+            if k > 0 && k % 18 == 0 {
                 v.push(Item::ColBreak);
             }
             v.push(check(Cmd::SetLang(l), l.label(), "", l == cur));
