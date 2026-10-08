@@ -62,6 +62,12 @@ The details are in the [0.3.0 release notes](release-notes-0.3.0.md). In short:
 
 ## Later
 
+- **A Linux version, Raspberry Pi included (L).** The engine (`src/core`: text storage, search, JSON/XML, line
+  tools) is plain Rust except for a few file-handling and ANSI code-page calls, which go behind a small platform
+  layer. The window and drawing get a second front end on a cross-platform toolkit (GTK 4, or winit with a 2D GPU
+  renderer and a text-shaping crate; to be decided by what keeps huge files instant). Builds for x86-64 and ARM64
+  (the Pi) in CI, packaged as an AppImage or .deb; release files get their own names, so the Windows updater's
+  `Slate.exe` / `Slate.exe.sha256` stay exactly as they are.
 - **Maybe: a Markdown preview** (a rendered view next to the text, off by default) (M). Only if people ask for
   it: Slate is meant to stay quick and open anything, so it must cost nothing while it isn't used.
 - Several windows; drag a tab out into its own window (L).
