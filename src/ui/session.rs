@@ -1432,16 +1432,43 @@ fn finish_rewrites_in(d: &Path, tabs: &mut [SessionTab]) {
     while changed {
         changed = false;
         for x in names(".pieces") {
-            let Some((h, _)) = fs::read(d.join(pieces_file(&x))).ok().and_then(|b| decode_pieces(&b)) else { continue };
-            let Some(w) = h.replaces.filter(|w| *w != x && d.join(pieces_file(w)).exists()) else { continue };
+            let Some((header, pieces)) = fs::read(d.join(pieces_file(&x))).ok().and_then(|b| decode_pieces(&b)) else {
+                continue;
+            };
+            let Some(w) = header.replaces.clone().filter(|w| *w != x && d.join(pieces_file(w)).exists()) else { continue };
             // (its text is written before the list, under a temporary name until after it)
             let (data, tmp) = (d.join(data_file(&x)), d.join(format!("{}.tmp", data_file(&x))));
-            let whole = h.data_len == 0 || data.exists() || (tmp.exists() && fs::rename(&tmp, &data).is_ok());
-            let (keep, drop) = if whole { (x, w) } else { (w, x) };
+            if !data.exists() && tmp.exists() {
+                let _ = fs::rename(&tmp, &data);
+            }
+            // The new list wins only when its text is all there and checks out: a drive that doesn't keep the order
+            // of writes (a USB stick) can lose some of it in a power cut, and then the old list is the good copy.
+            // Nor when the old list was written after it: then it's a rewrite that didn't finish, left behind.
+            let modified = |n: &str| fs::metadata(d.join(pieces_file(n))).and_then(|m| m.modified()).ok();
+            let stale = matches!((modified(&w), modified(&x)), (Some(a), Some(b)) if a > b);
+            let list = BigList { header, pieces };
+            let check = Ctx { cancel: Default::default(), progress: Default::default() };
+            let new_wins = !stale
+                && match read_data(d, &x, &list, &check) {
+                    Ok(_) => true,
+                    Err(ListErr::Damaged(_)) => false,
+                    // (another program has it open: decided next time)
+                    Err(ListErr::Busy(_)) => continue,
+                };
+            let (keep, drop) = if new_wins { (x, w) } else { (w, x) };
             for t in tabs.iter_mut().filter(|t| t.pieces.as_deref() == Some(drop.as_str())) {
                 t.pieces = Some(keep.clone());
             }
-            forget(&drop);
+            if new_wins {
+                forget(&drop);
+            } else {
+                // (kept for a look, never deleted)
+                for f in [pieces_file(&drop), data_file(&drop), format!("{}.tmp", data_file(&drop))] {
+                    if d.join(&f).exists() {
+                        set_aside_in(d, &f);
+                    }
+                }
+            }
             changed |= !d.join(pieces_file(&drop)).exists();
         }
     }
@@ -2193,6 +2220,47 @@ mod tests {
         assert_eq!(fs::read(dir.join("tab-4.data")).unwrap(), b"new!");
         assert!(!dir.join("tab-9.data.tmp").exists());
         assert!(big_orphans_in(&dir, &named.iter().map(|n| n.to_string()).collect::<Vec<_>>()).is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_rewrite_whose_text_didnt_all_reach_the_disk_loses_to_the_old_list() {
+        let dir = test_dir("rewrites-bad");
+        let st = |n: &str| SessionTab { pieces: Some(n.to_string()), ..SessionTab::untitled() };
+        // the new text cut short (a drive that didn't keep the order of writes, then a power cut)
+        put_list(&dir, "tab-1", None, Some(b"old!"));
+        put_list(&dir, "tab-2", Some("tab-1"), Some(b"new!"));
+        fs::write(dir.join(data_file("tab-2")), b"ne").unwrap();
+        // the new text all there, but not what was written
+        put_list(&dir, "tab-3", None, Some(b"old!"));
+        let mut h = StableHasher::default();
+        h.update(b"new!");
+        let header = PiecesHeader {
+            len: 4,
+            data_len: 4,
+            sums: vec![(0, 4, h.finish())],
+            replaces: Some("tab-3".into()),
+            ..PiecesHeader::empty()
+        };
+        fs::write(dir.join(pieces_file("tab-4")), encode_pieces(&header, &[(0, 0, 4)]).unwrap()).unwrap();
+        fs::write(dir.join(data_file("tab-4")), b"neW!").unwrap();
+        // a rewrite that didn't finish, with the old list written after it: the old one is the newest text
+        put_list(&dir, "tab-6", Some("tab-5"), Some(b"mid!"));
+        std::thread::sleep(Duration::from_millis(20));
+        put_list(&dir, "tab-5", None, Some(b"new!"));
+        let mut tabs = vec![st("tab-1"), st("tab-3"), st("tab-5")];
+        finish_rewrites_in(&dir, &mut tabs);
+        let named: Vec<&str> = tabs.iter().map(|t| t.pieces.as_deref().unwrap()).collect();
+        assert_eq!(named, ["tab-1", "tab-3", "tab-5"]);
+        for kept in ["tab-1", "tab-3", "tab-5"] {
+            assert_eq!(fs::read(dir.join(data_file(kept))).unwrap().len(), 4, "{kept}'s text");
+            assert!(dir.join(pieces_file(kept)).exists(), "{kept}'s list");
+        }
+        // the losers are set aside, never deleted
+        for lost in ["tab-2", "tab-4", "tab-6"] {
+            assert!(!dir.join(pieces_file(lost)).exists());
+            assert!(dir.join("damaged").join(pieces_file(lost)).exists(), "{lost} set aside");
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 }
