@@ -42,6 +42,11 @@ its numbered lines in the `.txt` files Desigo exports (and as `.ppcl`, or a `.pc
 comment puts the `C` after each line's number. Prompts follow dark mode. Details in the
 [0.5.0 release notes](release-notes-0.5.0.md).
 
+## 0.6.0
+
+Seven more languages: Dart, Scala, Objective-C and Objective-C++, G-code, Inno Setup (with Pascal Script in its
+`[Code]` section) and NSIS, none slower than C. Details in the [0.6.0 release notes](release-notes-0.6.0.md).
+
 ## Next
 
 1. **Accessibility: UI Automation (L).** The high-contrast theme (Windows' colors, read again when they change) and a

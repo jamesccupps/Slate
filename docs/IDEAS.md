@@ -19,3 +19,4 @@ sizes of everything that's coming.
   better detection by name, folder and content (0.4.0).
 - PPCL (Siemens APOGEE and Desigo): colored much as Desigo shows it, simple mistakes in red, its exports recognized,
   Toggle comment after the line numbers; prompts in dark mode (0.5.0).
+- Dart, Scala, Objective-C(++), G-code, Inno Setup and NSIS (0.6.0).
