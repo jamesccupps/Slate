@@ -1,6 +1,7 @@
 //! Streaming JSON tools: pretty-print, minify and validate documents of any size in one pass (output goes to a
 //! writer, e.g. a temp file). Several top-level values in a row (JSON Lines / NDJSON) are accepted; each one
-//! goes on its own line.
+//! goes on its own line. Comments (JSONC, like VS Code's settings) are refused with a message saying so, as
+//! formatting would have to drop or move them.
 
 use std::io::{self, Write};
 
@@ -53,7 +54,15 @@ enum St {
     Hex { key: bool, n: u8 },
     Num(Num),
     Lit { word: &'static [u8], i: u8 },
+    /// After a `/` outside a string at the end of a chunk: a comment if `/` or `*` follows.
+    Slash,
 }
+
+/// The message when the text has `//` or `/* */` comments, which plain JSON doesn't allow.
+pub const COMMENTS: &str = "It has comments (JSONC), which plain JSON doesn't allow";
+
+/// Deeper levels aren't indented any further, so absurdly deep input can't turn into gigabytes of spaces.
+const MAX_INDENT: usize = 100;
 
 pub struct Formatter<'w> {
     mode: Mode,
@@ -74,6 +83,9 @@ pub struct Formatter<'w> {
     gap: bool,
     /// The last top-level value was a number, true, false or null (which need a space before the next value).
     bare: bool,
+    /// Where the `/` of `St::Slash` is, and the state before it.
+    slash_at: u64,
+    before_slash: St,
 }
 
 fn err(offset: u64, msg: impl Into<String>) -> JsonError {
@@ -108,6 +120,8 @@ impl<'w> Formatter<'w> {
             io_err: None,
             gap: false,
             bare: false,
+            slash_at: 0,
+            before_slash: St::Value,
         }
     }
 
@@ -141,10 +155,27 @@ impl<'w> Formatter<'w> {
             self.emit(&eol);
             self.eol = eol;
             let ind = std::mem::take(&mut self.indent);
-            for _ in 0..depth {
+            for _ in 0..depth.min(MAX_INDENT) {
                 self.emit(&ind);
             }
             self.indent = ind;
+        }
+    }
+
+    /// The error for an unexpected byte `b` at `at` in state `st` (between tokens).
+    fn bad(&self, st: St, b: u8, at: u64) -> JsonError {
+        match st {
+            St::Colon => err(at, "Expected ':' after the key"),
+            St::Key | St::KeyOrClose => err(at, format!("Expected a key in quotes, found {}", describe(b))),
+            // `01` or `truefalse` is a mistake, not two values
+            St::After if self.stack.is_empty() && self.bare && !self.gap => {
+                err(at, format!("Unexpected {} after the value", describe(b)))
+            }
+            St::After if !self.stack.is_empty() => {
+                let close = if *self.stack.last().unwrap() { '}' } else { ']' };
+                err(at, format!("Expected ',' or '{close}', found {}", describe(b)))
+            }
+            _ => err(at, format!("Expected a value, found {}", describe(b))),
         }
     }
 
@@ -272,6 +303,13 @@ impl<'w> Formatter<'w> {
                     self.emit(&[b]);
                     self.st = if k as usize + 1 == word.len() { St::After } else { St::Lit { word, i: k + 1 } };
                 }
+                St::Slash => {
+                    return Err(if matches!(b, b'/' | b'*') {
+                        err(self.slash_at, COMMENTS)
+                    } else {
+                        self.bad(self.before_slash, b'/', self.slash_at)
+                    });
+                }
                 st => {
                     if matches!(b, b' ' | b'\t' | b'\r' | b'\n') {
                         if self.stack.is_empty() {
@@ -279,6 +317,20 @@ impl<'w> Formatter<'w> {
                         }
                         i += 1;
                         continue;
+                    }
+                    if b == b'/' {
+                        // `//` or `/*` starts a comment (JSONC); any other `/` is a mistake
+                        match data.get(i + 1) {
+                            Some(b'/' | b'*') => return Err(err(at, COMMENTS)),
+                            Some(_) => return Err(self.bad(st, b, at)),
+                            None => {
+                                self.before_slash = st;
+                                self.slash_at = at;
+                                self.st = St::Slash;
+                                i += 1;
+                                continue;
+                            }
+                        }
                     }
                     match (st, b) {
                         (St::Value | St::ValueOrClose, b'{') => {
@@ -340,23 +392,12 @@ impl<'w> Formatter<'w> {
                             self.newline(self.stack.len());
                             self.st = if *self.stack.last().unwrap() { St::Key } else { St::Value };
                         }
-                        (St::After, _) if self.stack.is_empty() => {
-                            // Another top-level value (JSON Lines). `01` or `truefalse` is a mistake, not two values.
-                            if self.bare && !self.gap {
-                                return Err(err(at, format!("Unexpected {} after the value", describe(b))));
-                            }
+                        (St::After, _) if self.stack.is_empty() && !(self.bare && !self.gap) => {
+                            // Another top-level value (JSON Lines).
                             self.st = St::Value;
                             continue;
                         }
-                        (St::Colon, _) => return Err(err(at, "Expected ':' after the key")),
-                        (St::Key | St::KeyOrClose, _) => {
-                            return Err(err(at, format!("Expected a key in quotes, found {}", describe(b))));
-                        }
-                        (St::After, _) => {
-                            let close = if *self.stack.last().unwrap() { '}' } else { ']' };
-                            return Err(err(at, format!("Expected ',' or '{close}', found {}", describe(b))));
-                        }
-                        _ => return Err(err(at, format!("Expected a value, found {}", describe(b)))),
+                        _ => return Err(self.bad(st, b, at)),
                     }
                 }
             }
@@ -381,6 +422,7 @@ impl<'w> Formatter<'w> {
             St::Str { .. } | St::Esc { .. } | St::Hex { .. } => {
                 return Err(err(at, "The file ends inside a string"));
             }
+            St::Slash => return Err(self.bad(self.before_slash, b'/', self.slash_at)),
             _ => return Err(err(at, "The file ends before the JSON is complete")),
         }
         if self.mode == Mode::Pretty && self.stats.values > 0 {
@@ -494,5 +536,32 @@ mod tests {
         assert_eq!(fmt(Mode::Minify, "12").unwrap(), "12");
         assert_eq!(fmt(Mode::Minify, "[0, -0.5, 1e9]").unwrap(), "[0,-0.5,1e9]");
         assert!(fmt(Mode::Minify, "-").is_err());
+    }
+
+    #[test]
+    fn comments_are_refused_clearly() {
+        // (fed byte by byte, so the `/` always ends a chunk)
+        for (src, at) in [("{\n  // size\n  \"a\": 1\n}", 4), ("/* c */ {}", 0), ("[1, /* x */ 2]", 4), ("{\"a\": 1} // end", 9)] {
+            let e = fmt(Mode::Validate, src).unwrap_err();
+            assert_eq!((e.offset, e.msg.as_str()), (at, COMMENTS), "{src}");
+            let mut f = Formatter::new(Mode::Pretty, b"  ", b"\n", None, None);
+            assert_eq!(f.feed(src.as_bytes()).unwrap_err().msg, COMMENTS, "{src} in one piece");
+        }
+        // any other `/` is just a mistake
+        assert_eq!(fmt(Mode::Validate, "[1/2]").unwrap_err().msg, "Expected ',' or ']', found '/'");
+        assert_eq!(fmt(Mode::Validate, "{\"a\":1}/").unwrap_err(), err(7, "Expected a value, found '/'"));
+        assert_eq!(fmt(Mode::Validate, "{/}").unwrap_err().msg, "Expected a key in quotes, found '/'");
+        assert_eq!(fmt(Mode::Validate, "1/").unwrap_err().msg, "Unexpected '/' after the value");
+        // a slash inside a string is fine
+        assert_eq!(fmt(Mode::Minify, "{\"url\": \"http://x/*y*/\"}").unwrap(), "{\"url\":\"http://x/*y*/\"}");
+    }
+
+    #[test]
+    fn deep_nesting_stops_indenting() {
+        let s = format!("{}{}", "[".repeat(150), "]".repeat(150));
+        let p = fmt(Mode::Pretty, &s).unwrap();
+        let widest = p.lines().map(|l| l.len() - l.trim_start().len()).max().unwrap();
+        assert_eq!(widest, MAX_INDENT * 2);
+        assert_eq!(fmt(Mode::Minify, &p).unwrap(), s);
     }
 }

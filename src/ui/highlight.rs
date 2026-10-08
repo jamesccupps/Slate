@@ -183,11 +183,7 @@ impl Lang {
                 Lang::Html
             }
             "md" | "markdown" | "mdown" | "mkd" | "mdx" => Lang::Markdown,
-            "csv" => {
-                let first = head.split(|&b| b == b'\n').next().unwrap_or(b"");
-                let count = |c: u8| first.iter().filter(|&&b| b == c).count();
-                if count(b';') > count(b',') { Lang::CsvSemi } else { Lang::Csv }
-            }
+            "csv" => csv_kind(head),
             "tsv" | "tab" => Lang::Tsv,
             "yaml" | "yml" => Lang::Yaml,
             "py" | "pyw" | "pyi" | "pyx" => Lang::Python,
@@ -267,12 +263,45 @@ impl Lang {
                     return Lang::Ini;
                 }
             }
-            return Lang::Json;
+            // `[2026-10-07 12:00:01] INFO …` is a log and `[ ] buy milk` a list: only what reads as JSON is JSON
+            if !looks_like_log(head) && looks_like_json(t) {
+                return Lang::Json;
+            }
         }
         if looks_like_log(head) {
             return Lang::Log;
         }
         Lang::Plain
+    }
+}
+
+/// Whether the start of a file reads as JSON (or JSON with comments) as far as it goes.
+fn looks_like_json(head: &[u8]) -> bool {
+    use crate::core::json;
+    match json::Formatter::new(json::Mode::Validate, b"", b"\n", None, None).feed(head) {
+        Ok(()) => true,
+        Err(e) => e.msg == json::COMMENTS,
+    }
+}
+
+/// Which separator a CSV file uses: the one its first line has most of outside quotes (tabs, semicolons or commas).
+fn csv_kind(head: &[u8]) -> Lang {
+    let (mut quoted, mut n) = (false, [0usize; 3]);
+    for &b in head.split(|&b| b == b'\n').next().unwrap_or(b"") {
+        match b {
+            b'"' => quoted = !quoted,
+            b',' if !quoted => n[0] += 1,
+            b';' if !quoted => n[1] += 1,
+            b'\t' if !quoted => n[2] += 1,
+            _ => {}
+        }
+    }
+    if n[2] > n[0] && n[2] > n[1] {
+        Lang::Tsv
+    } else if n[1] > n[0] {
+        Lang::CsvSemi
+    } else {
+        Lang::Csv
     }
 }
 
@@ -388,11 +417,12 @@ pub fn lex(lang: Lang, text: &[u8], st: State, out: Option<&mut Vec<Span>>) -> S
         Lang::Json => json(text, st, &mut o),
         Lang::Log => by_line(text, st, &mut o, log_line),
         Lang::Ini => by_line(text, st, &mut o, ini_line),
-        Lang::Diff => by_line(text, st, &mut o, diff_line),
+        Lang::Diff => diff(text, st, &mut o),
         Lang::Csv => csv(text, st, b',', &mut o),
         Lang::CsvSemi => csv(text, st, b';', &mut o),
         Lang::Tsv => csv(text, st, b'\t', &mut o),
         Lang::Xml | Lang::Html => markup::markup(lang == Lang::Html, text, st, &mut o),
+        Lang::Php => markup::php(text, st, &mut o),
         Lang::Markdown => markup::markdown(text, st, &mut o),
         Lang::Yaml => markup::yaml(text, st, &mut o),
         Lang::Css => code::css(text, st, &mut o),
@@ -477,8 +507,12 @@ const J_BLOCK_COMMENT: u8 = 3;
 /// Whether a JSON segment that doesn't start its line starts inside a string, judged from the bytes before it:
 /// exact from the line start, otherwise a guess from the last quote that clearly closed a string.
 fn json_starts_in_string(prefix: &[u8]) -> bool {
-    // A quote followed by ':' ',' '}' or ']' almost always ends a string.
-    let Some(start) = (1..prefix.len()).rev().find(|&i| matches!(prefix[i], b':' | b',' | b'}' | b']') && prefix[i - 1] == b'"')
+    // A quote followed by ':' ',' '}' or ']' almost always ends a string, unless it is escaped (`\"` in a string
+    // holding JSON itself: `"payload": "{\"a\":1}"`).
+    let escaped = |q: usize| prefix[..q].iter().rev().take_while(|&&b| b == b'\\').count() % 2 == 1;
+    let Some(start) = (1..prefix.len())
+        .rev()
+        .find(|&i| matches!(prefix[i], b':' | b',' | b'}' | b']') && prefix[i - 1] == b'"' && !escaped(i - 1))
     else {
         return false;
     };
@@ -616,25 +650,65 @@ fn by_line(t: &[u8], st: State, o: &mut Out, f: fn(&[u8], bool, bool, &mut Out))
     State { kind: 0, ..st }
 }
 
-const LEVELS: [(&[u8], Tok); 12] = [
+/// Level words (as whole words), in the spellings logs use: `ERROR`, `error` (nginx, logfmt, JSON logs), `ERR`
+/// (Serilog), `fail` and `crit` (.NET), `emerg` and `alert` (syslog)...
+const LEVELS: [(&[u8], Tok); 38] = [
     (b"FATAL", Tok::Error),
+    (b"Fatal", Tok::Error),
+    (b"fatal", Tok::Error),
+    (b"FTL", Tok::Error),
     (b"CRITICAL", Tok::Error),
+    (b"Critical", Tok::Error),
+    (b"critical", Tok::Error),
+    (b"CRIT", Tok::Error),
+    (b"crit", Tok::Error),
+    (b"emerg", Tok::Error),
+    (b"alert", Tok::Error),
     (b"ERROR", Tok::Error),
     (b"Error", Tok::Error),
+    (b"error", Tok::Error),
+    (b"ERR", Tok::Error),
+    (b"err", Tok::Error),
     (b"Exception", Tok::Error),
     (b"FAIL", Tok::Error),
+    (b"fail", Tok::Error),
     (b"WARNING", Tok::Warn),
-    (b"WARN", Tok::Warn),
     (b"Warning", Tok::Warn),
+    (b"warning", Tok::Warn),
+    (b"WARN", Tok::Warn),
+    (b"warn", Tok::Warn),
+    (b"WRN", Tok::Warn),
     (b"INFO", Tok::Info),
+    (b"Information", Tok::Info),
+    (b"info", Tok::Info),
+    (b"INF", Tok::Info),
+    (b"notice", Tok::Info),
+    (b"NOTICE", Tok::Info),
     (b"DEBUG", Tok::Dim),
+    (b"debug", Tok::Dim),
+    (b"DBG", Tok::Dim),
+    (b"dbug", Tok::Dim),
     (b"TRACE", Tok::Dim),
+    (b"trace", Tok::Dim),
+    (b"VERBOSE", Tok::Dim),
 ];
+
+const MONTHS: [&[u8]; 12] = [b"Jan", b"Feb", b"Mar", b"Apr", b"May", b"Jun", b"Jul", b"Aug", b"Sep", b"Oct", b"Nov", b"Dec"];
 
 fn log_line(t: &[u8], col0: bool, _bol: bool, o: &mut Out) {
     let n = t.len();
     let mut i = 0usize;
-    if col0 {
+    if col0 && n > 4 && MONTHS.contains(&&t[..3]) && t[3] == b' ' {
+        // a syslog time: `Oct  7 12:00:01`
+        let mut j = 4 + t[4..].iter().take_while(|&&b| b == b' ').count();
+        j += t[j..].iter().take_while(|b| b.is_ascii_digit()).count();
+        let k = j + t[j..].iter().take_while(|&&b| b == b' ').count();
+        let e = k + t[k..].iter().take_while(|&&b| b.is_ascii_digit() || b == b':' || b == b'.').count();
+        if e > k {
+            o.put(0, e, Tok::Dim);
+            i = e;
+        }
+    } else if col0 {
         // A timestamp at the start: digits and date/time punctuation.
         let mut j = 0;
         let mut digits = 0;
@@ -647,7 +721,8 @@ fn log_line(t: &[u8], col0: bool, _bol: bool, o: &mut Out) {
             }
             j += 1;
         }
-        while j > 0 && t[j - 1] == b' ' {
+        // (not the `[` of `12:00:01 [main]`)
+        while j > 0 && matches!(t[j - 1], b' ' | b'[') {
             j -= 1;
         }
         if digits >= 6 && j > 0 {
@@ -683,10 +758,16 @@ fn ini_line(t: &[u8], _col0: bool, bol: bool, o: &mut Out) {
         return;
     }
     match t[s] {
-        b';' | b'#' => o.put(s, n, Tok::Comment),
+        // (`!` starts a comment in Java .properties files)
+        b';' | b'#' | b'!' => o.put(s, n, Tok::Comment),
         b'[' => o.put(s, n, Tok::Section),
         _ => {
-            let Some(eq) = t[s..].iter().position(|&b| b == b'=' || b == b':').map(|p| s + p) else { return };
+            // `key = value`, or `key: value` with a one-word key (not `proxy_pass http://…` in nginx.conf)
+            let eq = t[s..].iter().position(|&b| b == b'=').map(|p| s + p);
+            let colon = t[s..eq.unwrap_or(n)].iter().position(|&b| b == b':').map(|p| s + p).filter(|&c| {
+                !t[s..c].trim_ascii_end().iter().any(|b| b.is_ascii_whitespace()) && !matches!(at(t, c + 1), b'/' | b'\\')
+            });
+            let Some(eq) = colon.or(eq) else { return };
             o.put(s, eq, Tok::Key);
             o.put(eq, eq + 1, Tok::Punct);
             ini_value(t, eq + 1, o);
@@ -727,14 +808,53 @@ fn ini_value(t: &[u8], mut i: usize, o: &mut Out) {
     }
 }
 
-fn diff_line(t: &[u8], col0: bool, _bol: bool, o: &mut Out) {
-    if !col0 {
-        return;
+/// Diffs: inside a hunk every line is a removed, added or unchanged one (so `--- x` there is a removed line, not a
+/// file header). The state carries how many old lines (`b`) and new lines (`a`, and `mode` for the high byte) the
+/// hunk still has, from its `@@ -1,5 +1,6 @@` line.
+fn diff(t: &[u8], st: State, o: &mut Out) -> State {
+    let mut left = (st.b as u32, st.a as u32 | (st.mode as u32) << 8);
+    let mut col0 = st.col0;
+    let mut start = 0;
+    loop {
+        let end = line_end(t, start);
+        // (after the text's last line break nothing has started yet: the text that comes next counts that line)
+        if col0 && start < t.len() {
+            left = diff_line(&t[start..end], left, &mut o.at(start));
+        }
+        if end >= t.len() {
+            break;
+        }
+        start = end + 1;
+        col0 = true;
     }
-    let tok = if t.starts_with(b"+++") || t.starts_with(b"---") {
+    let (old, new) = (left.0.min(0xFFFF), left.1.min(0xFFFF));
+    State { kind: 0, a: new as u8, b: old as u16, mode: (new >> 8) as u8, ..st }
+}
+
+/// Colors one line of a diff; `left` = (old, new) lines still to come in the current hunk.
+fn diff_line(t: &[u8], left: (u32, u32), o: &mut Out) -> (u32, u32) {
+    let (old, new) = left;
+    if old > 0 || new > 0 {
+        match t.first() {
+            Some(b'-') => {
+                o.put(0, t.len(), Tok::Removed);
+                return (old.saturating_sub(1), new);
+            }
+            Some(b'+') => {
+                o.put(0, t.len(), Tok::Added);
+                return (old, new.saturating_sub(1));
+            }
+            // unchanged (an empty one when a tool trimmed the space)
+            Some(b' ' | b'\r') | None => return (old.saturating_sub(1), new.saturating_sub(1)),
+            Some(b'\\') => return left, // "\ No newline at end of file"
+            _ => {}                     // anything else: the hunk is over
+        }
+    }
+    let tok = if t.starts_with(b"@@") {
+        o.put(0, t.len(), Tok::Section);
+        return hunk_lines(t);
+    } else if t.starts_with(b"+++") || t.starts_with(b"---") {
         Tok::Heading
-    } else if t.starts_with(b"@@") {
-        Tok::Section
     } else if t.starts_with(b"+") {
         Tok::Added
     } else if t.starts_with(b"-") {
@@ -742,9 +862,24 @@ fn diff_line(t: &[u8], col0: bool, _bol: bool, o: &mut Out) {
     } else if t.starts_with(b"diff ") || t.starts_with(b"index ") || t.starts_with(b"new file") || t.starts_with(b"deleted file") {
         Tok::Keyword
     } else {
-        return;
+        return (0, 0);
     };
     o.put(0, t.len(), tok);
+    (0, 0)
+}
+
+/// How many old and new lines a `@@ -1,5 +1,6 @@` hunk has (a count left out is 1).
+fn hunk_lines(t: &[u8]) -> (u32, u32) {
+    let s = String::from_utf8_lossy(t);
+    let mut parts = s.split_whitespace().skip(1);
+    let mut count = |sign: char| {
+        let p = parts.next()?.strip_prefix(sign)?;
+        p.split(',').nth(1).map_or(Some(1), |c| c.parse::<u32>().ok())
+    };
+    match (count('-'), count('+')) {
+        (Some(old), Some(new)) => (old, new),
+        _ => (0, 0),
+    }
 }
 
 // ---- CSV ----
@@ -815,6 +950,18 @@ mod tests {
         }
     }
 
+    /// The tokens of each line of `text`, each line lexed in the state the view gives it (what everything before it
+    /// ends in).
+    pub(super) fn view(lang: Lang, text: &str) -> Vec<Vec<(String, Tok)>> {
+        let mut st = State::START;
+        let mut out = Vec::new();
+        for l in text.split_inclusive('\n') {
+            out.push(toks(lang, l.trim_end_matches('\n'), st));
+            st = lex(lang, l.as_bytes(), st, None);
+        }
+        out
+    }
+
     /// The state after `text`, lexed in one piece and split at every position, must be the same.
     pub(super) fn end_state(lang: Lang, text: &str) -> State {
         let whole = lex(lang, text.as_bytes(), State::START, None);
@@ -869,6 +1016,76 @@ mod tests {
         assert_eq!(d(None, b"diff --git a/x b/x\n"), Lang::Diff);
         assert_eq!(d(Some("x.txt"), b"2026-10-07 12:00:01 INFO start\n2026-10-07 12:00:02 WARN slow\n"), Lang::Log);
         assert_eq!(d(Some("readme.txt"), b"Hello there.\nThis is a note.\n"), Lang::Plain);
+        // a `[` or `{` start is JSON only when it reads as JSON (also with comments, or cut off by the sample)
+        assert_eq!(d(Some("app.txt"), b"[2026-10-07 12:00:01] INFO start\n[2026-10-07 12:00:02] WARN slow\n"), Lang::Log);
+        assert_eq!(d(Some("error_log"), b"[07-Oct-2026 12:00:01 UTC] PHP Warning: x\n[07-Oct-2026 12:00:02 UTC] PHP Notice: y\n"), Lang::Log);
+        assert_eq!(d(Some("todo.txt"), b"[ ] buy milk\n[x] call mom\n"), Lang::Plain);
+        assert_eq!(d(Some("x.txt"), b"{{ jinja }}"), Lang::Plain);
+        assert_eq!(d(Some("x.txt"), b"{\n  // comment\n  \"a\": [1, 2"), Lang::Json);
+        assert_eq!(d(Some("x.txt"), b"{\"a\":1}\n{\"a\":2}\n"), Lang::Json);
+        assert_eq!(d(Some("x.txt"), b"[\"2026-10-07 12:00:01\", 2]"), Lang::Json);
+        // the CSV separator counts outside quotes, and tabs count too
+        assert_eq!(d(Some("data.csv"), b"\"Name, First\";\"Age\"\n\"x\";1"), Lang::CsvSemi);
+        assert_eq!(d(Some("data.csv"), b"a\tb\tc\n1\t2\t3"), Lang::Tsv);
+    }
+
+    #[test]
+    fn logs_configs_and_diffs() {
+        has(Lang::Log, "2026/10/07 12:00:01 [error] 123#0: open() failed", &[("2026/10/07 12:00:01", Tok::Dim), ("error", Tok::Error)]);
+        has(Lang::Log, "time=x level=warn msg=slow", &[("warn", Tok::Warn)]);
+        has(Lang::Log, "{\"level\":\"info\"} fail: Microsoft.Hosting [ERR] [DBG]", &[
+            ("info", Tok::Info),
+            ("fail", Tok::Error),
+            ("ERR", Tok::Error),
+            ("DBG", Tok::Dim),
+        ]);
+        has(Lang::Log, "Oct  7 12:00:01 host sshd[1]: Failed", &[("Oct  7 12:00:01", Tok::Dim)]);
+        assert!(toks(Lang::Log, "the errors and terrors", State::START).is_empty());
+        // `key: value` needs a one-word key: nginx's `proxy_pass http://…` has none
+        assert!(toks(Lang::Ini, "    proxy_pass http://backend:8080;", State::START).is_empty());
+        assert!(toks(Lang::Ini, "<VirtualHost *:80>", State::START).is_empty());
+        has(Lang::Ini, "time: 12:00", &[("time", Tok::Key)]);
+        has(Lang::Ini, "path = C:\\x", &[("path ", Tok::Key)]);
+        has(Lang::Ini, "! a .properties comment", &[("! a .properties comment", Tok::Comment)]);
+        // in a hunk, --- and +++ are a removed and an added line; the hunk's counts say where it ends
+        let diff = "--- a/x\n+++ b/x\n@@ -1,2 +1,2 @@\n--- old sql comment\n+++ new counter\n context\n--- a/y\n+++ b/y\n";
+        let st = end_state(Lang::Diff, diff);
+        assert_eq!((st.a, st.b), (0, 0));
+        let mut lines = diff.lines();
+        let mut st = State::START;
+        let mut got = Vec::new();
+        for l in lines.by_ref() {
+            got.push(toks(Lang::Diff, l, st).first().map(|t| t.1));
+            st = lex(Lang::Diff, format!("{l}\n").as_bytes(), st, None);
+        }
+        use Tok::*;
+        assert_eq!(got, [Some(Heading), Some(Heading), Some(Section), Some(Removed), Some(Added), None, Some(Heading), Some(Heading)]);
+        assert_eq!(super::hunk_lines(b"@@ -3 +3,0 @@ fn x()"), (1, 0));
+    }
+
+    #[test]
+    fn huge_json_segments_inside_escaped_json() {
+        // a segment starting inside `"payload": "{\"a\":1,…}"` is inside the string
+        let rec = r#"{"id":1,"payload":"{\"a\":1,\"b\":[1,2],\"c\":{\"d\":\"e\"}}","n":2},"#;
+        let line = rec.repeat(200);
+        let (mut in_str, mut esc) = (false, false);
+        for (i, b) in line.bytes().enumerate() {
+            if i > 4096 && matches!(line.as_bytes()[i - 1], b',' | b'}' | b']' | b' ') {
+                let st = guess(Lang::Json, &line.as_bytes()[i - 4096..i], false);
+                assert_eq!(st.kind == J_STR, in_str, "at {i}");
+            }
+            if in_str {
+                if esc {
+                    esc = false;
+                } else if b == b'\\' {
+                    esc = true;
+                } else if b == b'"' {
+                    in_str = false;
+                }
+            } else if b == b'"' {
+                in_str = true;
+            }
+        }
     }
 
     #[test]
@@ -896,6 +1113,70 @@ mod tests {
         let t = toks(Lang::Tsv, "1\t\"say \"\"hi\"\"\t!\"\t3", State::START);
         assert_eq!(t[0], ("\"say \"\"hi\"\"\t!\"".into(), Tok::Col(1)));
         end_state(Lang::Csv, "a,\"b\nc\",d\ne,f\n");
+    }
+
+    /// Random text that is likely to trip `lang`'s lexer.
+    fn tricky_text(lang: Lang, r: &mut u64, len: usize) -> Vec<u8> {
+        let common: &[&str] = &[
+            " ", "\n", "\t", "x", "1", "-", "=", ":", ";", ",", "(", ")", "{", "}", "[", "]", "<", ">", "/", "*", "\\", "\"", "'", "#",
+            "$", "@", "!", "%", "&", "|", "`", "\r\n", "\n\n", "  \n",
+        ];
+        let extra: &[&str] = match lang {
+            Lang::Json => &["//", "/*", "*/", "true"],
+            Lang::Xml | Lang::Html => &["<!--", "-->", "<![CDATA[", "]]>", "<?", "?>", "<a", "</a>", "<script>", "</script>", "<style>", "&amp;"],
+            Lang::Php => &["<?php", "<?=", "?>", "<a href=\"", "<script>", "</script>", "<!--", "//", "/*", "*/", "$x"],
+            Lang::Markdown => &["```", "`", "<!--", "-->", "# ", "> ", "- ", "**", "_", "[", "](", "    "],
+            Lang::Yaml => &["key: ", "- ", "  ", "|", ">-", "# ", "&a", "!t", "{{ "],
+            Lang::Css => &["/*", "*/", "//", "url(", "@media", "#fff", ".c", ":hover"],
+            Lang::Python => &["\"\"\"", "'''", "def ", "r\""],
+            Lang::Rust => &["r#\"", "\"#", "/*", "*/", "//", "'a", "'\\''", "#["],
+            Lang::CSharp => &["@\"", "$\"", "\"\"\"", "/*", "*/", "//", "new ", "X("],
+            Lang::Lua => &["--[[", "]]", "[==[", "]==]", "--"],
+            Lang::PowerShell => &["@\"", "\"@", "@'", "'@", "<#", "#>", "$x"],
+            Lang::Batch => &["REM ", "::", ":l", "%%i", "%X%", "echo "],
+            Lang::Shell | Lang::Dockerfile => &["${", "<<EOF", "<<-'E'", "\nEOF\n", "\nE\n", "$'", "(("],
+            Lang::Ruby => &["<<~EOS", "\nEOS\n", " << ", ":s"],
+            Lang::Sql => &["--", "/*", "*/", "''", "[x]", "E'", "-- mysql\n", "/*!"],
+            Lang::JavaScript | Lang::TypeScript | Lang::Go => &["${", "/*", "*/", "//", "return ", "/a/", "[/]", "</"],
+            Lang::Kotlin | Lang::Swift | Lang::Java | Lang::C | Lang::Cpp => &["\"\"\"", "/*", "*/", "//", "#include <x>"],
+            Lang::Diff => &["@@ -1,2 +1,2 @@", "---", "+++", " "],
+            _ => &["[s]", "k=v", "ERROR"],
+        };
+        let mut s = Vec::new();
+        while s.len() < len {
+            *r ^= *r << 13;
+            *r ^= *r >> 7;
+            *r ^= *r << 17;
+            let k = (*r % (common.len() + 2 * extra.len()) as u64) as usize;
+            s.extend_from_slice(if k < common.len() { common[k] } else { extra[(k - common.len()) % extra.len()] }.as_bytes());
+        }
+        s
+    }
+
+    /// The view works out the state where each line starts by lexing up to it from a checkpoint, and keeps
+    /// checkpoints (in very long lines) after a space, comma, ';' or '>'. So lexing a text in two pieces must end
+    /// in the same state as lexing it whole: for every language when it's cut after a line break, and for those
+    /// whose lexers don't look ahead within a line also when it's cut at those characters.
+    #[test]
+    fn states_dont_depend_on_where_text_is_cut() {
+        use Lang::*;
+        let exact_mid_line = [Json, Log, Ini, Xml, Html, Csv, CsvSemi, Tsv, Python, JavaScript, TypeScript, C, Cpp, CSharp, Java, Kotlin, Swift, Go, Php, Lua];
+        let mut r = 0x2545_F491_4F6C_DD1Du64;
+        for lang in Lang::ALL {
+            for _ in 0..150 {
+                let len = 10 + (r % 60) as usize;
+                let t = tricky_text(lang, &mut r, len);
+                let whole = lex(lang, &t, State::START, None);
+                for cut in 1..t.len() {
+                    let mid_line = matches!(t[cut - 1], b' ' | b',' | b';' | b'>' | b'\t' | b'}');
+                    if t[cut - 1] != b'\n' && !(mid_line && exact_mid_line.contains(&lang)) {
+                        continue;
+                    }
+                    let split = lex(lang, &t[cut..], lex(lang, &t[..cut], State::START, None), None);
+                    assert_eq!(split, whole, "{lang:?} cut after byte {cut} of {:?}", String::from_utf8_lossy(&t));
+                }
+            }
+        }
     }
 
     #[test]

@@ -2,7 +2,8 @@
 //! container by scanning only that container's bytes; `path_at` finds the path to an offset (`data › [1203] ›
 //! name`) from such lists. Nothing is parsed up front, so it works on huge files: the top level of an 800 MB
 //! document is one background scan, and deeper levels are small. The scan is forgiving: broken JSON just ends the
-//! list early.
+//! list early, `//` and `/* */` comments (JSONC) are skipped, and in a file cut short whatever is still open ends at
+//! the end of the file (so its structure up to there still shows).
 
 use std::sync::Arc;
 
@@ -100,6 +101,12 @@ impl Child {
 /// rescanning at most `STRIDE` children. So a flat array of 25 million numbers costs about 10 MB, not 600 MB.
 pub const DENSE_MAX: u64 = 100_000;
 pub const STRIDE: u64 = 64;
+/// The same for the lists of the containers a scan passes through (kept when they are big): a coordinate-heavy
+/// GeoJSON is thousands of such lists, which would otherwise cost about as much memory as the file.
+pub const NESTED_MAX: u64 = 1024;
+
+const LINE_COMMENT: u8 = 1;
+const BLOCK_COMMENT: u8 = 2;
 
 #[derive(Clone, Debug, Default)]
 pub struct Children {
@@ -175,6 +182,8 @@ const C_OPEN: u8 = 3;
 const C_CLOSE: u8 = 4;
 const C_COMMA: u8 = 5;
 const C_COLON: u8 = 6;
+/// The `/` of `//` or `/*` (worked out when it's seen; CLASS has it as C_OTHER).
+const C_COMMENT: u8 = 7;
 
 const fn classes() -> [u8; 256] {
     let mut t = [C_OTHER; 256];
@@ -210,14 +219,16 @@ struct Level {
     /// Where this level's children start in the shared list.
     items_from: usize,
     count: u64,
-    /// Only every STRIDE-th child is kept (the level has more than DENSE_MAX).
+    /// Only every STRIDE-th child is kept (the level has more than DENSE_MAX, or NESTED_MAX when `nested`).
     sparse: bool,
     /// Never thin this level (a rescan, which must return every child it is asked for).
     dense: bool,
+    /// A container inside the scanned one (its list is kept only if it is big).
+    nested: bool,
 }
 
 impl Level {
-    fn new(open: Option<u64>, is_object: bool, items_from: usize) -> Level {
+    fn new(open: Option<u64>, is_object: bool, items_from: usize, nested: bool) -> Level {
         Level {
             open,
             is_object,
@@ -229,6 +240,7 @@ impl Level {
             count: 0,
             sparse: false,
             dense: false,
+            nested,
         }
     }
 
@@ -250,7 +262,7 @@ fn add_child(items: &mut Vec<Child>, lv: &mut Level, s: u64, e: u64) {
         Some((ks, ke)) if ks < s => ((s - ks).min(u32::MAX as u64) as u32, (ke - ks).min(u32::MAX as u64) as u32),
         _ => (0, 0),
     };
-    if !lv.sparse && !lv.dense && lv.count >= DENSE_MAX {
+    if !lv.sparse && !lv.dense && lv.count >= if lv.nested { NESTED_MAX } else { DENSE_MAX } {
         let from = lv.items_from;
         let mut w = from;
         for k in (from..items.len()).step_by(STRIDE as usize) {
@@ -278,7 +290,7 @@ pub fn scan(src: &dyn Chunked, open: Option<u64>, keep: u64, ctx: Option<&Ctx>) 
 }
 
 /// The scanner. Reads from `start` (inside the container at `open`, or at the top level when `top`), stops at the
-/// container's end or after `limit` children.
+/// container's end or after `limit` children. `//` and `/* */` comments (JSONC) count as whitespace.
 #[allow(clippy::too_many_arguments)]
 fn scan_core(
     src: &dyn Chunked,
@@ -292,12 +304,17 @@ fn scan_core(
 ) -> Vec<(Option<u64>, Children)> {
     let total = src.total();
     let mut items: Vec<Child> = Vec::new();
-    let mut stack: Vec<Level> = vec![Level::new(open, root_obj, 0)];
+    let mut stack: Vec<Level> = vec![Level::new(open, root_obj, 0, false)];
     stack[0].dense = limit != u64::MAX;
     let mut out: Vec<(Option<u64>, Children)> = Vec::new();
     let mut in_str = false;
     let mut esc = false;
     let mut str_start = 0u64;
+    // In a comment (and a `*` of a block comment ended the last chunk); a `/` ended the last chunk (at `slash_at`).
+    let mut comment = 0u8;
+    let mut star = false;
+    let mut slash = false;
+    let mut slash_at = 0u64;
     let mut end: Option<u64> = None;
     let mut broken = false;
     let mut pos = start;
@@ -340,9 +357,77 @@ fn scan_core(
                 }
                 continue;
             }
+            if comment == LINE_COMMENT {
+                match memchr::memchr(b'\n', &chunk[i..]) {
+                    None => i = n,
+                    Some(k) => {
+                        i += k + 1;
+                        comment = 0;
+                    }
+                }
+                continue;
+            }
+            if comment == BLOCK_COMMENT {
+                if star && chunk[i] == b'/' {
+                    comment = 0;
+                    i += 1;
+                }
+                star = false;
+                if comment == 0 {
+                    continue;
+                }
+                match memchr::memchr(b'*', &chunk[i..]) {
+                    None => i = n,
+                    Some(k) => {
+                        i += k + 1;
+                        if i == n {
+                            star = true;
+                        } else if chunk[i] == b'/' {
+                            comment = 0;
+                            i += 1;
+                        }
+                    }
+                }
+                continue;
+            }
             let b = chunk[i];
-            let c = CLASS[b as usize];
             let p = base + i as u64;
+            if slash {
+                slash = false;
+                let lv = stack.last_mut().unwrap();
+                if b == b'/' || b == b'*' {
+                    // The last chunk ended with the `/` of a comment, which ends a scalar like whitespace.
+                    if let Some(last) = lv.scalar_last.take() {
+                        let s = lv.val_start.take().unwrap_or(last);
+                        add_child(&mut items, lv, s, last + 1);
+                        if stack.len() == 1 && stack[0].count >= limit {
+                            end = Some(slash_at);
+                            return false;
+                        }
+                    }
+                    comment = if b == b'/' { LINE_COMMENT } else { BLOCK_COMMENT };
+                    i += 1;
+                    continue;
+                }
+                // a stray `/`, part of a scalar
+                if lv.scalar_last.is_none() {
+                    lv.val_start = Some(slash_at);
+                }
+                lv.scalar_last = Some(slash_at);
+            }
+            let mut c = CLASS[b as usize];
+            if b == b'/' {
+                match chunk.get(i + 1) {
+                    Some(b'/' | b'*') => c = C_COMMENT,
+                    Some(_) => {}
+                    None => {
+                        slash = true;
+                        slash_at = p;
+                        i += 1;
+                        continue;
+                    }
+                }
+            }
             let lv = stack.last_mut().unwrap();
             if let Some(last) = lv.scalar_last {
                 if c == C_OTHER {
@@ -361,6 +446,11 @@ fn scan_core(
             let lv = stack.last_mut().unwrap();
             match c {
                 C_WS => {}
+                C_COMMENT => {
+                    comment = if chunk[i + 1] == b'/' { LINE_COMMENT } else { BLOCK_COMMENT };
+                    i += 2;
+                    continue;
+                }
                 C_QUOTE => {
                     in_str = true;
                     str_start = p;
@@ -371,7 +461,7 @@ fn scan_core(
                 C_OPEN => {
                     lv.val_start = Some(p);
                     let from = items.len();
-                    stack.push(Level::new(Some(p), b == b'{', from));
+                    stack.push(Level::new(Some(p), b == b'{', from, true));
                 }
                 C_CLOSE => {
                     if stack.len() == 1 {
@@ -421,16 +511,40 @@ fn scan_core(
 
     let cancelled = ctx.is_some_and(|c| c.cancelled());
     let mut partial = broken || cancelled;
-    if end.is_none() {
-        // Ran to the end of the document without the container closing.
-        if stack.len() == 1 {
-            let lv = stack.last_mut().unwrap();
-            if let Some(last) = lv.scalar_last.take() {
-                let s = lv.val_start.take().unwrap_or(last);
-                add_child(&mut items, lv, s, last + 1);
+    if end.is_none() && !cancelled {
+        // Ran to the end of the document without the container closing (a truncated file, say): what is still
+        // open ends there, so everything up to that point can be shown.
+        let unclosed = stack.len() > 1;
+        let lv = stack.last_mut().unwrap();
+        if slash {
+            if lv.scalar_last.is_none() {
+                lv.val_start = Some(slash_at);
             }
+            lv.scalar_last = Some(slash_at);
         }
-        partial |= !top || stack.len() > 1 || in_str;
+        if in_str {
+            if !(lv.is_object && lv.expect_key) {
+                add_child(&mut items, lv, str_start, total);
+                lv.val_start = None;
+            }
+        } else if let Some(last) = lv.scalar_last.take() {
+            let s = lv.val_start.take().unwrap_or(last);
+            add_child(&mut items, lv, s, last + 1);
+        }
+        while stack.len() > 1 {
+            let child = stack.pop().unwrap();
+            let cs = child.open.unwrap();
+            if total - cs >= keep {
+                let list = items.split_off(child.items_from);
+                out.push((child.open, child.list(list, total, true)));
+            } else {
+                items.truncate(child.items_from);
+            }
+            let parent = stack.last_mut().unwrap();
+            let s = parent.val_start.take().unwrap_or(cs);
+            add_child(&mut items, parent, s, total);
+        }
+        partial |= !top || unclosed || in_str;
     }
     let own = stack.get(1).map_or(items.len(), |l| l.items_from);
     items.truncate(own);
@@ -624,21 +738,79 @@ pub struct Step {
 }
 
 impl Step {
+    /// The step as the path bar shows it.
     pub fn label(&self) -> String {
         match &self.key {
-            Some(k) => k.clone(),
+            Some(k) => key_label(k),
             None => format!("[{}]", self.index),
         }
     }
 }
 
-/// A key's text for display: quotes removed, common escapes resolved, very long keys shortened.
+/// A key's exact text: quotes removed and every escape resolved (`\"`, `\\`, `\/`, `\b`, `\f`, `\n`, `\r`, `\t`,
+/// `\uXXXX` with surrogate pairs).
 pub fn key_text(raw: &[u8]) -> String {
     let inner = raw.strip_prefix(b"\"").unwrap_or(raw);
     let inner = inner.strip_suffix(b"\"").unwrap_or(inner);
-    let s = String::from_utf8_lossy(&inner[..inner.len().min(200)]).into_owned();
-    let s = s.replace("\\\"", "\"").replace("\\\\", "\\").replace("\\n", "⏎").replace("\\t", " ");
-    if inner.len() > 200 { format!("{s}…") } else { s }
+    if !inner.contains(&b'\\') {
+        return String::from_utf8_lossy(inner).into_owned();
+    }
+    let hex = |s: Option<&[u8]>| s.and_then(|s| std::str::from_utf8(s).ok()).and_then(|h| u32::from_str_radix(h, 16).ok());
+    let mut out = Vec::with_capacity(inner.len());
+    let mut i = 0;
+    while i < inner.len() {
+        if inner[i] != b'\\' || i + 1 == inner.len() {
+            out.push(inner[i]);
+            i += 1;
+            continue;
+        }
+        let e = inner[i + 1];
+        i += 2;
+        match e {
+            b'b' => out.push(8),
+            b'f' => out.push(12),
+            b'n' => out.push(b'\n'),
+            b'r' => out.push(b'\r'),
+            b't' => out.push(b'\t'),
+            b'u' => {
+                let Some(mut cp) = hex(inner.get(i..i + 4)) else {
+                    out.extend_from_slice(b"\\u");
+                    continue;
+                };
+                i += 4;
+                if (0xD800..0xDC00).contains(&cp) && inner.get(i..i + 2) == Some(b"\\u") {
+                    if let Some(lo) = hex(inner.get(i + 2..i + 6)).filter(|lo| (0xDC00..0xE000).contains(lo)) {
+                        cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                        i += 6;
+                    }
+                }
+                let c = char::from_u32(cp).unwrap_or('\u{FFFD}');
+                out.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes());
+            }
+            // `\"`, `\\`, `\/` (and anything else, as it is)
+            c => out.push(c),
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// A key as the path bar and the panel show it: line breaks and other control characters as symbols, very long
+/// keys shortened.
+pub fn key_label(key: &str) -> String {
+    let mut s = String::new();
+    for (n, c) in key.chars().enumerate() {
+        if n == 200 {
+            s.push('…');
+            break;
+        }
+        s.push(match c {
+            '\n' => '⏎',
+            '\t' => ' ',
+            c if c.is_control() => '·',
+            c => c,
+        });
+    }
+    s
 }
 
 /// The path to `offset`. `get(open)` returns the cached children of a container (None = top level); when one
@@ -654,8 +826,8 @@ pub fn path_at(
         let Some(ch) = get(open) else { return Err(open) };
         let Some((i, c)) = ch.find(src, offset) else { break };
         let key = c.key_range().map(|(a, b)| key_text(&src.bytes(a, b)));
-        // A single top-level value (normal JSON) isn't shown as "[0]".
-        let single_root = open.is_none() && ch.count == 1 && !ch.partial;
+        // A single top-level value (normal JSON, also when the file is cut short) isn't shown as "[0]".
+        let single_root = open.is_none() && ch.count == 1;
         if !single_root {
             path.push(Step { index: i, key, start: c.start, end: c.end, parent: open });
         }
@@ -688,18 +860,24 @@ pub fn preview(src: &dyn Chunked, c: &Child, max: usize) -> (Kind, String) {
     (kind, text)
 }
 
-/// Path text for copying: `data[1203].name`.
+/// Path text for copying, as JavaScript writes it: `data[1203].name`, `["my key"]`, `["1234"]`.
 pub fn path_string(path: &[Step]) -> String {
+    let ident = |k: &str| {
+        let mut cs = k.chars();
+        cs.next().is_some_and(|c| c.is_alphabetic() || c == '_' || c == '$')
+            && cs.all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+    };
     let mut s = String::new();
     for st in path {
         match &st.key {
-            Some(k) if !k.is_empty() && k.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '$') => {
+            Some(k) if ident(k) => {
                 if !s.is_empty() {
                     s.push('.');
                 }
                 s.push_str(k);
             }
-            Some(k) => s.push_str(&format!("[{:?}]", k)),
+            // a JSON string literal is a valid JavaScript one
+            Some(k) => s.push_str(&format!("[{}]", serde_json::to_string(k).unwrap_or_default())),
             None => s.push_str(&format!("[{}]", st.index)),
         }
     }
@@ -792,10 +970,123 @@ mod tests {
         let d = doc(r#"{"a": [1, 2"#);
         let root = children(&d, Some(0), None);
         assert!(root.partial);
-        assert_eq!(root.count, 0);
+        // the open array ends where the file does
+        assert_eq!(texts(&d, &root), vec![(Some("a".into()), "[1, 2".into())]);
         let arr = children(&d, Some(6), None);
         assert!(arr.partial);
         assert_eq!(texts(&d, &arr).into_iter().map(|x| x.1).collect::<Vec<_>>(), vec!["1", "2"]);
+    }
+
+    /// Paths at every offset, scanning what's needed.
+    fn all_paths(src: &dyn Chunked) -> Vec<String> {
+        let mut cache: HashMap<Option<u64>, Arc<Children>> = HashMap::new();
+        (0..=src.total())
+            .map(|off| loop {
+                match path_at(src, off, &mut |o| cache.get(&o).cloned()) {
+                    Ok(p) => break path_string(&p),
+                    Err(o) => {
+                        let ch = children(src, o, None);
+                        cache.insert(o, Arc::new(ch));
+                    }
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_truncated_file_keeps_its_structure() {
+        let s = r#"{"meta": {"n": 3}, "data": [{"id": 1}, {"id": 2}, {"id": 3, "name": "thr"#;
+        let d = doc(s);
+        let top = children(&d, None, None);
+        assert_eq!((top.count, top.partial), (1, true));
+        let root = children(&d, Some(0), None);
+        assert_eq!(texts(&d, &root).iter().map(|t| t.0.clone().unwrap()).collect::<Vec<_>>(), ["meta", "data"]);
+        assert_eq!(root.get(&d, 1).unwrap().end, s.len() as u64);
+        let paths = all_paths(&d);
+        assert_eq!(paths[s.find("thr").unwrap()], "data[2].name");
+        assert_eq!(paths[s.find("3,").unwrap()], "data[2].id");
+        // the background scan keeps the open containers' lists too
+        let lists: HashMap<Option<u64>, Children> = scan(&d, None, 1, None).into_iter().collect();
+        let data = &lists[&Some(s.find('[').unwrap() as u64)];
+        assert_eq!((data.count, data.partial, data.end), (3, true, s.len() as u64));
+    }
+
+    /// Hands out its bytes in pieces of `.1` bytes.
+    struct Pieces<'a>(&'a [u8], usize);
+    impl Chunked for Pieces<'_> {
+        fn total(&self) -> u64 {
+            self.0.len() as u64
+        }
+        fn chunked(&self, a: u64, b: u64, f: &mut dyn FnMut(&[u8]) -> bool) -> bool {
+            self.0[a as usize..b as usize].chunks(self.1).all(|c| f(c))
+        }
+    }
+
+    #[test]
+    fn comments_count_as_whitespace() {
+        let s = "// head: [x\n{\"a\": 1 /* b: [2, {}] */, \"c\" /**/: [1, 2] // done }\n, \"d\": \"no // comment\", \"e\": 5/**/ }\n";
+        // the same text with the comments blanked out must have the same structure
+        let mut blank = s.as_bytes().to_vec();
+        for (a, b) in [("//", "\n"), ("/*", "*/")] {
+            let mut from = 0;
+            while let Some(p) = s[from..].find(a).map(|p| p + from) {
+                if s[..p].matches('"').count() % 2 == 1 {
+                    from = p + 2;
+                    continue;
+                }
+                let e = s[p + 2..].find(b).map_or(s.len(), |q| p + 2 + q + if b == "*/" { 2 } else { 0 });
+                blank[p..e].iter_mut().for_each(|c| *c = b' ');
+                from = e;
+            }
+        }
+        let want = all_paths(&Pieces(&blank, 1000));
+        assert!(want.contains(&"c[1]".to_string()) && want.contains(&"e".to_string()));
+        for step in [1, 2, 3, 7, 1000] {
+            let src = Pieces(s.as_bytes(), step);
+            assert_eq!(all_paths(&src), want, "pieces of {step}");
+            let top = children(&src, None, None);
+            assert_eq!((top.count, top.partial), (1, false));
+            assert_eq!(children(&src, Some(12), None).count, 4, "pieces of {step}");
+        }
+    }
+
+    #[test]
+    fn keys_are_decoded_and_copied_as_valid_paths() {
+        assert_eq!(key_text(br#""a\\nb""#), "a\\nb");
+        assert_eq!(key_text(br#""a\nb\t\"q\"\/""#), "a\nb\t\"q\"/");
+        // (the escapes are put together so they stay escapes in this file)
+        let raw = format!("\"caf{0}u00e9 {0}ud83d{0}ude00 {0}u00\"", '\\');
+        assert_eq!(key_text(raw.as_bytes()), "café 😀 \\u00");
+        assert_eq!(key_label("a\nb\tc\u{1}"), "a⏎b c·");
+        assert_eq!(key_label(&"k".repeat(300)).chars().count(), 201);
+        let s = r#"{"1234": {"x y": [10, 20]}, "é": {"a\nb": 1, "$ok_1": 2, "say \"hi\"": 3, "": 4}}"#;
+        let d = doc(s);
+        let paths = all_paths(&d);
+        assert_eq!(paths[s.find("20").unwrap()], r#"["1234"]["x y"][1]"#);
+        assert_eq!(paths[s.find("1,").unwrap()], r#"é["a\nb"]"#);
+        assert_eq!(paths[s.find("2,").unwrap()], "é.$ok_1");
+        assert_eq!(paths[s.find("3,").unwrap()], r#"é["say \"hi\""]"#);
+        assert_eq!(paths[s.find("4}").unwrap()], r#"é[""]"#);
+    }
+
+    #[test]
+    fn nested_lists_are_thinned_sooner() {
+        // 300 rings of 3000 points, like a GeoJSON file
+        let ring = format!("[{}]", vec!["[12.3456,45.6789]"; 3000].join(","));
+        let s = format!("{{\"features\": [{}]}}", vec![ring.as_str(); 300].join(","));
+        let d = doc(&s);
+        let lists = scan(&d, None, 4096, None);
+        let items: usize = lists.iter().map(|(_, c)| c.items.len()).sum();
+        let children_total: u64 = lists.iter().map(|(_, c)| c.count).sum();
+        assert!(children_total > 900_000 && items < 20_000, "{items} kept of {children_total}");
+        let (open, ring_list) = lists.iter().find(|(_, c)| c.count == 3000).unwrap();
+        assert_eq!(ring_list.stride, STRIDE);
+        let simple = children_simple(&d, *open, u64::MAX, None);
+        assert_eq!(all(&d, ring_list), simple.items);
+        for i in [0, 63, 64, 1000, 2999] {
+            let c = simple.items[i as usize];
+            assert_eq!(ring_list.find(&d, c.start), Some((i, c)));
+        }
     }
 
     fn rnd(r: &mut u64) -> u64 {

@@ -20,39 +20,156 @@ pub enum CaseOp {
     Title,
 }
 
-/// Compares the way people sort: letters ignoring case, numbers by value ("file2" before "file10").
+/// Compares the way people sort: letters ignoring case, accented Latin letters next to their plain one (é with e,
+/// accents deciding only between otherwise equal lines), numbers by value: "file2" before "file10", "-5" before "3",
+/// "1.25" before "1.5". A number glued to a word or to another number's dot is a whole number, so versions and
+/// addresses sort by their parts ("v1.9" before "v1.10", "1.2.3" before "1.10.0").
 pub fn natural_cmp(a: &[u8], b: &[u8]) -> Ordering {
+    natural(a, b, true).then_with(|| natural(a, b, false))
+}
+
+/// One pass of `natural_cmp`; `base`: letters compare by their plain letter.
+fn natural(a: &[u8], b: &[u8], base: bool) -> Ordering {
+    let class = |n: &Number| if n.neg { b'-' as u32 } else { b'0' as u32 };
     let (mut i, mut j) = (0, 0);
     while i < a.len() && j < b.len() {
-        if a[i].is_ascii_digit() && b[j].is_ascii_digit() {
-            let (si, sj) = (i, j);
-            while i < a.len() && a[i].is_ascii_digit() {
-                i += 1;
+        let c = match (number_at(a, i), number_at(b, j)) {
+            (Some(x), Some(y)) => {
+                let c = cmp_numbers(a, &x, b, &y);
+                (i, j) = (x.end, y.end);
+                c
             }
-            while j < b.len() && b[j].is_ascii_digit() {
-                j += 1;
+            // a number and a character: by the character the number starts with ('-' or a digit)
+            (Some(x), None) => class(&x).cmp(&char_key(b, j, base).0).then(Ordering::Less),
+            (None, Some(y)) => char_key(a, i, base).0.cmp(&class(&y)).then(Ordering::Greater),
+            (None, None) => {
+                let ((x, la), (y, lb)) = (char_key(a, i, base), char_key(b, j, base));
+                (i, j) = (i + la, j + lb);
+                x.cmp(&y)
             }
-            let x = trim_zeros(&a[si..i]);
-            let y = trim_zeros(&b[sj..j]);
-            let c = x.len().cmp(&y.len()).then_with(|| x.cmp(y));
-            if c != Ordering::Equal {
-                return c;
-            }
-            continue;
-        }
-        let c = a[i].to_ascii_lowercase().cmp(&b[j].to_ascii_lowercase());
+        };
         if c != Ordering::Equal {
             return c;
         }
-        i += 1;
-        j += 1;
     }
     (a.len() - i).cmp(&(b.len() - j))
+}
+
+/// A number in a line: its sign, digits before and after the decimal point, and where it ends.
+struct Number {
+    neg: bool,
+    int: (usize, usize),
+    frac: (usize, usize),
+    end: usize,
+}
+
+fn number_at(s: &[u8], i: usize) -> Option<Number> {
+    let digit = |k: usize| s.get(k).is_some_and(|c| c.is_ascii_digit());
+    let prev = if i > 0 { s[i - 1] } else { b' ' };
+    // not glued to a word or to another number ("x-5", "v1.10", "1.2.3")
+    let free = !prev.is_ascii_alphanumeric() && prev != b'.';
+    let neg = s[i] == b'-' && free && prev != b'-' && digit(i + 1);
+    let mut k = i + neg as usize;
+    if !digit(k) {
+        return None;
+    }
+    let from = k;
+    while digit(k) {
+        k += 1;
+    }
+    let int = (from, k);
+    let mut frac = (k, k);
+    if free && s.get(k) == Some(&b'.') && digit(k + 1) {
+        let mut f = k + 1;
+        while digit(f) {
+            f += 1;
+        }
+        if !(s.get(f) == Some(&b'.') && digit(f + 1)) {
+            frac = (k + 1, f);
+            k = f;
+        }
+    }
+    Some(Number { neg, int, frac, end: k })
+}
+
+fn cmp_numbers(a: &[u8], x: &Number, b: &[u8], y: &Number) -> Ordering {
+    if x.neg != y.neg {
+        return if x.neg { Ordering::Less } else { Ordering::Greater };
+    }
+    let (p, q) = (trim_zeros(&a[x.int.0..x.int.1]), trim_zeros(&b[y.int.0..y.int.1]));
+    let mut c = p.len().cmp(&q.len()).then_with(|| p.cmp(q));
+    if c == Ordering::Equal {
+        // fractions digit by digit ("5" after "25"; missing digits are zeros)
+        let (f, g) = (&a[x.frac.0..x.frac.1], &b[y.frac.0..y.frac.1]);
+        for k in 0..f.len().max(g.len()) {
+            let (d, e) = (f.get(k).copied().unwrap_or(b'0'), g.get(k).copied().unwrap_or(b'0'));
+            if d != e {
+                c = d.cmp(&e);
+                break;
+            }
+        }
+    }
+    if x.neg { c.reverse() } else { c }
 }
 
 fn trim_zeros(d: &[u8]) -> &[u8] {
     let n = d.iter().take_while(|&&b| b == b'0').count();
     &d[n.min(d.len().saturating_sub(1))..]
+}
+
+/// The plain letters of U+00C0…U+017F (Latin-1 and Latin Extended-A), 8 per row; '.' = not a letter.
+const LATIN: &str = concat!(
+    "aaaaaaac", // À Á Â Ã Ä Å Æ Ç
+    "eeeeiiii", // È É Ê Ë Ì Í Î Ï
+    "dnooooo.", // Ð Ñ Ò Ó Ô Õ Ö ×
+    "ouuuuyts", // Ø Ù Ú Û Ü Ý Þ ß
+    "aaaaaaac", // à á â ã ä å æ ç
+    "eeeeiiii", // è é ê ë ì í î ï
+    "dnooooo.", // ð ñ ò ó ô õ ö ÷
+    "ouuuuyty", // ø ù ú û ü ý þ ÿ
+    "aaaaaacc", // Ā ā Ă ă Ą ą Ć ć
+    "ccccccdd", // Ĉ ĉ Ċ ċ Č č Ď ď
+    "ddeeeeee", // Đ đ Ē ē Ĕ ĕ Ė ė
+    "eeeegggg", // Ę ę Ě ě Ĝ ĝ Ğ ğ
+    "gggghhhh", // Ġ ġ Ģ ģ Ĥ ĥ Ħ ħ
+    "iiiiiiii", // Ĩ ĩ Ī ī Ĭ ĭ Į į
+    "iiiijjkk", // İ ı Ĳ ĳ Ĵ ĵ Ķ ķ
+    "klllllll", // ĸ Ĺ ĺ Ļ ļ Ľ ľ Ŀ
+    "lllnnnnn", // ŀ Ł ł Ń ń Ņ ņ Ň
+    "nnnnoooo", // ň ŉ Ŋ ŋ Ō ō Ŏ ŏ
+    "oooorrrr", // Ő ő Œ œ Ŕ ŕ Ŗ ŗ
+    "rrssssss", // Ř ř Ś ś Ŝ ŝ Ş ş
+    "sstttttt", // Š š Ţ ţ Ť ť Ŧ ŧ
+    "uuuuuuuu", // Ũ ũ Ū ū Ŭ ŭ Ů ů
+    "uuuuwwyy", // Ű ű Ų ų Ŵ ŵ Ŷ ŷ
+    "yzzzzzzs", // Ÿ Ź ź Ż ż Ž ž ſ
+);
+const _: () = assert!(LATIN.len() == 0x180 - 0xC0);
+
+/// The character at `i` for sorting (lowercase; with `base`, accented Latin letters as their plain letter) and its
+/// length in bytes. Bytes that aren't UTF-8 come after every character.
+fn char_key(s: &[u8], i: usize, base: bool) -> (u32, usize) {
+    let b = s[i];
+    if b < 0x80 {
+        return (b.to_ascii_lowercase() as u32, 1);
+    }
+    let n = match b {
+        0xC2..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        0xF0..=0xF4 => 4,
+        _ => 0,
+    };
+    let c = s.get(i..i + n).filter(|_| n > 0).and_then(|x| std::str::from_utf8(x).ok()).and_then(|x| x.chars().next());
+    match c {
+        Some(c) => {
+            let cp = c as u32;
+            if base && (0xC0..0x180).contains(&cp) && LATIN.as_bytes()[(cp - 0xC0) as usize] != b'.' {
+                return (LATIN.as_bytes()[(cp - 0xC0) as usize] as u32, n);
+            }
+            (c.to_lowercase().next().unwrap_or(c) as u32, n)
+        }
+        None => (0x110000 + b as u32, 1),
+    }
 }
 
 /// Runs `op` over `text` (whole lines). Returns the new text and how many lines were sorted, removed or changed.
@@ -180,6 +297,53 @@ mod tests {
         assert_eq!(run(LineOp::SortAsc, "b\r\nc\r\na").0, "a\r\nb\r\nc");
         assert_eq!(natural_cmp(b"x007", b"x7"), Ordering::Equal);
         assert_eq!(natural_cmp(b"v1.10", b"v1.9"), Ordering::Greater);
+    }
+
+    #[test]
+    fn numbers_and_accents_sort_as_people_expect() {
+        let sorted = |t: &str| run(LineOp::SortAsc, t).0;
+        assert_eq!(sorted("10\n9\n-5\n-10\n1.5\n1.25\n-0.5\n"), "-10\n-5\n-0.5\n1.25\n1.5\n9\n10\n");
+        assert_eq!(sorted("$9.99\n$10.25\n$10.5\n"), "$9.99\n$10.25\n$10.5\n");
+        // versions and addresses go by their parts; a dash inside a word or date isn't a minus
+        assert_eq!(sorted("1.10.0\n1.2.3\n1.9.9\n"), "1.2.3\n1.9.9\n1.10.0\n");
+        assert_eq!(sorted("10.0.0.2\n9.1.1.1\n10.0.0.10\n"), "9.1.1.1\n10.0.0.2\n10.0.0.10\n");
+        assert_eq!(sorted("2026-10-07\n2026-9-30\n2025-12-31\n"), "2025-12-31\n2026-9-30\n2026-10-07\n");
+        assert_eq!(sorted("x-5\nx-10\n"), "x-5\nx-10\n");
+        // accented letters next to their plain one; between equal words, plain first
+        assert_eq!(sorted("Zoe\némile\nEve\nÄrger\narger\nzebra\nŁódź\nlodz\n"), "arger\nÄrger\némile\nEve\nlodz\nŁódź\nzebra\nZoe\n");
+        assert_eq!(sorted("Straße\nstrasse\nStrand\nStrasbourg\n"), "Strand\nStrasbourg\nStraße\nstrasse\n");
+        assert_eq!(sorted("Émile\nemile\n"), "emile\nÉmile\n");
+        // other scripts fold case too, and bytes that aren't UTF-8 go last
+        assert_eq!(natural_cmp("Ωmega".as_bytes(), "ωmega".as_bytes()), Ordering::Equal);
+        assert_eq!(natural_cmp(b"a\xFF", "aé".as_bytes()), Ordering::Greater);
+    }
+
+    #[test]
+    fn natural_order_is_a_total_order() {
+        // sort_by needs a consistent order (or it may panic): check it on random lines
+        let parts = ["-", "1", "10", "0.5", ".", "a", "A", "é", "É", "x", " ", "-5", "2.3.4", "_", "\u{FF}", "ß", "Z"];
+        let mut r = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            r ^= r << 13;
+            r ^= r >> 7;
+            r ^= r << 17;
+            r
+        };
+        let lines: Vec<Vec<u8>> = (0..200)
+            .map(|_| (0..1 + next() % 4).flat_map(|_| parts[(next() % parts.len() as u64) as usize].bytes()).collect())
+            .collect();
+        for a in &lines {
+            for b in &lines {
+                assert_eq!(natural_cmp(a, b), natural_cmp(b, a).reverse(), "{a:?} {b:?}");
+                for c in lines.iter().take(40) {
+                    if natural_cmp(a, b).is_le() && natural_cmp(b, c).is_le() {
+                        assert!(natural_cmp(a, c).is_le(), "{a:?} <= {b:?} <= {c:?}");
+                    }
+                }
+            }
+        }
+        let mut v = lines.clone();
+        v.sort_by(|a, b| natural_cmp(a, b).then_with(|| a.cmp(b)));
     }
 
     #[test]
