@@ -22,7 +22,11 @@
 //! (WM_CANCELMODE: something took the mouse capture), `timer:<id>` (run a timer's tick now; 3 = disk check, 4 = drag
 //! scrolling). More `print:` values: `focus` (main, find, replace, goto), `armed` (menu bar title with the
 //! keyboard), `opened` (menus that would have opened: native menus are never shown in this mode), `keys0`…`keys4`
-//! (each menu item's access key), `scrollx`, `zoom`, `topline`, `drag`, `wintitle`, `tabnames`, `indent`.
+//! (each menu item's access key), `scrollx`, `zoom`, `topline`, `drag`, `wintitle`, `tabnames`, `indent`, `theme`
+//! (light, dark or high contrast), `syscaret` (whether the hidden system caret is where the caret is: `follows`),
+//! `statusbar` (all its texts), `closed` (tabs Reopen closed tab would bring back), `tablist` (the list of all
+//! tabs, or `hidden` while they all fit), `bracket` (the bracket pair at the caret), `overtype`.
+//! `contrast:on|off|system` pretends Windows' high contrast is on or off (and tells the window it changed).
 //!
 //! Also: `args:<path>` (open it as if named on the command line: a missing file becomes a new one), `lang:<name>`
 //! (pick the language), `hit:<x>,<y>` / `hover:<x>,<y>` (what's at a point / move the mouse
@@ -88,6 +92,7 @@ fn busy(cell: &Cell) -> bool {
             || t.find_job.is_some()
             || t.structure.busy()
     }) || a.disk_job.is_some()
+        || a.count_job.is_some()
         || matches!(a.update, super::app::UpdateState::Checking { .. } | super::app::UpdateState::Downloading { .. })
         || a.session_job.is_some()
 }
@@ -174,6 +179,14 @@ fn cmd_of(name: &str) -> Option<Cmd> {
         "IndentTabs" => Cmd::IndentSpaces(false),
         "Shortcuts" => Cmd::Shortcuts,
         "SaveAs" => Cmd::SaveAs,
+        "ToggleWhitespace" => Cmd::ToggleWhitespace,
+        "ToggleOvertype" => Cmd::ToggleOvertype,
+        "ReopenClosed" => Cmd::ReopenClosed,
+        "CloseOthers" => Cmd::CloseOthers,
+        "CloseSaved" => Cmd::CloseSaved,
+        "CloseAll" => Cmd::CloseAll,
+        "ToggleRestoreSession" => Cmd::ToggleRestoreSession,
+        n if n.starts_with("JsonIndent") => Cmd::JsonIndent(n["JsonIndent".len()..].parse().ok()?),
         "ReplaceAll" => return None,
         _ => return None,
     })
@@ -348,21 +361,43 @@ fn describe(cell: &Cell, what: &str) -> String {
         "tabs" => a.tabs.len().to_string(),
         m if m.starts_with("menu") => {
             // menu0 … menu4: the menu bar's menus, as their labels (submenus in brackets)
-            fn labels(items: &[super::commands::Item]) -> String {
-                items
-                    .iter()
-                    .map(|it| match it {
-                        super::commands::Item::Cmd { label, enabled, .. } => format!("{}{}", label.replace('&', ""), if *enabled { "" } else { " (off)" }),
-                        super::commands::Item::Sep => "-".into(),
-                        super::commands::Item::ColBreak => "||".into(),
-                        super::commands::Item::Sub { label, items } => format!("{} [{}]", label.replace('&', ""), labels(items)),
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" | ")
-            }
             let items = a.menu_items(m[4..].parse().unwrap_or(0));
             labels(&items)
         }
+        "tablist" if a.tablist_rect.w <= 0.0 => "hidden".into(),
+        "tablist" => labels(&a.tab_list_items()),
+        "theme" => (if a.theme.hc { "high contrast" } else if a.theme.dark { "dark" } else { "light" }).into(),
+        "syscaret" => {
+            let (k, ov) = (a.dpi as f32 / 96.0, a.overtype);
+            let ours = a.with_view(|v, cx| v.caret_rect(cx, ov)).map(|c| ((c.x * k).round() as i32, (c.y * k).round() as i32));
+            match (super::win::caret_pos(), ours) {
+                (None, _) => "none".into(),
+                (Some(p), Some(o)) if p == o => "follows".into(),
+                (Some(p), o) => format!("at {p:?}, caret at {o:?}"),
+            }
+        }
+        "statusbar" => {
+            let (pos, items, counts, size) = a.status_items();
+            let mut parts = vec![pos];
+            parts.extend(items.into_iter().map(|(_, l)| l));
+            parts.extend(counts);
+            parts.push(size);
+            parts.join(" | ")
+        }
+        "closed" => a
+            .closed_tabs
+            .iter()
+            .map(|c| format!("{}@{}", c.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), c.caret))
+            .collect::<Vec<_>>()
+            .join(" | "),
+        "bracket" => {
+            let t = a.tab();
+            match super::editor::matching_bracket(&t.doc, t.view.sel.caret) {
+                Some((p, q)) => format!("{p},{q}"),
+                None => "none".into(),
+            }
+        }
+        "overtype" => a.overtype.to_string(),
         k if k.starts_with("keys") => {
             // keys0 … keys4: each item's access key (the letter after '&'; '?' for none), submenus in brackets
             fn keys(items: &[super::commands::Item]) -> String {
@@ -417,6 +452,23 @@ fn describe(cell: &Cell, what: &str) -> String {
         }
         _ => format!("(unknown: {what})"),
     }
+}
+
+/// A menu as its labels (submenus in brackets).
+fn labels(items: &[super::commands::Item]) -> String {
+    items
+        .iter()
+        .map(|it| match it {
+            super::commands::Item::Cmd { label, enabled, checked, .. } => {
+                let label = label.replace("&&", "\u{1}").replace('&', "").replace('\u{1}', "&");
+                format!("{label}{}{}", if *checked { " (on)" } else { "" }, if *enabled { "" } else { " (off)" })
+            }
+            super::commands::Item::Sep => "-".into(),
+            super::commands::Item::ColBreak => "||".into(),
+            super::commands::Item::Sub { label, items } => format!("{} [{}]", label.replace('&', ""), labels(items)),
+        })
+        .collect::<Vec<_>>()
+        .join(" | ")
 }
 
 pub fn run(args: &[String]) -> i32 {
@@ -479,6 +531,7 @@ pub fn run(args: &[String]) -> i32 {
                     "line_numbers" => a.settings.line_numbers = v == "true",
                     "font_size" => a.settings.font_size = v.parse().unwrap_or(11.0),
                     "restore_session" => a.settings.restore_session = v == "true",
+                    "show_whitespace" => a.settings.show_whitespace = v == "true",
                     _ => {}
                 }
                 a.rebuild_style();
@@ -726,6 +779,18 @@ pub fn run(args: &[String]) -> i32 {
                 unsafe { SendMessageW(hwnd, WM_SYSCOMMAND, WPARAM(SC_KEYMENU as usize), LPARAM(0)) };
             }
             "altgr" => super::commands::FORCED_ALTGR.with(|f| f.set(arg == "on")),
+            "contrast" => {
+                use windows::Win32::Foundation::{LPARAM, WPARAM};
+                use windows::Win32::UI::WindowsAndMessaging::{SPI_SETHIGHCONTRAST, SendMessageW, WM_SETTINGCHANGE};
+                let forced = match arg {
+                    "on" => Some(true),
+                    "off" => Some(false),
+                    _ => None,
+                };
+                super::theme::FORCED_HIGH_CONTRAST.with(|f| f.set(forced));
+                // what Windows sends when high contrast goes on or off
+                unsafe { SendMessageW(hwnd, WM_SETTINGCHANGE, WPARAM(SPI_SETHIGHCONTRAST.0 as usize), LPARAM(0)) };
+            }
             "activate" | "deactivate" | "cancelmode" => {
                 use windows::Win32::Foundation::{LPARAM, WPARAM};
                 use windows::Win32::UI::WindowsAndMessaging::{SendMessageW, WA_ACTIVE, WA_INACTIVE, WM_ACTIVATE, WM_CANCELMODE};

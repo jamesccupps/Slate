@@ -126,7 +126,20 @@ Commits use the GitHub no-reply address (repo-local git config); GitHub refuses 
   the default). Line operations over many lines (indent, comment) rewrite the lines as one replacement.
 - Keys: Ctrl+Alt shortcuts don't fire when the key types a character (AltGr is Ctrl+Alt: Polish AltGr+S is "ś");
   Alt on its own gives the custom menu bar the keyboard (WM_SYSCOMMAND SC_KEYMENU); a key that opens a menu drops
-  the character it queued. Caret movement and Delete go by visible characters (`text::cluster_len_at`).
+  the character it queued. Caret movement and Delete go by visible characters (`text::cluster_len_at`). Insert
+  toggles overtype (not kept: "OVR" in the status bar), which never types over a line break.
+- Accessibility: while Windows' high contrast is on, the theme is built from `GetSysColor` (`Theme::high_contrast`):
+  everything on the window color with borders, no syntax colors, selected text drawn again in the highlight's text
+  color, no light/dark switch; it's read again on WM_SETTINGCHANGE (SPI_SETHIGHCONTRAST), WM_SYSCOLORCHANGE and
+  WM_THEMECHANGED. A hidden system caret (`win::follow_caret`, never shown) is moved to the drawn caret after each
+  paint while the text has the keyboard, with EVENT_OBJECT_LOCATIONCHANGE for OBJID_CARET; WM_KILLFOCUS destroys it
+  (the find box's edit control makes its own). UI Automation is designed in the roadmap, not built.
+- Status bar counts: a selection up to 4 MiB is counted at once; a document up to 1 MiB at once, up to 64 MiB on
+  another thread (after an edit only once the typing pauses: the count's snapshot ends the piece typing goes into),
+  a bigger one not at all. Words are runs of non-space characters, like `wc -w`.
+- `Tab::goto` is where a tab goes once its document is ready and it's the tab shown: `slate file.txt:120:5` (only
+  when the path as given doesn't exist; a name with any other colon never becomes a new file, as it would be an
+  alternate data stream) and Reopen closed tab (the last 20 tabs closed that had a file, back at their place).
 - The App lives in `Rc<RefCell<App>>`. Anything that shows a dialog or menu runs from the `Deferred` queue outside
   the borrow. Dialogs run a modal loop in which timers and job messages still arrive (tabs can close, open or move),
   so code that shows one finds its tab again **by id** afterwards, never by an index taken before. The queue isn't
@@ -165,7 +178,8 @@ Commits use the GitHub no-reply address (repo-local git config); GitHub refuses 
   prompts are never shown (they take answers from `answer:` lines and are listed by `print:asked`), nor are menus
   (`print:opened` lists them), the clipboard is a private one, and settings/session aren't written (unless
   `persist`, which needs `SLATE_DATA_DIR`). Mouse drags, raw wheel deltas, Alt, AltGr and window activation have
-  their own commands (`down:`/`move:`/`up:`, `wheelraw:`, `altkey`, `altgr:on`, `activate`…).
+  their own commands (`down:`/`move:`/`up:`, `wheelraw:`, `altkey`, `altgr:on`, `activate`…), and `contrast:on`
+  pretends Windows' high contrast is on (`print:theme`, `print:syscaret`, `print:statusbar` check the results).
   `SLATE_DATA_DIR` sets the data folder, `SLATE_TEST_LOG` the log file; `session:save|soon|restore` writes the
   session now, writes it the way the timer does, or restores it. `SLATE_UPDATE_TEST_VERSION=0.1.0` makes Slate
   believe it's that version (to try the updater against the real latest release, in a scratch folder).

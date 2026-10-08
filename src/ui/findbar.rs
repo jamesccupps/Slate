@@ -382,7 +382,7 @@ impl FindBar {
                 }
                 Part::Go => {
                     g.fill_round(*b, 4.0, t.accent);
-                    g.text("Go", ui, *b, super::gfx::rgb(0xFFFFFF), Align::Center);
+                    g.text("Go", ui, *b, t.on_accent, Align::Center);
                 }
             }
         }

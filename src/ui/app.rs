@@ -29,12 +29,12 @@ use crate::core::text::{Encoding, Eol};
 use super::commands::{Cmd, MENU_KEYS, MENU_TITLES};
 use super::update::Release;
 pub use super::editor::Indent;
-use super::editor::{Ctx, Geom, Style, View};
+use super::editor::{Counts, Ctx, Geom, Style, View};
 use super::findbar::{self, FindBar};
 use super::gfx::{Align, Gfx, Rect, font_info, rgb};
 use super::highlight::Lang;
 use super::settings::{Settings, ThemeMode};
-use super::theme::{Theme, metrics, system_accent, system_prefers_dark};
+use super::theme::{Theme, high_contrast_on, metrics, system_accent, system_prefers_dark};
 use super::win;
 
 pub type Cell = Rc<RefCell<App>>;
@@ -179,6 +179,25 @@ pub struct Tab {
     pub ask_lossy: Option<(PathBuf, bool, bool)>,
     /// The document's path and its canonical form, worked out once (for "is this file open already?").
     pub canon: Option<(PathBuf, Option<PathBuf>)>,
+    /// Where to go once the document is ready and its tab is shown (`slate file.txt:120`, a reopened tab).
+    pub goto: Option<Goto>,
+}
+
+/// A place to go in a document that may not be ready yet (see `App::apply_goto`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Goto {
+    /// A line (1-based) and column (characters, 1-based): needs the line index.
+    Line(u64, Option<u64>),
+    /// The caret and scroll position (bytes) a closed tab had.
+    Place { caret: u64, top: u64 },
+}
+
+/// A tab closed with File → Close (or Ctrl+W...), for Reopen closed tab: its file and where it was in it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ClosedTab {
+    pub path: PathBuf,
+    pub caret: u64,
+    pub top: u64,
 }
 
 impl Tab {
@@ -208,6 +227,7 @@ impl Tab {
             title_override: None,
             ask_lossy: None,
             canon: None,
+            goto: None,
         }
     }
 
@@ -243,6 +263,8 @@ pub enum Deferred {
     UpdatePrompt,
     /// Saving tab (id) as ANSI would turn some characters into "?": save as UTF-8, as ANSI anyway, or not.
     AskLossy(u64),
+    /// The list of all tabs (the button at the end of a tab strip that overflows).
+    TabList,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -253,6 +275,10 @@ pub enum StatusItem {
     Encoding,
     Lang,
     Update,
+    /// How the document is indented ("Spaces: 4"): opens the indentation menu.
+    Indent,
+    /// "OVR" while typing replaces characters (Insert); a click turns it off.
+    Overtype,
 }
 
 /// Where updating Slate is at (see `update.rs`).
@@ -270,6 +296,7 @@ pub enum Hit {
     Tab(usize),
     TabClose(usize),
     NewTab,
+    TabList,
     TabStrip,
     Menu(usize),
     ThemeToggle,
@@ -365,6 +392,19 @@ pub struct App {
     pub flash_search: bool,
     /// Looking at the open files on disk (a network drive that went away can take long to answer).
     pub disk_job: Option<Job<Vec<DiskCheck>>>,
+    /// Typing replaces the character after the caret (Insert toggles it).
+    pub overtype: bool,
+    /// Tabs closed recently (with a file), the last one closed last; Ctrl+Shift+T opens them again.
+    pub closed_tabs: Vec<ClosedTab>,
+    /// The button listing all tabs, at the end of the tab strip (zero size while all tabs fit).
+    pub tablist_rect: Rect,
+    /// Characters and words of a document (tab id, document version), and a count running on another thread.
+    pub doc_counts: Option<(u64, u64, Counts)>,
+    pub count_job: Option<(Job<Option<Counts>>, u64, u64)>,
+    /// The same for the selection: (document version, start, end).
+    pub sel_counts: Option<((u64, u64, u64), Counts)>,
+    /// The document version a recount waits to start for, and since when (see `doc_counts_now`).
+    pub count_wait: Option<(u64, Instant)>,
 }
 
 pub const ZOOM_STEPS: [f32; 15] = [0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0, 4.0, 5.0];
@@ -445,6 +485,13 @@ impl App {
             line_clip: None,
             flash_search: false,
             disk_job: None,
+            overtype: false,
+            closed_tabs: Vec::new(),
+            tablist_rect: Rect::default(),
+            doc_counts: None,
+            count_job: None,
+            sel_counts: None,
+            count_wait: None,
         };
         app.apply_theme();
         app
@@ -488,8 +535,12 @@ impl App {
     /// Re-reads the theme (settings or Windows changed).
     pub fn apply_theme(&mut self) {
         self.theme = make_theme(self.settings.theme);
-        win::style_title_bar(self.hwnd, self.theme.dark, self.theme.frame, self.theme.text);
-        win::set_menu_dark(self.theme.dark);
+        if self.theme.hc {
+            win::system_title_bar(self.hwnd);
+        } else {
+            win::style_title_bar(self.hwnd, self.theme.dark, self.theme.frame, self.theme.text);
+        }
+        win::set_menu_dark(self.theme.dark && !self.theme.hc);
         self.find.style_edits(self.dpi, &self.theme);
         self.rebuild_style();
     }
@@ -570,7 +621,12 @@ impl App {
         let bar = self.r_tabs;
         let left = 8.0;
         let new_w = 36.0;
-        let avail = (bar.w - left - new_w - 16.0).max(metrics::TAB_MIN_W);
+        let mut avail = (bar.w - left - new_w - 16.0).max(metrics::TAB_MIN_W);
+        // Tabs that don't all fit: a button after the new-tab one lists them all.
+        let overflow = self.tabs.len() as f32 * metrics::TAB_MIN_W > avail;
+        if overflow {
+            avail = (avail - 32.0).max(metrics::TAB_MIN_W);
+        }
         let n = self.tabs.len().max(1) as f32;
         let tw = (avail / n).clamp(metrics::TAB_MIN_W, metrics::TAB_MAX_W);
         let total = tw * self.tabs.len() as f32;
@@ -586,6 +642,7 @@ impl App {
         }
         let nx = (bar.x + left + total - self.tab_scroll).min(bar.x + left + avail) + 4.0;
         self.newtab_rect = Rect::new(nx, top + (h - 28.0) / 2.0, 28.0, 28.0);
+        self.tablist_rect = if overflow { Rect::new(nx + 32.0, self.newtab_rect.y, 28.0, 28.0) } else { Rect::default() };
     }
 
     /// Where tabs stop being drawn (and clicked): just before the new-tab button, which follows the last tab or,
@@ -600,7 +657,7 @@ impl App {
         if let Some((r, _)) = self.tab_rects.get(self.active) {
             let bar = self.r_tabs;
             let left = bar.x + 8.0;
-            let right = bar.right() - 52.0;
+            let right = self.tabs_clip_right();
             if r.x < left {
                 self.tab_scroll -= left - r.x;
             } else if r.right() > right {
@@ -619,7 +676,12 @@ impl App {
             self.menu_rects.push(r);
             x += w + 22.0;
         }
-        self.theme_rect = Rect::new(self.r_menu.right() - 44.0, self.r_menu.y + 3.0, 34.0, self.r_menu.h - 6.0);
+        // (In high contrast Windows' colors are used whatever the theme: no light/dark switch.)
+        self.theme_rect = if self.theme.hc {
+            Rect::default()
+        } else {
+            Rect::new(self.r_menu.right() - 44.0, self.r_menu.y + 3.0, 34.0, self.r_menu.h - 6.0)
+        };
     }
 
     pub fn editor_geom(&self) -> Geom {
@@ -640,6 +702,9 @@ impl App {
             }
             if self.newtab_rect.contains(x, y) {
                 return Hit::NewTab;
+            }
+            if self.tablist_rect.contains(x, y) {
+                return Hit::TabList;
             }
             return Hit::TabStrip;
         }
@@ -828,6 +893,10 @@ impl App {
             if active {
                 // Rounded top corners; the bottom merges into the menu bar.
                 g.fill_round(Rect::new(r.x, r.y, r.w, r.h + 10.0), 7.0, t.surface);
+                if t.hc {
+                    // (In high contrast the strip has the tab's color: outline the active tab instead.)
+                    g.stroke_round(Rect::new(r.x + 1.0, r.y + 1.0, r.w - 2.0, r.h - 3.0), 6.0, t.accent, 2.0);
+                }
             } else if hovered {
                 g.fill_round(Rect::new(r.x + 2.0, r.y + 2.0, r.w - 4.0, r.h - 6.0), 6.0, t.hover);
             } else if i + 1 != self.active && i + 1 < self.tabs.len() {
@@ -868,6 +937,13 @@ impl App {
             g.fill_round(nr, 5.0, t.hover);
         }
         g.text("\u{E710}", &self.fonts.icons_small, nr, t.text_dim, Align::Center);
+        let lr = self.tablist_rect;
+        if lr.w > 0.0 {
+            if self.hover == Hit::TabList {
+                g.fill_round(lr, 5.0, t.hover);
+            }
+            g.text("\u{E70D}", &self.fonts.icons_small, lr, t.text_dim, Align::Center);
+        }
     }
 
     fn paint_menu(&mut self) {
@@ -897,7 +973,9 @@ impl App {
             g.fill_round(self.theme_rect, 5.0, t.hover);
         }
         let glyph = if t.dark { "\u{E706}" } else { "\u{E708}" };
-        g.text(glyph, &self.fonts.icons, self.theme_rect, t.text_dim, Align::Center);
+        if self.theme_rect.w > 0.0 {
+            g.text(glyph, &self.fonts.icons, self.theme_rect, t.text_dim, Align::Center);
+        }
         if self.find.open || self.tab().notice.is_some() {
             return;
         }
@@ -996,6 +1074,7 @@ impl App {
     fn paint_editor(&mut self, focused: bool) {
         let geom = self.editor_geom();
         let caret_on = self.caret_on && self.focused;
+        let (hwnd, k) = (self.hwnd, self.dpi as f32 / 96.0);
         let matcher = if self.find.open && self.find.mode != findbar::Mode::GoTo { self.find.matcher.clone() } else { None };
         let tab = &mut self.tabs[self.active];
         tab.view.sync(&mut tab.doc);
@@ -1011,7 +1090,15 @@ impl App {
                 matches = m.matches_in(&bytes, a, 5000);
             }
         }
-        tab.view.paint(&cx, focused && self.focused, caret_on, &matches);
+        let editor_focused = focused && self.focused;
+        tab.view.paint(&cx, editor_focused, caret_on, &matches, self.overtype);
+        if editor_focused {
+            // The hidden system caret goes where Slate's is (Magnifier and screen readers follow that one).
+            if let Some(c) = tab.view.caret_rect(&cx, self.overtype) {
+                let px = |v: f32| (v * k).round() as i32;
+                win::follow_caret(hwnd, px(c.x), px(c.y), px(c.w).max(1), px(c.h).max(1));
+            }
+        }
         // Loading / converting overlay.
         if let Some(job) = &tab.load_job {
             let msg = format!("Opening… {:.0}%", job.fraction() * 100.0);
@@ -1068,24 +1155,23 @@ impl App {
         self.g.fill(r, t.frame);
         self.g.line(r.x, r.y + 0.5, r.right(), r.y + 0.5, t.border, 1.0);
         let fonts_ui = self.fonts.ui.clone();
-        let mut items: Vec<(StatusItem, String)> = Vec::new();
-        let tab = &self.tabs[self.active];
-        let doc = &tab.doc;
-        if self.settings.zoom != 1.0 {
-            items.push((StatusItem::Zoom, format!("{:.0}%", self.settings.zoom * 100.0)));
-        }
-        if let UpdateState::Available(r) = &self.update {
-            items.push((StatusItem::Update, format!("Update to {}", r.version)));
-        }
-        items.push((StatusItem::Lang, tab.lang.label().to_string()));
-        items.push((StatusItem::Eol, doc.eol.short().to_string()));
-        items.push((StatusItem::Encoding, doc.encoding.label()));
-        let size = format_size(doc.len());
-        // Right-aligned items.
+        let (pos, items, counts, size) = self.status_items();
+        let (pw, _) = self.g.measure(&pos, &fonts_ui);
+        let pr = Rect::new(r.x + 6.0, r.y + 2.0, pw + 16.0, r.h - 4.0);
+        // Right-aligned items, after the size at the end (with the counts before it, when there's room).
         let mut x = r.right() - 12.0;
+        let items_w: f32 = items.iter().map(|(_, l)| self.g.measure(l, &fonts_ui).0 + 20.0).sum();
+        let right = match counts {
+            Some(c) => {
+                let both = format!("{c}  ·  {size}");
+                let (bw, _) = self.g.measure(&both, &fonts_ui);
+                if x - bw - 12.0 - items_w > pr.right() + 24.0 { both } else { size }
+            }
+            None => size,
+        };
         let mut rects = Vec::new();
-        let (sw, _) = self.g.measure(&size, &fonts_ui);
-        self.g.text(&size, &fonts_ui, Rect::new(x - sw, r.y, sw + 2.0, r.h), t.text_dim, Align::Left);
+        let (sw, _) = self.g.measure(&right, &fonts_ui);
+        self.g.text(&right, &fonts_ui, Rect::new(x - sw, r.y, sw + 2.0, r.h), t.text_dim, Align::Left);
         x -= sw + 12.0;
         for (item, label) in items.iter().rev() {
             let (w, _) = self.g.measure(label, &fonts_ui);
@@ -1093,15 +1179,16 @@ impl App {
             if self.hover == Hit::Status(*item) {
                 self.g.fill_round(br, 4.0, t.hover);
             }
-            let color = if *item == StatusItem::Update { t.accent } else { t.text_dim };
+            let color = match item {
+                StatusItem::Update => t.accent,
+                StatusItem::Overtype => t.text,
+                _ => t.text_dim,
+            };
             self.g.text(label, &fonts_ui, br, color, Align::Center);
             rects.push((*item, br));
             x = br.x - 4.0;
         }
         // Left: position, then progress or a message.
-        let pos = position_text(tab);
-        let (pw, _) = self.g.measure(&pos, &fonts_ui);
-        let pr = Rect::new(r.x + 6.0, r.y + 2.0, pw + 16.0, r.h - 4.0);
         if self.hover == Hit::Status(StatusItem::Position) {
             self.g.fill_round(pr, 4.0, t.hover);
         }
@@ -1117,6 +1204,130 @@ impl App {
             self.g.text(&msg, &fonts_ui, Rect::new(msg_x, r.y, msg_w, r.h), if bad { t.error } else { t.text_dim }, Align::Left);
         }
         self.status_rects = rects;
+    }
+
+    /// What the status bar says: the position (with what's selected), the items on the right (left to right), the
+    /// document's word and character counts (when known) and its size.
+    pub fn status_items(&mut self) -> (String, Vec<(StatusItem, String)>, Option<String>, String) {
+        let counts = self.doc_counts_now();
+        let sel_counts = self.selection_counts();
+        let indent = match self.indent_now() {
+            Indent::Spaces(n) => format!("Spaces: {n}"),
+            Indent::Tabs => format!("Tab size: {}", self.settings.tab_size),
+        };
+        let mut items: Vec<(StatusItem, String)> = Vec::new();
+        let tab = &self.tabs[self.active];
+        let doc = &tab.doc;
+        if self.overtype {
+            items.push((StatusItem::Overtype, "OVR".into()));
+        }
+        if self.settings.zoom != 1.0 {
+            items.push((StatusItem::Zoom, format!("{:.0}%", self.settings.zoom * 100.0)));
+        }
+        if let UpdateState::Available(r) = &self.update {
+            items.push((StatusItem::Update, format!("Update to {}", r.version)));
+        }
+        items.push((StatusItem::Indent, indent));
+        items.push((StatusItem::Lang, tab.lang.label().to_string()));
+        items.push((StatusItem::Eol, doc.eol.short().to_string()));
+        items.push((StatusItem::Encoding, doc.encoding.label()));
+        let counts = counts
+            .filter(|c| c.chars > 0)
+            .map(|c| format!("{}, {}", plural(c.words, "word", "words"), plural(c.chars, "character", "characters")));
+        (position_text(tab, sel_counts), items, counts, format_size(doc.len()))
+    }
+
+    /// The active document's characters and words: counted at once when it's small, on another thread up to
+    /// 64 MiB (meanwhile the last count of that tab), not at all for a bigger one or while it's still opening.
+    pub fn doc_counts_now(&mut self) -> Option<Counts> {
+        const AT_ONCE: u64 = 1 << 20;
+        const MAX: u64 = 64 << 20;
+        let notify = self.notify.clone();
+        let tab = &mut self.tabs[self.active];
+        let (id, version, len) = (tab.id, tab.doc.version, tab.doc.len());
+        let last = self.doc_counts.filter(|c| c.0 == id);
+        if let Some((_, v, c)) = last {
+            if v == version {
+                return Some(c);
+            }
+        }
+        if !tab.doc.is_ready() || tab.load_job.is_some() || len > MAX {
+            return None;
+        }
+        if len <= AT_ONCE {
+            let c = super::editor::count(&tab.doc.read(0, len));
+            self.doc_counts = Some((id, version, c));
+            return Some(c);
+        }
+        // Counting again after an edit waits until the typing stops for a moment (the count's snapshot of the text
+        // ends the piece the typing goes into). One still running for an older text: the next starts after it.
+        if last.is_some() {
+            match self.count_wait {
+                Some((v, at)) if v == version && at.elapsed() >= std::time::Duration::from_millis(700) => {}
+                Some((v, _)) if v == version => return last.map(|c| c.2),
+                _ => {
+                    self.count_wait = Some((version, Instant::now()));
+                    unsafe {
+                        windows::Win32::UI::WindowsAndMessaging::SetTimer(self.hwnd, super::actions::TIMER_COUNT, 750, None);
+                    }
+                    return last.map(|c| c.2);
+                }
+            }
+        }
+        if self.count_job.is_none() {
+            let snap = tab.doc.snapshot();
+            let job = Job::spawn(len, notify, move |ctx| {
+                let mut c = super::editor::Counter::default();
+                let mut pos = 0;
+                while pos < snap.len() {
+                    if ctx.cancelled() {
+                        return None;
+                    }
+                    let end = (pos + (1 << 20)).min(snap.len());
+                    snap.chunks(pos, end, &mut |b| {
+                        c.feed(b);
+                        true
+                    });
+                    pos = end;
+                    ctx.set(pos);
+                }
+                Some(c.finish())
+            });
+            self.count_job = Some((job, id, version));
+            unsafe {
+                windows::Win32::UI::WindowsAndMessaging::SetTimer(self.hwnd, super::actions::TIMER_JOBS, 100, None);
+            }
+        }
+        last.map(|c| c.2)
+    }
+
+    /// Picks up a finished background count; returns whether one is still running.
+    pub fn poll_counts(&mut self) -> bool {
+        let Some((job, _, _)) = self.count_job.as_mut() else { return false };
+        let Some(r) = job.take() else { return true };
+        let (_, id, version) = self.count_job.take().unwrap();
+        if let Some(c) = r {
+            self.doc_counts = Some((id, version, c));
+        }
+        false
+    }
+
+    /// Characters and words of the selection (up to 4 MiB of it), counted once per selection.
+    fn selection_counts(&mut self) -> Option<Counts> {
+        let tab = &self.tabs[self.active];
+        let sel = tab.view.sel;
+        if sel.is_empty() || sel.end() - sel.start() > 4 << 20 {
+            return None;
+        }
+        let key = (tab.doc.version, sel.start(), sel.end());
+        if let Some((k, c)) = self.sel_counts {
+            if k == key {
+                return Some(c);
+            }
+        }
+        let c = super::editor::count(&tab.doc.read(sel.start(), sel.end()));
+        self.sel_counts = Some((key, c));
+        Some(c)
     }
 
     /// Progress of background work, or a recent message.
@@ -1146,7 +1357,11 @@ impl App {
             }
         }
         if let Some(j) = &tab.index_job {
-            return Some((format!("Reading lines… {:.0}%", j.fraction() * 100.0), false));
+            let then = match tab.goto {
+                Some(Goto::Line(l, _)) => format!(" (then to line {})", group(l)),
+                _ => String::new(),
+            };
+            return Some((format!("Reading lines… {:.0}%{then}", j.fraction() * 100.0), false));
         }
         if let UpdateState::Downloading { release, job } = &self.update {
             return Some((format!("Downloading Slate {}… {:.0}%", release.version, job.fraction() * 100.0), false));
@@ -1205,7 +1420,7 @@ pub fn group(n: u64) -> String {
     out
 }
 
-fn position_text(tab: &Tab) -> String {
+fn position_text(tab: &Tab, sel_counts: Option<Counts>) -> String {
     let doc = &tab.doc;
     let sel = tab.view.sel;
     let caret = sel.caret;
@@ -1225,23 +1440,34 @@ fn position_text(tab: &Tab) -> String {
     };
     if !sel.is_empty() {
         let n = sel.end() - sel.start();
-        if n <= 4 << 20 {
-            let b = doc.read(sel.start(), sel.end());
-            let chars = bytecount::num_chars(&b) as u64;
-            let lines = bytecount::count(&b, b'\n') as u64;
-            if lines > 0 {
-                s.push_str(&format!("  ({} selected, {} lines)", group(chars), group(lines + 1)));
-            } else {
-                s.push_str(&format!("  ({} selected)", group(chars)));
+        match sel_counts {
+            Some(c) => {
+                // (lines: from the line of the start to that of the end)
+                let lines = match (doc.line_of(sel.start()), doc.line_of(sel.end())) {
+                    (Some(a), Some(b)) => b - a + 1,
+                    _ => 1,
+                };
+                let words = plural(c.words, "word", "words");
+                if lines > 1 {
+                    s.push_str(&format!("  ({} selected, {words}, {} lines)", group(c.chars), group(lines)));
+                } else {
+                    s.push_str(&format!("  ({} selected, {words})", group(c.chars)));
+                }
             }
-        } else {
-            s.push_str(&format!("  ({} selected)", format_size(n)));
+            None => s.push_str(&format!("  ({} selected)", format_size(n))),
         }
     }
     s
 }
 
+fn plural(n: u64, one: &str, many: &str) -> String {
+    if n == 1 { format!("1 {one}") } else { format!("{} {many}", group(n)) }
+}
+
 pub fn make_theme(mode: ThemeMode) -> Theme {
+    if high_contrast_on() {
+        return Theme::high_contrast();
+    }
     let accent = system_accent();
     let dark = match mode {
         ThemeMode::System => system_prefers_dark(),
@@ -1294,6 +1520,7 @@ pub fn make_style(g: &Gfx, s: &Settings, generation: u64) -> Style {
         tab_size: s.tab_size,
         use_spaces: s.use_spaces,
         line_numbers: s.line_numbers,
+        show_whitespace: s.show_whitespace,
         generation,
     }
 }

@@ -52,6 +52,8 @@ pub const TIMER_SESSION: usize = 6;
 pub const TIMER_UPDATE: usize = 7;
 /// A status bar message has had its time: repaint without it (nothing else may repaint meanwhile).
 pub const TIMER_FLASH: usize = 8;
+/// The typing has paused: count the words of a bigger document again (see `App::doc_counts_now`).
+pub const TIMER_COUNT: usize = 9;
 
 /// Documents up to this size are searched on the UI thread (fast enough to feel instant).
 const SYNC_SEARCH: u64 = 32 << 20;
@@ -354,7 +356,38 @@ impl App {
         }
         self.restart_caret();
         self.layout();
+        self.apply_goto(i);
         self.invalidate();
+    }
+
+    /// Goes where tab `i` was asked to go (`Tab::goto`), once it's the tab shown and its document is ready.
+    pub fn apply_goto(&mut self, i: usize) {
+        if i != self.active || i >= self.tabs.len() {
+            return;
+        }
+        let tab = &mut self.tabs[i];
+        let Some(goto) = tab.goto else { return };
+        if tab.load_job.is_some() {
+            return;
+        }
+        match goto {
+            Goto::Line(line, col) => {
+                // (The lines of a big file are still being counted: once they are.)
+                let Some(pos) = line_col_pos(&tab.doc, line, col) else { return };
+                tab.goto = None;
+                self.go_to(pos, true);
+            }
+            Goto::Place { caret, top } => {
+                tab.goto = None;
+                let v = &mut tab.view;
+                v.sel = Sel::at(editor::char_start(&tab.doc, caret));
+                v.top = editor::char_start(&tab.doc, top);
+                v.upstream = false;
+                v.want_x = None;
+                self.restart_caret();
+                self.invalidate();
+            }
+        }
     }
 
     pub fn update_title(&self) {
@@ -380,12 +413,20 @@ impl App {
         self.add_tab(doc);
     }
 
-    /// Closes tab `i` without asking anything.
+    /// Closes tab `i` without asking anything. One with a file (read from or saved to disk) can be opened again
+    /// with Reopen closed tab.
     pub fn remove_tab(&mut self, i: usize) {
         if i >= self.tabs.len() {
             return;
         }
-        self.tabs.remove(i);
+        let t = self.tabs.remove(i);
+        if let (Some(path), Some(_), None) = (&t.doc.path, t.doc.disk, &t.title_override) {
+            self.closed_tabs.retain(|c| &c.path != path);
+            self.closed_tabs.push(ClosedTab { path: path.clone(), caret: t.view.sel.caret, top: t.view.top });
+            if self.closed_tabs.len() > 20 {
+                self.closed_tabs.remove(0);
+            }
+        }
         if self.tabs.is_empty() {
             self.new_untitled();
         }
@@ -399,10 +440,28 @@ impl App {
 
     // ---- files ----
 
-    /// Opens files named on a command line (Slate's own, or another Slate's that handed them over).
+    /// Opens files named on a command line (Slate's own, or another Slate's that handed them over). A name that
+    /// isn't there but ends in `:line` or `:line:column` (`notes.txt:120`) opens that file at that line.
     pub fn open_command_line(&mut self, paths: &[PathBuf]) {
-        self.create_missing = true;
-        self.open_paths(paths);
+        for p in paths {
+            let p = std::path::absolute(p).unwrap_or_else(|_| p.clone());
+            let (file, goto) = match line_suffix(&p) {
+                Some((file, line, col)) if !p.exists() => (file, Some(Goto::Line(line, col))),
+                _ => (p, None),
+            };
+            // A name that isn't there yet becomes a new file, but not one with a colon in it: saving that would write
+            // an alternate data stream of another file.
+            self.create_missing = !file.file_name().is_some_and(|n| n.to_string_lossy().contains(':'));
+            self.open_paths(std::slice::from_ref(&file));
+            if let Some(goto) = goto {
+                // That file's tab (just opened, or open already) goes there once it's ready.
+                let canon = std::fs::canonicalize(&file).ok();
+                if let Some(i) = self.tabs.iter_mut().position(|t| has_file(t, &file, canon.as_deref())) {
+                    self.tabs[i].goto = Some(goto);
+                    self.apply_goto(i);
+                }
+            }
+        }
         self.create_missing = false;
     }
 
@@ -688,6 +747,10 @@ impl App {
         any |= self.poll_update();
         any |= self.poll_session();
         any |= self.poll_disk();
+        any |= self.poll_counts();
+        // (A document that just became ready: where it was asked to go.)
+        let a = self.active;
+        self.apply_goto(a);
         if !any {
             self.kill_timer(TIMER_JOBS);
         }
@@ -1331,12 +1394,13 @@ impl App {
         if s.is_empty() || !self.editable() {
             return;
         }
+        let overtype = self.overtype;
         let tab = &mut self.tabs[self.active];
         let sel = tab.view.sel;
         // Closing a block that Enter indented: the bracket lines up with the line that opened it (in code and JSON;
         // in text, data and makefiles a bracket is just typed).
         let code = !matches!(tab.lang, Lang::Plain | Lang::Log | Lang::Markdown | Lang::Csv | Lang::CsvSemi | Lang::Tsv) && !needs_tabs(tab);
-        if (s == "}" || s == "]") && code {
+        if (s == "}" || s == "]") && code && !overtype {
             if let Some(new) = editor::close_bracket(&mut tab.doc, sel, s.as_bytes()[0]) {
                 tab.view.sel = new;
                 self.after_edit();
@@ -1353,7 +1417,11 @@ impl App {
         }
         // (Typing over a selection starts a typing run too, so undo takes back the selection and what replaced it
         // in one step.)
-        tab.view.sel = editor::replace_selection(&mut tab.doc, sel, s.as_bytes(), EditKind::Typing);
+        tab.view.sel = if overtype {
+            editor::overtype(&mut tab.doc, sel, s.as_bytes())
+        } else {
+            editor::replace_selection(&mut tab.doc, sel, s.as_bytes(), EditKind::Typing)
+        };
         self.after_edit();
     }
 
@@ -1570,6 +1638,7 @@ impl App {
                 }
                 self.tab_key(ext);
             }
+            VK_INSERT if !m.ctrl && !m.shift => self.exec(Cmd::ToggleOvertype),
             VK_ESCAPE => {
                 // Closing and deselecting come first: a save is cancelled only by an Esc meant for nothing else.
                 if self.find.open {
@@ -1962,25 +2031,10 @@ impl App {
             self.flash("Type a line number", true);
             return;
         };
-        let tab = self.tab();
-        let Some(count) = tab.doc.line_count() else {
+        let Some(pos) = line_col_pos(&self.tab().doc, line, col) else {
             self.flash("Still reading the file's lines — try again in a moment.", true);
             return;
         };
-        let line = line.max(1).min(count.max(1));
-        let ls = tab.doc.line_start(line - 1).unwrap_or(0);
-        let mut pos = ls;
-        if let Some(c) = col {
-            let le = tab.doc.line_end_of(ls);
-            let mut p = ls;
-            for _ in 1..c {
-                if p >= le {
-                    break;
-                }
-                p = tab.doc.next_char(p);
-            }
-            pos = p;
-        }
         self.close_find();
         self.go_to(pos, true);
     }
@@ -2351,6 +2405,7 @@ impl App {
         match (button, down, hit) {
             (0, Hit::TabClose(i), Hit::TabClose(j)) if i == j => self.pending.push(Deferred::Cmd(Cmd::CloseTabAt(i))),
             (0, Hit::NewTab, Hit::NewTab) => self.pending.push(Deferred::Cmd(Cmd::NewTab)),
+            (0, Hit::TabList, Hit::TabList) => self.pending.push(Deferred::TabList),
             (0, Hit::ThemeToggle, Hit::ThemeToggle) => {
                 let to = if self.theme.dark { ThemeMode::Light } else { ThemeMode::Dark };
                 self.exec(Cmd::Theme(to));
@@ -2362,6 +2417,7 @@ impl App {
                 StatusItem::Position => self.pending.push(Deferred::Cmd(Cmd::GoToLine)),
                 StatusItem::Zoom => self.pending.push(Deferred::Cmd(Cmd::ZoomReset)),
                 StatusItem::Update => self.pending.push(Deferred::UpdatePrompt),
+                StatusItem::Overtype => self.pending.push(Deferred::Cmd(Cmd::ToggleOvertype)),
                 other => self.pending.push(Deferred::StatusMenu(other)),
             },
             (1, _, Hit::Text) | (1, _, Hit::Gutter) => self.pending.push(Deferred::ContextMenu(x, y)),
@@ -2454,8 +2510,8 @@ impl App {
                 self.caret_on = !self.caret_on;
                 self.invalidate();
             }
-            TIMER_FLASH => {
-                self.kill_timer(TIMER_FLASH);
+            TIMER_FLASH | TIMER_COUNT => {
+                self.kill_timer(id);
                 self.invalidate();
             }
             TIMER_JOBS => self.poll_jobs(),
@@ -2677,6 +2733,34 @@ impl App {
             Cmd::ToggleLineNumbers => {
                 self.settings.line_numbers = !self.settings.line_numbers;
                 self.settings_changed();
+            }
+            Cmd::ToggleWhitespace => {
+                self.settings.show_whitespace = !self.settings.show_whitespace;
+                self.settings_changed();
+            }
+            Cmd::ToggleOvertype => {
+                self.overtype = !self.overtype;
+                self.restart_caret();
+                let msg =
+                    if self.overtype { "Overtype: typing replaces characters (Insert turns it off)" } else { "Overtype off" };
+                self.flash(msg, false);
+            }
+            Cmd::ToggleRestoreSession => {
+                self.settings.restore_session = !self.settings.restore_session;
+                self.settings.save();
+                self.session_dirty = true;
+                let msg = if self.settings.restore_session {
+                    "Slate will open with these tabs (and their unsaved changes) next time"
+                } else {
+                    "Slate will open with a new tab next time; closing asks about unsaved changes"
+                };
+                self.flash(msg, false);
+            }
+            Cmd::JsonIndent(n) => {
+                self.settings.json_indent = n.clamp(1, 8);
+                self.settings.save();
+                let n = self.settings.json_indent as u64;
+                self.flash(format!("Formatting indents by {}", plural(n, "space", "spaces")), false);
             }
             Cmd::ToggleStructure => {
                 self.settings.structure_panel = !self.settings.structure_panel;
@@ -2906,6 +2990,25 @@ impl App {
                 let i = if i == 8 { self.tabs.len() - 1 } else { i };
                 self.activate(i.min(self.tabs.len() - 1));
             }
+            Cmd::ShowTab(id) => {
+                if let Some(i) = self.tabs.iter().position(|t| t.id == id) {
+                    self.activate(i);
+                }
+            }
+            Cmd::ReopenClosed => {
+                let Some(c) = self.closed_tabs.pop() else {
+                    self.flash("No closed tabs to reopen", false);
+                    return;
+                };
+                let before: Vec<u64> = self.tabs.iter().map(|t| t.id).collect();
+                self.open_paths(std::slice::from_ref(&c.path));
+                // A new tab (not one with that file open already): back where it was.
+                let i = self.active;
+                if !before.contains(&self.tabs[i].id) {
+                    self.tabs[i].goto = Some(Goto::Place { caret: c.caret, top: c.top });
+                    self.apply_goto(i);
+                }
+            }
             Cmd::Reload => {
                 let i = self.active;
                 self.reload(i, None);
@@ -3033,6 +3136,7 @@ impl App {
                     item(Cmd::NewTab, "&New tab", "Ctrl+N"),
                     item(Cmd::Open, "&Open…", "Ctrl+O"),
                     sub("Open &recent", recent),
+                    enabled(Cmd::ReopenClosed, "Reop&en closed tab", "Ctrl+Shift+T", !self.closed_tabs.is_empty()),
                     Item::Sep,
                     item(Cmd::Save, "&Save", "Ctrl+S"),
                     item(Cmd::SaveAs, "Save &as…", "Ctrl+Shift+S"),
@@ -3044,6 +3148,10 @@ impl App {
                     Item::Sep,
                     item(Cmd::CloseTab, "&Close tab", "Ctrl+W"),
                     item(Cmd::CloseOthers, "Close o&ther tabs", ""),
+                    item(Cmd::CloseSaved, "Close sa&ved tabs", ""),
+                    item(Cmd::CloseAll, "Close all ta&bs", ""),
+                    Item::Sep,
+                    check(Cmd::ToggleRestoreSession, "Restore last sess&ion", "", s.restore_session),
                     item(Cmd::Exit, "E&xit", "Alt+F4"),
                 ]
             }
@@ -3112,6 +3220,7 @@ impl App {
                 let mut v = vec![
                     check(Cmd::ToggleWrap, "&Word wrap", "Alt+Z", s.wrap),
                     check(Cmd::ToggleLineNumbers, "&Line numbers", "", s.line_numbers),
+                    check(Cmd::ToggleWhitespace, "Show w&hitespace", "", s.show_whitespace),
                 ];
                 if json {
                     v.push(Item::Sep);
@@ -3144,11 +3253,6 @@ impl App {
                 let tab = self.tab();
                 let doc = &tab.doc;
                 let s = &self.settings;
-                let ind = self.indent_now();
-                let width = match ind {
-                    Indent::Spaces(n) => n,
-                    Indent::Tabs => s.tab_size,
-                };
                 let mut v = Vec::new();
                 let f = match tab.lang {
                     Lang::Json => Some("JSON"),
@@ -3159,6 +3263,9 @@ impl App {
                     v.push(item(Cmd::Format, &format!("&Format {f}"), "Shift+Alt+F"));
                     v.push(item(Cmd::Minify, &format!("&Minify {f}"), ""));
                     v.push(item(Cmd::Validate, &format!("Chec&k {f}"), ""));
+                    let widths =
+                        [2u32, 3, 4, 8].iter().map(|&n| check(Cmd::JsonIndent(n), &format!("&{n} spaces"), "", s.json_indent == n));
+                    v.push(sub("Formatting in&dent", widths.collect()));
                     v.push(Item::Sep);
                 }
                 v.extend([
@@ -3171,17 +3278,7 @@ impl App {
                         ],
                     ),
                     sub("En&coding", self.encoding_items()),
-                    sub(
-                        "&Indentation",
-                        vec![
-                            check(Cmd::IndentSpaces(true), "&Spaces", "", ind != Indent::Tabs),
-                            check(Cmd::IndentSpaces(false), "&Tabs", "", ind == Indent::Tabs),
-                            Item::Sep,
-                            check(Cmd::TabSize(2), "Width &2", "", width == 2),
-                            check(Cmd::TabSize(4), "Width &4", "", width == 4),
-                            check(Cmd::TabSize(8), "Width &8", "", width == 8),
-                        ],
-                    ),
+                    sub("&Indentation", self.indent_items()),
                 ]);
                 v
             }
@@ -3204,6 +3301,34 @@ impl App {
                 ]
             }
         }
+    }
+
+    /// Format → Indentation, also the status bar's indentation menu.
+    pub fn indent_items(&self) -> Vec<Item> {
+        let ind = self.indent_now();
+        let width = match ind {
+            Indent::Spaces(n) => n,
+            Indent::Tabs => self.settings.tab_size,
+        };
+        vec![
+            check(Cmd::IndentSpaces(true), "&Spaces", "", ind != Indent::Tabs),
+            check(Cmd::IndentSpaces(false), "&Tabs", "", ind == Indent::Tabs),
+            Item::Sep,
+            check(Cmd::TabSize(2), "Width &2", "", width == 2),
+            check(Cmd::TabSize(4), "Width &4", "", width == 4),
+            check(Cmd::TabSize(8), "Width &8", "", width == 8),
+        ]
+    }
+
+    /// The list of all tabs (the tab strip's button when they don't all fit): choosing one shows it.
+    pub fn tab_list_items(&self) -> Vec<Item> {
+        (0..self.tabs.len())
+            .map(|i| {
+                let t = &self.tabs[i];
+                let dirty = if t.doc.is_dirty() { "  \u{25CF}" } else { "" };
+                check(Cmd::ShowTab(t.id), &format!("{}{dirty}", self.tab_label(i).replace('&', "&&")), "", i == self.active)
+            })
+            .collect()
     }
 
     pub fn lang_items(&self) -> Vec<Item> {
@@ -3279,6 +3404,45 @@ fn nothing_to_clean(op: LineOp) -> &'static str {
         LineOp::RemoveBlank => "No blank lines",
         LineOp::TrimTrailing => "No spaces at line ends",
     }
+}
+
+/// Where line `line` (1-based, at most the last) and column `col` (in characters, 1-based, at most the line's end)
+/// are; None while the document's lines are still being counted.
+fn line_col_pos(doc: &Document, line: u64, col: Option<u64>) -> Option<u64> {
+    let count = doc.line_count()?;
+    let line = line.max(1).min(count.max(1));
+    let ls = doc.line_start(line - 1).unwrap_or(0);
+    let mut pos = ls;
+    if let Some(c) = col {
+        let le = doc.line_end_of(ls);
+        for _ in 1..c {
+            if pos >= le {
+                break;
+            }
+            pos = doc.next_char(pos);
+        }
+    }
+    Some(pos)
+}
+
+/// A file name ending in `:120` or `:120:5` (a line, and a column), as editors take on their command line: the file
+/// and where to go in it. Only the end of the name counts, so a drive's colon never does.
+fn line_suffix(p: &Path) -> Option<(PathBuf, u64, Option<u64>)> {
+    let name = p.file_name()?.to_str()?;
+    let number = |s: &str| {
+        let digits = !s.is_empty() && s.len() <= 18 && s.bytes().all(|b| b.is_ascii_digit());
+        if digits { s.parse::<u64>().ok() } else { None }
+    };
+    let (rest, last) = name.rsplit_once(':')?;
+    let last = number(last)?;
+    let (base, line, col) = match rest.rsplit_once(':').and_then(|(b, l)| Some((b, number(l)?))) {
+        Some((base, line)) => (base, line, Some(last)),
+        None => (rest, last, None),
+    };
+    if base.is_empty() {
+        return None;
+    }
+    Some((p.with_file_name(base), line, col))
 }
 
 fn unix_now() -> u64 {
@@ -3481,10 +3645,15 @@ pub fn run(cell: &Cell, d: Deferred) {
         Deferred::TabMenu(i, x, y) => {
             let Some(id) = cell.borrow().tabs.get(i).map(|t| t.id) else { return };
             let has_path = cell.borrow().tabs[i].doc.path.is_some();
+            let reopen = !cell.borrow().closed_tabs.is_empty();
             let items = vec![
                 item(Cmd::CloseTab, "&Close", "Ctrl+W"),
                 item(Cmd::CloseOthers, "Close &others", ""),
                 item(Cmd::CloseRight, "Close tabs to the &right", ""),
+                item(Cmd::CloseSaved, "Close sa&ved", ""),
+                item(Cmd::CloseAll, "Close &all", ""),
+                Item::Sep,
+                enabled(Cmd::ReopenClosed, "Reop&en closed tab", "Ctrl+Shift+T", reopen),
                 Item::Sep,
                 enabled(Cmd::CopyPath, "Copy &path", "", has_path),
                 enabled(Cmd::RevealFile, "Show in &folder", "", has_path),
@@ -3498,6 +3667,15 @@ pub fn run(cell: &Cell, d: Deferred) {
             }
         }
         Deferred::AskLossy(id) => ask_lossy(cell, id),
+        Deferred::TabList => {
+            let (items, r) = {
+                let a = cell.borrow();
+                (a.tab_list_items(), a.tablist_rect)
+            };
+            if let Some(c) = popup(cell, "tabs", items, r.x, r.bottom(), false) {
+                run_cmd(cell, c);
+            }
+        }
         Deferred::UpdatePrompt => {
             let (rel, hwnd) = {
                 let a = cell.borrow();
@@ -3524,6 +3702,7 @@ pub fn run(cell: &Cell, d: Deferred) {
                 let items = match item_kind {
                     StatusItem::Lang => a.lang_items(),
                     StatusItem::Encoding => a.encoding_items(),
+                    StatusItem::Indent => a.indent_items(),
                     StatusItem::Eol => {
                         let e = a.tab().doc.eol;
                         vec![
@@ -3622,6 +3801,23 @@ pub fn run_cmd(cell: &Cell, cmd: Cmd) {
                     if !close_tab(cell, i) {
                         break;
                     }
+                }
+            }
+        }
+        Cmd::CloseAll | Cmd::CloseSaved => {
+            // One by one as Close tab does it (asking about unsaved changes; Cancel stops). Close saved leaves the
+            // tabs with unsaved changes, and those still busy opening, saving or converting.
+            let ids: Vec<u64> = cell
+                .borrow()
+                .tabs
+                .iter()
+                .filter(|t| cmd == Cmd::CloseAll || !(t.doc.is_dirty() || t.busy()))
+                .map(|t| t.id)
+                .collect();
+            for id in ids {
+                let Some(i) = tab_index(cell, id) else { continue };
+                if !close_tab(cell, i) {
+                    break;
                 }
             }
         }
@@ -3876,5 +4072,37 @@ impl App {
                 maximized: wp.showCmd == SW_SHOWMAXIMIZED.0 as u32,
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_line_after_the_file_name() {
+        let p = |s: &str| line_suffix(Path::new(s));
+        assert_eq!(p(r"C:\work\notes.txt:120"), Some((PathBuf::from(r"C:\work\notes.txt"), 120, None)));
+        assert_eq!(p(r"C:\work\notes.txt:120:5"), Some((PathBuf::from(r"C:\work\notes.txt"), 120, Some(5))));
+        // not a line: no number, nothing before it, a drive
+        assert_eq!(p(r"C:\work\notes.txt"), None);
+        assert_eq!(p(r"C:\work\notes.txt:"), None);
+        assert_eq!(p(r"C:\work\notes.txt:x"), None);
+        assert_eq!(p(r"C:\work\:12"), None);
+        assert_eq!(p(r"C:"), None);
+        assert_eq!(p(r"C:\"), None);
+        // a stream name before the number stays part of the name
+        assert_eq!(p(r"C:\w\a.txt:s:7"), Some((PathBuf::from(r"C:\w\a.txt:s"), 7, None)));
+    }
+
+    #[test]
+    fn lines_and_columns_to_positions() {
+        let d = Document::from_text("ab\r\ncdé\nlast".as_bytes());
+        assert_eq!(line_col_pos(&d, 1, None), Some(0));
+        assert_eq!(line_col_pos(&d, 2, Some(3)), Some(6));
+        // past the end of the line, or of the document: the end of the line, the last line
+        assert_eq!(line_col_pos(&d, 2, Some(99)), Some(8));
+        assert_eq!(line_col_pos(&d, 99, None), Some(9));
+        assert_eq!(line_col_pos(&d, 0, None), Some(0));
     }
 }

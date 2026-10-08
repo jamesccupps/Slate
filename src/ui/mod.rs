@@ -250,13 +250,19 @@ fn handle(cell: &Cell, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<L
             Some(LRESULT(0))
         }
         WM_SETTINGCHANGE => {
-            if lp.0 != 0 {
-                let s = unsafe { PCWSTR(lp.0 as *const u16).to_string() }.unwrap_or_default();
-                if s == "ImmersiveColorSet" {
-                    if let Ok(mut a) = cell.try_borrow_mut() {
-                        a.apply_theme();
-                    }
+            // Light/dark mode or the accent color changed, or high contrast went on or off.
+            let colors = lp.0 != 0 && unsafe { PCWSTR(lp.0 as *const u16).to_string() }.unwrap_or_default() == "ImmersiveColorSet";
+            if colors || wp.0 as u32 == SPI_SETHIGHCONTRAST.0 {
+                if let Ok(mut a) = cell.try_borrow_mut() {
+                    a.apply_theme();
                 }
+            }
+            None
+        }
+        WM_SYSCOLORCHANGE | WM_THEMECHANGED => {
+            // (Another contrast theme: new high-contrast colors.)
+            if let Ok(mut a) = cell.try_borrow_mut() {
+                a.apply_theme();
             }
             None
         }
@@ -372,10 +378,11 @@ fn handle(cell: &Cell, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<L
             Some(LRESULT(0))
         }
         WM_KILLFOCUS => {
-            // No blinking (and repainting) while the keyboard is elsewhere.
+            // No blinking (and repainting) while the keyboard is elsewhere, and the system caret goes with it.
             unsafe {
                 let _ = KillTimer(hwnd, actions::TIMER_CARET);
             }
+            win::drop_caret();
             if let Ok(mut a) = cell.try_borrow_mut() {
                 a.focused = false;
                 a.caret_on = true;
