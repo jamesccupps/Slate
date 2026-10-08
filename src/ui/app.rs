@@ -1140,10 +1140,15 @@ impl App {
         let editor_focused = focused && self.focused;
         tab.view.paint(&cx, editor_focused, caret_on, &matches, self.overtype);
         if editor_focused {
-            // The hidden system caret goes where Slate's is (Magnifier and screen readers follow that one).
-            if let Some(c) = tab.view.caret_rect(&cx, self.overtype) {
-                let px = |v: f32| (v * k).round() as i32;
-                win::follow_caret(hwnd, px(c.x), px(c.y), px(c.w).max(1), px(c.h).max(1));
+            // The hidden system caret goes where Slate's is (Magnifier and screen readers follow that one). While the
+            // caret is scrolled out of view there's none, so they don't stay on a place it has left.
+            let (left, right) = (geom.text_x - 2.0, geom.text_x + geom.text_w + 2.0);
+            match tab.view.caret_rect(&cx, self.overtype).filter(|c| c.right() > left && c.x < right) {
+                Some(c) => {
+                    let px = |v: f32| (v * k).round() as i32;
+                    win::follow_caret(hwnd, px(c.x), px(c.y), px(c.w).max(1), px(c.h).max(1));
+                }
+                None => win::drop_caret(),
             }
         }
         // Loading / converting overlay.

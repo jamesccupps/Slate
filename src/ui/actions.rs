@@ -29,7 +29,7 @@ use crate::core::lines::{self, CaseOp, LineOp};
 use crate::core::xml;
 use crate::core::search::{self, Matcher};
 use crate::core::source::{IndexBuilder, Source, create_temp_file};
-use crate::core::text::{Encoding, Eol};
+use crate::core::text::{Encoding, Eol, is_continuation};
 
 use super::app::*;
 use super::commands::*;
@@ -3829,17 +3829,30 @@ fn line_col_pos(doc: &Document, line: u64, col: Option<u64>) -> Option<u64> {
     let count = doc.line_count()?;
     let line = line.max(1).min(count.max(1));
     let ls = doc.line_start(line - 1).unwrap_or(0);
-    let mut pos = ls;
-    if let Some(c) = col {
-        let le = doc.line_end_of(ls);
-        for _ in 1..c {
-            if pos >= le {
-                break;
-            }
-            pos = doc.next_char(pos);
+    Some(match col {
+        Some(c) if c > 1 => skip_chars(doc, ls, doc.line_end_of(ls), c - 1),
+        _ => ls,
+    })
+}
+
+/// The place `n` characters after `from` (a character start), at most `end`. Characters are counted as the status
+/// bar's column counts them (each byte that isn't a UTF-8 continuation byte starts one), a piece of text at a time,
+/// so a column far into an 800 MB line is still quick.
+fn skip_chars(doc: &Document, from: u64, end: u64, n: u64) -> u64 {
+    let (mut left, mut pos, mut found) = (n, from, None);
+    doc.chunks(from, end, &mut |c| {
+        let here = bytecount::num_chars(c) as u64;
+        if here <= left {
+            left -= here;
+            pos += c.len() as u64;
+            return true;
         }
-    }
-    Some(pos)
+        // the start of character `left` (counting from 0) in this piece
+        let i = c.iter().enumerate().filter(|(_, b)| !is_continuation(**b)).nth(left as usize).map_or(c.len(), |(i, _)| i);
+        found = Some(pos + i as u64);
+        false
+    });
+    found.unwrap_or(end)
 }
 
 /// A file name ending in `:120` or `:120:5` (a line, and a column), as editors take on their command line: the file
@@ -4526,6 +4539,25 @@ mod tests {
         assert_eq!(p(r"C:\"), None);
         // a stream name before the number stays part of the name
         assert_eq!(p(r"C:\w\a.txt:s:7"), Some((PathBuf::from(r"C:\w\a.txt:s"), 7, None)));
+    }
+
+    #[test]
+    fn columns_are_counted_in_bulk() {
+        // as the character-by-character walk counted them, over text made of several pieces
+        let mut d = Document::from_text("aé€😀 x\t".as_bytes());
+        d.begin(EditKind::Other, Sel::at(0));
+        d.insert(3, "日本".as_bytes());
+        d.insert(0, "zz".as_bytes());
+        d.end(Sel::at(0));
+        let len = d.len();
+        let mut walk = 0;
+        for n in 0..20 {
+            assert_eq!(skip_chars(&d, 0, len, n), walk, "{n} characters");
+            walk = d.next_char(walk).min(len);
+        }
+        // at most the end given
+        assert_eq!(skip_chars(&d, 0, 4, 99), 4);
+        assert_eq!(skip_chars(&d, 2, len, 0), 2);
     }
 
     #[test]

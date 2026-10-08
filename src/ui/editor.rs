@@ -13,7 +13,7 @@ use std::rc::Rc;
 
 use windows::Win32::Foundation::BOOL;
 use windows::Win32::Graphics::DirectWrite::{
-    DWRITE_FONT_STYLE_ITALIC, DWRITE_FONT_WEIGHT_BOLD, DWRITE_HIT_TEST_METRICS, DWRITE_LINE_METRICS, DWRITE_TEXT_METRICS, DWRITE_TEXT_RANGE, IDWriteTextFormat,
+    DWRITE_CLUSTER_METRICS, DWRITE_FONT_STYLE_ITALIC, DWRITE_FONT_WEIGHT_BOLD, DWRITE_HIT_TEST_METRICS, DWRITE_LINE_METRICS, DWRITE_TEXT_METRICS, DWRITE_TEXT_RANGE, IDWriteTextFormat,
     IDWriteTextLayout,
 };
 
@@ -162,6 +162,33 @@ impl SegLayout {
             let _ = self.layout.HitTestTextPosition(u, BOOL(trailing as i32), &mut x, &mut y, &mut m);
         }
         x
+    }
+
+    /// Each cluster's text position, x from the start of its row, and width: one call for the whole layout, where a
+    /// hit test per position gets dearer the further into a long line it is.
+    fn clusters(&self) -> Vec<(u32, f32, f32)> {
+        let mut n = 0u32;
+        // (the first call says how many there are)
+        unsafe {
+            let _ = self.layout.GetClusterMetrics(None, &mut n);
+        }
+        let mut m = vec![DWRITE_CLUSTER_METRICS::default(); n as usize];
+        if n == 0 || unsafe { self.layout.GetClusterMetrics(Some(&mut m), &mut n) }.is_err() {
+            return Vec::new();
+        }
+        let mut out = Vec::with_capacity(m.len());
+        let (mut pos, mut x, mut row) = (0u32, 0f32, 0usize);
+        for c in &m[..(n as usize).min(m.len())] {
+            // (rows start at x 0: the text is left-aligned, and only left to right)
+            while row + 1 < self.rows.len() && pos >= self.rows[row + 1].0 {
+                row += 1;
+                x = 0.0;
+            }
+            out.push((pos, x, c.width));
+            pos += c.length as u32;
+            x += c.width;
+        }
+        out
     }
 }
 
@@ -363,6 +390,8 @@ pub struct View {
     hl_guess: bool,
     /// The bracket pair at the caret, for (document version, caret).
     bracket: Option<((u64, u64), Option<(u64, u64)>)>,
+    /// The clusters (`SegLayout::clusters`) of the layouts last shown with whitespace marks.
+    ws_clusters: Vec<(Rc<SegLayout>, Rc<Vec<(u32, f32, f32)>>)>,
 }
 
 impl Default for View {
@@ -395,6 +424,7 @@ impl View {
             hl: HlIndex::default(),
             hl_guess: false,
             bracket: None,
+            ws_clusters: Vec::new(),
         }
     }
 
@@ -414,6 +444,7 @@ impl View {
     /// Forgets cached layouts (font, theme or wrap changed).
     pub fn clear_cache(&mut self) {
         self.cache.clear();
+        self.ws_clusters.clear();
         self.max_top = None;
     }
 
@@ -1104,6 +1135,8 @@ impl View {
 
         if cx.style.show_whitespace {
             self.paint_whitespace(cx, ox);
+        } else if !self.ws_clusters.is_empty() {
+            self.ws_clusters.clear();
         }
 
         // Caret: a thin bar, or a bar under the character typing replaces.
@@ -1166,7 +1199,8 @@ impl View {
     }
 
     /// Faint dots for spaces, arrows for tabs, and after each line a mark for its line break (↵ for CRLF, ↓ for
-    /// LF), on the visible rows.
+    /// LF), on what's on screen. Without word wrap a row is a whole segment (up to 8 KiB, mostly off to the side): only
+    /// the part in view is looked at, with x positions from each layout's clusters (kept while it stays on screen).
     fn paint_whitespace(&mut self, cx: &Ctx, ox: f32) {
         let g = cx.g;
         let color = cx.theme.whitespace;
@@ -1175,54 +1209,56 @@ impl View {
         let fmt = &cx.style.format_nowrap;
         let crlf = g.layout(&super::gfx::wide("\u{21B5}"), fmt, 200.0, row_h);
         let lf = g.layout(&super::gfx::wide("\u{2193}"), fmt, 200.0, row_h);
+        // in layout x
+        let pad = cx.style.char_w * 2.0;
+        let (vx0, vx1) = (self.scroll_x - pad, self.scroll_x + cx.geom.text_w + pad);
+        let before = std::mem::take(&mut self.ws_clusters);
+        let mut shown: Vec<(Rc<SegLayout>, Rc<Vec<(u32, f32, f32)>>)> = Vec::new();
         for k in 0..self.rows.len() {
             let r = self.rows[k].clone();
-            let bytes = self.window(cx.doc, r.start, r.end).to_vec();
+            let found = shown.iter().rev().chain(before.iter()).find(|(l, _)| Rc::ptr_eq(l, &r.lay)).map(|(_, c)| c.clone());
+            let all = match found {
+                Some(c) => c,
+                None => Rc::new(r.lay.clusters()),
+            };
+            if !shown.iter().any(|(l, _)| Rc::ptr_eq(l, &r.lay)) {
+                shown.push((r.lay.clone(), all.clone()));
+            }
+            // this row's clusters, then those in view
+            let (ra, rb) = r.lay.rows[r.row];
+            let row = &all[all.partition_point(|c| c.0 < ra)..all.partition_point(|c| c.0 < rb)];
+            let seen = &row[row.partition_point(|c| c.1 + c.2 < vx0)..row.partition_point(|c| c.1 <= vx1)];
             let mid = r.y + row_h / 2.0;
-            let rel = r.start - r.seg.start;
-            let mut i = 0;
-            while i < bytes.len() {
-                let c = bytes[i];
-                if c != b' ' && c != b'\t' {
-                    i += 1;
-                    continue;
-                }
-                // a run of spaces at once (they're all as wide), each tab on its own
-                let mut j = i + 1;
-                while c == b' ' && j < bytes.len() && bytes[j] == b' ' {
-                    j += 1;
-                }
-                let us = r.lay.u16_of(rel + i as u64);
-                let ue = r.lay.u16_of(rel + j as u64);
-                let mut count = 0u32;
-                let mut buf = [DWRITE_HIT_TEST_METRICS::default(); 4];
-                unsafe {
-                    let _ = r.lay.layout.HitTestTextRange(us, ue - us, 0.0, 0.0, Some(&mut buf), &mut count);
-                }
-                for m in &buf[..(count as usize).min(4)] {
-                    let x0 = ox + m.left;
-                    if c == b' ' {
-                        let n = m.length.max(1);
-                        let w = m.width / n as f32;
-                        for q in 0..n {
-                            let x = x0 + (q as f32 + 0.5) * w;
+            if let (Some(first), Some(last)) = (seen.first(), seen.last()) {
+                let a = r.seg.start + r.lay.rel_of(first.0);
+                let b = r.seg.start + r.lay.rel_of(last.0) + 1;
+                let bytes = self.window(cx.doc, a, b).to_vec();
+                for &(pos, x, w) in seen {
+                    let x0 = ox + x;
+                    match bytes.get((r.seg.start + r.lay.rel_of(pos) - a) as usize) {
+                        Some(b' ') => {
+                            let x = x0 + w / 2.0;
                             g.fill_round(Rect::new(x - dot / 2.0, mid - dot / 2.0, dot, dot), dot / 2.0, color);
                         }
-                    } else if m.width > 4.0 {
-                        let (a, b) = (x0 + 2.0, x0 + m.width - 2.0);
-                        let head = (row_h * 0.18).min((b - a) / 2.0);
-                        g.line(a, mid, b, mid, color, 1.0);
-                        g.line(b - head, mid - head, b, mid, color, 1.0);
-                        g.line(b - head, mid + head, b, mid, color, 1.0);
+                        Some(b'\t') if w > 4.0 => {
+                            let (a, b) = (x0 + 2.0, x0 + w - 2.0);
+                            let head = (row_h * 0.18).min((b - a) / 2.0);
+                            g.line(a, mid, b, mid, color, 1.0);
+                            g.line(b - head, mid - head, b, mid, color, 1.0);
+                            g.line(b - head, mid + head, b, mid, color, 1.0);
+                        }
+                        _ => {}
                     }
                 }
-                i = j;
             }
             if r.row + 1 == r.lay.rows.len() && r.seg.line_end && r.seg.eol > 0 {
-                let x = ox + r.lay.x_of(r.lay.rows[r.row].1, false);
-                g.draw_layout(if r.seg.eol == 2 { &crlf } else { &lf }, x + 1.0, r.y, color);
+                let x = row.last().map_or(0.0, |c| c.1 + c.2);
+                if x >= vx0 && x <= vx1 {
+                    g.draw_layout(if r.seg.eol == 2 { &crlf } else { &lf }, ox + x + 1.0, r.y, color);
+                }
             }
         }
+        self.ws_clusters = shown;
     }
 }
 
@@ -1505,8 +1541,8 @@ fn matching_open(doc: &Document, before: u64, open: u8, close: u8) -> Option<u64
 }
 
 /// Typing `text` with overtype on (Insert): it replaces as many characters after the caret as it has, but not a
-/// line break (at the end of a line it's added). A selection is replaced as usual. Characters typed one after the
-/// other are one undo step, as with ordinary typing.
+/// line break (at the end of a line it's added; a lone CR isn't one). A selection is replaced as usual. Characters
+/// typed one after the other are one undo step, as with ordinary typing.
 pub fn overtype(doc: &mut Document, sel: Sel, text: &[u8]) -> Sel {
     if !sel.is_empty() {
         return replace_selection(doc, sel, text, EditKind::Typing);
@@ -1515,7 +1551,8 @@ pub fn overtype(doc: &mut Document, sel: Sel, text: &[u8]) -> Sel {
     let mut end = pos;
     for _ in String::from_utf8_lossy(text).chars() {
         match doc.byte_at(end) {
-            None | Some(b'\r') | Some(b'\n') => break,
+            None | Some(b'\n') => break,
+            Some(b'\r') if doc.byte_at(end + 1) == Some(b'\n') => break,
             _ => end = next_cluster(doc, end),
         }
     }
@@ -2390,6 +2427,12 @@ mod tests {
         assert_eq!(s, Sel::at(7));
         overtype(&mut d, Sel::new(0, 2), b"Q");
         assert_eq!(d.read(0, d.len()), b"QYZ\r\nex");
+        // a lone CR is a character like any other; CRLF is a line break
+        let mut d = Document::from_text(b"a\rb\r\nc");
+        let s = overtype(&mut d, Sel::at(1), b"X");
+        assert_eq!(d.read(0, d.len()), b"aXb\r\nc");
+        overtype(&mut d, Sel::at(s.caret + 1), b"Y");
+        assert_eq!(d.read(0, d.len()), b"aXbY\r\nc");
         // typed one after another: one undo step
         let mut d = Document::from_text(b"hello");
         let mut s = Sel::at(0);

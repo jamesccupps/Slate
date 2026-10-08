@@ -129,6 +129,9 @@ Commits use the GitHub no-reply address (repo-local git config); GitHub refuses 
 - Lines are split only at `\n` (`\r\n` handled as one). Lone `\r` shows as a symbol.
 - Display "segments": a line longer than ~4 KiB is cut at fixed 8 KiB grid points (only where no line break is
   within 4 KiB before), so a 800 MB one-line JSON renders and scrolls instantly. Segments never need the index.
+  Without word wrap a row is a whole segment, mostly off to the side: per-character work on a row (whitespace marks)
+  looks only at the part in view, with x positions from the layout's cluster metrics (a DirectWrite hit test costs
+  more the further into a long layout it is).
 - Scrollbar is proportional to bytes, not lines, so it needs no layout of the whole file.
 - Coloring across lines: documents up to 32 MiB keep lexer states at checkpoints (every ~16 KiB, at line starts) in
   `editor::HlIndex`, plus the start state of segments already seen (always worked out from the checkpoint before,
@@ -150,7 +153,7 @@ Commits use the GitHub no-reply address (repo-local git config); GitHub refuses 
   color, no light/dark switch; it's read again on WM_SETTINGCHANGE (SPI_SETHIGHCONTRAST), WM_SYSCOLORCHANGE and
   WM_THEMECHANGED. A hidden system caret (`win::follow_caret`, never shown) is moved to the drawn caret after each
   paint while the text has the keyboard, with EVENT_OBJECT_LOCATIONCHANGE for OBJID_CARET; WM_KILLFOCUS destroys it
-  (the find box's edit control makes its own). UI Automation is designed in the roadmap, not built.
+  (the find box's edit control makes its own), and so does the caret scrolling out of view. UI Automation is designed in the roadmap, not built.
 - Status bar counts: a selection up to 4 MiB is counted at once; a document up to 1 MiB at once, up to 64 MiB on
   another thread (after an edit only once the typing pauses: the count's snapshot ends the piece typing goes into),
   a bigger one not at all. Words are runs of non-space characters, like `wc -w`.
