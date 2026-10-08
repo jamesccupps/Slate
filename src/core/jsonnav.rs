@@ -131,6 +131,9 @@ pub struct Children {
     pub xml: bool,
     pub names: Vec<u32>,
     pub same_names: bool,
+    /// XML: where the element's content ends (its end tag's `<`, or where an end tag of one around it closed it), so
+    /// a scan again between its children stops there as the first one did.
+    pub content_end: u64,
 }
 
 impl Children {
@@ -143,7 +146,11 @@ impl Children {
 
     /// Up to `count` children from `from` (where a child begins), scanned again.
     fn rescan(&self, src: &dyn Chunked, from: u64, count: u64) -> Vec<Child> {
-        if self.xml { super::xmlnav::rescan(src, from, count) } else { rescan(src, from, self.is_object, count) }
+        if self.xml {
+            super::xmlnav::rescan(src, from, count, self.content_end)
+        } else {
+            rescan(src, from, self.is_object, count)
+        }
     }
 
     /// Children `a..b`.
@@ -188,7 +195,7 @@ impl Children {
 
 /// Up to `count` children of a container, starting at `from` (where a child begins).
 fn rescan(src: &dyn Chunked, from: u64, is_object: bool, count: u64) -> Vec<Child> {
-    scan_core(src, None, from, is_object, false, u64::MAX, count, None).pop().map(|(_, c)| c.items).unwrap_or_default()
+    scan_core(src, None, from, is_object, false, u64::MAX, None, count, None).pop().map(|(_, c)| c.items).unwrap_or_default()
 }
 
 const C_OTHER: u8 = 0;
@@ -221,7 +228,7 @@ static CLASS: [u8; 256] = classes();
 /// Lists the direct children of the container whose opening bracket is at `open`; with `open == None`, the
 /// top-level values of the document (one for normal JSON, one per record for JSON Lines).
 pub fn children(src: &dyn Chunked, open: Option<u64>, ctx: Option<&Ctx>) -> Children {
-    scan(src, open, u64::MAX, ctx).pop().map(|(_, c)| c).unwrap_or_default()
+    scan(src, open, u64::MAX, None, ctx).pop().map(|(_, c)| c).unwrap_or_default()
 }
 
 /// One level of the scanner's stack: a container being read.
@@ -297,13 +304,19 @@ fn add_child(items: &mut Vec<Child>, lv: &mut Level, s: u64, e: u64) {
 
 /// Scans the container at `open` (None = the whole document) in one pass. Returns its child list last, preceded by
 /// the lists of all containers inside it that are at least `keep` bytes long, so a single read of a huge file
-/// covers every big level.
-pub fn scan(src: &dyn Chunked, open: Option<u64>, keep: u64, ctx: Option<&Ctx>) -> Vec<(Option<u64>, Children)> {
+/// covers every big level, or that hold `path_to` (all of the path to it, from one scan).
+pub fn scan(
+    src: &dyn Chunked,
+    open: Option<u64>,
+    keep: u64,
+    path_to: Option<u64>,
+    ctx: Option<&Ctx>,
+) -> Vec<(Option<u64>, Children)> {
     let (start, root_obj) = match open {
         Some(o) => (o + 1, src.bytes(o, o + 1).first() == Some(&b'{')),
         None => (0, false),
     };
-    scan_core(src, open, start, root_obj, open.is_none(), keep, u64::MAX, ctx)
+    scan_core(src, open, start, root_obj, open.is_none(), keep, path_to, u64::MAX, ctx)
 }
 
 /// The scanner. Reads from `start` (inside the container at `open`, or at the top level when `top`), stops at the
@@ -316,10 +329,13 @@ fn scan_core(
     root_obj: bool,
     top: bool,
     keep: u64,
+    path_to: Option<u64>,
     limit: u64,
     ctx: Option<&Ctx>,
 ) -> Vec<(Option<u64>, Children)> {
     let total = src.total();
+    // a container's list is kept when it's big, or holds `path_to`
+    let kept = |cs: u64, end: u64| end - cs >= keep || path_to.is_some_and(|q| cs < q && q < end);
     let mut items: Vec<Child> = Vec::new();
     let mut stack: Vec<Level> = vec![Level::new(open, root_obj, 0, false)];
     stack[0].dense = limit != u64::MAX;
@@ -489,7 +505,7 @@ fn scan_core(
                     }
                     let child = stack.pop().unwrap();
                     let cs = child.open.unwrap();
-                    if p + 1 - cs >= keep {
+                    if kept(cs, p + 1) {
                         let list = items.split_off(child.items_from);
                         out.push((child.open, child.list(list, p + 1, false)));
                     } else {
@@ -551,7 +567,7 @@ fn scan_core(
         while stack.len() > 1 {
             let child = stack.pop().unwrap();
             let cs = child.open.unwrap();
-            if total - cs >= keep {
+            if kept(cs, total) {
                 let list = items.split_off(child.items_from);
                 out.push((child.open, child.list(list, total, true)));
             } else {
@@ -837,28 +853,45 @@ pub fn key_label(key: &str) -> String {
     s
 }
 
+/// What a path walk needs before it can go on: the container to scan (None = the top level) and where it ends.
+pub type Missing = (Option<u64>, u64);
+
+/// The step of an earlier walk (`prev`, over the same text) that the walk meets again at depth `k`: the same child
+/// of the same container, which needn't be read again.
+pub(crate) fn same_step(prev: &[Step], k: usize, open: Option<u64>, i: u64, start: u64) -> Option<&Step> {
+    prev.get(k).filter(|s| s.parent == open && s.index == i && s.start == start)
+}
+
 /// The path to `offset`. `get(open)` returns the cached children of a container (None = top level); when one
-/// isn't known yet this returns `Err(open)` so the caller can scan it and ask again.
+/// isn't known yet this returns `Err` with it (and where it ends) so the caller can scan it and ask again. `prev` is
+/// the path worked out last for the same text: where this one goes the same way, its steps are taken as they are.
 pub fn path_at(
     src: &dyn Chunked,
     offset: u64,
+    prev: &[Step],
     get: &mut dyn FnMut(Option<u64>) -> Option<Arc<Children>>,
-) -> Result<Vec<Step>, Option<u64>> {
-    let mut path = Vec::new();
-    let mut open: Option<u64> = None;
+) -> Result<Vec<Step>, Missing> {
+    let mut path: Vec<Step> = Vec::new();
+    let (mut open, mut end): (Option<u64>, u64) = (None, src.total());
     loop {
-        let Some(ch) = get(open) else { return Err(open) };
+        let Some(ch) = get(open) else { return Err((open, end)) };
         let Some((i, c)) = ch.find(src, offset) else { break };
-        let key = c.key_range().map(|(a, b)| key_text(&src.bytes(a, b)));
         // A single top-level value (normal JSON, also when the file is cut short) isn't shown as "[0]".
         let single_root = open.is_none() && ch.count == 1;
+        let k = path.len();
+        let again = same_step(prev, k, open, i, c.start).filter(|_| !single_root);
         if !single_root {
+            let key = match again {
+                Some(s) => s.key.clone(),
+                None => c.key_range().map(|(a, b)| key_text(&src.bytes(a, b))),
+            };
             path.push(Step { index: i, key, start: c.start, end: c.end, parent: open, ord: 0 });
         }
-        let first = src.bytes(c.start, c.start + 1);
-        let kind = first.first().map_or(Kind::Other, |&b| Kind::of(b));
-        if kind.is_container() && offset > c.start && offset < c.end {
-            open = Some(c.start);
+        // (a step the last walk went into is a container)
+        let container = (again.is_some() && prev.get(k + 1).is_some_and(|n| n.parent == Some(c.start)))
+            || src.bytes(c.start, c.start + 1).first().is_some_and(|&b| Kind::of(b).is_container());
+        if container && offset > c.start && offset < c.end {
+            (open, end) = (Some(c.start), c.end);
             continue;
         }
         break;
@@ -972,10 +1005,10 @@ mod tests {
         let d = doc(s);
         let mut cache: HashMap<Option<u64>, Arc<Children>> = HashMap::new();
         let mut path = |off: u64| loop {
-            let r = path_at(&d, off, &mut |o| cache.get(&o).cloned());
+            let r = path_at(&d, off, &[], &mut |o| cache.get(&o).cloned());
             match r {
                 Ok(p) => return path_string(&p),
-                Err(o) => {
+                Err((o, _)) => {
                     let ch = children(&d, o, None);
                     cache.insert(o, Arc::new(ch));
                 }
@@ -1006,9 +1039,9 @@ mod tests {
         let mut cache: HashMap<Option<u64>, Arc<Children>> = HashMap::new();
         (0..=src.total())
             .map(|off| loop {
-                match path_at(src, off, &mut |o| cache.get(&o).cloned()) {
+                match path_at(src, off, &[], &mut |o| cache.get(&o).cloned()) {
                     Ok(p) => break path_string(&p),
-                    Err(o) => {
+                    Err((o, _)) => {
                         let ch = children(src, o, None);
                         cache.insert(o, Arc::new(ch));
                     }
@@ -1030,7 +1063,7 @@ mod tests {
         assert_eq!(paths[s.find("thr").unwrap()], "data[2].name");
         assert_eq!(paths[s.find("3,").unwrap()], "data[2].id");
         // the background scan keeps the open containers' lists too
-        let lists: HashMap<Option<u64>, Children> = scan(&d, None, 1, None).into_iter().collect();
+        let lists: HashMap<Option<u64>, Children> = scan(&d, None, 1, None, None).into_iter().collect();
         let data = &lists[&Some(s.find('[').unwrap() as u64)];
         assert_eq!((data.count, data.partial, data.end), (3, true, s.len() as u64));
     }
@@ -1099,7 +1132,7 @@ mod tests {
         let ring = format!("[{}]", vec!["[12.3456,45.6789]"; 3000].join(","));
         let s = format!("{{\"features\": [{}]}}", vec![ring.as_str(); 300].join(","));
         let d = doc(&s);
-        let lists = scan(&d, None, 4096, None);
+        let lists = scan(&d, None, 4096, None, None);
         let items: usize = lists.iter().map(|(_, c)| c.items.len()).sum();
         let children_total: u64 = lists.iter().map(|(_, c)| c.count).sum();
         assert!(children_total > 900_000 && items < 20_000, "{items} kept of {children_total}");
@@ -1200,7 +1233,7 @@ mod tests {
             let top_new = children(&d, None, None);
             let top_old = children_simple(&d, None, u64::MAX, None);
             assert_eq!(all(&d, &top_new), top_old.items, "top level of {s}");
-            let lists: HashMap<Option<u64>, Children> = scan(&d, None, 20, None).into_iter().collect();
+            let lists: HashMap<Option<u64>, Children> = scan(&d, None, 20, None, None).into_iter().collect();
             for o in containers(s.as_bytes()) {
                 let old = children_simple(&d, Some(o), u64::MAX, None);
                 let new = children(&d, Some(o), None);
@@ -1236,7 +1269,7 @@ mod tests {
         }
         s.push_str("}}");
         let d = doc(&s);
-        let lists: HashMap<Option<u64>, Children> = scan(&d, None, 1 << 20, None).into_iter().collect();
+        let lists: HashMap<Option<u64>, Children> = scan(&d, None, 1 << 20, None, None).into_iter().collect();
         let root = children(&d, Some(0), None);
         let nums = root.get(&d, 0).unwrap();
         let obj = root.get(&d, 1).unwrap();
@@ -1262,9 +1295,9 @@ mod tests {
         cache.insert(Some(0), Arc::new(root));
         let target = s.find("\"k123456\"").unwrap() as u64 + 3;
         let p = loop {
-            match path_at(&d, target, &mut |o| cache.get(&o).cloned()) {
+            match path_at(&d, target, &[], &mut |o| cache.get(&o).cloned()) {
                 Ok(p) => break p,
-                Err(o) => {
+                Err((o, _)) => {
                     let ch = children(&d, o, None);
                     cache.insert(o, Arc::new(ch));
                 }

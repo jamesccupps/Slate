@@ -12,8 +12,8 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use crate::core::document::Document;
-use crate::core::job::{Job, Notify};
-use crate::core::jsonnav::{self, Children, Kind, Step};
+use crate::core::job::{Ctx, Job, Notify};
+use crate::core::jsonnav::{self, Children, Chunked, Kind, Step};
 use crate::core::xmlnav;
 
 use super::gfx::{Align, Gfx, Rect};
@@ -25,6 +25,9 @@ const SYNC_SCAN: u64 = 4 << 20;
 /// A background scan also keeps the child lists of every container at least this big it passes through.
 const KEEP: u64 = 1 << 20;
 const BUCKET: u64 = 100;
+/// The tree shows this many levels at most (deeper ones would be off to the side anyway); following the caret opens
+/// no more than that.
+const TREE_DEPTH_MAX: u16 = 100;
 pub const ROW_H: f32 = 24.0;
 pub const PATH_H: f32 = 28.0;
 pub const HEADER_H: f32 = 34.0;
@@ -50,6 +53,19 @@ fn node_id(parent: u64, key: Option<&str>, index: u64) -> u64 {
         None => index.hash(&mut h),
     }
     h.finish() | 1
+}
+
+/// One scan of a JSON or XML container ending at `end` (see `jsonnav::scan`, `xmlnav::scan`).
+fn scan_lists(
+    xml: bool,
+    src: &dyn Chunked,
+    open: Option<u64>,
+    end: u64,
+    keep: u64,
+    path_to: Option<u64>,
+    ctx: Option<&Ctx>,
+) -> Vec<(Option<u64>, Children)> {
+    if xml { xmlnav::scan(src, open, Some(end), keep, path_to, ctx) } else { jsonnav::scan(src, open, keep, path_to, ctx) }
 }
 
 #[derive(Clone, Debug)]
@@ -166,27 +182,35 @@ impl Structure {
         self.cache.get(&open).cloned()
     }
 
-    /// Makes sure the children of `open` are (or will be) known. Small containers are scanned now.
-    fn ensure(&mut self, doc: &mut Document, open: Option<u64>, size: u64, notify: &Notify) -> Option<Arc<Children>> {
+    /// Makes sure the children of `open`, which ends at `end` (as its parent's list says), are (or will be) known.
+    /// Small containers are scanned now. The same scan keeps the lists of the containers on the way to `path_to` (the
+    /// caret), so a path many levels deep is worked out from one pass.
+    fn ensure(
+        &mut self,
+        doc: &mut Document,
+        open: Option<u64>,
+        end: u64,
+        path_to: Option<u64>,
+        notify: &Notify,
+    ) -> Option<Arc<Children>> {
         if let Some(c) = self.get(open) {
             return Some(c);
         }
-        if size <= SYNC_SCAN && doc.is_ready() {
-            let ch = if self.xml { xmlnav::children(&*doc, open, None) } else { jsonnav::children(&*doc, open, None) };
-            let ch = Arc::new(ch);
-            self.cache.insert(open, ch.clone());
-            return Some(ch);
+        if end.saturating_sub(open.unwrap_or(0)) <= SYNC_SCAN && doc.is_ready() {
+            let mut own = None;
+            for (o, ch) in scan_lists(self.xml, &*doc, open, end, u64::MAX, path_to, None) {
+                let ch = Arc::new(ch);
+                if o == open {
+                    own = Some(ch.clone());
+                }
+                self.cache.insert(o, ch);
+            }
+            return own;
         }
         if self.scanning.is_none() {
             let snap = doc.snapshot();
-            let total = match open {
-                None => snap.len(),
-                Some(o) => size.max(1) + o,
-            };
             let xml = self.xml;
-            let job = Job::spawn(total, notify.clone(), move |ctx| {
-                if xml { xmlnav::scan(&snap, open, KEEP, Some(ctx)) } else { jsonnav::scan(&snap, open, KEEP, Some(ctx)) }
-            });
+            let job = Job::spawn(end.max(1), notify.clone(), move |ctx| scan_lists(xml, &snap, open, end, KEEP, path_to, Some(ctx)));
             self.scanning = Some((open, job));
         }
         None
@@ -221,13 +245,24 @@ impl Structure {
         if self.path_for == Some((caret, doc.version)) {
             return;
         }
+        // the last path: for the same text, the walk takes its steps as they are where it goes the same way (what's
+        // missing on the way is read in one scan, which keeps the lists of everything up to the caret)
+        let old = self.path.take();
+        let prev: &[Step] = match &old {
+            Some(p) if self.path_version == doc.version => p,
+            _ => &[],
+        };
         for _ in 0..64 {
             let cache = &self.cache;
             let get = &mut |o: Option<u64>| cache.get(&o).cloned();
-            let r = if self.xml { xmlnav::path_at(&*doc, caret, get) } else { jsonnav::path_at(&*doc, caret, get) };
+            let r = if self.xml {
+                xmlnav::path_at(&*doc, caret, prev, get)
+            } else {
+                jsonnav::path_at(&*doc, caret, prev, get)
+            };
             match r {
                 Ok(p) => {
-                    let changed = self.path.as_ref() != Some(&p);
+                    let changed = old.as_ref() != Some(&p);
                     self.path = Some(p);
                     self.path_for = Some((caret, doc.version));
                     self.path_version = doc.version;
@@ -236,15 +271,15 @@ impl Structure {
                     }
                     return;
                 }
-                Err(open) => {
-                    let size = self.size_of(doc, open);
-                    if self.ensure(doc, open, size, notify).is_none() {
+                Err((open, end)) => {
+                    if self.ensure(doc, open, end, Some(caret), notify).is_none() {
                         // being scanned in the background; keep the old path meanwhile
-                        return;
+                        break;
                     }
                 }
             }
         }
+        self.path = old;
     }
 
     /// The path at `caret` right now, even when the path bar is hidden. None while a big container on the way is
@@ -254,45 +289,37 @@ impl Structure {
         if self.path_for == Some((caret, doc.version)) { self.path.clone() } else { None }
     }
 
-    /// Byte size of a container (from its parent's list), or the whole document for the top level.
-    fn size_of(&self, doc: &Document, open: Option<u64>) -> u64 {
-        match open {
-            None => doc.len(),
-            Some(o) => self
-                .cache
-                .values()
-                .find_map(|ch| ch.find_start(doc, o).map(|c| c.end - o))
-                .unwrap_or(doc.len() - o),
-        }
-    }
-
     /// Expands the tree down to the caret's node and selects it. What the last reveal opened closes again (unless the
     /// user opened or closed it since), so following the caret through thousands of records doesn't leave them all
     /// open (and the tree slow to rebuild).
     fn reveal_path(&mut self) {
-        let Some(path) = self.path.clone() else { return };
+        // (no further than the tree shows)
+        let Some(path) = self.path.as_ref().map(|p| p.iter().take(TREE_DEPTH_MAX as usize).cloned().collect::<Vec<_>>()) else { return };
         for k in std::mem::take(&mut self.revealed) {
             self.expanded.remove(&k);
         }
         let mut id = TOP;
+        // the tree's depth so far (ranges count as levels too)
+        let mut depth = 0u16;
         for (n, st) in path.iter().enumerate() {
             if let Some(ch) = self.get(st.parent) {
                 // ranges containing this index
                 let (mut a, mut b) = (0u64, ch.count);
-                while b - a > BUCKET && st.index < b {
+                while b - a > BUCKET && st.index < b && depth + 1 < TREE_DEPTH_MAX {
                     let size = bucket_size(b - a);
                     let s = a + (st.index - a) / size * size;
                     let e = (s + size).min(b);
                     self.open_by_reveal(NodeKey::Bucket(id, s, e));
-                    a = s;
-                    b = e;
+                    (a, b, depth) = (s, e, depth + 1);
                 }
             }
             id = self.child_id(id, st.key.as_deref(), st.index);
             self.selected = Some(NodeKey::Value(id));
-            if n + 1 < path.len() {
-                self.open_by_reveal(NodeKey::Value(id));
+            if n + 1 == path.len() || depth + 1 >= TREE_DEPTH_MAX {
+                break;
             }
+            self.open_by_reveal(NodeKey::Value(id));
+            depth += 1;
         }
         self.rows_dirty = true;
     }
@@ -334,14 +361,14 @@ impl Structure {
             return;
         }
         self.rows_dirty = false;
-        let Some(top) = self.ensure(doc, None, doc.len(), notify) else {
+        let Some(top) = self.ensure(doc, None, doc.len(), None, notify) else {
             self.rows_dirty = true;
             return;
         };
         let (open, list) = match self.root_open(doc) {
             Some(r) => {
-                let size = top.items.first().map_or(0, |c| c.end) - r;
-                match self.ensure(doc, Some(r), size, notify) {
+                let end = top.items.first().map_or(r, |c| c.end);
+                match self.ensure(doc, Some(r), end, None, notify) {
                     Some(l) => (Some(r), l),
                     None => {
                         self.rows_dirty = true;
@@ -401,8 +428,10 @@ impl Structure {
                     end,
                     loading: false,
                 });
-                if expanded {
+                if expanded && depth + 1 < TREE_DEPTH_MAX {
                     self.add(doc, notify, open, id, list, s, e, depth + 1, out);
+                } else if expanded {
+                    out.push(empty_row(depth + 1, "(deeper levels aren't shown)"));
                 }
                 s = e;
             }
@@ -442,8 +471,10 @@ impl Structure {
                 end: c.end,
                 loading: false,
             });
-            if expanded {
-                match self.ensure(doc, Some(c.start), size, notify) {
+            if expanded && depth + 1 >= TREE_DEPTH_MAX {
+                out.push(empty_row(depth + 1, "(deeper levels aren't shown)"));
+            } else if expanded {
+                match self.ensure(doc, Some(c.start), c.end, None, notify) {
                     Some(sub) => {
                         let n = sub.count;
                         if n == 0 {
@@ -477,41 +508,47 @@ impl Structure {
         let mut x = r.x + 12.0;
         let limit = toggle.x - 8.0;
         let label = |s: &str| -> String { if s.chars().count() > 40 { format!("{}…", s.chars().take(39).collect::<String>()) } else { s.to_string() } };
-        let segs: Vec<String> = match &self.path {
-            Some(p) if p.is_empty() => vec!["(top)".into()],
-            Some(p) => p.iter().map(|s| label(&s.label())).collect(),
-            None if self.broken => vec![if self.xml { "Not well-formed XML here" } else { "Not valid JSON here" }.into()],
-            None => vec!["…".into()],
+        let n = self.path.as_ref().map_or(1, |p| p.len().max(1));
+        let seg = |i: usize| -> String {
+            match &self.path {
+                Some(p) if p.is_empty() => "(top)".into(),
+                Some(p) => label(&p[i].label()),
+                None if self.broken => if self.xml { "Not well-formed XML here" } else { "Not valid JSON here" }.into(),
+                None => "…".into(),
+            }
         };
-        // When it doesn't fit, show the end of the path.
-        let widths: Vec<f32> = segs.iter().map(|s| g.measure(s, ui).0 + 12.0).collect();
+        // When it doesn't fit, show the end of the path: only that much is measured (it can be thousands of steps).
         let sep_w = 18.0;
-        let total: f32 = widths.iter().sum::<f32>() + sep_w * segs.len().saturating_sub(1) as f32;
-        let mut skip = 0;
-        let mut need = total;
-        while need > limit - x && skip + 1 < segs.len() {
-            need -= widths[skip] + sep_w;
-            skip += 1;
+        let mut shown: Vec<(String, f32)> = Vec::new();
+        let mut need = 0.0;
+        for i in (0..n).rev() {
+            let s = seg(i);
+            let w = g.measure(&s, ui).0 + 12.0;
+            let more = w + if shown.is_empty() { 0.0 } else { sep_w };
+            if !shown.is_empty() && need + more > limit - x {
+                break;
+            }
+            need += more;
+            shown.push((s, w));
         }
+        shown.reverse();
+        let skip = n - shown.len();
         if skip > 0 {
             g.text("… ›", ui, Rect::new(x, r.y, 30.0, r.h), t.text_faint, Align::Left);
             x += 30.0;
         }
-        for (i, s) in segs.iter().enumerate() {
-            if i < skip {
-                self.path_rects.push(Rect::default());
-                continue;
-            }
-            if i > skip {
+        self.path_rects.resize(skip, Rect::default());
+        for (k, (s, w)) in shown.iter().enumerate() {
+            let i = skip + k;
+            if k > 0 {
                 g.text("›", ui, Rect::new(x, r.y, sep_w, r.h), t.text_faint, Align::Center);
                 x += sep_w;
             }
-            let w = widths[i];
             let br = Rect::new(x, r.y + 3.0, w.min((limit - x).max(0.0)), r.h - 6.0);
             if hover == Some(i) {
                 g.fill_round(br, 4.0, t.hover);
             }
-            let last = i + 1 == segs.len();
+            let last = i + 1 == n;
             g.text(s, ui, br, if last { t.text } else { t.text_dim }, Align::Center);
             self.path_rects.push(br);
             x += w;
@@ -764,6 +801,38 @@ mod tests {
         // read as JSON, it's another document
         s.set_lang(Lang::Json);
         assert!(s.rows.is_empty() && s.path.is_none());
+    }
+
+    #[test]
+    fn deep_paths_are_worked_out_in_one_go() {
+        let n = notify();
+        let deep = 20_000;
+        let docs = [
+            (Lang::Xml, format!("{}x{}", "<a>".repeat(deep), "</a>".repeat(deep))),
+            (Lang::Json, format!("{}1{}", "[".repeat(deep), "]".repeat(deep))),
+        ];
+        for (lang, text) in docs {
+            let mut d = Document::from_text(text.as_bytes());
+            let mut s = Structure::default();
+            s.set_lang(lang);
+            // (in the innermost one)
+            let caret = text.find(['x', '1']).unwrap() as u64 + 1;
+            let start = std::time::Instant::now();
+            s.update_path(&mut d, caret, &n);
+            assert_eq!(s.path.as_ref().map(|p| p.len()), Some(deep), "{lang:?}");
+            // the caret moving inside it: the path's steps are taken as they were
+            s.update_path(&mut d, caret - 1, &n);
+            assert!(s.path_current(&d) && s.path.as_ref().unwrap().len() == deep);
+            // the panel, following the caret, opens only as many levels as the tree shows
+            let mut s = Structure::default();
+            s.set_lang(lang);
+            s.follow = true;
+            s.update_path(&mut d, caret, &n);
+            s.rows(&mut d, &n);
+            assert!(s.rows.len() <= TREE_DEPTH_MAX as usize + 2, "{lang:?}: {} rows", s.rows.len());
+            assert!(s.rows.iter().any(|r| Some(r.key) == s.selected));
+            assert!(start.elapsed().as_secs_f64() < 2.0, "{lang:?}: {:?}", start.elapsed());
+        }
     }
 
     #[test]

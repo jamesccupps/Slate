@@ -6,7 +6,9 @@
 //! short whatever is still open ends at the end of the file.
 
 use super::job::Ctx;
-use super::jsonnav::{Child, Children, Chunked, DENSE_MAX, Kind, NESTED_MAX, ORD_UNKNOWN, STRIDE, Step, key_label};
+use super::jsonnav::{
+    Child, Children, Chunked, DENSE_MAX, Kind, Missing, NESTED_MAX, ORD_UNKNOWN, STRIDE, Step, key_label, same_step,
+};
 use std::sync::Arc;
 
 /// Names are told apart by their first bytes only.
@@ -124,7 +126,7 @@ impl Level {
         }
     }
 
-    fn list(&self, items: Vec<Child>, names: Vec<u32>, end: u64, partial: bool) -> Children {
+    fn list(&self, items: Vec<Child>, names: Vec<u32>, end: u64, content_end: u64, partial: bool) -> Children {
         Children {
             items,
             count: self.count,
@@ -135,6 +137,7 @@ impl Level {
             xml: true,
             names,
             same_names: self.same_names,
+            content_end,
         }
     }
 }
@@ -153,17 +156,20 @@ struct Scanner {
     last: u8,
     keep: u64,
     limit: u64,
+    /// The lists of the elements whose content holds this offset are kept too (the path to it).
+    path_to: Option<u64>,
     /// The element scanned (None: the document).
     scan_open: Option<u64>,
     /// Scanning one element (not the document, nor a rescan): it is opened by the first start tag.
     root: bool,
-    /// Where the scanned element ends, once it has.
+    /// Where the scanned element ends, once it has, and where its content ends (its end tag's `<`).
     end: Option<u64>,
+    content_end: u64,
     broken: bool,
 }
 
 impl Scanner {
-    fn new(open: Option<u64>, keep: u64, limit: u64) -> Scanner {
+    fn new(open: Option<u64>, keep: u64, limit: u64, path_to: Option<u64>) -> Scanner {
         Scanner {
             at: At::Text,
             stack: Vec::new(),
@@ -176,9 +182,11 @@ impl Scanner {
             last: 0,
             keep,
             limit,
+            path_to,
             scan_open: open,
             root: false,
             end: None,
+            content_end: 0,
             broken: false,
         }
     }
@@ -209,14 +217,15 @@ impl Scanner {
         lv.count += 1;
     }
 
-    /// The top element ends at `end`: it becomes a child of the one around it (its list kept if it's big).
-    fn finish(&mut self, end: u64, partial: bool) {
+    /// The top element ends at `end` (its content at `content_end`): it becomes a child of the one around it (its
+    /// list kept if it's big, or holds `path_to`).
+    fn finish(&mut self, end: u64, content_end: u64, partial: bool) {
         let lv = self.stack.pop().unwrap();
         let open = lv.open.unwrap_or(0);
         let names = self.names.split_off(lv.items_from);
         let items = self.items.split_off(lv.items_from);
-        if end - open >= self.keep {
-            self.out.push((lv.open, lv.list(items, names, end, partial)));
+        if end - open >= self.keep || self.path_to.is_some_and(|p| open + lv.tag_len <= p && p < end) {
+            self.out.push((lv.open, lv.list(items, names, end, content_end, partial)));
         }
         let c = Child { start: open, end, key_back: 0, key_len: info(lv.tag_len, lv.count > 0) };
         self.add_child(c, lv.name);
@@ -230,7 +239,7 @@ impl Scanner {
             self.root = false;
             self.stack.push(Level::new(Some(self.tag_start), self.tag_hash, tag_len, 0, false));
             if empty {
-                self.end = Some(end);
+                (self.end, self.content_end) = (Some(end), end);
             }
             return;
         }
@@ -248,17 +257,17 @@ impl Scanner {
         let h = self.tag_hash;
         let found = self.stack.iter().rev().take(MAX_UNCLOSED).position(|l| l.open.is_some() && l.name == h);
         let Some(d) = found.map(|k| self.stack.len() - 1 - k) else {
-            // a stray end tag
-            self.broken |= self.stack.len() == 1;
+            // a stray end tag (in the document itself: it isn't well-formed)
+            self.broken |= self.stack.len() == 1 && self.stack[0].open.is_none();
             return;
         };
         while self.stack.len() > d + 1 {
-            self.finish(self.tag_start, true);
+            self.finish(self.tag_start, self.tag_start, true);
         }
         if d == 0 {
-            self.end = Some(end);
+            (self.end, self.content_end) = (Some(end), self.tag_start);
         } else {
-            self.finish(end, false);
+            self.finish(end, self.tag_start, false);
         }
     }
 
@@ -425,10 +434,20 @@ impl Scanner {
     }
 }
 
-/// Scans the element whose `<` is at `open` (None = the whole document) in one pass. Returns its child list last,
-/// preceded by the lists of the elements inside it that are at least `keep` bytes long.
-pub fn scan(src: &dyn Chunked, open: Option<u64>, keep: u64, ctx: Option<&Ctx>) -> Vec<(Option<u64>, Children)> {
-    let mut sc = Scanner::new(open, keep, u64::MAX);
+/// Scans the element whose `<` is at `open` (None = the whole document) in one pass, up to `end`: where its
+/// parent's list says it ends (None: unknown, or the document's end). There whatever is still open ends, as at the
+/// end of the file, so an element closed by an end tag of one around it (`<rows><row>a</rows>`) reads the same as
+/// in its parent's scan. Returns its child list last, preceded by the lists of the elements inside it that are at
+/// least `keep` bytes long or whose content holds `path_to` (all of the path to it, from one scan).
+pub fn scan(
+    src: &dyn Chunked,
+    open: Option<u64>,
+    end: Option<u64>,
+    keep: u64,
+    path_to: Option<u64>,
+    ctx: Option<&Ctx>,
+) -> Vec<(Option<u64>, Children)> {
+    let mut sc = Scanner::new(open, keep, u64::MAX, path_to);
     if open.is_some() {
         // its start tag opens it
         sc.at = At::Lt;
@@ -437,23 +456,23 @@ pub fn scan(src: &dyn Chunked, open: Option<u64>, keep: u64, ctx: Option<&Ctx>) 
         sc.stack.push(Level::new(None, 0, 0, 0, false));
     }
     let start = open.map_or(0, |o| o + 1);
-    run(&mut sc, src, start, ctx)
+    run(&mut sc, src, start, end.unwrap_or(u64::MAX), ctx)
 }
 
-/// Up to `count` elements at one level from `from` (where one starts).
-pub fn rescan(src: &dyn Chunked, from: u64, count: u64) -> Vec<Child> {
-    let mut sc = Scanner::new(None, u64::MAX, count);
+/// Up to `count` elements at one level from `from` (where one starts), in a list whose content ends at `bound`.
+pub fn rescan(src: &dyn Chunked, from: u64, count: u64, bound: u64) -> Vec<Child> {
+    let mut sc = Scanner::new(None, u64::MAX, count, None);
     let mut lv = Level::new(None, 0, 0, 0, false);
     lv.dense = true;
     sc.stack.push(lv);
-    run(&mut sc, src, from, None).pop().map(|(_, c)| c.items).unwrap_or_default()
+    run(&mut sc, src, from, bound, None).pop().map(|(_, c)| c.items).unwrap_or_default()
 }
 
-fn run(sc: &mut Scanner, src: &dyn Chunked, start: u64, ctx: Option<&Ctx>) -> Vec<(Option<u64>, Children)> {
-    let total = src.total();
+fn run(sc: &mut Scanner, src: &dyn Chunked, start: u64, bound: u64, ctx: Option<&Ctx>) -> Vec<(Option<u64>, Children)> {
+    let total = src.total().min(bound);
     let mut pos = start;
     let mut since_check = 0u64;
-    src.chunked(start, total, &mut |chunk: &[u8]| {
+    src.chunked(start.min(total), total, &mut |chunk: &[u8]| {
         let more = sc.feed(chunk, pos);
         if let Some(&b) = chunk.last() {
             sc.last = b;
@@ -474,36 +493,38 @@ fn run(sc: &mut Scanner, src: &dyn Chunked, start: u64, ctx: Option<&Ctx>) -> Ve
     let cancelled = ctx.is_some_and(|c| c.cancelled());
     if sc.stack.is_empty() {
         // the element to scan never started (there's no element there)
-        return vec![(sc.scan_open, Children { xml: true, partial: true, end: total, ..Default::default() })];
+        return vec![(sc.scan_open, Children { xml: true, partial: true, end: total, content_end: total, ..Default::default() })];
     }
     let mut partial = sc.broken || cancelled;
     let end = match sc.end {
         Some(e) => e,
         None => {
-            // the file ends with elements still open (or the element scanned): they end there
+            // the file (or the element) ends with elements still open (or the one scanned): they end there
             let unclosed = sc.stack.len() > 1 || sc.stack[0].open.is_some();
             if !cancelled {
                 while sc.stack.len() > 1 {
-                    sc.finish(total, true);
+                    sc.finish(total, total, true);
                 }
                 partial |= unclosed && sc.limit == u64::MAX;
             }
+            sc.content_end = total;
             total
         }
     };
     let own = sc.stack.get(1).map_or(sc.items.len(), |l| l.items_from);
     sc.items.truncate(own);
     sc.names.truncate(own);
-    let list = sc.stack[0].list(std::mem::take(&mut sc.items), std::mem::take(&mut sc.names), end, partial);
+    let (items, names) = (std::mem::take(&mut sc.items), std::mem::take(&mut sc.names));
+    let list = sc.stack[0].list(items, names, end, sc.content_end, partial);
     let mut out = std::mem::take(&mut sc.out);
     out.push((sc.scan_open, list));
     out
 }
 
-/// Lists the elements directly inside the element whose `<` is at `open`; with `open == None`, the top-level
-/// elements of the document (normally one).
-pub fn children(src: &dyn Chunked, open: Option<u64>, ctx: Option<&Ctx>) -> Children {
-    scan(src, open, u64::MAX, ctx).pop().map(|(_, c)| c).unwrap_or_default()
+/// Lists the elements directly inside the element whose `<` is at `open` and which ends at `end` (see `scan`); with
+/// `open == None`, the top-level elements of the document (normally one).
+pub fn children(src: &dyn Chunked, open: Option<u64>, end: Option<u64>, ctx: Option<&Ctx>) -> Children {
+    scan(src, open, end, u64::MAX, None, ctx).pop().map(|(_, c)| c).unwrap_or_default()
 }
 
 /// The name of the element whose `<` is at `start`.
@@ -529,24 +550,32 @@ fn ordinal(ch: &Children, i: u64, name: &str) -> u64 {
 }
 
 /// The path to `offset`: the elements around it, from the outermost. `get(open)` returns the cached children of
-/// an element (None = the document); when one isn't known yet this returns `Err(open)` so the caller can scan it
-/// and ask again.
+/// an element (None = the document); when one isn't known yet this returns `Err` with it (and where it ends) so the
+/// caller can scan it and ask again. `prev` is the path worked out last for the same text: where this one goes the
+/// same way, its steps (names, places among their siblings) are taken as they are.
 pub fn path_at(
     src: &dyn Chunked,
     offset: u64,
+    prev: &[Step],
     get: &mut dyn FnMut(Option<u64>) -> Option<Arc<Children>>,
-) -> Result<Vec<Step>, Option<u64>> {
-    let mut path = Vec::new();
-    let mut open: Option<u64> = None;
+) -> Result<Vec<Step>, Missing> {
+    let mut path: Vec<Step> = Vec::new();
+    let (mut open, mut end): (Option<u64>, u64) = (None, src.total());
     loop {
-        let Some(ch) = get(open) else { return Err(open) };
+        let Some(ch) = get(open) else { return Err((open, end)) };
         let Some((i, c)) = ch.find(src, offset) else { break };
-        let name = name_at(src, c.start);
-        let ord = ordinal(&ch, i, &name);
-        path.push(Step { index: i, key: Some(name), start: c.start, end: c.end, parent: open, ord });
+        let step = match same_step(prev, path.len(), open, i, c.start) {
+            Some(s) => Step { end: c.end, ..s.clone() },
+            None => {
+                let name = name_at(src, c.start);
+                let ord = ordinal(&ch, i, &name);
+                Step { index: i, key: Some(name), start: c.start, end: c.end, parent: open, ord }
+            }
+        };
+        path.push(step);
         // in its content (past the start tag) with elements in it: go in
         if has_elements(&c) && offset >= c.start + tag_len(&c) && offset < c.end {
-            open = Some(c.start);
+            (open, end) = (Some(c.start), c.end);
             continue;
         }
         break;
@@ -660,10 +689,10 @@ mod tests {
     fn path(src: &dyn Chunked, off: u64) -> String {
         let mut cache: HashMap<Option<u64>, Arc<Children>> = HashMap::new();
         loop {
-            match path_at(src, off, &mut |o| cache.get(&o).cloned()) {
+            match path_at(src, off, &[], &mut |o| cache.get(&o).cloned()) {
                 Ok(p) => return p.iter().map(|s| s.label()).collect::<Vec<_>>().join(" › "),
-                Err(o) => {
-                    cache.insert(o, Arc::new(children(src, o, None)));
+                Err((o, end)) => {
+                    cache.insert(o, Arc::new(children(src, o, Some(end), None)));
                 }
             }
         }
@@ -675,18 +704,18 @@ mod tests {
     fn lists_elements_and_skips_the_rest() {
         for k in [1, 2, 3, 7, 64, 1 << 20] {
             let src = Bits(DOC.as_bytes().to_vec(), k);
-            let top = children(&src, None, None);
+            let top = children(&src, None, None, None);
             assert_eq!(names(&src, &top), ["catalog"], "chunks of {k}");
             assert!(!top.partial && top.xml);
             let root = top.items[0];
             assert!(has_elements(&root) && root.end == DOC.find("</catalog>").unwrap() as u64 + 10);
-            let cat = children(&src, Some(root.start), None);
+            let cat = children(&src, Some(root.start), None, None);
             assert_eq!(names(&src, &cat), ["book", "book", "magazine"], "chunks of {k}");
             assert!(!cat.same_names);
             let book = cat.items[0];
             assert_eq!(tag_len(&book), "<book id=\"1\" note='a > b'>".len() as u64);
-            assert_eq!(names(&src, &children(&src, Some(book.start), None)), ["title", "price"]);
-            let book2 = children(&src, Some(cat.items[1].start), None);
+            assert_eq!(names(&src, &children(&src, Some(book.start), None, None)), ["title", "price"]);
+            let book2 = children(&src, Some(cat.items[1].start), None, None);
             assert_eq!(names(&src, &book2), ["title", "empty"]);
             assert!(!has_elements(&book2.items[0]) && !has_elements(&book2.items[1]));
             assert!(!has_elements(&cat.items[2]) && cat.items[2].end - cat.items[2].start == 11);
@@ -706,10 +735,10 @@ mod tests {
         assert_eq!(path(&d, 3), "");
         let mut cache: HashMap<Option<u64>, Arc<Children>> = HashMap::new();
         let p = loop {
-            match path_at(&d, at("<empty"), &mut |o| cache.get(&o).cloned()) {
+            match path_at(&d, at("<empty"), &[], &mut |o| cache.get(&o).cloned()) {
                 Ok(p) => break p,
-                Err(o) => {
-                    cache.insert(o, Arc::new(children(&d, o, None)));
+                Err((o, end)) => {
+                    cache.insert(o, Arc::new(children(&d, o, Some(end), None)));
                 }
             }
         };
@@ -717,7 +746,7 @@ mod tests {
         let book = &p[1];
         assert_eq!(preview(&d, &Child { start: book.start, end: book.end, key_back: 0, key_len: info(14, true) }, 80), (Kind::Element, "id=\"2\"".into()));
         let cat = cache[&Some(p[0].start)].clone();
-        assert_eq!(preview(&d, &children(&d, Some(cat.items[0].start), None).items[1], 80), (Kind::Leaf, "4".into()));
+        assert_eq!(preview(&d, &children(&d, Some(cat.items[0].start), None, None).items[1], 80), (Kind::Leaf, "4".into()));
     }
 
     #[test]
@@ -725,16 +754,16 @@ mod tests {
         // an end tag closes what it names and what's open inside it; a stray one is ignored
         let src = "<a><b><c>x</a><d/></e>";
         let d = Document::from_text(src.as_bytes());
-        let top = children(&d, None, None);
+        let top = children(&d, None, None, None);
         assert_eq!(names(&d, &top), ["a", "d"]);
-        let a = children(&d, Some(0), None);
+        let a = children(&d, Some(0), None, None);
         assert_eq!(names(&d, &a), ["b"]);
         assert_eq!(a.items[0].end, src.find("</a>").unwrap() as u64);
         assert!(top.partial);
         // cut short: what's open ends at the end
         let src = "<r><x>1</x><y><z";
         let d = Document::from_text(src.as_bytes());
-        let r = children(&d, Some(0), None);
+        let r = children(&d, Some(0), None, None);
         assert_eq!(names(&d, &r), ["x", "y"]);
         assert!(r.partial && r.items[1].end == src.len() as u64);
         assert_eq!(path(&d, 14), "r › y");
@@ -761,10 +790,10 @@ mod tests {
             }
             let whole = Bits(s.as_bytes().to_vec(), 1 << 20);
             let lists = |src: &dyn Chunked, open| {
-                let ch = children(src, open, None);
+                let ch = children(src, open, None, None);
                 (ch.count, ch.items.clone(), ch.names.clone(), ch.end, ch.partial)
             };
-            let top = children(&whole, None, None);
+            let top = children(&whole, None, None, None);
             let mut opens = vec![None];
             opens.extend(top.items.iter().map(|c| Some(c.start)));
             for k in [1, 2, 3, 5] {
@@ -788,10 +817,66 @@ mod tests {
             let s = format!("<!DOCTYPE catalog [ {subset} <!ELEMENT catalog ANY> ]>\n<catalog><book/></catalog>\n");
             for k in [1, 2, 3, 1 << 20] {
                 let src = Bits(s.as_bytes().to_vec(), k);
-                let top = children(&src, None, None);
+                let top = children(&src, None, None, None);
                 assert_eq!(names(&src, &top), ["catalog"], "{s}");
                 let cat = top.items[0];
-                assert_eq!(names(&src, &children(&src, Some(cat.start), None)), ["book"], "{s}");
+                assert_eq!(names(&src, &children(&src, Some(cat.start), Some(cat.end), None)), ["book"], "{s}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_element_closed_by_an_outer_end_tag_reads_the_same_on_its_own() {
+        // the second <row> is closed by </rows>: scanned on its own it mustn't take in what comes after
+        let s = "<doc><rows><row>a</row><row><x/></rows><other/><more/></doc>";
+        let d = Document::from_text(s.as_bytes());
+        let el = children(&d, None, None, None).items[0];
+        let inside = children(&d, Some(el.start), Some(el.end), None);
+        assert_eq!(names(&d, &inside), ["rows", "other", "more"]);
+        let rows = inside.items[0];
+        let list = children(&d, Some(rows.start), Some(rows.end), None);
+        assert_eq!(names(&d, &list), ["row", "row"]);
+        let row = list.items[1];
+        assert_eq!(row.end, s.find("</rows>").unwrap() as u64);
+        assert_eq!(names(&d, &children(&d, Some(row.start), Some(row.end), None)), ["x"]);
+        assert_eq!(path(&d, s.find("<x/>").unwrap() as u64 + 1), "doc › rows › row[2] › x");
+        // a huge list whose last element is closed by the list's end tag: read again from the 64th element before,
+        // it ends there too, not at the end of the file
+        let s = format!("<rows>{}<row>b</rows><z/>", "<row>a</row>".repeat(150_000));
+        let d = Document::from_text(s.as_bytes());
+        let top = children(&d, None, None, None);
+        assert_eq!(names(&d, &top), ["rows", "z"]);
+        let rows = children(&d, Some(0), Some(top.items[0].end), None);
+        assert_eq!((rows.count, rows.stride), (150_001, STRIDE));
+        let last = rows.get(&d, 150_000).unwrap();
+        assert_eq!((last.end, has_elements(&last)), (s.find("</rows>").unwrap() as u64, false));
+    }
+
+    /// Malformed markup: an element scanned on its own, and its children scanned again from any of them, read as in
+    /// the scan of the whole document.
+    #[test]
+    fn scans_of_parts_agree_with_the_whole() {
+        let parts = ["<a>", "</a>", "<b>", "</b>", "<c>", "</c>", "</d>", "<e/>", "x", "<a k='>'>", "<!-- </a> -->"];
+        let mut r = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move || {
+            r ^= r << 13;
+            r ^= r >> 7;
+            r ^= r << 17;
+            r
+        };
+        for _ in 0..3000 {
+            let s: String = (0..next() % 30).map(|_| parts[(next() % parts.len() as u64) as usize]).collect();
+            let d = Bits(s.as_bytes().to_vec(), 1 << 20);
+            let lists = scan(&d, None, None, 0, None, None);
+            for (open, l) in &lists {
+                let what = |c: &Children| (c.items.clone(), c.count, c.names.clone(), c.end, c.content_end);
+                if let Some(o) = *open {
+                    assert_eq!(what(&children(&d, Some(o), Some(l.end), None)), what(l), "element at {o} in {s}");
+                }
+                for k in 0..l.items.len() {
+                    let again = rescan(&d, l.items[k].start, l.count - k as u64, l.content_end);
+                    assert_eq!(again, l.items[k..], "from child {k} of {open:?} in {s}");
+                }
             }
         }
     }
@@ -802,7 +887,7 @@ mod tests {
         let s = format!("<r>{}{}</r>", "<a>".repeat(n), "</b>".repeat(n));
         let d = Document::from_text(s.as_bytes());
         let start = std::time::Instant::now();
-        let top = children(&d, None, None);
+        let top = children(&d, None, None, None);
         assert_eq!(top.count, 1);
         assert!(start.elapsed().as_secs_f64() < 2.0, "{:?}", start.elapsed());
     }
@@ -815,7 +900,7 @@ mod tests {
         }
         s.push_str("</rows>");
         let d = Document::from_text(s.as_bytes());
-        let rows = children(&d, Some(0), None);
+        let rows = children(&d, Some(0), None, None);
         assert_eq!(rows.count, 150_000);
         assert_eq!(rows.stride, STRIDE);
         assert!(!rows.same_names);
@@ -825,10 +910,10 @@ mod tests {
         let off = c.start + 2;
         let mut cache: HashMap<Option<u64>, Arc<Children>> = HashMap::new();
         let p = loop {
-            match path_at(&d, off, &mut |o| cache.get(&o).cloned()) {
+            match path_at(&d, off, &[], &mut |o| cache.get(&o).cloned()) {
                 Ok(p) => break p,
-                Err(o) => {
-                    cache.insert(o, Arc::new(children(&d, o, None)));
+                Err((o, end)) => {
+                    cache.insert(o, Arc::new(children(&d, o, Some(end), None)));
                 }
             }
         };
