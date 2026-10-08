@@ -167,10 +167,13 @@ pub(super) fn markup(html: bool, t: &[u8], mut st: State, o: &mut Out) -> State 
                     if c == b'=' {
                         o.put(i, i + 1, Tok::Punct);
                         i += 1;
-                        // HTML allows values without quotes
+                        // HTML allows values without quotes (which can't hold quotes, `=`, `<`, `>` or backticks)
                         let v = i + t[i..].iter().take_while(|&&b| b == b' ' || b == b'\t').count();
                         if html && v < n && !matches!(t[v], b'"' | b'\'' | b'>' | b'\n' | b'\r') {
-                            let e = v + t[v..].iter().take_while(|&&b| !b.is_ascii_whitespace() && b != b'>').count();
+                            let e = v + t[v..]
+                                .iter()
+                                .take_while(|&&b| !b.is_ascii_whitespace() && !matches!(b, b'>' | b'"' | b'\'' | b'=' | b'<' | b'`'))
+                                .count();
                             o.put(v, e, Tok::Str);
                             i = e;
                         }
@@ -300,40 +303,146 @@ pub(super) fn php(t: &[u8], mut st: State, o: &mut Out) -> State {
 
 // ---- Markdown ----
 
-/// Inside a fenced code block; `a`: the fence character, `b`: the fence length.
+/// Inside a fenced code block; `a`: the fence character, `b`: the fence length; `mode`: 0, or 1 + the index (in
+/// `Lang::ALL`) of the language its lines are colored as, each on its own.
 const FENCE: u8 = 1;
 const HTML_COMMENT: u8 = 2;
+/// In `mode`: inside a ``` block (three backticks, or `~~~` with `FENCE_TILDE`) colored as the language whose index
+/// is in the low 6 bits, whose lexer's state `kind`, `a` and `b` are.
+const FENCE_LANG: u8 = 0x80;
+const FENCE_TILDE: u8 = 0x40;
+
+const _: () = assert!(Lang::ALL.len() < 63);
 
 fn indent(l: &[u8]) -> usize {
     l.iter().take_while(|&&b| b == b' ' || b == b'\t').count()
 }
 
-pub(super) fn markdown(t: &[u8], mut st: State, o: &mut Out) -> State {
-    let mut start = 0;
-    let mut col0 = st.col0;
-    loop {
-        let end = line_end(t, start);
-        st = md_line(&t[start..end], col0, st, &mut o.at(start));
-        if end >= t.len() {
-            return st;
-        }
-        start = end + 1;
-        col0 = true;
+/// The language a code fence's info string names (```` ```rust ````, ```` ```{r} ````, ```` ```js title="x" ````).
+fn fence_lang(info: &[u8]) -> Option<Lang> {
+    let s = info.trim_ascii_start();
+    let s = s.strip_prefix(b"{").unwrap_or(s);
+    let s = s.strip_prefix(b".").unwrap_or(s);
+    let w = s.iter().take(24).take_while(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'#' | b'-' | b'_' | b'.')).count();
+    let name = s[..w].to_ascii_lowercase();
+    use Lang::*;
+    Some(match name.as_slice() {
+        b"rust" | b"rs" => Rust,
+        b"python" | b"py" | b"python3" | b"py3" => Python,
+        b"javascript" | b"js" | b"jsx" | b"mjs" | b"cjs" | b"node" => JavaScript,
+        b"typescript" | b"ts" | b"tsx" => TypeScript,
+        b"json" | b"jsonc" | b"json5" | b"jsonl" | b"geojson" => Json,
+        b"shell" | b"sh" | b"bash" | b"zsh" | b"ksh" | b"fish" | b"console" | b"shellsession" | b"make" | b"makefile" => Shell,
+        b"powershell" | b"ps" | b"ps1" | b"pwsh" | b"posh" => PowerShell,
+        b"batch" | b"bat" | b"cmd" | b"dos" | b"batchfile" => Batch,
+        b"c" | b"h" => C,
+        b"cpp" | b"c++" | b"cc" | b"cxx" | b"hpp" | b"arduino" | b"ino" => Cpp,
+        b"csharp" | b"cs" | b"c#" => CSharp,
+        b"java" | b"groovy" | b"gradle" | b"jenkinsfile" => Java,
+        b"kotlin" | b"kt" | b"kts" => Kotlin,
+        b"swift" => Swift,
+        b"go" | b"golang" => Go,
+        b"php" => Php,
+        b"ruby" | b"rb" => Ruby,
+        b"lua" => Lua,
+        b"sql" | b"mysql" | b"postgresql" | b"postgres" | b"psql" | b"plsql" | b"tsql" | b"sqlite" => Sql,
+        b"yaml" | b"yml" => Yaml,
+        b"xml" | b"xsd" | b"xsl" | b"xslt" | b"svg" | b"xaml" | b"plist" | b"csproj" => Xml,
+        b"html" | b"htm" | b"xhtml" | b"vue" | b"svelte" => Html,
+        b"css" | b"scss" | b"sass" | b"less" => Css,
+        b"ini" | b"cfg" | b"conf" | b"editorconfig" | b"gitconfig" | b"dotenv" | b"env" => Ini,
+        b"toml" => Toml,
+        b"diff" | b"patch" | b"udiff" => Diff,
+        b"dockerfile" | b"docker" | b"containerfile" => Dockerfile,
+        b"csv" => Csv,
+        b"tsv" => Tsv,
+        b"log" => Log,
+        b"vb" | b"vba" | b"vbs" | b"vbscript" | b"vbnet" | b"vb.net" => Vb,
+        b"ahk" | b"autohotkey" => AutoHotkey,
+        b"nginx" | b"nginxconf" => Nginx,
+        b"apache" | b"apacheconf" | b"htaccess" => Apache,
+        b"perl" | b"pl" | b"pm" => Perl,
+        b"r" => R,
+        b"hcl" | b"terraform" | b"tf" | b"tfvars" => Hcl,
+        b"cmake" => CMake,
+        b"properties" | b"jproperties" => Properties,
+        b"srt" | b"vtt" | b"webvtt" => Subtitles,
+        b"ics" | b"ical" | b"icalendar" | b"vcard" | b"vcf" => Calendar,
+        b"sln" => Sln,
+        b"md" | b"markdown" => Markdown,
+        _ => return None,
+    })
+}
+
+/// A language's place in `Lang::ALL` (fits in 6 bits), and back.
+fn lang_index(lang: Lang) -> u8 {
+    Lang::ALL.iter().position(|&l| l == lang).unwrap_or(0) as u8
+}
+
+fn lang_at(i: u8) -> Lang {
+    Lang::ALL.get(i as usize).copied().unwrap_or(Lang::Plain)
+}
+
+/// Colors fenced code as `lang` (PHP as PHP code: a snippet seldom starts with `<?php`).
+fn fence_lex(lang: Lang, text: &[u8], st: State, o: &mut Out) -> State {
+    match lang {
+        Lang::Php => code::code(code::syntax(Lang::Php), text, st, o),
+        _ => super::lex_in(lang, text, st, o),
     }
 }
 
-fn md_line(l: &[u8], col0: bool, mut st: State, o: &mut Out) -> State {
-    let n = l.len();
-    if st.kind == FENCE {
-        if col0 {
-            let ind = indent(l);
-            let run = l[ind..].iter().take_while(|&&b| b == st.a).count();
-            if ind <= 3 && run >= st.b as usize && l[ind + run..].trim_ascii().is_empty() {
-                o.put(0, n, Tok::Punct);
-                return State { kind: 0, a: 0, b: 0, ..st };
-            }
+/// Whether `l` (at a line start) closes a fence of `len` or more `c`.
+fn fence_closes(l: &[u8], c: u8, len: usize) -> bool {
+    let ind = indent(l);
+    let run = l[ind..].iter().take_while(|&&b| b == c).count();
+    ind <= 3 && run >= len && l[ind + run..].trim_ascii().is_empty()
+}
+
+pub(super) fn markdown(t: &[u8], mut st: State, o: &mut Out) -> State {
+    let mut start = 0;
+    let (mut col0, mut bol) = (st.col0, st.bol);
+    loop {
+        let end = line_end(t, start);
+        let nl = end < t.len();
+        st = md_line(&t[start..end + nl as usize], nl, col0, bol, st, &mut o.at(start));
+        if !nl {
+            return st;
         }
-        o.put(0, n, Tok::Str);
+        start = end + 1;
+        (col0, bol) = (true, true);
+    }
+}
+
+/// One line of Markdown (`full`: with its line break when `nl`).
+fn md_line(full: &[u8], nl: bool, col0: bool, bol: bool, mut st: State, o: &mut Out) -> State {
+    let l = &full[..full.len() - nl as usize];
+    let n = l.len();
+    if st.mode & FENCE_LANG != 0 {
+        // a ``` block colored as its language, with that lexer's state kept from line to line
+        let fc = if st.mode & FENCE_TILDE != 0 { b'~' } else { b'`' };
+        if col0 && fence_closes(l, fc, 3) {
+            o.put(0, n, Tok::Punct);
+            return State { kind: 0, a: 0, b: 0, mode: 0, ..st };
+        }
+        let idx = st.mode & 0x3F;
+        let s = fence_lex(lang_at(idx), full, State { mode: 0, col0, bol, ..st }, o);
+        if s.mode != 0 {
+            // its state doesn't fit: the rest of the block is colored line by line
+            return State { kind: FENCE, a: fc, b: 3, mode: idx + 1, ..st };
+        }
+        return State { kind: s.kind, a: s.a, b: s.b, ..st };
+    }
+    if st.kind == FENCE {
+        if col0 && fence_closes(l, st.a, st.b as usize) {
+            o.put(0, n, Tok::Punct);
+            return State { kind: 0, a: 0, b: 0, mode: 0, ..st };
+        }
+        if st.mode == 0 {
+            o.put(0, n, Tok::Str);
+        } else if o.on() {
+            // each line from its language's line start
+            fence_lex(lang_at(st.mode - 1), l, State::START, o);
+        }
         return st;
     }
     let mut i = 0;
@@ -355,11 +464,18 @@ fn md_line(l: &[u8], col0: bool, mut st: State, o: &mut Out) -> State {
         let rest = &l[ind..];
         let c = at(rest, 0);
         if ind <= 3 {
-            // ``` or ~~~ code fence
+            // ``` or ~~~ code fence, with the language its code is in
             let run = rest.iter().take_while(|&&b| b == c).count();
             if (c == b'`' || c == b'~') && run >= 3 && !(c == b'`' && rest[run..].contains(&b'`')) {
                 o.put(0, n, Tok::Punct);
-                return State { kind: FENCE, a: c, b: run as u16, ..st };
+                return match fence_lang(&rest[run..]) {
+                    Some(lang) if run == 3 && lang != Lang::Markdown => {
+                        let tilde = if c == b'~' { FENCE_TILDE } else { 0 };
+                        State { kind: 0, a: 0, b: 0, mode: FENCE_LANG | tilde | lang_index(lang), ..st }
+                    }
+                    Some(lang) => State { kind: FENCE, a: c, b: run as u16, mode: lang_index(lang) + 1, ..st },
+                    None => State { kind: FENCE, a: c, b: run as u16, mode: 0, ..st },
+                };
             }
             // # heading
             if (1..=6).contains(&run) && c == b'#' && matches!(at(rest, run), 0 | b' ' | b'\t' | b'\r') {
@@ -563,14 +679,20 @@ fn md_inline(l: &[u8], mut i: usize, o: &mut Out, st: &mut State) {
 
 /// Inside a block scalar (`key: |` / `key: >`); `b`: the indentation of the line that started it.
 const BLOCK: u8 = 1;
+/// Inside a quoted scalar that goes on over lines; `a`: its quote, `b`: an escape pending (bit 0), the indentation
+/// of what it belongs to (bits 1-7) and the lines so far (bits 8-15).
+const QUOTED: u8 = 2;
+/// A quoted scalar left open gives up after this many lines.
+const MAX_QUOTED_LINES: u16 = 40;
 
 pub(super) fn yaml(t: &[u8], mut st: State, o: &mut Out) -> State {
     let mut start = 0;
     let mut col0 = st.col0;
     loop {
         let end = line_end(t, start);
-        st = yaml_line(&t[start..end], col0, st, &mut o.at(start));
-        if end >= t.len() {
+        let nl = end < t.len();
+        st = yaml_line(&t[start..end], nl, col0, st, &mut o.at(start));
+        if !nl {
             return st;
         }
         start = end + 1;
@@ -578,9 +700,69 @@ pub(super) fn yaml(t: &[u8], mut st: State, o: &mut Out) -> State {
     }
 }
 
-fn yaml_line(l: &[u8], col0: bool, mut st: State, o: &mut Out) -> State {
+/// Where a quoted scalar (`'` doubles itself inside, `"` has escapes) that is open at `i` closes on this line.
+fn yaml_quote_end(l: &[u8], mut i: usize, q: u8, esc: &mut bool) -> Option<usize> {
+    while i < l.len() {
+        let c = l[i];
+        if *esc {
+            *esc = false;
+        } else if c == b'\\' && q == b'"' {
+            *esc = true;
+        } else if c == q {
+            if q == b'\'' && at(l, i + 1) == b'\'' {
+                i += 2;
+                continue;
+            }
+            return Some(i + 1);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// A quoted scalar from `s` (its body from `i`); if it doesn't close on this line, the state it goes on in
+/// (`parent`: the indentation of the key or item it belongs to; `nl`: the line ends here, which uses up an escape).
+#[allow(clippy::too_many_arguments)]
+fn yaml_quoted(l: &[u8], s: usize, i: usize, q: u8, mut esc: bool, parent: u16, lines: u16, nl: bool, st: &mut State, o: &mut Out) -> Option<usize> {
+    let n = l.len();
+    match yaml_quote_end(l, i, q, &mut esc) {
+        Some(e) => {
+            o.put(s, e, Tok::Str);
+            *st = State { kind: 0, a: 0, b: 0, ..*st };
+            Some(e)
+        }
+        None => {
+            o.put(s, n, Tok::Str);
+            let lines = lines + nl as u16;
+            *st = if lines >= MAX_QUOTED_LINES {
+                State { kind: 0, a: 0, b: 0, ..*st }
+            } else {
+                State { kind: QUOTED, a: q, b: (esc && !nl) as u16 | parent.min(127) << 1 | lines << 8, ..*st }
+            };
+            None
+        }
+    }
+}
+
+fn yaml_line(l: &[u8], nl: bool, col0: bool, mut st: State, o: &mut Out) -> State {
     let n = l.len();
     let ind = if col0 { l.iter().take_while(|&&b| b == b' ').count() } else { 0 };
+    if st.kind == QUOTED {
+        let parent = (st.b >> 1 & 127) as usize;
+        // a new key or item no further in than the one it belongs to: it was left open by mistake
+        let rest = &l[ind..];
+        let ended = col0
+            && ind <= parent
+            && (yaml_key_end(l, ind).is_some() || rest.starts_with(b"- ") || rest.starts_with(b"#") || rest.starts_with(b"---"));
+        if !ended {
+            let Some(e) = yaml_quoted(l, 0, 0, st.a, st.b & 1 != 0, parent as u16, st.b >> 8, nl, &mut st, o) else { return st };
+            if let Some(p) = l[e..].iter().position(|&b| b == b'#') {
+                o.put(e + p, n, Tok::Comment);
+            }
+            return st;
+        }
+        st = State { kind: 0, a: 0, b: 0, ..st };
+    }
     if st.kind == BLOCK {
         if !col0 || l.trim_ascii().is_empty() || ind > st.b as usize {
             o.put(0, n, Tok::Str);
@@ -590,7 +772,7 @@ fn yaml_line(l: &[u8], col0: bool, mut st: State, o: &mut Out) -> State {
         st = State { kind: 0, a: 0, b: 0, ..st };
     }
     if !col0 {
-        yaml_value(l, 0, 0, o, &mut st);
+        yaml_value(l, 0, 0, nl, o, &mut st);
         // (where its key is isn't known here)
         if st.kind == BLOCK {
             st.kind = 0;
@@ -607,7 +789,7 @@ fn yaml_line(l: &[u8], col0: bool, mut st: State, o: &mut Out) -> State {
     }
     if i == 0 && (rest.starts_with(b"---") || rest.starts_with(b"...")) && matches!(at(rest, 3), 0 | b' ' | b'\t' | b'\r') {
         o.put(0, 3, Tok::Punct);
-        yaml_value(l, 3, ind, o, &mut st);
+        yaml_value(l, 3, ind, nl, o, &mut st);
         return st;
     }
     if i == 0 && at(rest, 0) == b'%' {
@@ -627,7 +809,7 @@ fn yaml_line(l: &[u8], col0: bool, mut st: State, o: &mut Out) -> State {
         parent = i;
         i = colon + 1;
     }
-    yaml_value(l, i, parent, o, &mut st);
+    yaml_value(l, i, parent, nl, o, &mut st);
     st
 }
 
@@ -664,7 +846,7 @@ fn yaml_scalar_tok(v: &[u8]) -> Tok {
     }
 }
 
-fn yaml_value(l: &[u8], mut i: usize, ind: usize, o: &mut Out, st: &mut State) {
+fn yaml_value(l: &[u8], mut i: usize, ind: usize, nl: bool, o: &mut Out, st: &mut State) {
     let n = l.len();
     i += l[i.min(n)..].iter().take_while(|&&b| b == b' ' || b == b'\t').count();
     if i >= n {
@@ -686,8 +868,8 @@ fn yaml_value(l: &[u8], mut i: usize, ind: usize, o: &mut Out, st: &mut State) {
             }
         }
         b'"' | b'\'' => {
-            let (e, _, _) = scan_str(l, i + 1, c, if c == b'"' { b'\\' } else { 0 }, false, true);
-            o.put(i, e, Tok::Str);
+            // (it may go on over lines)
+            let Some(e) = yaml_quoted(l, i, i + 1, c, false, ind as u16, 0, nl, st, o) else { return };
             if let Some(p) = l[e..].iter().position(|&b| b == b'#') {
                 o.put(e + p, n, Tok::Comment);
             }
@@ -696,7 +878,7 @@ fn yaml_value(l: &[u8], mut i: usize, ind: usize, o: &mut Out, st: &mut State) {
             // &anchor, *alias, !tag
             let e = i + l[i..].iter().take_while(|&&b| !matches!(b, b' ' | b'\t' | b',' | b']' | b'}')).count();
             o.put(i, e, if c == b'!' { Tok::Type } else { Tok::Var });
-            yaml_value(l, e, ind, o, st);
+            yaml_value(l, e, ind, nl, o, st);
         }
         b'[' | b'{' => {
             // flow collections: [a, "b", 3], {k: v}
@@ -745,8 +927,48 @@ fn yaml_value(l: &[u8], mut i: usize, ind: usize, o: &mut Out, st: &mut State) {
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::{end_state, has, toks};
-    use super::super::{Lang, Tok};
+    use super::super::tests::{end_state, has, toks, view};
+    use super::super::{Lang, State, Tok};
+
+    fn line_has(line: &[(String, Tok)], s: &str, tok: Tok) -> bool {
+        line.contains(&(s.to_string(), tok))
+    }
+
+    #[test]
+    fn markdown_code_blocks_in_their_language() {
+        let src = "Text\n```rust\nlet s = \"a\"; /* open\nstill */ fn f() {}\n```\n# After\n";
+        let v = view(Lang::Markdown, src);
+        assert!(line_has(&v[2], "let", Tok::Keyword) && line_has(&v[2], "\"a\"", Tok::Str) && line_has(&v[2], "/* open", Tok::Comment));
+        assert!(line_has(&v[3], "still */", Tok::Comment) && line_has(&v[3], "f", Tok::Func));
+        assert_eq!(v[4], vec![("```".into(), Tok::Punct)]);
+        assert_eq!(v[5], vec![("# After".into(), Tok::Heading)]);
+        assert_eq!(end_state(Lang::Markdown, src), State::START);
+        // a language whose state doesn't fit (HTML inside a script) goes on line by line
+        let v = view(Lang::Markdown, "~~~html\n<script>\nlet x = 1;\n</script>\n~~~\nok *x*\n");
+        assert!(line_has(&v[1], "script", Tok::Tag) && line_has(&v[3], "script", Tok::Tag));
+        assert!(line_has(&v[4], "~~~", Tok::Punct) && line_has(&v[5], "*x*", Tok::Italic));
+        // longer fences too, from each line's start
+        let v = view(Lang::Markdown, "````python\n'''doc\n```\n````\nafter\n");
+        assert!(line_has(&v[1], "'''doc", Tok::Str) && !line_has(&v[2], "```", Tok::Punct) && line_has(&v[3], "````", Tok::Punct));
+        // an unknown language looks as before; PHP snippets are PHP code without `<?php`
+        assert_eq!(view(Lang::Markdown, "```foo\nx = 1\n```\n")[1], vec![("x = 1".into(), Tok::Str)]);
+        let v = view(Lang::Markdown, "```php\n$x = 'a'; // c\n```\n");
+        assert!(line_has(&v[1], "$x", Tok::Var) && line_has(&v[1], "'a'", Tok::Str) && line_has(&v[1], "// c", Tok::Comment));
+        let v = view(Lang::Markdown, "```{r}\nx <- c(1, NA)\n```\n");
+        assert!(line_has(&v[1], "NA", Tok::Lit));
+    }
+
+    #[test]
+    fn yaml_quoted_scalars_over_lines() {
+        let v = view(Lang::Yaml, "msg: \"first\n  second # not a comment\n  third\" # c\nnext: 1\n");
+        assert_eq!(v[1], vec![("  second # not a comment".into(), Tok::Str)]);
+        assert!(line_has(&v[2], "  third\"", Tok::Str) && line_has(&v[2], "# c", Tok::Comment) && line_has(&v[3], "next", Tok::Key));
+        has(Lang::Yaml, "a: 'it''s' # c", &[("'it''s'", Tok::Str), ("# c", Tok::Comment)]);
+        // left open by mistake: over at the next key that isn't further in
+        let v = view(Lang::Yaml, "title: \"Hello\nauthor: Bob\n");
+        assert!(line_has(&v[1], "author", Tok::Key));
+        assert_eq!(end_state(Lang::Yaml, "title: \"Hello\nauthor: Bob\n").kind, 0);
+    }
 
     #[test]
     fn xml_and_html() {
@@ -795,9 +1017,10 @@ mod tests {
         has(Lang::Markdown, "| a | b |", &[("|", Tok::Punct)]);
         has(Lang::Markdown, "snake_case_name stays plain", &[]);
         assert!(toks(Lang::Markdown, "snake_case_name", super::super::State::START).is_empty());
-        // fenced code blocks span lines
+        // fenced code blocks span lines (colored as their language)
         let st = end_state(Lang::Markdown, "Text\n```python\nx = 1  # *not* emphasis\n");
-        assert_eq!(toks(Lang::Markdown, "y = 2", st), vec![("y = 2".into(), Tok::Str)]);
+        assert_eq!(toks(Lang::Markdown, "y = 2", st), vec![("2".into(), Tok::Num)]);
+        assert_eq!(toks(Lang::Markdown, "# *x*", st), vec![("# *x*".into(), Tok::Comment)]);
         let st = end_state(Lang::Markdown, "```\ncode\n```\n");
         assert_eq!(toks(Lang::Markdown, "# After", st), vec![("# After".into(), Tok::Heading)]);
         // emphasis or links that never close cost little to look for
