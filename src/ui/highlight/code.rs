@@ -1116,8 +1116,8 @@ fn extras(sx: &Syntax, t: &[u8], i: usize, st: State, o: &mut Out) -> Option<Ste
                 return Some(Ok(e));
             }
             if c == b'[' {
-                let le = line_end(t, i);
-                if let Some(p) = t[i + 1..le].iter().position(|&b| b == b']' || b == b'[') {
+                // (a name is short: not a scan to the line's end at each `[`)
+                if let Some(p) = t[i + 1..n.min(i + 129)].iter().position(|&b| b == b']' || b == b'[' || b == b'\n') {
                     if t[i + 1 + p] == b']' && p > 0 {
                         o.put(i, i + p + 2, Tok::Var);
                         return Some(Ok(i + p + 2));
