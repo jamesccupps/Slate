@@ -1416,6 +1416,7 @@ impl App {
             VK_SPACE => {
                 // The window menu (Restore, Move, Close...), as Alt+Space opens it.
                 self.disarm_menu_bar();
+                self.drop_typed_char();
                 unsafe {
                     let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
                         self.hwnd,
