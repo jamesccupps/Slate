@@ -30,6 +30,14 @@ pub enum Cmd {
     CloseOthers,
     CloseRight,
     CloseAll,
+    /// Close the tabs without unsaved changes.
+    CloseSaved,
+    /// Open the tab closed last again (Ctrl+Shift+T).
+    ReopenClosed,
+    /// Show the tab with this id (from the list of all tabs).
+    ShowTab(u64),
+    /// Keep the tabs and unsaved text for next time (settings.json's `restore_session`).
+    ToggleRestoreSession,
     Exit,
     Undo,
     Redo,
@@ -52,6 +60,9 @@ pub enum Cmd {
     Outdent,
     ToggleWrap,
     ToggleLineNumbers,
+    ToggleWhitespace,
+    /// Typing replaces the character after the caret (Insert).
+    ToggleOvertype,
     ToggleStructure,
     TogglePathBar,
     CopyJsonPath,
@@ -65,6 +76,8 @@ pub enum Cmd {
     Format,
     Minify,
     Validate,
+    /// How many spaces formatting JSON or XML indents by (settings.json's `json_indent`).
+    JsonIndent(u32),
     ToggleComment,
     Lines(LineOp),
     Case(CaseOp),
@@ -156,6 +169,7 @@ pub fn global_key(vk: u16, m: &Mods) -> Option<Cmd> {
     Some(match (k, c, m.shift) {
         (VK_N, true, false) => Cmd::NewTab,
         (VK_T, true, false) => Cmd::NewTab,
+        (VK_T, true, true) => Cmd::ReopenClosed,
         (VK_O, true, false) => Cmd::Open,
         (VK_S, true, false) => Cmd::Save,
         (VK_S, true, true) => Cmd::SaveAs,
@@ -309,6 +323,7 @@ Files
   Ctrl+Shift+S                  Save as
   Ctrl+Alt+S                    Save all
   Ctrl+W / Ctrl+F4              Close tab
+  Ctrl+Shift+T                  Reopen the tab closed last
   Ctrl+Tab / Ctrl+PgDn          Next tab
   Ctrl+Shift+Tab / Ctrl+PgUp    Previous tab
   Ctrl+1 … Ctrl+8               Go to that tab
@@ -328,6 +343,7 @@ Editing
   Ctrl+/                        Comment / uncomment the lines
   Ctrl+U / Ctrl+Shift+U         lowercase / UPPERCASE
   Ctrl+Backspace / Ctrl+Del     Delete the word before / after the caret
+  Insert                        Overtype on / off (typing replaces the next character)
   F5                            Insert the time and date
   Shift+Alt+F                   Format JSON or XML
 

@@ -176,6 +176,8 @@ pub struct Style {
     pub tab_size: u32,
     pub use_spaces: bool,
     pub line_numbers: bool,
+    /// Dots for spaces, arrows for tabs and a mark for each line break (View → Show whitespace).
+    pub show_whitespace: bool,
     /// Changes whenever anything that affects layouts changes (font, zoom, theme, render target).
     pub generation: u64,
 }
@@ -359,6 +361,8 @@ pub struct View {
     hl: HlIndex,
     /// Lay out with guessed rather than exact coloring states (only measuring, far from what's on screen).
     hl_guess: bool,
+    /// The bracket pair at the caret, for (document version, caret).
+    bracket: Option<((u64, u64), Option<(u64, u64)>)>,
 }
 
 impl Default for View {
@@ -390,6 +394,7 @@ impl View {
             spans: Vec::new(),
             hl: HlIndex::default(),
             hl_guess: false,
+            bracket: None,
         }
     }
 
@@ -566,7 +571,10 @@ impl View {
                 if ue > us {
                     let range = DWRITE_TEXT_RANGE { startPosition: us as u32, length: (ue - us) as u32 };
                     unsafe {
-                        let _ = layout.SetDrawingEffect(&cx.g.brush(c), range);
+                        // (High contrast: all text in the one text color, which selected text is drawn over in its own.)
+                        if !t.hc {
+                            let _ = layout.SetDrawingEffect(&cx.g.brush(c), range);
+                        }
                         match tok {
                             Tok::Bold | Tok::Heading => {
                                 let _ = layout.SetFontWeight(DWRITE_FONT_WEIGHT_BOLD, range);
@@ -796,6 +804,46 @@ impl View {
         Some((cx.geom.text_x - self.scroll_x + x, vr.y))
     }
 
+    /// The caret's place in client DIPs, if it's on screen: a thin bar, or (`overtype`) as wide as the character it
+    /// replaces.
+    pub fn caret_rect(&mut self, cx: &Ctx, overtype: bool) -> Option<Rect> {
+        let (x, y) = self.caret_point(cx)?;
+        let w = if overtype { self.cell_width(cx, self.sel.caret) } else { 2.0 };
+        Some(Rect::new(x, y, w, cx.style.row_h))
+    }
+
+    /// How wide the character at `pos` shows (a space's width at the end of a line).
+    fn cell_width(&mut self, cx: &Ctx, pos: u64) -> f32 {
+        let seg = self.segment_at(cx.doc, pos);
+        let next = next_cluster(cx.doc, pos);
+        if pos < seg.end && next <= seg.end {
+            let lay = self.layout_of(cx, &seg);
+            let (u0, u1) = (lay.u16_of(pos - seg.start), lay.u16_of(next - seg.start));
+            let mut count = 0u32;
+            let mut m = [DWRITE_HIT_TEST_METRICS::default(); 2];
+            unsafe {
+                let _ = lay.layout.HitTestTextRange(u0, u1.saturating_sub(u0), 0.0, 0.0, Some(&mut m), &mut count);
+            }
+            if count > 0 && m[0].width > 0.5 {
+                return m[0].width;
+            }
+        }
+        cx.style.char_w
+    }
+
+    /// The bracket pair at the caret (`matching_bracket`), worked out once per caret place and text.
+    fn brackets_at(&mut self, doc: &Document, caret: u64) -> Option<(u64, u64)> {
+        let key = (doc.version, caret);
+        if let Some((k, v)) = self.bracket {
+            if k == key {
+                return v;
+            }
+        }
+        let v = matching_bracket(doc, caret);
+        self.bracket = Some((key, v));
+        v
+    }
+
     /// Position under a point (client DIPs); also whether it belongs to the end of the row above.
     pub fn pos_at(&mut self, cx: &Ctx, x: f32, y: f32) -> (u64, bool) {
         if self.rows.is_empty() {
@@ -958,8 +1006,9 @@ impl View {
 
     // ---- painting ----
 
-    /// Paints the rows from the last `layout_rows` (call it first).
-    pub fn paint(&mut self, cx: &Ctx, focused: bool, caret_on: bool, matches: &[(u64, u64)]) {
+    /// Paints the rows from the last `layout_rows` (call it first). `overtype`: the caret marks the character that
+    /// typing replaces.
+    pub fn paint(&mut self, cx: &Ctx, focused: bool, caret_on: bool, matches: &[(u64, u64)], overtype: bool) {
         let g = cx.g;
         let t = cx.theme;
         let geom = cx.geom;
@@ -1018,6 +1067,18 @@ impl View {
             self.fill_range(cx, sel.start(), sel.end(), ox, c, true);
         }
 
+        // The bracket next to the caret and the one it pairs with.
+        if sel.is_empty() {
+            if let Some((a, b)) = self.brackets_at(cx.doc, sel.caret) {
+                for p in [a, b] {
+                    for (rc, _) in self.range_rects(cx, p, p + 1, ox, false) {
+                        g.fill(rc, t.bracket_bg);
+                        g.stroke_round(rc, 2.0, t.bracket_border, 1.0);
+                    }
+                }
+            }
+        }
+
         // Text: each segment layout once, positioned by its first visible row.
         let mut i = 0;
         while i < self.rows.len() {
@@ -1030,22 +1091,52 @@ impl View {
             }
         }
 
-        // Caret.
+        // High contrast: selected text in the highlight's own text color (where the selection has the highlight
+        // color), drawn again over the rest.
+        if t.hc && !sel.is_empty() && (focused || sel_is_match) {
+            for (rc, k) in self.range_rects(cx, sel.start(), sel.end(), ox, false) {
+                let r = &self.rows[k];
+                g.push_clip(rc);
+                g.draw_layout(&r.lay.layout, ox, r.y - r.row as f32 * row_h, t.selection_text);
+                g.pop_clip();
+            }
+        }
+
+        if cx.style.show_whitespace {
+            self.paint_whitespace(cx, ox);
+        }
+
+        // Caret: a thin bar, or a bar under the character typing replaces.
         if focused && caret_on {
             if let Some(r) = self.rows.iter().find(|r| r.start == caret_row_start && r.seg.start == caret_place.0.start) {
                 let x = ox + caret_place.3;
-                let w = (1.5f32 * g.dpi / 96.0).round() / (g.dpi / 96.0);
-                g.fill(Rect::new(x.round() - 0.5, r.y, w.max(1.0), row_h), t.caret);
+                let y = r.y;
+                if overtype {
+                    let w = self.cell_width(cx, sel.caret);
+                    let h = (row_h * 0.14).max(2.0);
+                    g.fill(Rect::new(x, y + row_h - h, w, h), t.caret);
+                } else {
+                    let w = (1.5f32 * g.dpi / 96.0).round() / (g.dpi / 96.0);
+                    g.fill(Rect::new(x.round() - 0.5, y, w.max(1.0), row_h), t.caret);
+                }
             }
         }
         g.pop_clip();
     }
 
     /// Fills the area of `[a, b)` on the visible rows (selection, matches). `eol` also marks selected line breaks.
-    fn fill_range(&mut self, cx: &Ctx, a: u64, b: u64, ox: f32, color: u32, eol: bool) {
-        let g = cx.g;
+    fn fill_range(&self, cx: &Ctx, a: u64, b: u64, ox: f32, color: u32, eol: bool) {
+        for (rc, _) in self.range_rects(cx, a, b, ox, eol) {
+            cx.g.fill(rc, color);
+        }
+    }
+
+    /// Where `[a, b)` is on the visible rows (client DIPs), with the index of the row of each part. `eol` adds a
+    /// small block after a row whose line break is in the range.
+    fn range_rects(&self, cx: &Ctx, a: u64, b: u64, ox: f32, eol: bool) -> Vec<(Rect, usize)> {
         let row_h = cx.style.row_h;
-        for r in &self.rows {
+        let mut out = Vec::new();
+        for (k, r) in self.rows.iter().enumerate() {
             if b < r.start || a > r.end {
                 continue;
             }
@@ -1061,14 +1152,75 @@ impl View {
                     let _ = r.lay.layout.HitTestTextRange(us, ue - us, 0.0, 0.0, Some(&mut buf), &mut count);
                 }
                 for m in &buf[..(count as usize).min(8)] {
-                    g.fill(Rect::new(ox + m.left, y0 + m.top, m.width.max(1.0), row_h), color);
+                    out.push((Rect::new(ox + m.left, y0 + m.top, m.width.max(1.0), row_h), k));
                 }
             }
-            // A selected line break shows as a small block after the row.
+            // A line break in the range shows as a small block after the row.
             let last_row_of_line = r.row + 1 == r.lay.rows.len() && r.seg.line_end && r.seg.eol > 0;
             if eol && last_row_of_line && a <= r.end && b > r.end {
                 let x = ox + r.lay.x_of(r.lay.rows[r.row].1, false);
-                g.fill(Rect::new(x, r.y, cx.style.char_w * 0.6, row_h), color);
+                out.push((Rect::new(x, r.y, cx.style.char_w * 0.6, row_h), k));
+            }
+        }
+        out
+    }
+
+    /// Faint dots for spaces, arrows for tabs, and after each line a mark for its line break (↵ for CRLF, ↓ for
+    /// LF), on the visible rows.
+    fn paint_whitespace(&mut self, cx: &Ctx, ox: f32) {
+        let g = cx.g;
+        let color = cx.theme.whitespace;
+        let row_h = cx.style.row_h;
+        let dot = (cx.style.char_w * 0.16).clamp(1.5, 3.0);
+        let fmt = &cx.style.format_nowrap;
+        let crlf = g.layout(&super::gfx::wide("\u{21B5}"), fmt, 200.0, row_h);
+        let lf = g.layout(&super::gfx::wide("\u{2193}"), fmt, 200.0, row_h);
+        for k in 0..self.rows.len() {
+            let r = self.rows[k].clone();
+            let bytes = self.window(cx.doc, r.start, r.end).to_vec();
+            let mid = r.y + row_h / 2.0;
+            let rel = r.start - r.seg.start;
+            let mut i = 0;
+            while i < bytes.len() {
+                let c = bytes[i];
+                if c != b' ' && c != b'\t' {
+                    i += 1;
+                    continue;
+                }
+                // a run of spaces at once (they're all as wide), each tab on its own
+                let mut j = i + 1;
+                while c == b' ' && j < bytes.len() && bytes[j] == b' ' {
+                    j += 1;
+                }
+                let us = r.lay.u16_of(rel + i as u64);
+                let ue = r.lay.u16_of(rel + j as u64);
+                let mut count = 0u32;
+                let mut buf = [DWRITE_HIT_TEST_METRICS::default(); 4];
+                unsafe {
+                    let _ = r.lay.layout.HitTestTextRange(us, ue - us, 0.0, 0.0, Some(&mut buf), &mut count);
+                }
+                for m in &buf[..(count as usize).min(4)] {
+                    let x0 = ox + m.left;
+                    if c == b' ' {
+                        let n = m.length.max(1);
+                        let w = m.width / n as f32;
+                        for q in 0..n {
+                            let x = x0 + (q as f32 + 0.5) * w;
+                            g.fill_round(Rect::new(x - dot / 2.0, mid - dot / 2.0, dot, dot), dot / 2.0, color);
+                        }
+                    } else if m.width > 4.0 {
+                        let (a, b) = (x0 + 2.0, x0 + m.width - 2.0);
+                        let head = (row_h * 0.18).min((b - a) / 2.0);
+                        g.line(a, mid, b, mid, color, 1.0);
+                        g.line(b - head, mid - head, b, mid, color, 1.0);
+                        g.line(b - head, mid + head, b, mid, color, 1.0);
+                    }
+                }
+                i = j;
+            }
+            if r.row + 1 == r.lay.rows.len() && r.seg.line_end && r.seg.eol > 0 {
+                let x = ox + r.lay.x_of(r.lay.rows[r.row].1, false);
+                g.draw_layout(if r.seg.eol == 2 { &crlf } else { &lf }, x + 1.0, r.y, color);
             }
         }
     }
@@ -1350,6 +1502,202 @@ fn matching_open(doc: &Document, before: u64, open: u8, close: u8) -> Option<u64
         }
     }
     None
+}
+
+/// Typing `text` with overtype on (Insert): it replaces as many characters after the caret as it has, but not a
+/// line break (at the end of a line it's added). A selection is replaced as usual. Characters typed one after the
+/// other are one undo step, as with ordinary typing.
+pub fn overtype(doc: &mut Document, sel: Sel, text: &[u8]) -> Sel {
+    if !sel.is_empty() {
+        return replace_selection(doc, sel, text, EditKind::Typing);
+    }
+    let pos = sel.caret;
+    let mut end = pos;
+    for _ in String::from_utf8_lossy(text).chars() {
+        match doc.byte_at(end) {
+            None | Some(b'\r') | Some(b'\n') => break,
+            _ => end = next_cluster(doc, end),
+        }
+    }
+    doc.begin(EditKind::Typing, sel);
+    doc.delete(pos, end);
+    doc.insert(pos, text);
+    let new = Sel::at(pos + text.len() as u64);
+    doc.end(new);
+    new
+}
+
+/// How far `matching_bracket` looks for the other bracket.
+const BRACKET_REACH: u64 = 1 << 20;
+
+/// The bracket just before `pos` (else the one just after it) and the bracket it pairs with: `(`, `[` and `{`
+/// with their closing ones, up to 1 MB away. Brackets in strings and comments count too.
+pub fn matching_bracket(doc: &Document, pos: u64) -> Option<(u64, u64)> {
+    for p in [pos.checked_sub(1), Some(pos)].into_iter().flatten() {
+        let Some(b) = doc.byte_at(p) else { continue };
+        let (open, close, forward) = match b {
+            b'(' => (b'(', b')', true),
+            b'[' => (b'[', b']', true),
+            b'{' => (b'{', b'}', true),
+            b')' => (b'(', b')', false),
+            b']' => (b'[', b']', false),
+            b'}' => (b'{', b'}', false),
+            _ => continue,
+        };
+        if let Some(q) = bracket_partner(doc, p, open, close, forward) {
+            return Some((p, q));
+        }
+    }
+    None
+}
+
+fn bracket_partner(doc: &Document, at: u64, open: u8, close: u8, forward: bool) -> Option<u64> {
+    const CHUNK: u64 = 64 << 10;
+    let mut depth = 0u64;
+    if forward {
+        let end = (at + 1 + BRACKET_REACH).min(doc.len());
+        let mut a = at + 1;
+        while a < end {
+            let b = (a + CHUNK).min(end);
+            for (i, &c) in doc.read(a, b).iter().enumerate() {
+                if c == open {
+                    depth += 1;
+                } else if c == close {
+                    if depth == 0 {
+                        return Some(a + i as u64);
+                    }
+                    depth -= 1;
+                }
+            }
+            a = b;
+        }
+    } else {
+        let start = at.saturating_sub(BRACKET_REACH);
+        let mut b = at;
+        while b > start {
+            let a = b.saturating_sub(CHUNK).max(start);
+            for (i, &c) in doc.read(a, b).iter().enumerate().rev() {
+                if c == close {
+                    depth += 1;
+                } else if c == open {
+                    if depth == 0 {
+                        return Some(a + i as u64);
+                    }
+                    depth -= 1;
+                }
+            }
+            b = a;
+        }
+    }
+    None
+}
+
+/// `pos`, moved back to the start of the character it falls in.
+pub fn char_start(doc: &Document, pos: u64) -> u64 {
+    let pos = pos.min(doc.len());
+    let mut p = pos;
+    while p > 0 && pos - p < 3 && doc.byte_at(p).is_some_and(is_continuation) {
+        p -= 1;
+    }
+    p
+}
+
+/// Characters and words in a text (the status bar's counts).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Counts {
+    pub chars: u64,
+    pub words: u64,
+}
+
+/// Counts characters and words of a text fed in pieces, which may cut a character in two. A word is a run of
+/// characters that aren't spaces (as `wc -w` counts); characters are counted as the status bar's selection count
+/// does (`\r\n` is two).
+#[derive(Default)]
+pub struct Counter {
+    counts: Counts,
+    in_word: bool,
+    /// The start of a character the last piece ended in.
+    partial: Vec<u8>,
+}
+
+impl Counter {
+    pub fn feed(&mut self, data: &[u8]) {
+        let mut i = 0;
+        if !self.partial.is_empty() {
+            let need = utf8_len(self.partial[0]);
+            while self.partial.len() < need && i < data.len() && is_continuation(data[i]) {
+                self.partial.push(data[i]);
+                i += 1;
+            }
+            if self.partial.len() < need && i == data.len() {
+                return;
+            }
+            let c = std::mem::take(&mut self.partial);
+            self.char(&c);
+        }
+        while i < data.len() {
+            let b = data[i];
+            if b < 0x80 {
+                self.counts.chars += 1;
+                self.step(matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0B | 0x0C));
+                i += 1;
+            } else if is_continuation(b) {
+                // (a stray continuation byte: part of the word it's in, not a character of its own)
+                self.step(false);
+                i += 1;
+            } else {
+                let need = utf8_len(b);
+                let mut j = i + 1;
+                while j < data.len() && j < i + need && is_continuation(data[j]) {
+                    j += 1;
+                }
+                if j == data.len() && j < i + need {
+                    self.partial.extend_from_slice(&data[i..j]);
+                    return;
+                }
+                self.char(&data[i..j]);
+                i = j;
+            }
+        }
+    }
+
+    pub fn finish(mut self) -> Counts {
+        if !self.partial.is_empty() {
+            let c = std::mem::take(&mut self.partial);
+            self.char(&c);
+        }
+        self.counts
+    }
+
+    fn char(&mut self, c: &[u8]) {
+        self.counts.chars += 1;
+        // the other Unicode spaces: U+0085, U+00A0, U+1680, U+2000..U+200A, U+2028, U+2029, U+202F, U+205F, U+3000
+        let space = matches!(
+            c,
+            [0xC2, 0x85 | 0xA0]
+                | [0xE1, 0x9A, 0x80]
+                | [0xE2, 0x80, 0x80..=0x8A | 0xA8 | 0xA9 | 0xAF]
+                | [0xE2, 0x81, 0x9F]
+                | [0xE3, 0x80, 0x80]
+        );
+        self.step(space);
+    }
+
+    fn step(&mut self, space: bool) {
+        if space {
+            self.in_word = false;
+        } else if !self.in_word {
+            self.in_word = true;
+            self.counts.words += 1;
+        }
+    }
+}
+
+/// Characters and words in `text`.
+pub fn count(text: &[u8]) -> Counts {
+    let mut c = Counter::default();
+    c.feed(text);
+    c.finish()
 }
 
 /// Line starts of the lines touched by the selection (a selection ending at a line start doesn't include that
@@ -2024,6 +2372,69 @@ mod tests {
         assert_eq!(detect_indent(b"no\nindentation\nhere\n"), None);
         assert_eq!(detect_indent(b""), None);
         assert_eq!(detect_indent(b"    starts indented\nx\n"), Some(Indent::Spaces(4)));
+    }
+
+    #[test]
+    fn overtype_replaces_characters_but_not_line_breaks() {
+        let mut d = Document::from_text("abc\r\néx".as_bytes());
+        let s = overtype(&mut d, Sel::at(1), b"X");
+        let s = overtype(&mut d, s, b"Y");
+        assert_eq!(d.read(0, d.len()), b"aXY\r\n\xC3\xA9x");
+        // at the end of the line it adds instead
+        let s = overtype(&mut d, s, b"Z");
+        assert_eq!(d.read(0, d.len()), b"aXYZ\r\n\xC3\xA9x");
+        assert_eq!(s, Sel::at(4));
+        // a whole character goes, and a selection is replaced as usual
+        let s = overtype(&mut d, Sel::at(6), b"e");
+        assert_eq!(d.read(0, d.len()), b"aXYZ\r\nex");
+        assert_eq!(s, Sel::at(7));
+        overtype(&mut d, Sel::new(0, 2), b"Q");
+        assert_eq!(d.read(0, d.len()), b"QYZ\r\nex");
+        // typed one after another: one undo step
+        let mut d = Document::from_text(b"hello");
+        let mut s = Sel::at(0);
+        for c in [b"j", b"e", b"l"] {
+            s = overtype(&mut d, s, c);
+        }
+        assert_eq!(d.read(0, d.len()), b"jello");
+        d.undo();
+        assert_eq!(d.read(0, d.len()), b"hello");
+    }
+
+    #[test]
+    fn brackets_pair_up() {
+        let d = Document::from_text(b"f(a[1], {b: (2)}) x");
+        // before the caret first, then after it
+        assert_eq!(matching_bracket(&d, 2), Some((1, 16)));
+        assert_eq!(matching_bracket(&d, 1), Some((1, 16)));
+        assert_eq!(matching_bracket(&d, 17), Some((16, 1)));
+        assert_eq!(matching_bracket(&d, 16), Some((15, 8)));
+        assert_eq!(matching_bracket(&d, 9), Some((8, 15)));
+        assert_eq!(matching_bracket(&d, 18), None);
+        // unmatched: nothing
+        let d = Document::from_text(b"((x)");
+        assert_eq!(matching_bracket(&d, 0), None);
+        assert_eq!(matching_bracket(&d, 1), Some((1, 3)));
+        assert_eq!(matching_bracket(&d, 2), Some((1, 3)));
+    }
+
+    #[test]
+    fn words_and_characters_are_counted_in_pieces() {
+        let text = "Hello, wörld!\r\n  two\u{a0}words\u{3000}三 ".as_bytes();
+        let all = count(text);
+        assert_eq!(all, Counts { chars: bytecount::num_chars(text) as u64, words: 5 });
+        // cut anywhere, even inside a character: the same
+        for cut in 0..=text.len() {
+            let mut c = Counter::default();
+            c.feed(&text[..cut]);
+            c.feed(&text[cut..]);
+            assert_eq!(c.finish(), all, "cut at {cut}");
+        }
+        assert_eq!(count(b""), Counts::default());
+        assert_eq!(count(b"   \n\t"), Counts { chars: 5, words: 0 });
+        // broken UTF-8 counts like the selection count does
+        let bad = b"a\xC3 b\x80c";
+        assert_eq!(count(bad), Counts { chars: bytecount::num_chars(bad) as u64, words: 2 });
     }
 
     #[test]

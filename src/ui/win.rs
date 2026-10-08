@@ -91,6 +91,65 @@ pub fn style_title_bar(hwnd: HWND, dark: bool, caption: u32, text: u32) {
     }
 }
 
+/// The title bar Windows draws by itself (in high contrast: its colors, not the tab strip's).
+pub fn system_title_bar(hwnd: HWND) {
+    const DWMWA_COLOR_DEFAULT: u32 = 0xFFFF_FFFF;
+    unsafe {
+        let d = BOOL(0);
+        let _ = DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &d as *const _ as _, 4);
+        for a in [DWMWA_CAPTION_COLOR, DWMWA_BORDER_COLOR, DWMWA_TEXT_COLOR] {
+            let _ = DwmSetWindowAttribute(hwnd, a, &DWMWA_COLOR_DEFAULT as *const _ as _, 4);
+        }
+    }
+}
+
+// ---- system caret ----
+
+thread_local! {
+    /// The hidden system caret: where it is and its size (pixels), while the window has one.
+    static SYS_CARET: std::cell::Cell<Option<(i32, i32, i32, i32)>> = const { std::cell::Cell::new(None) };
+}
+
+/// Puts the system caret at (x, y) with size (w, h) in client pixels, creating it first. Slate draws its own caret,
+/// so this one is never shown: it's there for Magnifier, screen readers and other tools that follow the caret
+/// (they're told it moved).
+pub fn follow_caret(hwnd: HWND, x: i32, y: i32, w: i32, h: i32) {
+    use windows::Win32::UI::Accessibility::NotifyWinEvent;
+    use windows::Win32::UI::WindowsAndMessaging::{CHILDID_SELF, CreateCaret, EVENT_OBJECT_LOCATIONCHANGE, OBJID_CARET, SetCaretPos};
+    let mut cur = SYS_CARET.with(|c| c.get());
+    if cur.map(|c| (c.2, c.3)) != Some((w, h)) {
+        // (a new size: a new caret; created hidden, and never shown)
+        if unsafe { CreateCaret(hwnd, windows::Win32::Graphics::Gdi::HBITMAP::default(), w, h) }.is_err() {
+            return;
+        }
+        cur = None;
+    }
+    if cur.map(|c| (c.0, c.1)) != Some((x, y)) {
+        unsafe {
+            let _ = SetCaretPos(x, y);
+            NotifyWinEvent(EVENT_OBJECT_LOCATIONCHANGE, hwnd, OBJID_CARET.0, CHILDID_SELF as i32);
+        }
+    }
+    SYS_CARET.with(|c| c.set(Some((x, y, w, h))));
+}
+
+/// The window lost the keyboard focus: its system caret goes (the find box makes its own).
+pub fn drop_caret() {
+    if SYS_CARET.with(|c| c.take()).is_some() {
+        unsafe {
+            let _ = windows::Win32::UI::WindowsAndMessaging::DestroyCaret();
+        }
+    }
+}
+
+/// Where the system caret is (client pixels), while Slate has one.
+pub fn caret_pos() -> Option<(i32, i32)> {
+    SYS_CARET.with(|c| c.get())?;
+    let mut p = windows::Win32::Foundation::POINT::default();
+    unsafe { windows::Win32::UI::WindowsAndMessaging::GetCaretPos(&mut p) }.ok()?;
+    Some((p.x, p.y))
+}
+
 /// Dark popup menus. Uses uxtheme's unnamed exports (ordinals 135 and 136), which Windows has kept stable since
 /// 1903 and which many apps (Notepad++ among them) rely on; silently does nothing if they're missing.
 pub fn set_menu_dark(dark: bool) {

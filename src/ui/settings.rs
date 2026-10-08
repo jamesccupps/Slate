@@ -32,6 +32,8 @@ pub struct Settings {
     pub zoom: f32,
     pub wrap: bool,
     pub line_numbers: bool,
+    /// Dots for spaces, arrows for tabs, marks for line breaks.
+    pub show_whitespace: bool,
     pub theme: ThemeMode,
     pub tab_size: u32,
     pub use_spaces: bool,
@@ -61,6 +63,7 @@ impl Default for Settings {
             zoom: 1.0,
             wrap: true,
             line_numbers: true,
+            show_whitespace: false,
             theme: ThemeMode::System,
             tab_size: 4,
             use_spaces: true,

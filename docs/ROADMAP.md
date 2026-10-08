@@ -32,8 +32,22 @@ The details are in the [0.3.0 release notes](release-notes-0.3.0.md). In short:
 2. **Network shares (M).** Restore a tab whose share doesn't answer as a placeholder that retries, instead of
    leaving it out; read files up to 64 MiB and reloads on a background thread (today they're read while the window
    waits); give background readers their own file handle so a slow share doesn't make the window wait.
-3. **Accessibility (S, then L).** A high-contrast theme built from Windows' colors; a system caret so Magnifier and
-   other tools can follow the cursor; then UI Automation, so screen readers can read the text.
+3. **Accessibility: UI Automation (L).** The high-contrast theme (Windows' colors, read again when they change) and a
+   hidden system caret that Magnifier and other tools follow are done. Next, so screen readers can read the text, a
+   provider for the text area:
+   - `WM_GETOBJECT` (`UiaRootObjectId`) answers `UiaReturnRawElementProvider` with one COM object:
+     `IRawElementProviderSimple` (Document control type, the tab's title as its name, `ServerSideProvider |
+     UseComThreading` so calls come on the UI thread) and `ITextProvider` (`DocumentRange`, `GetSelection`,
+     `GetVisibleRanges`, `RangeFromPoint`). The tab strip, menus and status bar can wait; the find bar's boxes are
+     native and already readable.
+   - `ITextRangeProvider` as two byte offsets into the active document, kept up to date through its change log like
+     the scroll position. Units: character (as the caret moves), word (`word_left`/`word_right`), line (the view's
+     rows), paragraph (lines), document. `GetText` reads at most what it's asked for (a range can be a whole 800 MB
+     file); `GetBoundingRectangles` only for rows on screen; `Select`, `ScrollIntoView`, `Compare`/`Move` endpoints.
+   - Events: text selection changed after the caret moves, text changed after edits.
+   - Why it's L: COM classes through the windows crate's `implement` feature; the provider is called while the App
+     may be borrowed (`try_borrow`, else `UIA_E_ELEMENTNOTAVAILABLE`, and never a panic across COM); offsets to
+     UTF-16 over huge documents and ones whose lines are still being counted; testing with Narrator and NVDA.
 4. **Release basics (S–M).** Code signing (SignPath Foundation is free for open source; Azure Artifact Signing is
    about $10 a month) so Windows stops warning, then the updater also checks the signature; winget and Scoop
    manifests. (Licensed MIT since October 2026.)
@@ -49,14 +63,11 @@ The details are in the [0.3.0 release notes](release-notes-0.3.0.md). In short:
 
 - **Print** and page setup (M).
 - **Find:** in the selection, a history, `\n` and `\t` in regex replacements, find in all open tabs (S–M).
-- **Editing:** show spaces and line endings, matching brackets, column (Alt+drag) selection, reopen a closed tab,
-  close all / close saved tabs, overtype (S each). Drag and drop of text (M).
+- **Editing:** column (Alt+drag) selection (S). Drag and drop of text (M).
 - **Spell check** like Notepad's (M). **Inline IME composition** for Chinese, Japanese and Korean (M).
-- **Tabs in the title bar**, like Windows 11 Notepad, to save space (M). A list of tabs when there are too many.
-- **Status bar:** character and word counts, the indentation in use (S).
-- **Settings in the menus** that only exist in settings.json today: restore last session, JSON indent (S).
+- **Tabs in the title bar**, like Windows 11 Notepad, to save space (M).
 - **XML** path bar and structure panel, like JSON's (M). Colors for Markdown code blocks by their language (S).
-- **Open at a line:** `slate file.txt:120`, and a taskbar jump list (S).
+- **A taskbar jump list** with the recent files (S).
 - **JSON structure panel:** keep an open array element open when elements are inserted before it (it's keyed by
   index today); while the panel is updating after an edit, clicks go to the row's old place (S).
 
