@@ -824,7 +824,7 @@ fn restore_session(app: &mut App) -> Option<u64> {
             let before = app.tabs.len();
             let name = || st.path.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned());
             big.extend(st.pieces.clone());
-            match restore_tab(app, st, there[k]) {
+            match restore_tab(app, st, there[k].clone()) {
                 Restored::Yes => {}
                 Restored::Missing => missing.extend(name()),
                 Restored::Unreachable => unreachable.extend(name()),
@@ -837,7 +837,7 @@ fn restore_session(app: &mut App) -> Option<u64> {
     }
     // Big documents whose lists of pieces session.json doesn't refer to (Slate stopped in between).
     for st in session::big_orphans(&big) {
-        restore_tab(app, &st, Some(true));
+        restore_tab(app, &st, (Some(true), None));
     }
     let claimed: Vec<String> = app.tabs.iter().filter_map(|t| t.backup_name.clone()).collect();
     let found = session::orphans(&claimed);
@@ -884,19 +884,21 @@ enum Restored {
     Damaged,
 }
 
-/// Whether each tab's file exists, all looked at together (`session::probe`); None for one that doesn't answer
-/// within 2 s (a network share that's gone: Windows can take half a minute to give up, and this runs before the
-/// window shows) or answers with something other than "not there".
-fn exist_all(tabs: &[session::SessionTab]) -> Vec<Option<bool>> {
+/// Whether each tab's file exists, all looked at together (`session::probe`), and its canonical path; None for one
+/// that doesn't answer within 2 s (a network share that's gone: Windows can take half a minute to give up, and this
+/// runs before the window shows) or answers with something other than "not there".
+fn exist_all(tabs: &[session::SessionTab]) -> Vec<(Option<bool>, Option<PathBuf>)> {
     let (tx, rx) = std::sync::mpsc::channel();
-    let mut out = vec![None; tabs.len()];
+    let mut out = vec![(None, None); tabs.len()];
     let mut asked = 0;
     for (i, t) in tabs.iter().enumerate() {
         if let Some(p) = t.path.clone() {
             let tx = tx.clone();
             asked += 1;
             std::thread::spawn(move || {
-                let _ = tx.send((i, session::probe(&p)));
+                let there = session::probe(&p);
+                let canon = if there == Some(true) { std::fs::canonicalize(&p).ok() } else { None };
+                let _ = tx.send((i, (there, canon)));
             });
         }
     }
@@ -909,7 +911,8 @@ fn exist_all(tabs: &[session::SessionTab]) -> Vec<Option<bool>> {
     out
 }
 
-fn restore_tab(app: &mut App, st: &session::SessionTab, there: Option<bool>) -> Restored {
+/// Puts back one tab of the session. `there`: whether its file is there (see `exist_all`), and its canonical path.
+fn restore_tab(app: &mut App, st: &session::SessionTab, (there, canon): (Option<bool>, Option<PathBuf>)) -> Restored {
     use crate::core::document::Document;
     // A big document: put back from its pieces on another thread (it reads its files again); its tab waits.
     let mut set_aside = false;
@@ -945,27 +948,26 @@ fn restore_tab(app: &mut App, st: &session::SessionTab, there: Option<bool>) -> 
                 // This tab's text is exactly what that backup file holds.
                 app.tabs[k].backup_name = Some(name.clone());
                 app.tabs[k].backup_version = app.tabs[k].doc.version;
+                if let Some(p) = &st.path {
+                    app.tabs[k].canon = Some((p.clone(), canon));
+                }
                 i = Some(k);
             }
         }
     }
-    if i.is_none() {
-        if let Some(p) = &st.path {
-            match there {
-                Some(true) => {}
-                Some(false) => return outcome(Restored::Missing),
-                None => {
-                    // A tab that waits for its file, opening it as soon as it answers.
-                    app.add_restoring(session::SessionTab { backup: None, pieces: None, ..st.clone() }, None);
-                    return outcome(Restored::Unreachable);
-                }
-            }
-            let before = app.tabs.len();
-            app.open_paths(std::slice::from_ref(p));
-            if app.tabs.len() > before {
-                i = Some(app.tabs.len() - 1);
+    if i.is_none() && st.path.is_some() {
+        match there {
+            Some(true) => {}
+            Some(false) => return outcome(Restored::Missing),
+            None => {
+                // A tab that waits for its file, opening it as soon as it answers.
+                app.add_restoring(session::SessionTab { backup: None, pieces: None, ..st.clone() }, None);
+                return outcome(Restored::Unreachable);
             }
         }
+        // (back where it was once it's read)
+        app.open_from_session(st);
+        return outcome(Restored::Yes);
     }
     let Some(i) = i else { return outcome(Restored::Yes) };
     let tab = &mut app.tabs[i];

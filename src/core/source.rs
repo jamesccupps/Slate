@@ -11,22 +11,26 @@
 //! handle on the old one) means the parts of a document still read from it aren't what the user had any more:
 //! `changed_in_place` tells, and saving refuses to mix the two. The index is only ever built from bytes that
 //! were read: a read that keeps failing stops it (`index_error`), so line commands never trust a guessed count.
+//!
+//! Reading a lot at once (the index, hashing, big ranges for search and saving) goes through a second handle on
+//! the same file (`bulk`): Windows runs the reads of one handle one after the other, so on a slow network drive the
+//! window's block reads would otherwise wait behind them.
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::os::windows::fs::{FileExt, OpenOptionsExt};
-use std::os::windows::io::AsRawHandle;
+use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use windows::Win32::Foundation::HANDLE;
+use windows::Win32::Foundation::{GENERIC_READ, HANDLE};
 use windows::Win32::Storage::FileSystem::{
-    BY_HANDLE_FILE_INFORMATION, FILE_BASIC_INFO, FileBasicInfo, GetFileInformationByHandle,
-    GetFileInformationByHandleEx,
+    BY_HANDLE_FILE_INFORMATION, FILE_BASIC_INFO, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_MODE, FileBasicInfo,
+    GetFileInformationByHandle, GetFileInformationByHandleEx, ReOpenFile,
 };
 
 pub const BLOCK: u64 = 64 * 1024;
@@ -112,8 +116,16 @@ struct BlockCache {
 
 enum Store {
     Mem(Box<[u8]>),
-    /// `opened`: the file's stamp and identity through `file` when this source was made.
-    File { file: File, cache: Mutex<BlockCache>, path: PathBuf, kind: SourceKind, opened: Option<(Stamp, FileId)> },
+    /// `opened`: the file's stamp and identity through `file` when this source was made. `bulk`: a second handle on
+    /// it, opened when first needed (None if it couldn't be: `file` does).
+    File {
+        file: File,
+        bulk: OnceLock<Option<File>>,
+        cache: Mutex<BlockCache>,
+        path: PathBuf,
+        kind: SourceKind,
+        opened: Option<(Stamp, FileId)>,
+    },
 }
 
 /// Where a source's bytes are (and so what keeping a document for a later run takes, see session.rs).
@@ -258,6 +270,13 @@ pub struct Identity {
     pub tail: Option<u64>,
 }
 
+/// A second handle on the file `file` is open on (that very file, even if another one took its name since).
+fn reopen(file: &File) -> Option<File> {
+    let h = HANDLE(file.as_raw_handle());
+    let h = unsafe { ReOpenFile(h, GENERIC_READ.0, FILE_SHARE_MODE(SHARE_ALL), FILE_FLAGS_AND_ATTRIBUTES(0)) }.ok()?;
+    Some(unsafe { File::from_raw_handle(h.0) })
+}
+
 /// Reads all of `buf` at `off` (an error if the file ends first). Counts nothing.
 fn read_exact_at(file: &File, off: u64, buf: &mut [u8]) -> io::Result<()> {
     let mut done = 0;
@@ -388,7 +407,8 @@ impl Source {
         let indexed = index.as_ref().is_some_and(|i| i.complete);
         let opened = stamp_of(&file);
         let cache = Mutex::new(BlockCache { map: HashMap::new(), tick: 0 });
-        let s = Source::new(Store::File { file, cache, path, kind, opened }, len, index.unwrap_or_else(NlIndex::empty));
+        let store = Store::File { file, bulk: OnceLock::new(), cache, path, kind, opened };
+        let s = Source::new(store, len, index.unwrap_or_else(NlIndex::empty));
         if indexed && kind == SourceKind::File {
             *s.fingerprint.lock().unwrap() = s.take_fingerprint(s.len);
         }
@@ -460,12 +480,11 @@ impl Source {
 
     /// Hash of `[a, b)` read straight from the file (None if the file doesn't have all of it or the read fails).
     fn hash_range(&self, a: u64, b: u64) -> Option<u64> {
-        let Store::File { file, .. } = &self.store else { return None };
-        if b > self.len {
+        if !self.is_file() || b > self.len {
             return None;
         }
         let mut buf = vec![0u8; (b - a) as usize];
-        read_exact_at(file, a, &mut buf).ok()?;
+        read_exact_at(self.bulk(), a, &mut buf).ok()?;
         Some(hash_bytes(&buf))
     }
 
@@ -486,10 +505,11 @@ impl Source {
     /// ours (renamed over it) doesn't count either: the handle still reads the old one. Memory and temp files are
     /// never changed by others.
     pub fn changed_in_place(&self) -> bool {
-        let Store::File { file, kind: SourceKind::File, opened: Some((then, _)), .. } = &self.store else {
+        let Store::File { kind: SourceKind::File, opened: Some((then, _)), .. } = &self.store else {
             return false;
         };
-        let Some((now, _)) = stamp_of(file) else { return false };
+        // (asked on another thread every few seconds: not through the window's handle)
+        let Some((now, _)) = stamp_of(self.bulk()) else { return false };
         if now == *then || *self.verified.lock().unwrap() == Some(now) {
             return false;
         }
@@ -547,6 +567,12 @@ impl Source {
             Store::Mem(d) => Some(d),
             _ => None,
         }
+    }
+
+    /// The handle for reading a lot at once (see the module docs): the second one, or `file` if there's none.
+    fn bulk(&self) -> &File {
+        let Store::File { file, bulk, .. } = &self.store else { unreachable!() };
+        bulk.get_or_init(|| reopen(file)).as_ref().unwrap_or(file)
     }
 
     /// Reads `buf.len()` bytes at `off`; missing bytes become zeros and count as a read error. Returns whether
@@ -610,7 +636,7 @@ impl Source {
         }
         match &self.store {
             Store::Mem(d) => f(&d[start as usize..end as usize]),
-            Store::File { file, .. } => {
+            Store::File { .. } => {
                 if end - start <= 4 * BLOCK {
                     let mut pos = start;
                     while pos < end {
@@ -629,7 +655,7 @@ impl Source {
                     let mut pos = start;
                     while pos < end {
                         let n = ((end - pos) as usize).min(buf.len());
-                        self.file_read(file, pos, &mut buf[..n]);
+                        self.file_read(self.bulk(), pos, &mut buf[..n]);
                         if !f(&buf[..n]) {
                             return false;
                         }
@@ -649,7 +675,7 @@ impl Source {
         }
         match &self.store {
             Store::Mem(d) => out.extend_from_slice(&d[start as usize..end as usize]),
-            Store::File { file, .. } => {
+            Store::File { .. } => {
                 if end - start <= 4 * BLOCK {
                     self.chunks(start, end, &mut |c| {
                         out.extend_from_slice(c);
@@ -658,7 +684,7 @@ impl Source {
                 } else {
                     let old = out.len();
                     out.resize(old + (end - start) as usize, 0);
-                    self.file_read(file, start, &mut out[old..]);
+                    self.file_read(self.bulk(), start, &mut out[old..]);
                 }
             }
         }
@@ -873,9 +899,10 @@ impl Source {
 
     /// `build_index`, counting progress from `base` (several files read one after the other).
     pub fn build_index_at(&self, cancel: &AtomicBool, progress: &AtomicU64, base: u64) -> bool {
-        let Store::File { file, opened, .. } = &self.store else {
+        let Store::File { opened, .. } = &self.store else {
             return true;
         };
+        let file = self.bulk();
         if self.index.read().unwrap().complete {
             return true;
         }
@@ -1174,6 +1201,44 @@ mod tests {
         assert!(s.index_error().is_some_and(|w| w.contains("shorter")), "{:?}", s.index_error());
         assert!(s.read_errors() > 0);
         drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bulk_reads_have_their_own_handle_on_the_same_file() {
+        let dir = test_dir("bulk");
+        let data = sample(700_000, 11);
+        let (path, s) = indexed(&dir, "big.txt", &data);
+        // the index was read through a second handle, on the very same file
+        let Store::File { file, bulk, .. } = &s.store else { unreachable!() };
+        let second = bulk.get().and_then(Option::as_ref).expect("a second handle");
+        assert_ne!(second.as_raw_handle(), file.as_raw_handle());
+        assert_eq!(stamp_of(second).map(|s| s.1), stamp_of(file).map(|s| s.1));
+        // another file put in its place: both still read the old one
+        std::fs::write(dir.join("new.txt"), sample(700_000, 12)).unwrap();
+        std::fs::rename(dir.join("new.txt"), &path).unwrap();
+        let (mut big, mut small) = (Vec::new(), Vec::new());
+        s.read_into(0, s.len(), &mut big);
+        s.read_into(100_000, 100_100, &mut small);
+        assert_eq!(big, data);
+        assert_eq!(small, &data[100_000..100_100]);
+        assert!(!s.changed_in_place());
+        // deleted before a second handle was needed: still read (through the first one, if need be)
+        let path = dir.join("gone.txt");
+        std::fs::write(&path, &data).unwrap();
+        let gone = Source::open_file(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let mut out = Vec::new();
+        gone.read_into(0, gone.len(), &mut out);
+        assert_eq!((out == data, gone.read_errors()), (true, 0));
+        // a self-deleting temp file
+        let temp = file_source(&data, true);
+        let mut out = Vec::new();
+        temp.read_into(0, temp.len(), &mut out);
+        assert_eq!(out, data);
+        let Store::File { bulk, .. } = &temp.store else { unreachable!() };
+        assert!(bulk.get().is_some_and(Option::is_some));
+        drop((s, gone, temp));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

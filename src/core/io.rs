@@ -3,7 +3,8 @@
 //! Small files (up to `MEM_LIMIT`) are read into memory and the file is closed again, like Notepad. Bigger files
 //! are read on demand straight from disk, so even multi-GB files open instantly; their newline index is built in
 //! the background. Files in UTF-16 or the ANSI code page are converted to UTF-8 when opened (big ones into a
-//! self-deleting temp file) and converted back when saved.
+//! self-deleting temp file) and converted back when saved. All of opening (`open`, `reload`) is meant for another
+//! thread: anything that asks the file system can take long on a network drive.
 //!
 //! A file is only taken as ANSI if its text converts back to exactly its bytes; otherwise it stays UTF-8, where
 //! every byte is kept as it is.
@@ -34,7 +35,7 @@ use windows::core::PCWSTR;
 
 use super::buffer::{Buffer, Snapshot};
 use super::document::{DiskInfo, Document};
-use super::job::{Ctx, Job, Notify};
+use super::job::{Ctx, Failure, Job, Notify};
 use super::source::{IndexBuilder, Source, create_temp_file};
 use super::text::{
     self, AnsiCheck, AnsiDecoder, AnsiEncoder, Encoding, Utf16Decoder, Utf16Encoder, detect_encoding, detect_eol,
@@ -80,20 +81,62 @@ pub fn disk_answer(path: &Path) -> Option<Option<DiskInfo>> {
     }
 }
 
-pub fn open(path: &Path, notify: Notify) -> io::Result<Loading> {
-    open_with(path, notify, None, None)
+/// Opening reports its progress in these steps (`Ctx::set`): the file's size isn't known before it starts.
+pub const OPEN_STEPS: u64 = 1000;
+
+/// What opening a file came to (`open`, `reload`).
+pub struct Opened {
+    pub loading: io::Result<Loading>,
+    /// The file's canonical path (to tell whether a tab has it open already under another name).
+    pub canon: Option<PathBuf>,
+    /// It looks like a binary file (`looks_binary`).
+    pub binary: bool,
+    /// It isn't there, but its folder is: a new file, which saving creates (if `open` was asked to look).
+    pub creatable: bool,
+}
+
+impl Failure for Opened {
+    fn failure(msg: &str) -> Opened {
+        Opened { loading: Err(io::Error::other(msg.to_string())), canon: None, binary: false, creatable: false }
+    }
+}
+
+/// Opens `path` for a new tab, with everything that asks the file system, so it can run on another thread (a
+/// network drive can take long to answer). `create`: look whether a file that isn't there can be a new one.
+pub fn open(path: &Path, notify: Notify, create: bool, ctx: &Ctx) -> Opened {
+    let loading = open_with(path, notify, None, None, ctx);
+    let there = loading.is_ok();
+    let missing = matches!(&loading, Err(e) if e.kind() == io::ErrorKind::NotFound);
+    Opened {
+        loading,
+        canon: if there { fs::canonicalize(path).ok() } else { None },
+        binary: there && looks_binary(path),
+        creatable: create && missing && path.parent().is_some_and(Path::is_dir),
+    }
+}
+
+/// Reads `path` again (see `open_with`), on another thread like `open`.
+pub fn reload(path: &Path, notify: Notify, prev: Option<Arc<Source>>, force: Option<Encoding>, ctx: &Ctx) -> Opened {
+    Opened { loading: open_with(path, notify, prev, force, ctx), canon: None, binary: false, creatable: false }
 }
 
 /// Opens `path`. `prev` is the source of the same file opened earlier (a reload): if the file only grew, its
-/// index is reused. `force` overrides the detected encoding.
-pub fn open_with(path: &Path, notify: Notify, prev: Option<Arc<Source>>, force: Option<Encoding>) -> io::Result<Loading> {
+/// index is reused. `force` overrides the detected encoding. Progress goes to `ctx` (in `OPEN_STEPS`), which can
+/// also stop it.
+pub fn open_with(
+    path: &Path,
+    notify: Notify,
+    prev: Option<Arc<Source>>,
+    force: Option<Encoding>,
+    ctx: &Ctx,
+) -> io::Result<Loading> {
     let meta = fs::metadata(path)?;
     if meta.is_dir() {
         return Err(io::Error::other("That is a folder, not a file."));
     }
     let disk = disk_info(path);
     if meta.len() <= MEM_LIMIT {
-        let data = fs::read(path)?;
+        let data = read_whole(path, ctx)?;
         let mut doc = document_from_bytes_as(data, force);
         doc.path = Some(path.to_path_buf());
         doc.disk = disk;
@@ -148,6 +191,23 @@ pub fn open_with(path: &Path, notify: Notify, prev: Option<Arc<Source>>, force: 
         doc.disk = disk;
         Ok(doc)
     })))
+}
+
+/// All of a file's bytes, read a part at a time (for progress, and to stop when the tab is closed meanwhile).
+fn read_whole(path: &Path, ctx: &Ctx) -> io::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut f = File::open(path)?;
+    let len = f.metadata()?.len().max(1);
+    let mut data = Vec::with_capacity(len as usize);
+    loop {
+        if ctx.cancelled() {
+            return Err(io::ErrorKind::Interrupted.into());
+        }
+        if (&mut f).take(CHUNK).read_to_end(&mut data)? == 0 {
+            return Ok(data);
+        }
+        ctx.set((data.len() as u64).saturating_mul(OPEN_STEPS) / len);
+    }
 }
 
 /// A document from a whole file's bytes (encoding detected, BOM removed, converted to UTF-8).
@@ -322,6 +382,8 @@ pub struct Saved {
     pub rebase: Option<(Arc<Source>, u64, u64)>,
     /// Some characters couldn't be represented in the ANSI code page and were saved as `?`.
     pub lossy: bool,
+    /// The file's canonical path (to tell whether it's open already when it's opened again).
+    pub canon: Option<PathBuf>,
 }
 
 const GENERIC_READ: u32 = 0x8000_0000;
@@ -674,7 +736,7 @@ pub fn save(
         }
         _ => None,
     };
-    Ok(Saved { disk, rebase, lossy })
+    Ok(Saved { disk, rebase, lossy, canon: fs::canonicalize(path).ok() })
 }
 
 /// Whether two paths name the same file (compares canonical paths).
@@ -699,6 +761,38 @@ mod tests {
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn opening_tells_what_the_tab_needs_to_know() {
+        let dir = test_dir("open");
+        let notify: Notify = Arc::new(|| {});
+        let path = dir.join("notes.txt");
+        let text: Vec<u8> = (0..300_000u32).flat_map(|i| format!("line {i}\r\n").into_bytes()).collect();
+        fs::write(&path, &text).unwrap();
+        let c = ctx();
+        let o = open(&path, notify.clone(), false, &c);
+        let Ok(Loading::Ready(doc)) = o.loading else { panic!("not read") };
+        assert_eq!(doc.read(0, doc.len()), text);
+        assert_eq!(doc.path.as_deref(), Some(path.as_path()));
+        assert_eq!(o.canon, fs::canonicalize(&path).ok());
+        assert!(!o.binary && !o.creatable);
+        assert_eq!(c.progress.load(Ordering::Relaxed), OPEN_STEPS);
+        // binary; missing (a new file only if asked, and only in a folder that's there)
+        fs::write(dir.join("a.exe"), b"MZ\x90\0\x03\0\0\0").unwrap();
+        assert!(open(&dir.join("a.exe"), notify.clone(), false, &ctx()).binary);
+        let o = open(&dir.join("new.txt"), notify.clone(), true, &ctx());
+        assert!(o.loading.is_err() && o.creatable && o.canon.is_none());
+        assert!(!open(&dir.join("new.txt"), notify.clone(), false, &ctx()).creatable);
+        assert!(!open(&dir.join("no").join("new.txt"), notify.clone(), true, &ctx()).creatable);
+        // the tab was closed meanwhile: stops
+        let c = ctx();
+        c.cancel.store(true, Ordering::Relaxed);
+        assert!(open(&path, notify.clone(), false, &c).loading.is_err());
+        // a reload looks at nothing else
+        let o = reload(&path, notify, None, Some(Encoding::Utf8), &ctx());
+        assert!(matches!(o.loading, Ok(Loading::Ready(_))) && o.canon.is_none());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

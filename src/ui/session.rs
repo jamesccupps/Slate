@@ -13,7 +13,8 @@
 //! - While editing, the session is written on another thread (backups of big documents take a moment); closing and
 //!   shutting down write it right away.
 //! - A tab that isn't back yet (a big document being put back, a file on a network share that doesn't answer) is
-//!   written as it was read (`Restoring`), so nothing of it is lost meanwhile.
+//!   written as it was read (`Restoring`), so nothing of it is lost meanwhile; so is one whose file is still being
+//!   read (`Tab::place`).
 
 use std::collections::{BTreeSet, HashMap};
 use std::fs::{self, OpenOptions};
@@ -192,13 +193,13 @@ fn plan(tabs: &mut [Tab], active: usize) -> Plan {
         if tab.load_job.is_some() && tab.doc.path.is_none() {
             continue;
         }
-        // Not back yet: as it was (its files are still needed).
-        if let Some(r) = &tab.restore {
-            keep.extend(files_of(&r.st));
+        // Not back yet: as it was (its files are still needed). Its file still being read: as the session had it.
+        if let Some(st) = tab.restore.as_ref().map(|r| &r.st).or(tab.place.as_ref()) {
+            keep.extend(files_of(st));
             if i <= active {
                 active_idx = list.len();
             }
-            list.push(r.st.clone());
+            list.push(st.clone());
             continue;
         }
         let mut backup = None;

@@ -154,8 +154,13 @@ pub struct Tab {
     pub lang_picked: bool,
     pub untitled: u32,
     pub index_job: Option<Job<bool>>,
-    pub load_job: Option<Job<std::io::Result<Document>>>,
-    pub reload: bool,
+    /// Reading its file on another thread (opening or reloading it).
+    pub load_job: Option<Load>,
+    /// What `load_job` is: a reload (Some: whether the caret follows the end), else opening.
+    pub reload: Option<bool>,
+    /// A tab from the session whose file is being read: what the session says of it (kept as it is until then),
+    /// and where its view goes once the file is read.
+    pub place: Option<super::session::SessionTab>,
     pub save: Option<SaveTask>,
     pub task: Option<Task>,
     pub search: Search,
@@ -191,6 +196,23 @@ pub struct Tab {
     pub restore: Option<super::session::Restoring>,
 }
 
+/// A tab's file being read on another thread (`Tab::load_job`).
+pub enum Load {
+    /// Reading it (`fileio::open`, `fileio::reload`): all of it if it's small, what it takes to show it if it's big.
+    Read(Job<crate::core::io::Opened>),
+    /// A big file in another encoding, being converted.
+    Convert(Job<std::io::Result<Document>>),
+}
+
+impl Load {
+    pub fn fraction(&self) -> f32 {
+        match self {
+            Load::Read(j) => j.fraction(),
+            Load::Convert(j) => j.fraction(),
+        }
+    }
+}
+
 /// A place to go in a document that may not be ready yet (see `App::apply_goto`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Goto {
@@ -219,7 +241,8 @@ impl Tab {
             untitled: 0,
             index_job: None,
             load_job: None,
-            reload: false,
+            reload: None,
+            place: None,
             save: None,
             task: None,
             search: Search::default(),

@@ -208,19 +208,28 @@ fn name_of(p: &Path) -> String {
     p.file_name().map_or_else(|| p.display().to_string(), |n| n.to_string_lossy().into_owned())
 }
 
-/// Whether tab `t` has the file `p` (whose canonical form is `canon`) open. Its own path is canonicalized once
-/// and kept, so opening a file doesn't ask the file system about every open tab (slow, or stuck, on a network
-/// drive that went away).
-fn has_file(t: &mut Tab, p: &Path, canon: Option<&Path>) -> bool {
+/// Whether tab `t` has the file `p` (whose canonical form is `canon`, if known) open: by the canonical path its
+/// own was found to have (on another thread, when it was read or saved: never asked here, as that's slow, or stuck,
+/// on a network drive that went away), else by name.
+fn has_file(t: &Tab, p: &Path, canon: Option<&Path>) -> bool {
     let Some(path) = &t.doc.path else { return false };
-    if t.canon.as_ref().is_none_or(|c| &c.0 != path) {
-        t.canon = Some((path.clone(), std::fs::canonicalize(path).ok()));
-    }
-    match (t.canon.as_ref().and_then(|c| c.1.as_deref()), canon) {
+    match (t.canon.as_ref().filter(|c| &c.0 == path).and_then(|c| c.1.as_deref()), canon) {
         (Some(a), Some(b)) => a == b,
-        _ => path == p,
+        _ => path.as_os_str().eq_ignore_ascii_case(p.as_os_str()),
     }
 }
+
+/// In test mode, `SLATE_TEST_SLOW_OPEN=<ms>` makes reading a file take that long more (a slow network drive).
+fn test_slowness() -> Option<Duration> {
+    if !win::SCRIPTED.with(|s| s.borrow().is_some()) {
+        return None;
+    }
+    std::env::var("SLATE_TEST_SLOW_OPEN").ok()?.parse().ok().map(Duration::from_millis)
+}
+
+/// How long opening a file waits for it to be read before its tab shows "Opening…": most are read by then, and so
+/// come up whole at once.
+const OPEN_WAIT: Duration = Duration::from_millis(150);
 
 fn now_text() -> String {
     unsafe {
@@ -470,99 +479,241 @@ impl App {
         self.create_missing = false;
     }
 
+    /// Opens files in new tabs. Each is read on another thread (a network drive can take long to answer); its tab
+    /// shows "Opening…" until it is, unless that's done within `OPEN_WAIT`.
     pub fn open_paths(&mut self, paths: &[PathBuf]) {
-        for p in paths {
-            let p = std::path::absolute(p).unwrap_or_else(|_| p.clone());
-            let canon = std::fs::canonicalize(&p).ok();
-            if let Some(i) = self.tabs.iter_mut().position(|t| has_file(t, &p, canon.as_deref())) {
-                self.activate(i);
-                continue;
-            }
-            // Opening into a single blank tab replaces it, like Notepad.
-            let replace_blank = self.tabs.len() == 1 && self.tabs[0].is_blank();
-            match fileio::open(&p, self.notify.clone()) {
-                Ok(loading) => {
-                    let i = match loading {
-                        Loading::Ready(doc) => self.add_tab(doc),
-                        Loading::Indexing(doc, job) => {
-                            let i = self.add_tab(doc);
-                            self.tabs[i].index_job = Some(job);
-                            i
-                        }
-                        Loading::Converting(job) => {
-                            let mut doc = Document::new();
-                            doc.path = Some(p.clone());
-                            let i = self.add_tab(doc);
-                            self.tabs[i].load_job = Some(job);
-                            i
-                        }
-                    };
-                    // Binary files open too (as text), but saving one from here could damage it.
-                    if fileio::looks_binary(&p) {
-                        self.tabs[i].notice = Some(Notice {
-                            kind: NoticeKind::Warn,
-                            text: "This looks like a binary file, not text. Saving it from Slate could damage it.".into(),
-                            actions: vec![("Dismiss".into(), NoticeAction::Dismiss)],
-                        });
-                    }
-                    if replace_blank && i == 1 {
-                        self.tabs.remove(0);
-                        self.active = 0;
-                    }
-                    self.settings.add_recent(&p);
-                    self.timer(TIMER_JOBS, 100);
-                }
-                Err(e) => {
-                    let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                    if self.create_missing && e.kind() == io::ErrorKind::NotFound && p.parent().is_some_and(Path::is_dir) {
-                        // A file that isn't there yet in a folder that is (`Slate todo.txt`): an empty tab that
-                        // becomes that file when it's saved (Notepad offers to create it).
-                        let mut doc = Document::new();
-                        doc.path = Some(p.clone());
-                        let i = self.add_tab(doc);
-                        if replace_blank && i == 1 {
-                            self.tabs.remove(0);
-                            self.active = 0;
-                        }
-                        self.flash(format!("{name} is a new file: saving creates it."), false);
-                        continue;
-                    }
-                    self.flash(format!("Couldn't open {name}: {}", fileio::friendly_io(&e)), true);
-                }
-            }
-        }
-        self.settings.save();
+        let started: Vec<u64> = paths.iter().filter_map(|p| self.open_path(p, None)).collect();
+        self.settle(&started);
         let a = self.active;
         self.activate(a);
     }
 
-    /// Re-reads tab `i` from disk (keeping the view where it was).
+    /// Opens the file of a tab from the session (`st`) like `open_paths`: once it's read, the tab is where it was;
+    /// if it can't be read just now, the tab waits for it (and stays in the session).
+    pub fn open_from_session(&mut self, st: &SessionTab) {
+        let Some(p) = &st.path else { return };
+        let place = SessionTab { backup: None, pieces: None, ..st.clone() };
+        if let Some(id) = self.open_path(p, Some(place)) {
+            self.settle(&[id]);
+        }
+        let a = self.active;
+        self.activate(a);
+    }
+
+    /// Starts opening `p` in a new tab (`place`: see `Tab::place`). Returns its id; None if a tab has that file
+    /// already (shown instead).
+    fn open_path(&mut self, p: &Path, place: Option<SessionTab>) -> Option<u64> {
+        let p = std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
+        // (Open under another name: found once it's read, see `finish_read`.)
+        if let Some(i) = self.tabs.iter().position(|t| has_file(t, &p, None)) {
+            self.activate(i);
+            return None;
+        }
+        // Opening into a single blank tab replaces it, like Notepad.
+        let replace_blank = self.tabs.len() == 1 && self.tabs[0].is_blank();
+        let mut doc = Document::new();
+        doc.path = Some(p);
+        let mut i = self.add_tab(doc);
+        if replace_blank && i == 1 {
+            self.tabs.remove(0);
+            self.active = 0;
+            i = 0;
+        }
+        self.tabs[i].place = place;
+        self.start_load(i, None, self.create_missing);
+        Some(self.tabs[i].id)
+    }
+
+    /// Starts reading tab `i`'s file on another thread: opening it (`reload` None; `create`: one that isn't there
+    /// can be a new file), or reloading it.
+    fn start_load(&mut self, i: usize, force: Option<Encoding>, create: bool) {
+        let Some(path) = self.tabs[i].doc.path.clone() else { return };
+        let notify = self.notify.clone();
+        let slow = test_slowness();
+        let job = match self.tabs[i].reload {
+            None => Job::spawn(fileio::OPEN_STEPS, notify.clone(), move |ctx| {
+                if let Some(d) = slow {
+                    std::thread::sleep(d);
+                }
+                fileio::open(&path, notify, create, ctx)
+            }),
+            Some(_) => {
+                // (the file as read before: if it only grew, its newline index is used again)
+                let sources = self.tabs[i].doc.buffer().sources();
+                let prev = sources.iter().find(|s| s.file_path() == Some(path.as_path())).cloned();
+                Job::spawn(fileio::OPEN_STEPS, notify.clone(), move |ctx| {
+                    if let Some(d) = slow {
+                        std::thread::sleep(d);
+                    }
+                    fileio::reload(&path, notify, prev, force, ctx)
+                })
+            }
+        };
+        self.tabs[i].load_job = Some(Load::Read(job));
+        self.timer(TIMER_JOBS, 100);
+    }
+
+    /// Waits a moment (`OPEN_WAIT`) for the files tabs `ids` started reading, so one that's quick to read comes up at
+    /// once; the others go on in the background.
+    fn settle(&mut self, ids: &[u64]) {
+        let until = Instant::now() + OPEN_WAIT;
+        let reading = |a: &App| {
+            a.tabs.iter().any(|t| ids.contains(&t.id) && matches!(&t.load_job, Some(Load::Read(j)) if !j.is_finished()))
+        };
+        while reading(self) && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // (a tab can close here: by id)
+        for id in ids {
+            if let Some(i) = self.tabs.iter().position(|t| t.id == *id) {
+                self.poll_load(i);
+            }
+        }
+    }
+
+    /// Takes a finished read of tab `i`'s file; returns whether one is still going. The tab may be gone after.
+    fn poll_load(&mut self, i: usize) -> bool {
+        match self.tabs[i].load_job.as_mut() {
+            Some(Load::Read(job)) => {
+                let Some(opened) = job.take() else { return true };
+                self.tabs[i].load_job = None;
+                self.finish_read(i, opened)
+            }
+            Some(Load::Convert(job)) => {
+                let Some(r) = job.take() else { return true };
+                self.tabs[i].load_job = None;
+                match r {
+                    Ok(doc) => self.loaded(i, doc, None),
+                    Err(e) => self.load_failed(i, e, false),
+                }
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// Tab `i`'s file was read (or not); returns whether it still is (a big file being converted).
+    fn finish_read(&mut self, i: usize, opened: fileio::Opened) -> bool {
+        let loading = match opened.loading {
+            Ok(l) => l,
+            Err(e) => {
+                self.load_failed(i, e, opened.creatable);
+                return false;
+            }
+        };
+        if self.tabs[i].reload.is_none() {
+            let id = self.tabs[i].id;
+            let path = self.tabs[i].doc.path.clone().unwrap_or_default();
+            // Open in another tab already, under another name (the same canonical path): that one, then.
+            let canon = opened.canon.as_deref();
+            if let Some(other) = self.tabs.iter().find(|t| t.id != id && has_file(t, &path, canon)).map(|t| t.id) {
+                self.remove_tab(i);
+                if let Some(k) = self.tabs.iter().position(|t| t.id == other) {
+                    self.activate(k);
+                }
+                return false;
+            }
+            self.tabs[i].canon = Some((path.clone(), opened.canon));
+            // Binary files open too (as text), but saving one from here could damage it.
+            if opened.binary {
+                self.tabs[i].notice = Some(Notice {
+                    kind: NoticeKind::Warn,
+                    text: "This looks like a binary file, not text. Saving it from Slate could damage it.".into(),
+                    actions: vec![("Dismiss".into(), NoticeAction::Dismiss)],
+                });
+                self.layout();
+            }
+            self.settings.add_recent(&path);
+            // (once for files opened together)
+            if !self.tabs.iter().any(|t| matches!(t.load_job, Some(Load::Read(_)))) {
+                self.settings.save();
+            }
+        }
+        match loading {
+            Loading::Ready(doc) => self.loaded(i, doc, None),
+            Loading::Indexing(doc, job) => self.loaded(i, doc, Some(job)),
+            Loading::Converting(job) => {
+                self.tabs[i].load_job = Some(Load::Convert(job));
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Tab `i`'s file is read: its document from now on.
+    fn loaded(&mut self, i: usize, doc: Document, index_job: Option<Job<bool>>) {
+        match self.tabs[i].reload.take() {
+            Some(follow_end) => self.replace_doc(i, doc, index_job, follow_end),
+            None => {
+                let tab = &mut self.tabs[i];
+                tab.doc = doc;
+                tab.index_job = index_job;
+                tab.backup_version = u64::MAX;
+                tab.view.forget_text();
+                if !tab.lang_picked {
+                    let head = tab.doc.read(0, 4096);
+                    let name = tab.doc.path.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy());
+                    tab.lang = Lang::detect(name.as_deref(), &head);
+                }
+                self.detect_indent(i);
+            }
+        }
+        // (a tab from the session: back where it was)
+        if let Some(st) = self.tabs[i].place.take() {
+            super::place_tab(&mut self.tabs[i], &st);
+        }
+        if self.tabs[i].index_job.is_some() {
+            self.timer(TIMER_JOBS, 100);
+        }
+        self.session_dirty = true;
+        self.update_title();
+        self.invalidate();
+    }
+
+    /// Tab `i`'s file couldn't be read (`e`). `creatable`: it isn't there, but can be a new file.
+    fn load_failed(&mut self, i: usize, e: io::Error, creatable: bool) {
+        let name = self.tabs[i].title();
+        let place = self.tabs[i].place.take();
+        if self.tabs[i].reload.take().is_some() {
+            self.tabs[i].notice = Some(Notice {
+                kind: NoticeKind::Error,
+                text: format!("Couldn't reload the file: {}", fileio::friendly_io(&e)),
+                actions: vec![("Dismiss".into(), NoticeAction::Dismiss)],
+            });
+            self.layout();
+        } else if creatable {
+            // A file that isn't there yet in a folder that is (`Slate todo.txt`): an empty tab that becomes that
+            // file when it's saved (Notepad offers to create it).
+            self.flash(format!("{name} is a new file: saving creates it."), false);
+        } else if let Some(st) = place.filter(|_| !matches!(e.raw_os_error(), Some(2 | 3))) {
+            // A tab from the session whose file stopped answering (a network drive): it waits for it, and stays.
+            self.tabs[i].restore = Some(Restoring::new(st, None));
+            self.wait_for_file(i, Some(fileio::friendly_io(&e)));
+        } else {
+            self.remove_tab(i);
+            self.flash(format!("Couldn't open {name}: {}", fileio::friendly_io(&e)), true);
+        }
+        self.invalidate();
+    }
+
+    /// Re-reads tab `i` from disk (keeping the view where it was), on another thread like opening it.
     pub fn reload(&mut self, i: usize, force: Option<Encoding>) {
         // A tab from the session that isn't back yet: that's what to try again.
         if self.tabs[i].restore.is_some() {
             self.start_restore(i);
             return;
         }
-        let Some(path) = self.tabs[i].doc.path.clone() else { return };
-        let prev = self.tabs[i].doc.buffer().sources().iter().find(|s| s.file_path() == Some(path.as_path())).cloned();
-        let at_end = self.tabs[i].view.sel.caret >= self.tabs[i].doc.len() && self.tabs[i].doc.len() > 0;
-        match fileio::open_with(&path, self.notify.clone(), prev, force) {
-            Ok(Loading::Ready(doc)) => self.replace_doc(i, doc, None, at_end),
-            Ok(Loading::Indexing(doc, job)) => self.replace_doc(i, doc, Some(job), at_end),
-            Ok(Loading::Converting(job)) => {
-                let tab = &mut self.tabs[i];
-                tab.load_job = Some(job);
-                tab.reload = true;
-                self.timer(TIMER_JOBS, 100);
-            }
-            Err(e) => {
-                self.tabs[i].notice = Some(Notice {
-                    kind: NoticeKind::Error,
-                    text: format!("Couldn't reload the file: {}", fileio::friendly_io(&e)),
-                    actions: vec![("Dismiss".into(), NoticeAction::Dismiss)],
-                });
-            }
+        let tab = &mut self.tabs[i];
+        if tab.doc.path.is_none() {
+            return;
         }
+        // (Still being opened: opened again.)
+        if tab.load_job.is_none() || tab.reload.is_some() {
+            tab.reload = Some(tab.view.sel.caret >= tab.doc.len() && !tab.doc.is_empty());
+        }
+        let id = tab.id;
+        self.start_load(i, force, false);
+        self.settle(&[id]);
         self.invalidate();
     }
 
@@ -681,7 +832,11 @@ impl App {
         } else {
             Notice {
                 kind: NoticeKind::Info,
-                text: format!("{name} doesn't answer (a network drive?). Slate opens it as soon as it does."),
+                text: if why.is_empty() {
+                    format!("{name} doesn't answer (a network drive?). Slate opens it as soon as it does.")
+                } else {
+                    format!("{name} can't be read just now{why}. Slate opens it as soon as it can.")
+                },
                 actions: vec![("Try now".into(), NoticeAction::Retry)],
             }
         });
@@ -822,8 +977,9 @@ impl App {
             Some(true) => {
                 let Some(r) = self.tabs[i].restore.take() else { return };
                 self.tabs[i].notice = None;
+                // (back where it was once it's read; if it still can't be, it waits again)
+                self.tabs[i].place = Some(SessionTab { backup: None, pieces: None, ..r.st });
                 self.reopen_as_it_is(i);
-                super::place_tab(&mut self.tabs[i], &r.st);
             }
             Some(false) => {
                 let name = self.tabs[i].title();
@@ -840,7 +996,8 @@ impl App {
     /// Opens tab `i`'s file into it, as it is on disk (a tab that was waiting for it), or leaves the tab empty.
     fn reopen_as_it_is(&mut self, i: usize) {
         if self.tabs[i].doc.path.is_some() {
-            self.reload(i, None);
+            self.tabs[i].reload = None;
+            self.start_load(i, None, false);
         }
     }
 
@@ -1146,44 +1303,10 @@ impl App {
         if self.tabs.get(i).map(|t| t.id) != Some(id) {
             return running;
         }
-        // Loading (conversion of a big UTF-16 / ANSI file).
-        if let Some(job) = self.tabs[i].load_job.as_mut() {
-            if let Some(r) = job.take() {
-                self.tabs[i].load_job = None;
-                let reload = std::mem::replace(&mut self.tabs[i].reload, false);
-                match r {
-                    Ok(doc) => {
-                        if reload {
-                            self.replace_doc(i, doc, None, false);
-                        } else {
-                            let tab = &mut self.tabs[i];
-                            tab.doc = doc;
-                            tab.backup_version = u64::MAX;
-                            tab.view.forget_text();
-                            let head = tab.doc.read(0, 4096);
-                            let name = tab.doc.path.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned());
-                            tab.lang = Lang::detect(name.as_deref(), &head);
-                            self.detect_indent(i);
-                        }
-                    }
-                    Err(e) => {
-                        if reload {
-                            self.tabs[i].notice = Some(Notice {
-                                kind: NoticeKind::Error,
-                                text: format!("Couldn't reload: {}", fileio::friendly_io(&e)),
-                                actions: vec![("Dismiss".into(), NoticeAction::Dismiss)],
-                            });
-                        } else {
-                            let msg = format!("Couldn't open {}: {}", self.tabs[i].title(), fileio::friendly_io(&e));
-                            self.remove_tab(i);
-                            self.flash(msg, true);
-                            return false;
-                        }
-                    }
-                }
-            } else {
-                running = true;
-            }
+        // Reading its file (opening, reloading, converting a big UTF-16 / ANSI file); it may close.
+        running |= self.poll_load(i);
+        if self.tabs.get(i).map(|t| t.id) != Some(id) {
+            return running;
         }
         // Newline index.
         if let Some(job) = self.tabs[i].index_job.as_mut() {
@@ -1280,6 +1403,7 @@ impl App {
                 // A new name, or a new kind of name (notes.txt saved as notes.md): pick the language again.
                 let renamed = tab.doc.path.as_deref().map(ext) != Some(ext(&st.path));
                 tab.doc.path = Some(st.path.clone());
+                tab.canon = Some((st.path.clone(), saved.canon));
                 tab.doc.encoding = st.encoding;
                 tab.doc.disk = saved.disk;
                 tab.doc.mark_saved_at(st.state);

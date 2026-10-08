@@ -58,7 +58,9 @@ Commits use the GitHub no-reply address (repo-local git config); GitHub refuses 
     are tried again; one that keeps failing stops the index (`index_error`: the doc stays pending), never a guessed
     count. Each file source keeps its file's stamp through its own handle (size, write/change times):
     `changed_in_place` tells another program writing into that file (the text read from it isn't the user's any
-    more) from a file that only grew or was replaced by a new one (the handle keeps reading the old one).
+    more) from a file that only grew or was replaced by a new one (the handle keeps reading the old one). Bulk
+    reads (index, hashing, big ranges for search and save, the stamp checks) go through a second handle on the same
+    file (`ReOpenFile`), so the window's block reads don't queue behind them on a slow share.
   - `buffer.rs` — piece table in leaves of ≤256 pieces with cached byte/newline totals. Add buffer for typing;
     big inserts (≥1 MiB) get their own source. `snapshot()` freezes it for worker threads.
   - `document.rs` — undo/redo steps (typing/backspace runs coalesce; `seal()` ends a run), dirty state, change log
@@ -66,7 +68,8 @@ Commits use the GitHub no-reply address (repo-local git config); GitHub refuses 
     `version` is unique across all documents (caches key on it).
   - `io.rs` — open (≤64 MiB into memory; bigger = file-backed + background index; UTF-16/ANSI converted to UTF-8,
     big ones into a self-deleting temp file; ANSI only if the text converts back to exactly the file's bytes, else
-    it stays UTF-8 with every byte kept) and save (temp file `.slate-save-*.tmp` in the same folder + POSIX-
+    it stays UTF-8 with every byte kept; `open`/`reload` do all of it, canonical path and binary check included, on
+    another thread) and save (temp file `.slate-save-*.tmp` in the same folder + POSIX-
     semantics rename with `\\?\` paths, so it works while we still read the old file; then MoveFileEx, then
     ReplaceFile for a file still open on a share/FAT drive — not atomic, so last, with a backup it restores; never
     writes the target in place). Save refuses text read from a file changed in place (`Changed`) and ANSI that
@@ -156,6 +159,10 @@ Commits use the GitHub no-reply address (repo-local git config); GitHub refuses 
   (`check_disk`, then `poll_disk`; a network drive that went away mustn't freeze the window). A clean document
   reloads (one whose lines are still being read, once they are); with unsaved changes the user is told, and for a
   big file another program wrote into, "Keep mine" isn't offered: saving would mix the two versions, so it's refused.
+- Opening and reloading never touch the file system on the UI thread: the tab is there at once and its file is read
+  on another thread (`Tab::load_job`); opening waits up to 150 ms for that (`OPEN_WAIT`), so only a slower file
+  shows "Opening…". "Open already?" goes by name, then by the canonical path found when a file was read or saved.
+  A tab from the session keeps its entry as read (`Tab::place`) until its file is read.
 - The session (session.rs) holds that unsaved text, so: files are flushed to disk before they replace the old ones;
   reading is lenient (one bad tab or a value from a newer version loses nothing else; settings too); Slate deletes
   only backups it wrote or read itself, and backups no tab refers to come back as new tabs; restoring that crashes is
@@ -193,7 +200,8 @@ Commits use the GitHub no-reply address (repo-local git config); GitHub refuses 
   pretends Windows' high contrast is on (`print:theme`, `print:syscaret`, `print:statusbar` check the results).
   `SLATE_DATA_DIR` sets the data folder, `SLATE_TEST_LOG` the log file; `session:save|soon|restore` writes the
   session now, writes it the way the timer does, or restores it. `SLATE_UPDATE_TEST_VERSION=0.1.0` makes Slate
-  believe it's that version (to try the updater against the real latest release, in a scratch folder).
+  believe it's that version (to try the updater against the real latest release, in a scratch folder);
+  `SLATE_TEST_SLOW_OPEN=<ms>` makes reading each file take that much longer (a slow network drive).
 - `tests/smoke.txt` is the smoke test CI runs on the built exe (paths in it are relative to the working folder).
 - `SLATE_TEST_VISIBLE=1` runs the same scripts in the real window (on top, without taking the focus), drawing
   through the real swap chain; `shot:` then captures the screen.
