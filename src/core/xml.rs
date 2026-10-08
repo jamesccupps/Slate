@@ -961,6 +961,18 @@ mod tests {
     }
 
     #[test]
+    fn quotes_in_the_doctypes_comments_and_pis() {
+        // an apostrophe in a comment or a PI of the internal subset starts no string
+        for subset in ["<!-- the catalog's elements -->", "<?pi don't?>"] {
+            let s = format!("<!DOCTYPE catalog [ {subset} <!ELEMENT catalog ANY> ]><catalog><book/></catalog>");
+            let (_, stats) = feed(Mode::Validate, &s, 1).unwrap();
+            assert_eq!(stats, XmlStats { elements: 2, max_depth: 2, roots: 1 }, "{s}");
+            let pretty = fmt(Mode::Pretty, &s).unwrap();
+            assert!(pretty.starts_with(&format!("<!DOCTYPE catalog [ {subset} <!ELEMENT catalog ANY> ]>\n<catalog>\n")), "{pretty}");
+        }
+    }
+
+    #[test]
     fn several_top_level_elements() {
         assert_eq!(fmt(Mode::Pretty, "<a/> <b>x</b>\n<!-- c --><c/>").unwrap(), "<a/>\n<b>x</b>\n<!-- c -->\n<c/>\n");
         let (min, stats) = feed(Mode::Minify, "<a/> <b><c/></b>", 1).unwrap();

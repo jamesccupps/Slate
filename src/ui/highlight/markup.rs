@@ -15,7 +15,8 @@ const COMMENT: u8 = 3;
 const CDATA: u8 = 4;
 /// `<?xml …?>`
 const PI: u8 = 5;
-/// `<!DOCTYPE …>`; `a`: depth of `[…]`.
+/// `<!DOCTYPE …>`; `a`: depth of `[…]`, `b`: in a quoted string (its quote), or in the subset a comment (1) or a
+/// processing instruction (2).
 const DOCTYPE: u8 = 6;
 
 /// `State::mode` inside an HTML `<script>` / `<style>` element.
@@ -72,10 +73,38 @@ fn until(t: &[u8], s: usize, from: usize, end: &[u8], tok: Tok, kind: u8, st: St
     }
 }
 
-/// A `<!DOCTYPE …>` from `s`, scanning from `from` with `depth` open `[`.
-fn doctype(t: &[u8], s: usize, mut i: usize, mut depth: u8, st: State, o: &mut Out) -> Result<usize, State> {
-    while i < t.len() {
+/// A `<!DOCTYPE …>` from `s`, scanning from `i` with `depth` open `[` and in `sub` what hides its brackets and its
+/// `>`: a quoted string (its quote), or in the `[…]` subset a comment (1) or a processing instruction (2), which
+/// are colored as such (`<!-- the catalog's [elements] -->`).
+#[allow(clippy::too_many_arguments)]
+fn doctype(t: &[u8], mut s: usize, mut i: usize, mut depth: u8, mut sub: u16, st: State, o: &mut Out) -> Result<usize, State> {
+    let n = t.len();
+    while i < n {
+        if sub == 1 || sub == 2 {
+            let (end, tok): (&[u8], Tok) = if sub == 1 { (b"-->", Tok::Comment) } else { (b"?>", Tok::Section) };
+            let Some(p) = find(t, i, end) else {
+                o.put(s, n, tok);
+                return Err(State { kind: DOCTYPE, a: depth, b: sub, ..st });
+            };
+            o.put(s, p + end.len(), tok);
+            (i, s, sub) = (p + end.len(), p + end.len(), 0);
+            continue;
+        }
+        if sub != 0 {
+            // in a quoted string
+            let Some(p) = memchr::memchr(sub as u8, &t[i..]) else { break };
+            (i, sub) = (i + p + 1, 0);
+            continue;
+        }
         match t[i] {
+            b'"' | b'\'' => sub = t[i] as u16,
+            b'<' if depth > 0 && (t[i..].starts_with(b"<!--") || t[i..].starts_with(b"<?")) => {
+                o.put(s, i, Tok::Keyword);
+                let comment = t[i + 1] == b'!';
+                (s, sub) = (i, if comment { 1 } else { 2 });
+                i += if comment { 4 } else { 2 };
+                continue;
+            }
             b'[' => depth = depth.saturating_add(1),
             b']' => depth = depth.saturating_sub(1),
             b'>' if depth == 0 => {
@@ -86,8 +115,8 @@ fn doctype(t: &[u8], s: usize, mut i: usize, mut depth: u8, st: State, o: &mut O
         }
         i += 1;
     }
-    o.put(s, t.len(), Tok::Keyword);
-    Err(State { kind: DOCTYPE, a: depth, ..st })
+    o.put(s, n, Tok::Keyword);
+    Err(State { kind: DOCTYPE, a: depth, b: sub, ..st })
 }
 
 /// A quoted attribute value from `s`, closing quote `q` searched from `from`.
@@ -192,7 +221,13 @@ pub(super) fn markup(html: bool, t: &[u8], mut st: State, o: &mut Out) -> State 
             COMMENT => step!(until(t, i, i, b"-->", Tok::Comment, COMMENT, st, o), TEXT),
             CDATA => step!(until(t, i, i, b"]]>", Tok::Str, CDATA, st, o), TEXT),
             PI => step!(until(t, i, i, b"?>", Tok::Section, PI, st, o), TEXT),
-            DOCTYPE => step!(doctype(t, i, i, st.a, st, o), TEXT),
+            DOCTYPE => match doctype(t, i, i, st.a, st.b, st, o) {
+                Ok(e) => {
+                    i = e;
+                    st = State { kind: TEXT, a: 0, b: 0, ..st };
+                }
+                Err(s) => return s,
+            },
             _ => {
                 // text: find the next tag or entity
                 let Some(p) = memchr::memchr2(b'<', b'&', &t[i..]) else { return st };
@@ -221,7 +256,7 @@ pub(super) fn markup(html: bool, t: &[u8], mut st: State, o: &mut Out) -> State 
                     continue;
                 }
                 if rest.starts_with(b"<!") {
-                    step!(doctype(t, j, j + 2, 0, st, o), TEXT);
+                    step!(doctype(t, j, j + 2, 0, 0, st, o), TEXT);
                     continue;
                 }
                 let close = at(t, j + 1) == b'/';
@@ -932,6 +967,18 @@ mod tests {
 
     fn line_has(line: &[(String, Tok)], s: &str, tok: Tok) -> bool {
         line.contains(&(s.to_string(), tok))
+    }
+
+    #[test]
+    fn doctype_subsets() {
+        // in the subset, comments, PIs and quoted values hide brackets and `>`
+        let src = "<!DOCTYPE c [\n  <!-- the c's [elements] > -->\n  <?pi don't ]>?>\n  <!ENTITY e \"]>\">\n]>\n<c a='1'/>\n";
+        let v = view(Lang::Xml, src);
+        assert!(line_has(&v[1], "<!-- the c's [elements] > -->", Tok::Comment));
+        assert!(line_has(&v[2], "<?pi don't ]>?>", Tok::Section));
+        assert!(line_has(&v[3], "  <!ENTITY e \"]>\">", Tok::Keyword));
+        assert!(line_has(&v[5], "c", Tok::Tag) && line_has(&v[5], "'1'", Tok::Str));
+        assert_eq!(end_state(Lang::Xml, src), State::START);
     }
 
     #[test]

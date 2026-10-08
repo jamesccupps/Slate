@@ -61,8 +61,24 @@ enum At {
     CData(u8),
     /// A processing instruction; whether a `?` was just before.
     Pi(bool),
-    /// `<!DOCTYPE …>` or another declaration: its `[…]` depth, and its quote if inside one.
-    Decl(u32, u8),
+    /// `<!DOCTYPE …>` or another declaration: its `[…]` depth, and what in it is being read.
+    Decl(u32, Sub),
+}
+
+/// What's being read in a declaration: in its `[…]` internal subset, comments and processing instructions are
+/// skipped as they are (a quote or a bracket in them is just a character: `<!-- the catalog's elements -->`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Sub {
+    None,
+    Quote(u8),
+    /// In the subset: `<`, `<!` or `<!-` just read.
+    Lt,
+    Bang,
+    BangDash,
+    /// A comment in the subset; the `-` just before (up to 2).
+    Comment(u8),
+    /// A processing instruction in the subset; whether a `?` was just before.
+    Pi(bool),
 }
 
 /// An end tag closes the element it names only if that is among the innermost ones this many (a document left so
@@ -339,7 +355,7 @@ impl Scanner {
                             }
                         }
                         _ => {
-                            self.at = At::Decl(0, 0);
+                            self.at = At::Decl(0, Sub::None);
                             continue;
                         }
                     };
@@ -374,14 +390,29 @@ impl Scanner {
                         _ => At::Pi(false),
                     };
                 }
-                At::Decl(depth, quote) => {
-                    self.at = match c {
-                        _ if quote != 0 => At::Decl(depth, if c == quote { 0 } else { quote }),
-                        b'"' | b'\'' => At::Decl(depth, c),
-                        b'[' => At::Decl(depth + 1, 0),
-                        b']' => At::Decl(depth.saturating_sub(1), 0),
-                        b'>' if depth == 0 => At::Text,
-                        _ => self.at,
+                At::Decl(depth, sub) => {
+                    let decl = |sub| At::Decl(depth, sub);
+                    self.at = match (sub, c) {
+                        (Sub::Quote(q), _) => decl(if c == q { Sub::None } else { sub }),
+                        (Sub::Comment(2), b'>') | (Sub::Pi(true), b'>') => decl(Sub::None),
+                        (Sub::Comment(d), b'-') => decl(Sub::Comment((d + 1).min(2))),
+                        (Sub::Comment(_), _) => decl(Sub::Comment(0)),
+                        (Sub::Pi(_), _) => decl(Sub::Pi(c == b'?')),
+                        (Sub::Lt, b'!') => decl(Sub::Bang),
+                        (Sub::Lt, b'?') => decl(Sub::Pi(false)),
+                        (Sub::Bang, b'-') => decl(Sub::BangDash),
+                        (Sub::BangDash, b'-') => decl(Sub::Comment(0)),
+                        (Sub::Lt | Sub::Bang | Sub::BangDash, _) => {
+                            // another declaration (`<!ELEMENT …>`): this byte is read as part of it
+                            self.at = decl(Sub::None);
+                            continue;
+                        }
+                        (Sub::None, b'"' | b'\'') => decl(Sub::Quote(c)),
+                        (Sub::None, b'<') if depth > 0 => decl(Sub::Lt),
+                        (Sub::None, b'[') => At::Decl(depth + 1, Sub::None),
+                        (Sub::None, b']') => At::Decl(depth.saturating_sub(1), Sub::None),
+                        (Sub::None, b'>') if depth == 0 => At::Text,
+                        (Sub::None, _) => self.at,
                     };
                 }
             }
@@ -747,6 +778,20 @@ mod tests {
             }
             for c in &top.items {
                 preview(&whole, c, 80);
+            }
+        }
+    }
+
+    #[test]
+    fn comments_and_pis_in_the_doctype_hide_their_quotes() {
+        for subset in ["<!-- the catalog's elements -->", "<?pi don't?>", "<!ENTITY co \"Acme ]> Inc\">", "<!-- a [ b > -->"] {
+            let s = format!("<!DOCTYPE catalog [ {subset} <!ELEMENT catalog ANY> ]>\n<catalog><book/></catalog>\n");
+            for k in [1, 2, 3, 1 << 20] {
+                let src = Bits(s.as_bytes().to_vec(), k);
+                let top = children(&src, None, None);
+                assert_eq!(names(&src, &top), ["catalog"], "{s}");
+                let cat = top.items[0];
+                assert_eq!(names(&src, &children(&src, Some(cat.start), None)), ["book"], "{s}");
             }
         }
     }

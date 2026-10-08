@@ -1446,7 +1446,9 @@ mod tests {
         ];
         let extra: &[&str] = match lang {
             Lang::Json => &["//", "/*", "*/", "true"],
-            Lang::Xml | Lang::Html => &["<!--", "-->", "<![CDATA[", "]]>", "<?", "?>", "<a", "</a>", "<script>", "</script>", "<style>", "&amp;"],
+            Lang::Xml | Lang::Html => &[
+                "<!--", "-->", "<![CDATA[", "]]>", "<?", "?>", "<a", "</a>", "<script>", "</script>", "<style>", "&amp;", "<!DOCTYPE x [", "]>",
+            ],
             Lang::Php => &["<?php", "<?=", "?>", "<a href=\"", "<script>", "</script>", "<!--", "//", "/*", "*/", "$x"],
             Lang::Markdown => &[
                 "```", "`", "<!--", "-->", "# ", "> ", "- ", "**", "_", "[", "](", "    ", "\n```rust\n", "\n```html\n", "\n~~~sql\n",
