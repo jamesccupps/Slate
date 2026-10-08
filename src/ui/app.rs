@@ -1155,20 +1155,33 @@ impl App {
         self.g.fill(r, t.frame);
         self.g.line(r.x, r.y + 0.5, r.right(), r.y + 0.5, t.border, 1.0);
         let fonts_ui = self.fonts.ui.clone();
-        let (pos, items, counts, size) = self.status_items();
+        let StatusTexts { mut pos, pos_short, mut items, counts, size } = self.status_items();
+        // In a narrow window things give way, the least needed first: the counts, the selection's words and lines,
+        // the indentation, the line endings, the language.
+        let g = &self.g;
+        let w = |s: &str| g.measure(s, &fonts_ui).0;
+        let fits = |pos: &str, items: &[(StatusItem, String)], right: &str| {
+            6.0 + w(pos) + 40.0 + items.iter().map(|(_, l)| w(l) + 20.0).sum::<f32>() + w(right) + 24.0 <= r.w
+        };
+        let mut right = match &counts {
+            Some(c) => format!("{c}  ·  {size}"),
+            None => size.clone(),
+        };
+        if !fits(&pos, &items, &right) {
+            right = size;
+        }
+        if !fits(&pos, &items, &right) {
+            pos = pos_short;
+        }
+        for less in [StatusItem::Indent, StatusItem::Eol, StatusItem::Lang] {
+            if !fits(&pos, &items, &right) {
+                items.retain(|(k, _)| *k != less);
+            }
+        }
         let (pw, _) = self.g.measure(&pos, &fonts_ui);
         let pr = Rect::new(r.x + 6.0, r.y + 2.0, pw + 16.0, r.h - 4.0);
-        // Right-aligned items, after the size at the end (with the counts before it, when there's room).
+        // Right-aligned items, after the size (and the counts) at the end.
         let mut x = r.right() - 12.0;
-        let items_w: f32 = items.iter().map(|(_, l)| self.g.measure(l, &fonts_ui).0 + 20.0).sum();
-        let right = match counts {
-            Some(c) => {
-                let both = format!("{c}  ·  {size}");
-                let (bw, _) = self.g.measure(&both, &fonts_ui);
-                if x - bw - 12.0 - items_w > pr.right() + 24.0 { both } else { size }
-            }
-            None => size,
-        };
         let mut rects = Vec::new();
         let (sw, _) = self.g.measure(&right, &fonts_ui);
         self.g.text(&right, &fonts_ui, Rect::new(x - sw, r.y, sw + 2.0, r.h), t.text_dim, Align::Left);
@@ -1206,9 +1219,8 @@ impl App {
         self.status_rects = rects;
     }
 
-    /// What the status bar says: the position (with what's selected), the items on the right (left to right), the
-    /// document's word and character counts (when known) and its size.
-    pub fn status_items(&mut self) -> (String, Vec<(StatusItem, String)>, Option<String>, String) {
+    /// What the status bar says.
+    pub fn status_items(&mut self) -> StatusTexts {
         let counts = self.doc_counts_now();
         let sel_counts = self.selection_counts();
         let indent = match self.indent_now() {
@@ -1234,7 +1246,8 @@ impl App {
         let counts = counts
             .filter(|c| c.chars > 0)
             .map(|c| format!("{}, {}", plural(c.words, "word", "words"), plural(c.chars, "character", "characters")));
-        (position_text(tab, sel_counts), items, counts, format_size(doc.len()))
+        let (pos, pos_short) = position_text(tab, sel_counts);
+        StatusTexts { pos, pos_short, items, counts, size: format_size(doc.len()) }
     }
 
     /// The active document's characters and words: counted at once when it's small, on another thread up to
@@ -1378,6 +1391,18 @@ impl App {
     }
 }
 
+/// What the status bar says (`App::status_items`).
+pub struct StatusTexts {
+    /// The position with what's selected, and the same without the selection's words and lines (for a narrow window).
+    pub pos: String,
+    pub pos_short: String,
+    /// The items on the right, left to right.
+    pub items: Vec<(StatusItem, String)>,
+    /// The document's word and character counts (when known), and its size.
+    pub counts: Option<String>,
+    pub size: String,
+}
+
 pub fn tab_progress(tab: &Tab) -> Option<f32> {
     if let Some(j) = &tab.load_job {
         return Some(j.fraction());
@@ -1420,7 +1445,8 @@ pub fn group(n: u64) -> String {
     out
 }
 
-fn position_text(tab: &Tab, sel_counts: Option<Counts>) -> String {
+/// The caret's place ("Ln 3, Col 9") with what's selected, in full and without the selection's words and lines.
+fn position_text(tab: &Tab, sel_counts: Option<Counts>) -> (String, String) {
     let doc = &tab.doc;
     let sel = tab.view.sel;
     let caret = sel.caret;
@@ -1433,31 +1459,35 @@ fn position_text(tab: &Tab, sel_counts: Option<Counts>) -> String {
     } else {
         None
     };
-    let mut s = match (line, col) {
+    let s = match (line, col) {
         (Some(l), Some(c)) => format!("Ln {}, Col {}", group(l + 1), group(c)),
         (Some(l), None) => format!("Ln {}, byte {}", group(l + 1), group(caret - ls + 1)),
         (None, _) => format!("Byte {}", group(caret + 1)),
     };
-    if !sel.is_empty() {
-        let n = sel.end() - sel.start();
-        match sel_counts {
-            Some(c) => {
-                // (lines: from the line of the start to that of the end)
-                let lines = match (doc.line_of(sel.start()), doc.line_of(sel.end())) {
-                    (Some(a), Some(b)) => b - a + 1,
-                    _ => 1,
-                };
-                let words = plural(c.words, "word", "words");
-                if lines > 1 {
-                    s.push_str(&format!("  ({} selected, {words}, {} lines)", group(c.chars), group(lines)));
-                } else {
-                    s.push_str(&format!("  ({} selected, {words})", group(c.chars)));
-                }
-            }
-            None => s.push_str(&format!("  ({} selected)", format_size(n))),
+    if sel.is_empty() {
+        return (s.clone(), s);
+    }
+    match sel_counts {
+        Some(c) => {
+            // (lines: from the line of the start to that of the end)
+            let lines = match (doc.line_of(sel.start()), doc.line_of(sel.end())) {
+                (Some(a), Some(b)) => b - a + 1,
+                _ => 1,
+            };
+            let words = plural(c.words, "word", "words");
+            let chars = group(c.chars);
+            let full = if lines > 1 {
+                format!("{s}  ({chars} selected, {words}, {} lines)", group(lines))
+            } else {
+                format!("{s}  ({chars} selected, {words})")
+            };
+            (full, format!("{s}  ({chars} selected)"))
+        }
+        None => {
+            let s = format!("{s}  ({} selected)", format_size(sel.end() - sel.start()));
+            (s.clone(), s)
         }
     }
-    s
 }
 
 fn plural(n: u64, one: &str, many: &str) -> String {

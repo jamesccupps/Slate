@@ -377,11 +377,11 @@ fn describe(cell: &Cell, what: &str) -> String {
             }
         }
         "statusbar" => {
-            let (pos, items, counts, size) = a.status_items();
-            let mut parts = vec![pos];
-            parts.extend(items.into_iter().map(|(_, l)| l));
-            parts.extend(counts);
-            parts.push(size);
+            let s = a.status_items();
+            let mut parts = vec![s.pos];
+            parts.extend(s.items.into_iter().map(|(_, l)| l));
+            parts.extend(s.counts);
+            parts.push(s.size);
             parts.join(" | ")
         }
         "closed" => a
