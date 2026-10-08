@@ -53,17 +53,25 @@ Commits use the GitHub no-reply address (repo-local git config); GitHub refuses 
 - `src/core/` — the engine, no UI. Unit-tested (`cargo test --lib`).
   - `source.rs` — immutable byte sources: memory, or a file read on demand via a 64 KiB block cache (opened with
     full sharing, never locked). Newline index = cumulative count per 64 KiB block, built in the background; a file
-    that only grew (a log) reuses the old index if sampled blocks still match. Reads never fail: missing bytes read
-    as zeros and bump `read_errors` (save refuses to write then).
+    that only grew (a log) reuses the old index if sampled blocks (and the old last, incomplete block) still match.
+    Reads never fail: missing bytes read as zeros and bump `read_errors` (save refuses to write then). Index reads
+    are tried again; one that keeps failing stops the index (`index_error`: the doc stays pending), never a guessed
+    count. Each file source keeps its file's stamp through its own handle (size, write/change times):
+    `changed_in_place` tells another program writing into that file (the text read from it isn't the user's any
+    more) from a file that only grew or was replaced by a new one (the handle keeps reading the old one).
   - `buffer.rs` — piece table in leaves of ≤256 pieces with cached byte/newline totals. Add buffer for typing;
     big inserts (≥1 MiB) get their own source. `snapshot()` freezes it for worker threads.
   - `document.rs` — undo/redo steps (typing/backspace runs coalesce; `seal()` ends a run), dirty state, change log
     for views, char/word navigation. "Pending" docs: big file whose index isn't done — readable, not editable.
     `version` is unique across all documents (caches key on it).
   - `io.rs` — open (≤64 MiB into memory; bigger = file-backed + background index; UTF-16/ANSI converted to UTF-8,
-    big ones into a self-deleting temp file) and save (temp file `.slate-save-*.tmp` in the same folder + POSIX-
-    semantics rename with `\\?\` paths, so it works while we still read the old file; MoveFileEx fallback; never
-    writes the target in place). Stale temp files of dead processes are cleaned up.
+    big ones into a self-deleting temp file; ANSI only if the text converts back to exactly the file's bytes, else
+    it stays UTF-8 with every byte kept) and save (temp file `.slate-save-*.tmp` in the same folder + POSIX-
+    semantics rename with `\\?\` paths, so it works while we still read the old file; then MoveFileEx, then
+    ReplaceFile for a file still open on a share/FAT drive — not atomic, so last, with a backup it restores; never
+    writes the target in place). Save refuses text read from a file changed in place (`Changed`) and ANSI that
+    would turn characters into "?" (`Lossy`, unless the user said so). Stale temp files of dead processes are
+    cleaned up.
   - `search.rs` — byte-regex search in windows (8 MB, 64 KB overlap, grows for long matches), find next/prev,
     count all, streaming replace-all.
   - `json.rs` — one streaming tokenizer for pretty-print / minify / validate (JSON Lines OK), errors with offsets.
@@ -72,7 +80,9 @@ Commits use the GitHub no-reply address (repo-local git config); GitHub refuses 
   - `lines.rs` — sort (natural, ignoring case), remove duplicate / blank lines, trim line ends, change case.
   - `jsonnav.rs` — lazy JSON structure: the children of one container (lists over 100,000 keep every 64th child
     and rescan between them), the path at an offset (`data[1203].name`), previews.
-  - `text.rs` — encoding/EOL detection, UTF-16/ANSI codecs, display decoding (control chars → symbols), char classes.
+  - `text.rs` — encoding/EOL detection (mostly-UTF-8 with a few bad bytes stays UTF-8), UTF-16/ANSI codecs (ANSI
+    = the system code page, Windows-1252 under the UTF-8 code page option), display decoding (control chars →
+    symbols), char classes.
   - `job.rs` — background jobs with progress/cancel, notify the UI by posting a window message.
 - `src/ui/` — the Win32 app (see the module docs at the top of each file).
   - `highlight.rs` (+ `highlight/code.rs`, `highlight/markup.rs`) — syntax coloring for ~30 languages: hand-written
@@ -110,7 +120,12 @@ Commits use the GitHub no-reply address (repo-local git config); GitHub refuses 
 - Never lose work: closing the window keeps unsaved documents ≤64 MiB in the session (like Windows 11 Notepad);
   only bigger ones (or all, if the session can't be written) are asked about. A tab closed while it is saving closes
   once the save is done — unless the text changed meanwhile. On shutdown, unsaved work that can't be kept blocks it
-  with a reason (`ShutdownBlockReasonCreate`), so Windows asks the user.
+  with a reason (`ShutdownBlockReasonCreate`), so Windows asks the user. Saving in ANSI never turns characters into
+  "?" without asking first (Save as UTF-8 / ANSI anyway / Cancel), and a tab or window never closes after such a save.
+- Files changed by other programs are looked for every 2 s and when the window is activated, on a background thread
+  (`check_disk`, then `poll_disk`; a network drive that went away mustn't freeze the window). A clean document
+  reloads (one whose lines are still being read, once they are); with unsaved changes the user is told, and for a
+  big file another program wrote into, "Keep mine" isn't offered: saving would mix the two versions, so it's refused.
 - The session (session.rs) holds that unsaved text, so: files are flushed to disk before they replace the old ones;
   reading is lenient (one bad tab or a value from a newer version loses nothing else; settings too); Slate deletes
   only backups it wrote or read itself, and backups no tab refers to come back as new tabs; restoring that crashes is

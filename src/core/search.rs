@@ -101,7 +101,8 @@ impl Matcher {
         found
     }
 
-    /// Last match that starts at or after `from` and ends at or before `to`.
+    /// Last match that starts at or after `from` and ends at or before `to`. The text after `to` still counts for
+    /// whether something is a match (`\b`, `$`): the whole word "foo" isn't in "foobar", wherever the caret is.
     pub fn find_back(&self, h: &dyn Haystack, from: u64, to: u64, ctx: Option<&Ctx>) -> Option<(u64, u64)> {
         let len = h.hay_len();
         let to = to.min(len);
@@ -114,7 +115,7 @@ impl Matcher {
             }
             let start = end.saturating_sub(win).max(from);
             let hs = start.saturating_sub(CTX);
-            let he = (end + OVERLAP).min(to);
+            let he = (end + OVERLAP).min(len);
             let hay = h.hay(hs, he, &mut scratch);
             let mut best = None;
             let mut at = (start - hs) as usize;
@@ -124,7 +125,10 @@ impl Matcher {
                 if ms >= end {
                     break;
                 }
-                best = Some((ms, hs + m.end() as u64));
+                let me = hs + m.end() as u64;
+                if me <= to {
+                    best = Some((ms, me));
+                }
                 at = next_at(hay, &m);
             }
             if best.is_some() {
@@ -222,9 +226,14 @@ impl Matcher {
             .collect()
     }
 
-    /// Whether `text` is exactly one match (to decide if the selection is the current match).
-    pub fn is_match_exactly(&self, text: &[u8]) -> bool {
-        self.re.find(text).is_some_and(|m| m.start() == 0 && m.end() == text.len())
+    /// Whether `[s, e)` of `h` is a match where it is, with the text around it (to decide if the selection is the
+    /// current match): with `\b`, `^`, `$` or a run that goes on, a piece of text alone can match where it doesn't.
+    pub fn is_match_at(&self, h: &dyn Haystack, s: u64, e: u64) -> bool {
+        let hs = s.saturating_sub(CTX);
+        let he = (e + CTX).min(h.hay_len());
+        let mut scratch = Vec::new();
+        let hay = h.hay(hs, he, &mut scratch);
+        self.re.find_at(hay, (s - hs) as usize).is_some_and(|m| hs + m.start() as u64 == s && hs + m.end() as u64 == e)
     }
 
     /// The replacement for the match at `[s, e)` of `hay` (expands `$1`, `${name}` in regex mode).
@@ -375,6 +384,28 @@ mod tests {
         let last = memchr::memmem::rfind(&text, b"needle1").unwrap() as u64;
         assert_eq!(m.find_back(&snap, 0, snap.len(), None), Some((last, last + 7)));
         assert_eq!(m.find_back(&snap, 0, first + 6, None), None);
+    }
+
+    #[test]
+    fn find_previous_and_the_current_match_see_the_text_around_them() {
+        let snap = fragmented(b"foobar foo\nabc def\nabc\n");
+        let word = Matcher::new(&Query { whole_word: true, ..q("foo") }).unwrap();
+        // the caret between "foo" and "bar": "foo" isn't a whole word there
+        assert_eq!(word.find_back(&snap, 0, 3, None), None);
+        assert_eq!(word.find_back(&snap, 0, snap.len(), None), Some((7, 10)));
+        let end = Matcher::new(&Query { regex: true, ..q("abc$") }).unwrap();
+        // the caret after the first "abc", which isn't at a line end
+        assert_eq!(end.find_back(&snap, 0, 14, None), None);
+        assert_eq!(end.find_back(&snap, 0, snap.len(), None), Some((19, 22)));
+        // is the selection a match where it is?
+        assert!(!word.is_match_at(&snap, 0, 3));
+        assert!(word.is_match_at(&snap, 7, 10));
+        let run = Matcher::new(&Query { regex: true, ..q("o+") }).unwrap();
+        assert!(!run.is_match_at(&snap, 1, 2)); // part of "oo"
+        assert!(run.is_match_at(&snap, 1, 3));
+        let empty = Matcher::new(&Query { regex: true, ..q("^") }).unwrap();
+        assert!(empty.is_match_at(&snap, 11, 11));
+        assert!(!empty.is_match_at(&snap, 12, 12));
     }
 
     #[test]

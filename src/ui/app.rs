@@ -49,6 +49,16 @@ pub struct SaveTask {
     pub again: bool,
 }
 
+/// What a background look at a tab's file found (see `App::check_disk`).
+pub struct DiskCheck {
+    pub id: u64,
+    /// The document's `disk` when the check started.
+    pub old: crate::core::document::DiskInfo,
+    pub now: Option<crate::core::document::DiskInfo>,
+    /// Another program wrote into a file the (unsaved) text is read from: the text isn't the user's any more.
+    pub in_place: bool,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TaskKind {
     Format(Fmt),
@@ -156,6 +166,11 @@ pub struct Tab {
     pub discard: bool,
     /// JSON path bar and structure panel state.
     pub structure: super::structure::Structure,
+    /// A save stopped because ANSI can't hold some characters: (path, close after, closing the window), for the
+    /// question that follows (`Deferred::AskLossy`).
+    pub ask_lossy: Option<(PathBuf, bool, bool)>,
+    /// The document's path and its canonical form, worked out once (for "is this file open already?").
+    pub canon: Option<(PathBuf, Option<PathBuf>)>,
 }
 
 impl Tab {
@@ -180,6 +195,8 @@ impl Tab {
             seen_disk: None,
             discard: false,
             structure: Default::default(),
+            ask_lossy: None,
+            canon: None,
         }
     }
 
@@ -210,6 +227,8 @@ pub enum Deferred {
     StatusMenu(StatusItem),
     /// "Slate x.y.z is available — update?"
     UpdatePrompt,
+    /// Saving tab (id) as ANSI would turn some characters into "?": save as UTF-8, as ANSI anyway, or not.
+    AskLossy(u64),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -316,6 +335,8 @@ pub struct App {
     pub mouse_tracking: bool,
     /// `g.generation` the cached layouts were made for.
     pub gfx_generation: u64,
+    /// Looking at the open files on disk (a network drive that went away can take long to answer).
+    pub disk_job: Option<Job<Vec<DiskCheck>>>,
 }
 
 pub const ZOOM_STEPS: [f32; 15] = [0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0, 4.0, 5.0];
@@ -389,6 +410,7 @@ impl App {
             session_job: None,
             mouse_tracking: false,
             gfx_generation: 0,
+            disk_job: None,
         };
         app.apply_theme();
         app

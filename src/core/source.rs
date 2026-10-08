@@ -5,14 +5,28 @@
 //! Reads never fail from the caller's point of view: if the file shrank or became unreadable, the missing bytes
 //! read as zeros and `read_errors` goes up. The UI shows a warning; anything that writes data out (save) checks
 //! the counter and refuses to write zeros to disk.
+//!
+//! A file source also keeps what its file looked like through its own handle when it was opened (`Stamp`).
+//! Another program writing into that very file (rather than putting a new file in its place, which leaves the
+//! handle on the old one) means the parts of a document still read from it aren't what the user had any more:
+//! `changed_in_place` tells, and saving refuses to mix the two. The index is only ever built from bytes that
+//! were read: a read that keeps failing stops it (`index_error`), so line commands never trust a guessed count.
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::os::windows::fs::{FileExt, OpenOptionsExt};
+use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
+
+use windows::Win32::Foundation::HANDLE;
+use windows::Win32::Storage::FileSystem::{
+    BY_HANDLE_FILE_INFORMATION, FILE_BASIC_INFO, FileBasicInfo, GetFileInformationByHandle,
+    GetFileInformationByHandleEx,
+};
 
 pub const BLOCK: u64 = 64 * 1024;
 const CACHE_BLOCKS: usize = 512; // 32 MiB per file source
@@ -20,6 +34,11 @@ const SHARE_ALL: u32 = 0x1 | 0x2 | 0x4; // FILE_SHARE_READ | FILE_SHARE_WRITE | 
 const FILE_FLAG_DELETE_ON_CLOSE: u32 = 0x0400_0000;
 const FILE_ATTRIBUTE_TEMPORARY: u32 = 0x100;
 const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
+/// Complete blocks a fingerprint samples, spread over the file (plus its last complete block).
+const SAMPLES: u64 = 32;
+/// Waits before trying a failed index read again (a network drive that dropped for a moment, a region another
+/// program had locked).
+const RETRY_MS: [u64; 3] = if cfg!(test) { [60, 120, 240] } else { [100, 500, 2000] };
 
 /// Newline index: `cum[i]` is the number of `\n` bytes before block `i`. Blocks `0..cum.len()-1` are indexed;
 /// while a file is still being indexed in the background only a prefix is.
@@ -92,7 +111,8 @@ struct BlockCache {
 
 enum Store {
     Mem(Box<[u8]>),
-    File { file: File, cache: Mutex<BlockCache>, path: PathBuf, temp: bool },
+    /// `opened`: the file's stamp and identity through `file` when this source was made.
+    File { file: File, cache: Mutex<BlockCache>, path: PathBuf, temp: bool, opened: Option<(Stamp, FileId)> },
 }
 
 pub struct Source {
@@ -100,14 +120,63 @@ pub struct Source {
     len: u64,
     index: RwLock<NlIndex>,
     read_errors: AtomicU64,
-    /// Hashes of sample blocks, taken when the index was finished (see `reuse_index_from`).
+    /// Hashes of sample blocks of the bytes the index was built from (see `reuse_index_from`, `changed_in_place`).
     fingerprint: Mutex<Option<Fingerprint>>,
+    /// The samples `reuse_index_from` checked, for the part of the index it took over.
+    reused: Mutex<Vec<(u64, u64)>>,
+    /// A stamp the file was last found to only have grown (or got new times) at: no need to check it again.
+    verified: Mutex<Option<Stamp>>,
+    /// Why building the index stopped: the file couldn't be read, or changed while it was read.
+    index_error: Mutex<Option<String>>,
 }
 
-/// What a file looked like when it was indexed: hashes of up to 18 complete blocks spread over it.
+/// What a file looks like through a handle: its size, and its last-write and change times. Another program
+/// writing to the file changes it; a new file put in its place (by renaming over it) doesn't, as the handle stays
+/// on the old one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stamp {
+    pub size: u64,
+    pub written: i64,
+    pub changed: i64,
+}
+
+/// Which file a handle is on: the volume's serial number and the file's index on that volume.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FileId {
+    pub volume: u32,
+    pub index: u64,
+}
+
+/// The stamp and identity of the file `file` is open on (None if the file system won't say).
+pub fn stamp_of(file: &File) -> Option<(Stamp, FileId)> {
+    let h = HANDLE(file.as_raw_handle());
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    let mut basic = FILE_BASIC_INFO::default();
+    unsafe {
+        GetFileInformationByHandle(h, &mut info).ok()?;
+        GetFileInformationByHandleEx(
+            h,
+            FileBasicInfo,
+            &mut basic as *mut _ as *mut core::ffi::c_void,
+            std::mem::size_of::<FILE_BASIC_INFO>() as u32,
+        )
+        .ok()?;
+    }
+    let size = ((info.nFileSizeHigh as u64) << 32) | info.nFileSizeLow as u64;
+    let index = ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64;
+    Some((
+        Stamp { size, written: basic.LastWriteTime, changed: basic.ChangeTime },
+        FileId { volume: info.dwVolumeSerialNumber, index },
+    ))
+}
+
+/// What a file held when it was indexed: hashes of sample blocks (complete ones spread over it) and of the
+/// incomplete block at its end, if any (where a file that only grows is written next).
 #[derive(Clone, Debug)]
 struct Fingerprint {
+    len: u64,
     samples: Vec<(u64, u64)>,
+    tail: Option<u64>,
 }
 
 /// Which complete blocks of a file of `len` bytes a fingerprint samples.
@@ -116,11 +185,75 @@ fn sample_blocks(len: u64) -> Vec<u64> {
     if full == 0 {
         return Vec::new();
     }
-    let mut v: Vec<u64> = (0..=17).map(|k| full * k / 17).map(|b| b.min(full - 1)).collect();
+    let mut v: Vec<u64> = (0..SAMPLES).map(|k| full * k / SAMPLES).collect();
     v.push(full - 1);
     v.sort_unstable();
     v.dedup();
     v
+}
+
+/// Keeps at most `max` (at least 2) of the sorted samples `v`, evenly spread, the first and last among them.
+fn thin(v: &mut Vec<(u64, u64)>, max: usize) {
+    let n = v.len();
+    if n > max {
+        *v = (0..max).map(|k| v[k * (n - 1) / (max - 1)]).collect();
+    }
+}
+
+fn hash_bytes(data: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    data.hash(&mut h);
+    h.finish()
+}
+
+/// Reads all of `buf` at `off` (an error if the file ends first). Counts nothing.
+fn read_exact_at(file: &File, off: u64, buf: &mut [u8]) -> io::Result<()> {
+    let mut done = 0;
+    while done < buf.len() {
+        match file.seek_read(&mut buf[done..], off + done as u64) {
+            Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
+            Ok(n) => done += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// `read_exact_at`, trying again a few times (`RETRY_MS`) while it fails; gives up early when cancelled.
+fn read_retrying(file: &File, off: u64, buf: &mut [u8], cancel: &AtomicBool) -> io::Result<()> {
+    let mut r = read_exact_at(file, off, buf);
+    for ms in RETRY_MS {
+        if r.is_ok() {
+            break;
+        }
+        let until = Instant::now() + Duration::from_millis(ms);
+        while Instant::now() < until {
+            if cancel.load(Ordering::Relaxed) {
+                return r;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        r = read_exact_at(file, off, buf);
+    }
+    r
+}
+
+/// Why a read failed, in a few words for the user.
+fn read_failure(e: &io::Error) -> String {
+    match (e.kind(), e.raw_os_error()) {
+        (io::ErrorKind::UnexpectedEof, _) => "it got shorter while Slate was reading it".into(),
+        (_, Some(33)) => "another program has locked part of it".into(),
+        (_, Some(53 | 59 | 64 | 121 | 1231)) => "the network drive stopped answering".into(),
+        _ => {
+            let s = e.to_string();
+            match s.find(" (os error") {
+                Some(i) => s[..i].trim_end_matches('.').to_string(),
+                None => s,
+            }
+        }
+    }
 }
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -160,12 +293,19 @@ impl Source {
         let mut b = IndexBuilder::new();
         b.push(&data);
         let len = data.len() as u64;
+        Source::new(Store::Mem(data.into_boxed_slice()), len, b.finish())
+    }
+
+    fn new(store: Store, len: u64, index: NlIndex) -> Source {
         Source {
-            store: Store::Mem(data.into_boxed_slice()),
+            store,
             len,
-            index: RwLock::new(b.finish()),
+            index: RwLock::new(index),
             read_errors: AtomicU64::new(0),
             fingerprint: Mutex::new(None),
+            reused: Mutex::new(Vec::new()),
+            verified: Mutex::new(None),
+            index_error: Mutex::new(None),
         }
     }
 
@@ -180,46 +320,78 @@ impl Source {
     /// Wraps an already written file (a temp file, or a file just saved) whose index is known.
     pub fn from_file(file: File, len: u64, path: PathBuf, temp: bool, index: Option<NlIndex>) -> Source {
         let indexed = index.as_ref().is_some_and(|i| i.complete);
-        let s = Source {
-            store: Store::File {
-                file,
-                cache: Mutex::new(BlockCache { map: HashMap::new(), tick: 0 }),
-                path,
-                temp,
-            },
-            len,
-            index: RwLock::new(index.unwrap_or_else(NlIndex::empty)),
-            read_errors: AtomicU64::new(0),
-            fingerprint: Mutex::new(None),
-        };
+        let opened = stamp_of(&file);
+        let cache = Mutex::new(BlockCache { map: HashMap::new(), tick: 0 });
+        let s = Source::new(Store::File { file, cache, path, temp, opened }, len, index.unwrap_or_else(NlIndex::empty));
         if indexed && !temp {
             *s.fingerprint.lock().unwrap() = s.take_fingerprint(s.len);
         }
         s
     }
 
-    /// Hashes of the sample blocks of the first `len` bytes, read straight from the file (None if a read failed).
+    /// The fingerprint of the first `len` bytes, read straight from the file (None if a read failed).
     fn take_fingerprint(&self, len: u64) -> Option<Fingerprint> {
         let mut samples = Vec::new();
         for b in sample_blocks(len) {
-            samples.push((b, self.hash_block(b)?));
+            samples.push((b, self.hash_range(b * BLOCK, (b + 1) * BLOCK)?));
         }
-        Some(Fingerprint { samples })
+        let t = len / BLOCK * BLOCK;
+        let tail = if t < len { Some(self.hash_range(t, len)?) } else { None };
+        Some(Fingerprint { len, samples, tail })
     }
 
-    fn hash_block(&self, b: u64) -> Option<u64> {
-        use std::hash::{Hash, Hasher};
+    /// Hash of `[a, b)` read straight from the file (None if the file doesn't have all of it or the read fails).
+    fn hash_range(&self, a: u64, b: u64) -> Option<u64> {
         let Store::File { file, .. } = &self.store else { return None };
-        if (b + 1) * BLOCK > self.len {
+        if b > self.len {
             return None;
         }
-        let mut buf = vec![0u8; BLOCK as usize];
-        if !self.file_read(file, b * BLOCK, &mut buf) {
-            return None;
+        let mut buf = vec![0u8; (b - a) as usize];
+        read_exact_at(file, a, &mut buf).ok()?;
+        Some(hash_bytes(&buf))
+    }
+
+    /// Whether this source's file still has what `fp` saw, at its samples and its incomplete last block.
+    fn matches(&self, fp: &Fingerprint) -> bool {
+        if self.len < fp.len {
+            return false;
         }
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        buf.hash(&mut h);
-        Some(h.finish())
+        if fp.samples.iter().any(|&(b, h)| self.hash_range(b * BLOCK, (b + 1) * BLOCK) != Some(h)) {
+            return false;
+        }
+        fp.tail.is_none_or(|h| self.hash_range(fp.len / BLOCK * BLOCK, fp.len) == Some(h))
+    }
+
+    /// Whether another program has written into the file this source reads since it was opened, so it no longer
+    /// holds what was read from it. A file that only grew (a log being written) or only got new times hasn't:
+    /// when the size or times differ, the fingerprint's samples are read again to tell. A file put in place of
+    /// ours (renamed over it) doesn't count either: the handle still reads the old one. Memory and temp files are
+    /// never changed by others.
+    pub fn changed_in_place(&self) -> bool {
+        let Store::File { file, temp: false, opened: Some((then, _)), .. } = &self.store else { return false };
+        let Some((now, _)) = stamp_of(file) else { return false };
+        if now == *then || *self.verified.lock().unwrap() == Some(now) {
+            return false;
+        }
+        if now.size < self.len {
+            return true;
+        }
+        let fp = self.fingerprint.lock().unwrap().clone();
+        let same = fp.is_some_and(|fp| self.matches(&fp));
+        if same {
+            *self.verified.lock().unwrap() = Some(now);
+        }
+        !same
+    }
+
+    /// Why the index couldn't be finished (see `build_index`), if it couldn't.
+    pub fn index_error(&self) -> Option<String> {
+        self.index_error.lock().unwrap().clone()
+    }
+
+    fn stop_index(&self, why: String) {
+        *self.index_error.lock().unwrap() = Some(why);
+        self.read_errors.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn len(&self) -> u64 {
@@ -552,35 +724,31 @@ impl Source {
     }
 
     /// For a file that only grew (a log): starts this source's index with `old`'s complete blocks, so only the new
-    /// tail gets indexed. Only when this file still has, at the sampled places, exactly what `old` had when it
-    /// was indexed; otherwise the file was rewritten and gets indexed from scratch. Returns whether it reused.
+    /// tail gets indexed. Only when this file still has, at the sampled places and in the incomplete block that
+    /// ended it, exactly what `old` had when it was indexed; otherwise the file was rewritten and gets indexed
+    /// from scratch. Returns whether it reused.
     pub fn reuse_index_from(&self, old: &Source) -> bool {
-        if self.len < old.len {
-            return false;
-        }
         let Some(fp) = old.fingerprint.lock().unwrap().clone() else { return false };
-        if fp.samples.is_empty() || sample_blocks(old.len).len() != fp.samples.len() {
+        if fp.samples.is_empty() || fp.len != old.len || !self.matches(&fp) {
             return false;
-        }
-        for &(b, h) in &fp.samples {
-            if self.hash_block(b) != Some(h) {
-                return false;
-            }
         }
         let o = old.index.read().unwrap();
         let full = (old.len / BLOCK).min(o.blocks()) as usize;
         let mut idx = self.index.write().unwrap();
         if idx.blocks() == 0 && !idx.complete && full > 0 {
             idx.cum = o.cum[..=full].to_vec();
+            *self.reused.lock().unwrap() = fp.samples;
             return true;
         }
         false
     }
 
     /// Indexes the whole source, reading it sequentially. Meant for a background thread; the index becomes usable
-    /// prefix by prefix while this runs. Returns false if cancelled.
+    /// prefix by prefix while this runs. Returns false if cancelled, or if it had to stop (`index_error` says why):
+    /// a read that kept failing (a guessed count would let line commands run over text they shouldn't), or the
+    /// file was written over while it was read. Either way the index is never marked complete.
     pub fn build_index(&self, cancel: &AtomicBool, progress: &AtomicU64) -> bool {
-        let Store::File { file, .. } = &self.store else {
+        let Store::File { file, opened, .. } = &self.store else {
             return true;
         };
         if self.index.read().unwrap().complete {
@@ -588,26 +756,67 @@ impl Source {
         }
         const CHUNK: usize = 4 << 20;
         let mut buf = vec![0u8; CHUNK];
-        let mut pos = self.index.read().unwrap().blocks() * BLOCK;
-        let mut count = *self.index.read().unwrap().cum.last().unwrap();
+        let (mut pos, mut count) = {
+            let idx = self.index.read().unwrap();
+            (idx.blocks() * BLOCK, *idx.cum.last().unwrap())
+        };
+        // The fingerprint comes from the very bytes counted here (for a part reused from an earlier version of the
+        // file: from the samples `reuse_index_from` checked there).
+        let first = pos / BLOCK;
+        let wanted = sample_blocks(self.len);
+        let mut samples: Vec<(u64, u64)> =
+            self.reused.lock().unwrap().iter().copied().filter(|s| s.0 < first).collect();
+        if samples.is_empty() {
+            for &b in wanted.iter().filter(|&&b| b < first) {
+                match self.hash_range(b * BLOCK, (b + 1) * BLOCK) {
+                    Some(h) => samples.push((b, h)),
+                    None => {
+                        self.stop_index("part of it couldn't be read".into());
+                        return false;
+                    }
+                }
+            }
+        }
+        let mut tail = None;
         let mut pending: Vec<u64> = Vec::new();
         while pos < self.len {
             if cancel.load(Ordering::Relaxed) {
                 return false;
             }
             let n = ((self.len - pos) as usize).min(CHUNK);
-            self.file_read(file, pos, &mut buf[..n]);
-            for block in buf[..n].chunks(BLOCK as usize) {
+            if let Err(e) = read_retrying(file, pos, &mut buf[..n], cancel) {
+                if !cancel.load(Ordering::Relaxed) {
+                    self.stop_index(read_failure(&e));
+                }
+                return false;
+            }
+            for (k, block) in buf[..n].chunks(BLOCK as usize).enumerate() {
+                let b = pos / BLOCK + k as u64;
                 count += bytecount::count(block, b'\n') as u64;
                 pending.push(count);
+                if block.len() < BLOCK as usize {
+                    tail = Some(hash_bytes(block));
+                } else if wanted.binary_search(&b).is_ok() {
+                    samples.push((b, hash_bytes(block)));
+                }
             }
             pos += n as u64;
             progress.store(pos, Ordering::Relaxed);
             let mut idx = self.index.write().unwrap();
             idx.cum.append(&mut pending);
         }
+        samples.sort_unstable();
+        samples.dedup_by_key(|s| s.0);
+        thin(&mut samples, 2 * SAMPLES as usize);
+        let fp = Fingerprint { len: self.len, samples, tail };
+        // Written to while it was read? Fine if it only grew (a log); otherwise what was counted isn't what it holds.
+        let now = stamp_of(file).map(|s| s.0);
+        if now.is_some() && now != opened.map(|s| s.0) && !self.matches(&fp) {
+            self.stop_index("it changed while Slate was reading it".into());
+            return false;
+        }
+        *self.fingerprint.lock().unwrap() = Some(fp);
         self.index.write().unwrap().complete = true;
-        *self.fingerprint.lock().unwrap() = self.take_fingerprint(self.len);
         progress.store(self.len, Ordering::Relaxed);
         true
     }
@@ -755,5 +964,111 @@ mod tests {
         out.clear();
         s.read_into(150_000, 150_100, &mut out);
         assert!(s.read_errors() > after_first, "a second read of missing bytes must count again");
+    }
+
+    fn test_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("slate-test-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Writes `data` to `dir/name` and opens it as an indexed source.
+    fn indexed(dir: &Path, name: &str, data: &[u8]) -> (PathBuf, Source) {
+        let path = dir.join(name);
+        std::fs::write(&path, data).unwrap();
+        let s = Source::open_file(&path).unwrap();
+        assert!(s.build_index(&AtomicBool::new(false), &AtomicU64::new(0)));
+        (path, s)
+    }
+
+    fn write_at(path: &Path, off: u64, data: &[u8]) {
+        let f = OpenOptions::new().write(true).share_mode(0x7).open(path).unwrap();
+        f.seek_write(data, off).unwrap();
+    }
+
+    #[test]
+    fn changed_in_place_tells_a_rewrite_from_a_file_that_grew() {
+        let dir = test_dir("src-inplace");
+        let data = sample(700_000, 5);
+        let (_, same) = indexed(&dir, "same.txt", &data);
+        assert!(!same.changed_in_place());
+        // a log being written: only grew
+        let (p, grew) = indexed(&dir, "grew.txt", &data);
+        write_at(&p, data.len() as u64, b"more lines\n");
+        assert!(!grew.changed_in_place());
+        // only new times (opened for writing, nothing changed)
+        let (p, touched) = indexed(&dir, "touched.txt", &data);
+        let f = OpenOptions::new().write(true).share_mode(0x7).open(&p).unwrap();
+        f.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(60)).unwrap();
+        drop(f);
+        assert!(!touched.changed_in_place());
+        // rewritten in place, same length, other content (truncated and written, like most programs save)
+        let (p, rewritten) = indexed(&dir, "rewritten.txt", &data);
+        std::fs::write(&p, sample(700_000, 6)).unwrap();
+        assert!(rewritten.changed_in_place());
+        // the incomplete last block changed (and it grew): not just appended to
+        let (p, end) = indexed(&dir, "end.txt", &data);
+        write_at(&p, data.len() as u64 - 10, b"0123456789 and more\n");
+        assert!(end.changed_in_place());
+        // cut short
+        let (p, cut) = indexed(&dir, "cut.txt", &data);
+        OpenOptions::new().write(true).share_mode(0x7).open(&p).unwrap().set_len(1000).unwrap();
+        assert!(cut.changed_in_place());
+        drop((same, grew, touched, rewritten, end, cut));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn index_reads_are_tried_again_and_never_guessed() {
+        let dir = test_dir("idxerr");
+        let data = sample(300_000, 8);
+        // unreadable for a moment (a network drive that dropped): tried again, and the counts are right
+        let path = dir.join("blip.txt");
+        std::fs::write(&path, &data).unwrap();
+        let s = Source::open_file(&path).unwrap();
+        OpenOptions::new().write(true).share_mode(0x7).open(&path).unwrap().set_len(1000).unwrap();
+        let restore = {
+            let (path, data) = (path.clone(), data.clone());
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(30));
+                write_at(&path, 0, &data);
+            })
+        };
+        assert!(s.build_index(&AtomicBool::new(false), &AtomicU64::new(0)));
+        restore.join().unwrap();
+        assert_eq!(s.count_nl(0, s.len()), bytecount::count(&data, b'\n') as u64);
+        assert_eq!(s.index_error(), None);
+        // unreadable for good: stops, says why, and the index isn't complete (nothing is guessed)
+        let path = dir.join("gone.txt");
+        std::fs::write(&path, &data).unwrap();
+        let s = Source::open_file(&path).unwrap();
+        OpenOptions::new().write(true).share_mode(0x7).open(&path).unwrap().set_len(1000).unwrap();
+        assert!(!s.build_index(&AtomicBool::new(false), &AtomicU64::new(0)));
+        assert!(!s.index_complete());
+        assert!(s.index_error().is_some_and(|w| w.contains("shorter")), "{:?}", s.index_error());
+        assert!(s.read_errors() > 0);
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn index_is_not_reused_when_the_old_end_changed() {
+        let dir = test_dir("reuse-end");
+        let data = sample(700_000, 4);
+        let (path, old) = indexed(&dir, "log.txt", &data);
+        // the last (incomplete) block of what was indexed got other bytes, and more was added: rewritten
+        write_at(&path, data.len() as u64 - 100, &[b'\n'; 300]);
+        let new = Source::open_file(&path).unwrap();
+        assert!(!new.reuse_index_from(&old));
+        // a plain append is still reused
+        let (path, old) = indexed(&dir, "log2.txt", &data);
+        write_at(&path, data.len() as u64, b"appended\n");
+        let new = Source::open_file(&path).unwrap();
+        assert!(new.reuse_index_from(&old));
+        assert!(new.build_index(&AtomicBool::new(false), &AtomicU64::new(0)));
+        assert_eq!(new.count_nl(0, new.len()), bytecount::count(&data, b'\n') as u64 + 1);
+        drop((old, new));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
