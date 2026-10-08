@@ -422,6 +422,7 @@ pub fn lex(lang: Lang, text: &[u8], st: State, out: Option<&mut Vec<Span>>) -> S
         Lang::CsvSemi => csv(text, st, b';', &mut o),
         Lang::Tsv => csv(text, st, b'\t', &mut o),
         Lang::Xml | Lang::Html => markup::markup(lang == Lang::Html, text, st, &mut o),
+        Lang::Php => markup::php(text, st, &mut o),
         Lang::Markdown => markup::markdown(text, st, &mut o),
         Lang::Yaml => markup::yaml(text, st, &mut o),
         Lang::Css => code::css(text, st, &mut o),
@@ -949,6 +950,18 @@ mod tests {
         }
     }
 
+    /// The tokens of each line of `text`, each line lexed in the state the view gives it (what everything before it
+    /// ends in).
+    pub(super) fn view(lang: Lang, text: &str) -> Vec<Vec<(String, Tok)>> {
+        let mut st = State::START;
+        let mut out = Vec::new();
+        for l in text.split_inclusive('\n') {
+            out.push(toks(lang, l.trim_end_matches('\n'), st));
+            st = lex(lang, l.as_bytes(), st, None);
+        }
+        out
+    }
+
     /// The state after `text`, lexed in one piece and split at every position, must be the same.
     pub(super) fn end_state(lang: Lang, text: &str) -> State {
         let whole = lex(lang, text.as_bytes(), State::START, None);
@@ -1100,6 +1113,70 @@ mod tests {
         let t = toks(Lang::Tsv, "1\t\"say \"\"hi\"\"\t!\"\t3", State::START);
         assert_eq!(t[0], ("\"say \"\"hi\"\"\t!\"".into(), Tok::Col(1)));
         end_state(Lang::Csv, "a,\"b\nc\",d\ne,f\n");
+    }
+
+    /// Random text that is likely to trip `lang`'s lexer.
+    fn tricky_text(lang: Lang, r: &mut u64, len: usize) -> Vec<u8> {
+        let common: &[&str] = &[
+            " ", "\n", "\t", "x", "1", "-", "=", ":", ";", ",", "(", ")", "{", "}", "[", "]", "<", ">", "/", "*", "\\", "\"", "'", "#",
+            "$", "@", "!", "%", "&", "|", "`", "\r\n", "\n\n", "  \n",
+        ];
+        let extra: &[&str] = match lang {
+            Lang::Json => &["//", "/*", "*/", "true"],
+            Lang::Xml | Lang::Html => &["<!--", "-->", "<![CDATA[", "]]>", "<?", "?>", "<a", "</a>", "<script>", "</script>", "<style>", "&amp;"],
+            Lang::Php => &["<?php", "<?=", "?>", "<a href=\"", "<script>", "</script>", "<!--", "//", "/*", "*/", "$x"],
+            Lang::Markdown => &["```", "`", "<!--", "-->", "# ", "> ", "- ", "**", "_", "[", "](", "    "],
+            Lang::Yaml => &["key: ", "- ", "  ", "|", ">-", "# ", "&a", "!t", "{{ "],
+            Lang::Css => &["/*", "*/", "//", "url(", "@media", "#fff", ".c", ":hover"],
+            Lang::Python => &["\"\"\"", "'''", "def ", "r\""],
+            Lang::Rust => &["r#\"", "\"#", "/*", "*/", "//", "'a", "'\\''", "#["],
+            Lang::CSharp => &["@\"", "$\"", "\"\"\"", "/*", "*/", "//", "new ", "X("],
+            Lang::Lua => &["--[[", "]]", "[==[", "]==]", "--"],
+            Lang::PowerShell => &["@\"", "\"@", "@'", "'@", "<#", "#>", "$x"],
+            Lang::Batch => &["REM ", "::", ":l", "%%i", "%X%", "echo "],
+            Lang::Shell | Lang::Dockerfile => &["${", "<<EOF", "<<-'E'", "\nEOF\n", "\nE\n", "$'", "(("],
+            Lang::Ruby => &["<<~EOS", "\nEOS\n", " << ", ":s"],
+            Lang::Sql => &["--", "/*", "*/", "''", "[x]", "E'", "-- mysql\n", "/*!"],
+            Lang::JavaScript | Lang::TypeScript | Lang::Go => &["${", "/*", "*/", "//", "return ", "/a/", "[/]", "</"],
+            Lang::Kotlin | Lang::Swift | Lang::Java | Lang::C | Lang::Cpp => &["\"\"\"", "/*", "*/", "//", "#include <x>"],
+            Lang::Diff => &["@@ -1,2 +1,2 @@", "---", "+++", " "],
+            _ => &["[s]", "k=v", "ERROR"],
+        };
+        let mut s = Vec::new();
+        while s.len() < len {
+            *r ^= *r << 13;
+            *r ^= *r >> 7;
+            *r ^= *r << 17;
+            let k = (*r % (common.len() + 2 * extra.len()) as u64) as usize;
+            s.extend_from_slice(if k < common.len() { common[k] } else { extra[(k - common.len()) % extra.len()] }.as_bytes());
+        }
+        s
+    }
+
+    /// The view works out the state where each line starts by lexing up to it from a checkpoint, and keeps
+    /// checkpoints (in very long lines) after a space, comma, ';' or '>'. So lexing a text in two pieces must end
+    /// in the same state as lexing it whole: for every language when it's cut after a line break, and for those
+    /// whose lexers don't look ahead within a line also when it's cut at those characters.
+    #[test]
+    fn states_dont_depend_on_where_text_is_cut() {
+        use Lang::*;
+        let exact_mid_line = [Json, Log, Ini, Xml, Html, Csv, CsvSemi, Tsv, Python, JavaScript, TypeScript, C, Cpp, CSharp, Java, Kotlin, Swift, Go, Php, Lua];
+        let mut r = 0x2545_F491_4F6C_DD1Du64;
+        for lang in Lang::ALL {
+            for _ in 0..150 {
+                let len = 10 + (r % 60) as usize;
+                let t = tricky_text(lang, &mut r, len);
+                let whole = lex(lang, &t, State::START, None);
+                for cut in 1..t.len() {
+                    let mid_line = matches!(t[cut - 1], b' ' | b',' | b';' | b'>' | b'\t' | b'}');
+                    if t[cut - 1] != b'\n' && !(mid_line && exact_mid_line.contains(&lang)) {
+                        continue;
+                    }
+                    let split = lex(lang, &t[cut..], lex(lang, &t[..cut], State::START, None), None);
+                    assert_eq!(split, whole, "{lang:?} cut after byte {cut} of {:?}", String::from_utf8_lossy(&t));
+                }
+            }
+        }
     }
 
     #[test]

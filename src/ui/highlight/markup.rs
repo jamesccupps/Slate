@@ -245,6 +245,59 @@ pub(super) fn markup(html: bool, t: &[u8], mut st: State, o: &mut Out) -> State 
     }
 }
 
+// ---- PHP pages ----
+
+/// `State::mode` inside PHP code: this bit, plus what the HTML around it was in, to go back to after `?>`: script
+/// or style (bits 0-1), text, a tag, an attribute value or a comment (bits 2-3), the value's quote (bits 4-5).
+const IN_PHP: u8 = 0x80;
+
+/// A PHP file: an HTML page with PHP code between `<?php` (or `<?=`, `<?`) and `?>`. (Lexing all of it as PHP
+/// colored an apostrophe in the page's text as the start of a string running to the end of the file.)
+pub(super) fn php(t: &[u8], mut st: State, o: &mut Out) -> State {
+    let mut i = 0;
+    loop {
+        if st.mode & IN_PHP != 0 {
+            let saved = st.mode;
+            let (s, close) = code::php_code(&t[i..], State { mode: 0, ..st }, &mut o.at(i));
+            let Some(e) = close else { return State { mode: saved, ..s } };
+            i += e;
+            let quote = match (saved >> 4) & 3 {
+                1 => b'"',
+                2 => b'\'',
+                _ => 0,
+            };
+            let kind = match (saved >> 2) & 3 {
+                1 => TAG,
+                2 if quote != 0 => VALUE,
+                3 => COMMENT,
+                _ => TEXT,
+            };
+            st = State { kind, a: quote, b: 0, mode: saved & 3, ..s };
+        }
+        // the page, up to the next `<?`
+        let p = memchr::memmem::find(&t[i..], b"<?").map(|p| i + p);
+        let s = markup(true, &t[i..p.unwrap_or(t.len())], st, &mut o.at(i));
+        let Some(p) = p else { return s };
+        let len = if t.len() >= p + 5 && t[p + 2..p + 5].eq_ignore_ascii_case(b"php") {
+            5
+        } else if at(t, p + 2) == b'=' {
+            3
+        } else {
+            2
+        };
+        o.put(p, p + len, Tok::Control);
+        i = p + len;
+        // (in a script or style only that is kept: its own state starts again after `?>`)
+        let (kind, quote) = match (s.mode, s.kind) {
+            (0, TAG) => (1, 0),
+            (0, VALUE) => (2, if s.a == b'"' { 1 } else { 2 }),
+            (0, COMMENT) => (3, 0),
+            _ => (0, 0),
+        };
+        st = State { kind: 0, a: 0, b: 0, mode: IN_PHP | (s.mode & 3) | kind << 2 | quote << 4, ..s };
+    }
+}
+
 // ---- Markdown ----
 
 /// Inside a fenced code block; `a`: the fence character, `b`: the fence length.
@@ -343,12 +396,15 @@ fn md_line(l: &[u8], col0: bool, mut st: State, o: &mut Out) -> State {
     st
 }
 
-/// How far ahead the end of `code`, *emphasis*, a [link] or a <tag> is looked for.
+/// How far ahead the end of `code`, a [link] or a <tag> is looked for.
 const MD_LOOK: usize = 2048;
+/// The same for *emphasis*, which is rarely longer than a sentence (a line of `*a *b *c…` looked 2 KB ahead for
+/// each star).
+const EMPHASIS_LOOK: usize = 256;
 
 /// The closing run of `k` `c` characters for emphasis opened before `from`.
 fn emphasis_close(l: &[u8], from: usize, c: u8, k: usize) -> Option<usize> {
-    let end = l.len().min(from + MD_LOOK);
+    let end = l.len().min(from + EMPHASIS_LOOK);
     let mut p = from;
     while let Some(q) = memchr::memchr(c, &l[p.min(end)..end]) {
         let s = p + q;
@@ -737,6 +793,11 @@ mod tests {
         assert_eq!(toks(Lang::Markdown, "y = 2", st), vec![("y = 2".into(), Tok::Str)]);
         let st = end_state(Lang::Markdown, "```\ncode\n```\n");
         assert_eq!(toks(Lang::Markdown, "# After", st), vec![("# After".into(), Tok::Heading)]);
+        // emphasis that never closes costs little to look for
+        let line = "*a ".repeat(300_000);
+        let start = std::time::Instant::now();
+        toks(Lang::Markdown, &line, super::super::State::START);
+        assert!(start.elapsed().as_secs_f64() < 2.0, "{:?}", start.elapsed());
     }
 
     #[test]

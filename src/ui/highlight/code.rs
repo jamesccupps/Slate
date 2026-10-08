@@ -19,6 +19,20 @@ const VERBATIM: u8 = 6;
 const HERE: u8 = 7;
 /// Lua `[[…]]` / `--[[…]]`; `a`: the number of `=`, `b`: 1 for a comment.
 const LONG: u8 = 8;
+/// A JavaScript `/regex/`; `a`: 1 inside `[…]`, +2 if an escape is pending.
+const REGEX: u8 = 9;
+/// A shell or Ruby heredoc's lines (`<<EOF` … `EOF`); `a`: 1 if the end line may be indented, +2 while the line
+/// that starts it isn't over yet, and bits 2..7 with `b` hold a hash of the end word.
+const HEREDOC: u8 = 10;
+
+/// In `STR`'s `a`: a single quote with backslash escapes (shell `$'…'`, SQL `E'…'`).
+const ESC_QUOTE: u8 = 0x80 | b'\'';
+/// In SQL's `State::mode`: the text is MySQL's (`\` escapes in strings, `#` comments), as seen from a backtick,
+/// a `/*!` comment or a comment that names it.
+const MYSQL: u8 = 1;
+/// A string that may span lines in a language where a stray quote is easily mistaken for one (shell, SQL...) ends
+/// at a blank line or after this many lines, so a wrong guess can't recolor the rest of the file.
+const MAX_STR_LINES: u16 = 40;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Flavor {
@@ -65,6 +79,10 @@ pub(super) struct Syntax {
     cap_types: bool,
     /// A name followed by `(` is a function.
     calls: bool,
+    /// Strings that may span lines give up at a blank line or after `MAX_STR_LINES` (see there).
+    resync: bool,
+    /// `/regex/` literals (JavaScript).
+    regex: bool,
 }
 
 const BASE: Syntax = Syntax {
@@ -90,9 +108,29 @@ const BASE: Syntax = Syntax {
     decorators: false,
     cap_types: false,
     calls: true,
+    resync: false,
+    regex: false,
 };
 
 static PLAIN: Syntax = BASE;
+
+static C: Syntax = Syntax {
+    kw: &[
+        "_Alignas", "_Alignof", "_Atomic", "_Generic", "_Noreturn", "_Static_assert", "_Thread_local", "alignas",
+        "alignof", "auto", "const", "constexpr", "enum", "extern", "inline", "register", "restrict", "signed", "sizeof",
+        "static", "static_assert", "struct", "thread_local", "typedef", "typeof", "typeof_unqual", "union", "unsigned",
+        "volatile",
+    ],
+    ctl: &["break", "case", "continue", "default", "do", "else", "for", "goto", "if", "return", "switch", "while"],
+    types: &[
+        "_Bool", "_Complex", "_Imaginary", "bool", "char", "char16_t", "char32_t", "char8_t", "double", "float", "int",
+        "int16_t", "int32_t", "int64_t", "int8_t", "long", "ptrdiff_t", "short", "size_t", "ssize_t", "uint16_t",
+        "uint32_t", "uint64_t", "uint8_t", "uintptr_t", "void", "wchar_t",
+    ],
+    lits: &["NULL", "false", "nullptr", "true"],
+    preproc: true,
+    ..BASE
+};
 
 static CPP: Syntax = Syntax {
     kw: &[
@@ -269,6 +307,7 @@ static JS: Syntax = Syntax {
     dollar_ident: true,
     decorators: true,
     cap_types: true,
+    regex: true,
     ..BASE
 };
 
@@ -304,6 +343,7 @@ static PHP: Syntax = Syntax {
     sigils: b"$",
     nocase: true,
     cap_types: true,
+    resync: true,
     ..BASE
 };
 
@@ -321,6 +361,7 @@ static RUBY: Syntax = Syntax {
     multi: b"\"'`",
     sigils: b"@$",
     cap_types: true,
+    resync: true,
     ..BASE
 };
 
@@ -362,6 +403,7 @@ static SQL: Syntax = Syntax {
     ],
     lits: &["false", "null", "true"],
     sigils: b"@",
+    resync: true,
     ..BASE
 };
 
@@ -383,6 +425,7 @@ static POWERSHELL: Syntax = Syntax {
     ],
     sigils: b"$",
     dash_ident: true,
+    resync: true,
     ..BASE
 };
 
@@ -425,6 +468,7 @@ static SHELL: Syntax = Syntax {
     lits: &["false", "true"],
     sigils: b"$",
     calls: false,
+    resync: true,
     ..BASE
 };
 
@@ -440,7 +484,8 @@ static DOCKERFILE: Syntax = Syntax {
 
 pub(super) fn syntax(lang: Lang) -> &'static Syntax {
     match lang {
-        Lang::C | Lang::Cpp => &CPP,
+        Lang::C => &C,
+        Lang::Cpp => &CPP,
         Lang::CSharp => &CSHARP,
         Lang::Java => &JAVA,
         Lang::Kotlin => &KOTLIN,
@@ -570,11 +615,151 @@ fn block_rest(sx: &Syntax, t: &[u8], s: usize, mut i: usize, mut depth: u8, st: 
     Err(State { kind: BLOCK_COMMENT, a: depth, b: 0, ..st })
 }
 
-fn string_rest(sx: &Syntax, t: &[u8], s: usize, i: usize, q: u8, esc_pending: bool, st: State, o: &mut Out) -> Step {
-    let esc = if sx.raw.contains(&q) { 0 } else { sx.esc };
-    let (e, closed, pending) = scan_str(t, i, q, esc, esc_pending, !sx.multi.contains(&q));
+/// A string from `s`, its body scanned from `i`. `mark` is the quote as kept in the state (`ESC_QUOTE` for `$'…'`
+/// and `E'…'`); `b` is the state's (the escape pending, and with `resync` what `guarded_rest` keeps).
+#[allow(clippy::too_many_arguments)]
+fn string_rest(sx: &Syntax, t: &[u8], s: usize, i: usize, mark: u8, b: u16, st: State, o: &mut Out) -> Step {
+    let (q, esc) = match mark {
+        ESC_QUOTE => (b'\'', b'\\'),
+        q if sx.raw.contains(&q) => (q, 0),
+        q if sx.flavor == Flavor::Sql => (q, if st.mode & MYSQL != 0 { b'\\' } else { 0 }),
+        q => (q, sx.esc),
+    };
+    let multi = sx.multi.contains(&q);
+    if multi && sx.resync {
+        return guarded_rest(t, s, i, mark, q, esc, b, st, o);
+    }
+    let (e, closed, pending) = scan_str(t, i, q, esc, b & 1 != 0, !multi);
     o.put(s, e, Tok::Str);
-    if closed { Ok(e) } else { Err(State { kind: STR, a: q, b: pending as u16, ..st }) }
+    if closed { Ok(e) } else { Err(State { kind: STR, a: mark, b: pending as u16, ..st }) }
+}
+
+/// A string that may span lines, but gives up (ends, as far as coloring goes) at the end of a blank line or after
+/// `MAX_STR_LINES` lines: in shell scripts, SQL dumps or PHP pages a quote is easily a stray one (an apostrophe in
+/// text, `It\'s`), and it must not recolor the rest of the file. It only looks at what it has read, so it ends
+/// the same wherever the text was cut. `b` (and the state's): bit 0 an escape pending, bit 1 the line so far is
+/// blank, then the lines so far.
+#[allow(clippy::too_many_arguments)]
+fn guarded_rest(t: &[u8], s: usize, mut i: usize, mark: u8, q: u8, esc: u8, b: u16, st: State, o: &mut Out) -> Step {
+    let n = t.len();
+    let (mut pending, mut blank, mut lines) = (b & 1 != 0, b & 2 != 0, b >> 2);
+    while i < n {
+        let c = t[i];
+        if c == b'\n' {
+            pending = false;
+            lines = lines.saturating_add(1);
+            if blank || lines >= MAX_STR_LINES {
+                o.put(s, i, Tok::Str);
+                return Ok(i);
+            }
+            blank = true;
+        } else {
+            if !c.is_ascii_whitespace() {
+                blank = false;
+            }
+            if pending {
+                pending = false;
+            } else if c == esc && esc != 0 {
+                pending = true;
+            } else if c == q {
+                o.put(s, i + 1, Tok::Str);
+                return Ok(i + 1);
+            }
+        }
+        i += 1;
+    }
+    o.put(s, n, Tok::Str);
+    Err(State { kind: STR, a: mark, b: pending as u16 | (blank as u16) << 1 | lines.min(0x3FFF) << 2, ..st })
+}
+
+/// A `/regex/` from `s`, scanned from `i`; `class`: inside `[…]`. At a line break it is over (the caller decides
+/// before whether a `/` starts one at all).
+fn regex_rest(t: &[u8], s: usize, mut i: usize, mut class: bool, mut pending: bool, st: State, o: &mut Out) -> Step {
+    while i < t.len() {
+        let b = t[i];
+        if pending {
+            pending = false;
+        } else if b == b'\\' {
+            pending = true;
+        } else if b == b'\n' {
+            o.put(s, i, Tok::Str);
+            return Ok(i);
+        } else if b == b'[' {
+            class = true;
+        } else if b == b']' {
+            class = false;
+        } else if b == b'/' && !class {
+            let e = i + 1 + t[i + 1..].iter().take_while(|b| b.is_ascii_alphabetic()).count();
+            o.put(s, e, Tok::Str);
+            return Ok(e);
+        }
+        i += 1;
+    }
+    o.put(s, t.len(), Tok::Str);
+    Err(State { kind: REGEX, a: class as u8 | (pending as u8) << 1, b: 0, ..st })
+}
+
+/// The hash of a heredoc's end word, as kept in its state (22 bits: `b` and the top of `a`).
+fn word_hash(w: &[u8]) -> (u8, u16) {
+    let h = w.iter().fold(0x811C_9DC5u32, |h, &c| (h ^ c as u32).wrapping_mul(0x0100_0193));
+    (((h >> 16) as u8 & 0x3F) << 2, h as u16)
+}
+
+/// `<<EOF`, `<<-'EOF'`, `<<"END"` (shell) or `<<~SQL` (Ruby) at `i`: (where the opener ends, the end word, whether
+/// that may be indented).
+fn heredoc_open<'t>(sx: &Syntax, t: &'t [u8], i: usize) -> Option<(usize, &'t [u8], bool)> {
+    if !t[i..].starts_with(b"<<") || at(t, i + 2) == b'<' {
+        return None;
+    }
+    let mut j = i + 2;
+    let indent = matches!(at(t, j), b'-' | b'~');
+    if indent {
+        j += 1;
+    }
+    if sx.flavor == Flavor::Shell {
+        // `cat << EOF` is fine in a shell; `$(( x << y ))` is a shift
+        j += t[j..].iter().take_while(|&&b| b == b' ' || b == b'\t').count();
+        let line = &t[t[..i].iter().rposition(|&b| b == b'\n').map_or(0, |p| p + 1)..i];
+        if line.windows(2).any(|w| w == b"((") {
+            return None;
+        }
+        if at(t, j) == b'\\' {
+            j += 1;
+        }
+    }
+    let q = at(t, j);
+    if matches!(q, b'\'' | b'"' | b'`') {
+        let len = t[j + 1..].iter().take(64).position(|&b| b == q || b == b'\n')?;
+        return (at(t, j + 1 + len) == q && len > 0).then(|| (j + len + 2, &t[j + 1..j + 1 + len], indent));
+    }
+    // a bare word starts with a capital (EOF, END, SQL...), which `x << y` and `list << item` rarely do
+    if !(q.is_ascii_uppercase() || q == b'_') {
+        return None;
+    }
+    let len = t[j..].iter().take_while(|&&b| b.is_ascii_alphanumeric() || b == b'_').count();
+    Some((j + len, &t[j..j + len], indent))
+}
+
+/// A heredoc's lines from `i` (a line start) up to and including its end line. The text's end counts as a line's
+/// end (a segment is its line without the line break).
+fn heredoc_rest(t: &[u8], mut i: usize, a: u8, b: u16, st: State, o: &mut Out) -> Step {
+    loop {
+        let e = line_end(t, i);
+        let mut w = &t[i..e];
+        w = w.strip_suffix(b"\r").unwrap_or(w);
+        if a & 1 != 0 {
+            w = w.trim_ascii_start();
+        }
+        o.put(i, e, Tok::Str);
+        if word_hash(w) == (a & !3, b) {
+            return Ok(e);
+        }
+        if e >= t.len() {
+            break;
+        }
+        i = e + 1;
+    }
+    Err(State { kind: HEREDOC, a: a & !2, b, ..st })
 }
 
 fn triple_rest(t: &[u8], s: usize, mut i: usize, q: u8, esc: u8, mut pending: bool, st: State, o: &mut Out) -> Step {
@@ -672,19 +857,38 @@ fn triple_esc(sx: &Syntax) -> u8 {
 fn resume(sx: &Syntax, t: &[u8], st: State, o: &mut Out) -> Step {
     match st.kind {
         LINE_COMMENT => {
-            let e = line_end(t, 0);
+            let e = comment_end(sx, t, 0);
             o.put(0, e, Tok::Comment);
             if e == t.len() { Err(st) } else { Ok(e) }
         }
         BLOCK_COMMENT => block_rest(sx, t, 0, 0, st.a.max(1), st, o),
-        STR => string_rest(sx, t, 0, 0, st.a, st.b == 1, st, o),
+        STR => string_rest(sx, t, 0, 0, st.a, st.b, st, o),
         TRIPLE => triple_rest(t, 0, 0, st.a, triple_esc(sx), st.b == 1, st, o),
         RAW => raw_rest(t, 0, 0, st.a, st, o),
         VERBATIM => verbatim_rest(t, 0, 0, st, o),
         HERE => here_rest(t, 0, 0, st.a, st.col0, st, o),
         LONG => long_rest(t, 0, 0, st.a, st.b == 1, st, o),
+        REGEX => regex_rest(t, 0, 0, st.a & 1 != 0, st.a & 2 != 0, st, o),
+        HEREDOC if st.col0 => heredoc_rest(t, 0, st.a, st.b, st, o),
+        HEREDOC => {
+            // the rest of a heredoc line, then its next lines
+            let e = line_end(t, 0);
+            o.put(0, e, Tok::Str);
+            if e == t.len() { Err(st) } else { heredoc_rest(t, e + 1, st.a, st.b, st, o) }
+        }
         _ => Ok(0),
     }
+}
+
+/// Where a line comment starting at `i` ends: the line's end (or in PHP a `?>` before it, which ends PHP code).
+fn comment_end(sx: &Syntax, t: &[u8], i: usize) -> usize {
+    let e = line_end(t, i);
+    if sx.flavor == Flavor::Php {
+        if let Some(p) = memchr::memmem::find(&t[i..e], b"?>") {
+            return i + p;
+        }
+    }
+    e
 }
 
 fn line_comment(sx: &Syntax, t: &[u8], i: usize) -> bool {
@@ -692,6 +896,8 @@ fn line_comment(sx: &Syntax, t: &[u8], i: usize) -> bool {
         t[i..].starts_with(lc)
             // shells: `#` starts a comment only at the start of a word (not in `a#b` or `${#x}`)
             && !(sx.flavor == Flavor::Shell && i > 0 && !matches!(t[i - 1], b' ' | b'\t' | b'\n' | b'\r' | b';' | b'|' | b'&' | b'('))
+            // PHP 8 attributes: #[Route('/x')]
+            && !(sx.flavor == Flavor::Php && t[i..].starts_with(b"#["))
     })
 }
 
@@ -730,7 +936,8 @@ fn sigil_var(sx: &Syntax, t: &[u8], i: usize) -> Option<usize> {
     }
     let c = at(t, j);
     if c == b'{' {
-        let e = t[j..].iter().take(256).position(|&b| b == b'}' || b == b'\n')?;
+        // `${name}` (looked for in the next 64 bytes only: `${${${…` must not cost a scan each)
+        let e = memchr::memchr2(b'}', b'\n', &t[j..t.len().min(j + 64)])?;
         return (t[j + e] == b'}').then_some(j + e + 1);
     }
     if sx.flavor == Flavor::Shell && (c.is_ascii_digit() || matches!(c, b'@' | b'#' | b'?' | b'$' | b'!' | b'*' | b'-')) {
@@ -825,7 +1032,7 @@ fn extras(sx: &Syntax, t: &[u8], i: usize, st: State, o: &mut Out) -> Option<Ste
                 if t[i + 1..].starts_with(b"\"\"\"") {
                     return Some(triple_rest(t, i, i + 4, b'"', 0, false, st, o));
                 }
-                return Some(string_rest(sx, t, i, i + 2, b'"', false, st, o));
+                return Some(string_rest(sx, t, i, i + 2, b'"', 0, st, o));
             }
         }
         Flavor::Lua => {
@@ -885,7 +1092,7 @@ fn extras(sx: &Syntax, t: &[u8], i: usize, st: State, o: &mut Out) -> Option<Ste
             }
         }
         Flavor::Php => {
-            for tag in [&b"<?php"[..], b"<?=", b"?>"] {
+            for tag in [&b"<?php"[..], b"<?="] {
                 if t[i..].starts_with(tag) {
                     o.put(i, i + tag.len(), Tok::Control);
                     return Some(Ok(i + tag.len()));
@@ -893,6 +1100,14 @@ fn extras(sx: &Syntax, t: &[u8], i: usize, st: State, o: &mut Out) -> Option<Ste
             }
         }
         Flavor::Sql => {
+            let mysql = st.mode & MYSQL != 0;
+            // E'it\'s' (PostgreSQL), and in MySQL "strings" with \ escapes
+            if matches!(c, b'E' | b'e') && at(t, i + 1) == b'\'' && (i == 0 || !ident_char(sx, t[i - 1])) {
+                return Some(string_rest(sx, t, i, i + 2, ESC_QUOTE, 0, st, o));
+            }
+            if c == b'"' && mysql {
+                return Some(string_rest(sx, t, i, i + 1, b'"', 0, st, o));
+            }
             // "quoted", `quoted` and [bracketed] names
             if c == b'"' || c == b'`' {
                 let (e, _, _) = scan_str(t, i + 1, c, 0, false, true);
@@ -909,21 +1124,60 @@ fn extras(sx: &Syntax, t: &[u8], i: usize, st: State, o: &mut Out) -> Option<Ste
                 }
             }
         }
-        Flavor::Plain | Flavor::Batch | Flavor::Shell => {}
+        Flavor::Shell => {
+            // $'tab\there\'s' (backslash escapes in single quotes)
+            if c == b'$' && at(t, i + 1) == b'\'' {
+                return Some(string_rest(sx, t, i, i + 2, ESC_QUOTE, 0, st, o));
+            }
+        }
+        Flavor::Plain | Flavor::Batch => {}
     }
     None
 }
 
+/// After these words a `/` starts a regex rather than dividing (JavaScript).
+const REGEX_AFTER: [&[u8]; 14] =
+    [b"await", b"case", b"delete", b"do", b"else", b"in", b"instanceof", b"new", b"of", b"return", b"throw", b"typeof", b"void", b"yield"];
+
+fn contains_ci(hay: &[u8], needle: &[u8]) -> bool {
+    hay.windows(needle.len()).any(|w| w.eq_ignore_ascii_case(needle))
+}
+
 pub(super) fn code(sx: &Syntax, t: &[u8], st: State, o: &mut Out) -> State {
+    code_run(sx, t, st, o, &mut None)
+}
+
+/// PHP code (inside `<?php … ?>`): the state after it, and where the code ends when its `?>` is in `t` (after
+/// the `?>`).
+pub(super) fn php_code(t: &[u8], st: State, o: &mut Out) -> (State, Option<usize>) {
+    let mut close = None;
+    let s = code_run(&PHP, t, st, o, &mut close);
+    (s, close)
+}
+
+fn code_run(sx: &Syntax, t: &[u8], st: State, o: &mut Out, close: &mut Option<usize>) -> State {
     let n = t.len();
     let mut i = 0;
-    if st.kind != 0 {
+    // JavaScript: a `/` here starts a regex (a value may come) rather than dividing; kept in `a` (1: dividing).
+    let mut regex_ok = match st.kind {
+        0 => st.a == 0,
+        LINE_COMMENT | BLOCK_COMMENT => true,
+        _ => false,
+    };
+    // A heredoc opened on this line: its lines start after it (its state's `a` and `b`), unless something else
+    // (a string, a comment) goes on past the line's end.
+    let mut heredoc: Option<(u8, u16)> = None;
+    let mut heredoc_line_end = 0;
+    if st.kind == HEREDOC && st.a & 2 != 0 {
+        heredoc = Some((st.a & !2, st.b));
+        heredoc_line_end = line_end(t, 0);
+    } else if st.kind != 0 {
         match resume(sx, t, st, o) {
             Ok(e) => i = e,
             Err(s) => return s,
         }
     }
-    let mid = State { kind: 0, a: 0, b: 0, ..st };
+    let mut mid = State { kind: 0, a: 0, b: 0, ..st };
     let mut bol = st.bol && i == 0;
     // Batch: at the start of a statement (where `rem` starts a comment); inside an echo (plain text).
     let mut stmt = bol;
@@ -942,11 +1196,17 @@ pub(super) fn code(sx: &Syntax, t: &[u8], st: State, o: &mut Out) -> State {
         };
     }
     while i < n {
+        if heredoc.is_some() && i > heredoc_line_end {
+            heredoc = None;
+        }
         let c = t[i];
         match c {
             b'\n' => {
                 (bol, stmt, echo, expect) = (true, true, false, 0);
                 i += 1;
+                if let Some((a, b)) = heredoc.take() {
+                    step!(heredoc_rest(t, i, a, b, mid, o));
+                }
                 continue;
             }
             b' ' | b'\t' | b'\r' => {
@@ -959,6 +1219,17 @@ pub(super) fn code(sx: &Syntax, t: &[u8], st: State, o: &mut Out) -> State {
         let stmt_start = stmt;
         bol = false;
         stmt = false;
+        if sx.flavor == Flavor::Php && t[i..].starts_with(b"?>") {
+            // the end of the PHP code (the page around it is HTML)
+            o.put(i, i + 2, Tok::Control);
+            *close = Some(i + 2);
+            return mid;
+        }
+        if (sx.flavor == Flavor::Shell && c == b'\\') || (sx.flavor == Flavor::PowerShell && c == b'`') {
+            // an escaped character outside quotes (`It\'s`), or a line continuation
+            i += if matches!(at(t, i + 1), b'\n' | 0) { 1 } else { 2 };
+            continue;
+        }
         if sx.flavor == Flavor::Batch {
             if let Some(e) = batch_var(t, i) {
                 o.put(i, e, Tok::Var);
@@ -988,12 +1259,33 @@ pub(super) fn code(sx: &Syntax, t: &[u8], st: State, o: &mut Out) -> State {
                 continue;
             }
         }
+        if matches!(sx.flavor, Flavor::Shell | Flavor::Ruby) && c == b'<' {
+            if let Some((e, word, indent)) = heredoc_open(sx, t, i) {
+                o.put(i, e, Tok::Str);
+                let (a, b) = word_hash(word);
+                heredoc = Some((a | indent as u8, b));
+                heredoc_line_end = line_end(t, e);
+                i = e;
+                continue;
+            }
+        }
+        if sx.flavor == Flavor::Sql && mid.mode & MYSQL == 0 && (c == b'`' || t[i..].starts_with(b"/*!")) {
+            mid.mode |= MYSQL;
+        }
         if let Some(r) = extras(sx, t, i, mid, o) {
             step!(r);
         }
-        if line_comment(sx, t, i) {
-            let e = line_end(t, i);
+        // MySQL's # comments (and `# note` at a line's start in any SQL; `#temp` is a T-SQL table)
+        let sql_hash = sx.flavor == Flavor::Sql
+            && c == b'#'
+            && (mid.mode & MYSQL != 0 || (line_start && matches!(at(t, i + 1), b' ' | b'\t' | b'\r' | b'\n' | 0)));
+        if sql_hash || line_comment(sx, t, i) {
+            let e = comment_end(sx, t, i);
             o.put(i, e, Tok::Comment);
+            if sx.flavor == Flavor::Sql && (contains_ci(&t[i..e], b"mysql") || contains_ci(&t[i..e], b"mariadb")) {
+                mid.mode |= MYSQL;
+            }
+            regex_ok = true;
             if e == n {
                 return State { kind: LINE_COMMENT, ..mid };
             }
@@ -1002,8 +1294,14 @@ pub(super) fn code(sx: &Syntax, t: &[u8], st: State, o: &mut Out) -> State {
         }
         if let Some((open, _)) = sx.block {
             if t[i..].starts_with(open) {
+                regex_ok = true;
                 step!(block_rest(sx, t, i, i + open.len(), 1, mid, o));
             }
+        }
+        if sx.regex && c == b'/' && regex_ok {
+            // (judged only from what came before, so it's the same wherever a long line is cut)
+            regex_ok = false;
+            step!(regex_rest(t, i, i + 1, false, false, mid, o));
         }
         if sx.preproc && c == b'#' && line_start {
             // #include <x.h>, #define, #region
@@ -1029,6 +1327,7 @@ pub(super) fn code(sx: &Syntax, t: &[u8], st: State, o: &mut Out) -> State {
                 e = ident_end(sx, t, e + 1);
             }
             o.put(i, e, Tok::Func);
+            regex_ok = false;
             i = e;
             continue;
         }
@@ -1040,27 +1339,31 @@ pub(super) fn code(sx: &Syntax, t: &[u8], st: State, o: &mut Out) -> State {
             }
         }
         if sx.triple.contains(&c) && at(t, i + 1) == c && at(t, i + 2) == c {
+            regex_ok = false;
             step!(triple_rest(t, i, i + 3, c, triple_esc(sx), false, mid, o));
         }
         if sx.quotes.contains(&c) {
-            step!(string_rest(sx, t, i, i + 1, c, false, mid, o));
+            regex_ok = false;
+            step!(string_rest(sx, t, i, i + 1, c, 0, mid, o));
         }
         if c.is_ascii_digit() || (c == b'.' && at(t, i + 1).is_ascii_digit() && (i == 0 || !ident_char(sx, t[i - 1]))) {
             let e = number_end(t, i);
             o.put(i, e, Tok::Num);
             expect = 0;
+            regex_ok = false;
             i = e;
             continue;
         }
         if ident_start(sx, c) {
             let mut e = ident_end(sx, t, i);
             let w = &t[i..e];
+            // after a '.', a keyword is a member name (`re.match`, `map.get`, `promise.catch`)
+            let member = i > 0 && t[i - 1] == b'.' && !(i > 1 && t[i - 2] == b'.');
+            regex_ok = !member && REGEX_AFTER.contains(&w);
             if !o.on() && sx.flavor != Flavor::Batch {
                 i = e;
                 continue;
             }
-            // after a '.', a keyword is a member name (`re.match`, `map.get`, `promise.catch`)
-            let member = i > 0 && t[i - 1] == b'.' && !(i > 1 && t[i - 2] == b'.');
             let mut tok = if member { None } else { word_tok(sx, w) };
             if sx.flavor == Flavor::Batch {
                 let ends = matches!(at(t, e), 0 | b' ' | b'\t' | b'\r' | b'\n');
@@ -1085,6 +1388,9 @@ pub(super) fn code(sx: &Syntax, t: &[u8], st: State, o: &mut Out) -> State {
                     Some(Tok::Func)
                 } else if sx.dash_ident && w.contains(&b'-') {
                     Some(Tok::Func)
+                } else if sx.flavor == Flavor::CSharp && next == Some(b'(') {
+                    // C# methods are capitalized like types: `Console.WriteLine(…)`
+                    Some(Tok::Func)
                 } else if sx.cap_types && w[0].is_ascii_uppercase() && w.iter().any(|b| b.is_ascii_lowercase()) {
                     Some(Tok::Type)
                 } else if sx.calls && next == Some(b'(') {
@@ -1098,7 +1404,7 @@ pub(super) fn code(sx: &Syntax, t: &[u8], st: State, o: &mut Out) -> State {
                 let lower = w.to_ascii_lowercase();
                 if FUNC_KW.contains(&lower.as_slice()) {
                     expect = 1;
-                } else if TYPE_KW.contains(&lower.as_slice()) {
+                } else if TYPE_KW.contains(&lower.as_slice()) || (sx.flavor == Flavor::CSharp && lower == b"new") {
                     expect = 2;
                 }
             }
@@ -1108,8 +1414,17 @@ pub(super) fn code(sx: &Syntax, t: &[u8], st: State, o: &mut Out) -> State {
             i = e;
             continue;
         }
+        // punctuation: after `)` or `]` a `/` divides (after `<` it closes a JSX tag)
+        regex_ok = !matches!(c, b')' | b']' | b'<');
         expect = 0;
         i += 1;
+    }
+    if let Some((a, b)) = heredoc.filter(|_| i <= heredoc_line_end) {
+        // the line that opens a heredoc goes on in the next text
+        return State { kind: HEREDOC, a: a | 2, b, ..mid };
+    }
+    if sx.regex && !regex_ok {
+        mid.a = 1;
     }
     mid
 }
@@ -1273,8 +1588,8 @@ pub(super) fn css(t: &[u8], st: State, o: &mut Out) -> State {
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::{end_state, has, toks};
-    use super::super::{Lang, State, Tok};
+    use super::super::tests::{end_state, has, toks, view};
+    use super::super::{Lang, State, Tok, lex};
 
     #[test]
     fn keyword_lists_are_sorted() {
@@ -1415,5 +1730,106 @@ mod tests {
         let st = end_state(Lang::Css, "@media print {\n  body {\n");
         assert!(toks(Lang::Css, "    color: red;", st).contains(&("color".into(), Tok::Attr)));
         assert!(toks(Lang::Css, "    color: red;", State::START).contains(&("color".into(), Tok::Tag)));
+    }
+
+    fn line_has(line: &[(String, Tok)], s: &str, tok: Tok) -> bool {
+        line.contains(&(s.to_string(), tok))
+    }
+
+    #[test]
+    fn stray_quotes_stay_local() {
+        // a heredoc is text up to its end word: its apostrophes start nothing
+        let src = "cat <<EOF\nDon't run this as root.\nEOF\necho \"done\" # end\n";
+        let v = view(Lang::Shell, src);
+        assert_eq!(v[1], vec![("Don't run this as root.".into(), Tok::Str)]);
+        assert!(line_has(&v[3], "\"done\"", Tok::Str) && line_has(&v[3], "# end", Tok::Comment));
+        assert_eq!(end_state(Lang::Shell, src), State::START);
+        let v = view(Lang::Shell, "cat <<-'END' | sort\n\tit's\n\tEND\nls # c\n");
+        assert!(line_has(&v[0], "<<-'END'", Tok::Str) && line_has(&v[3], "# c", Tok::Comment));
+        // `<<` in arithmetic is a shift
+        assert!(line_has(&view(Lang::Shell, "echo $(( x << Y ))\necho 'a'\n")[1], "'a'", Tok::Str));
+        // escapes outside quotes, and $'…' with escapes
+        assert!(line_has(&view(Lang::Shell, "echo It\\'s done\nls # list\n")[1], "# list", Tok::Comment));
+        assert!(line_has(&view(Lang::Shell, "printf $'it\\'s'\necho ok # c\n")[1], "# c", Tok::Comment));
+        // a quote left open gives up at a blank line, or after 40 lines
+        let v = view(Lang::Shell, "echo it's\nstill\n  \necho 'ok' # c\n");
+        assert!(line_has(&v[1], "still", Tok::Str) && line_has(&v[3], "'ok'", Tok::Str) && line_has(&v[3], "# c", Tok::Comment));
+        let v = view(Lang::Shell, &format!("x='{}\necho # c\n", "a\n".repeat(60)));
+        assert!(line_has(&v[30], "a", Tok::Str) && v[45].is_empty() && line_has(&v[61], "# c", Tok::Comment));
+        let v = view(Lang::Ruby, "x = <<~EOS\n  Don't\n  EOS\nputs 1 # c\nlist << 'item'\n");
+        assert!(line_has(&v[1], "  Don't", Tok::Str) && line_has(&v[3], "# c", Tok::Comment) && line_has(&v[4], "'item'", Tok::Str));
+        // PowerShell: a backtick escapes outside quotes too
+        assert!(line_has(&view(Lang::PowerShell, "Write-Host It`'s\n$x = 1 # c\n")[1], "# c", Tok::Comment));
+    }
+
+    #[test]
+    fn sql_dialects() {
+        // MySQL (here from its dump's first comment): \' in strings and # comments
+        let v = view(Lang::Sql, "-- MySQL dump 10.13\nINSERT INTO t VALUES ('It\\'s', \"say \\\"x\\\"\");\n# it's a comment\nSELECT 1;\n");
+        assert!(line_has(&v[1], "'It\\'s'", Tok::Str) && line_has(&v[1], "\"say \\\"x\\\"\"", Tok::Str));
+        assert_eq!(v[2], vec![("# it's a comment".into(), Tok::Comment)]);
+        assert!(line_has(&v[3], "SELECT", Tok::Keyword));
+        // a backtick says MySQL too
+        assert!(line_has(&view(Lang::Sql, "SELECT `a` FROM t;\nSELECT 'x\\'y' # c\n")[1], "# c", Tok::Comment));
+        // otherwise a backslash is just a character (T-SQL paths), and #temp is a table
+        let v = view(Lang::Sql, "SELECT 'C:\\' AS p; -- c\nSELECT * INTO #tmp FROM t; -- d\n");
+        assert!(line_has(&v[0], "'C:\\'", Tok::Str) && line_has(&v[0], "-- c", Tok::Comment) && line_has(&v[1], "-- d", Tok::Comment));
+        assert_eq!(view(Lang::Sql, "# note, it's here\nSELECT 1;\n")[0], vec![("# note, it's here".into(), Tok::Comment)]);
+        // PostgreSQL's E'…' strings have escapes
+        assert!(line_has(&view(Lang::Sql, "SELECT E'it\\'s' -- c\n")[0], "-- c", Tok::Comment));
+    }
+
+    #[test]
+    fn php_pages_are_html_with_php_in_them() {
+        let src = "<p>Don't panic</p>\n<?php if ($x): // c ?>\n<a href=\"<?= $url ?>\">up</a>\n<?php echo 'x' ?><b>it's</b>\n";
+        let v = view(Lang::Php, src);
+        assert!(line_has(&v[0], "p", Tok::Tag) && !v[0].iter().any(|t| t.1 == Tok::Str));
+        assert!(line_has(&v[1], "<?php", Tok::Control) && line_has(&v[1], "$x", Tok::Var) && line_has(&v[1], "// c ", Tok::Comment));
+        assert!(line_has(&v[1], "?>", Tok::Control));
+        assert!(line_has(&v[2], "<?=", Tok::Control) && line_has(&v[2], "$url", Tok::Var) && line_has(&v[2], "a", Tok::Tag));
+        assert!(line_has(&v[2], "\"", Tok::Str), "the attribute value goes on after ?>: {:?}", v[2]);
+        assert!(line_has(&v[3], "'x'", Tok::Str) && line_has(&v[3], "b", Tok::Tag) && !line_has(&v[3], "'s</b>", Tok::Str));
+        assert_eq!(end_state(Lang::Php, src), State::START);
+        // a pure PHP file
+        let v = view(Lang::Php, "<?php\n$s = 'a';\n// done\n");
+        assert!(line_has(&v[1], "'a'", Tok::Str) && line_has(&v[2], "// done", Tok::Comment));
+        has(Lang::Php, "<?php #[Route('/x')] function f() {}", &[("'/x'", Tok::Str), ("f", Tok::Func)]);
+    }
+
+    #[test]
+    fn regex_literals() {
+        let src = "const p = s.replace(/\\/*$/, '');\nlet x = a / b / c; // d\nif (ok) return /'[/]/g.test(s);\nconst j = <div>x</div>;\n";
+        let v = view(Lang::JavaScript, src);
+        assert!(line_has(&v[0], "/\\/*$/", Tok::Str) && line_has(&v[0], "''", Tok::Str));
+        assert!(line_has(&v[1], "// d", Tok::Comment) && !v[1].iter().any(|t| t.1 == Tok::Str));
+        assert!(line_has(&v[2], "/'[/]/g", Tok::Str));
+        assert!(!v[3].iter().any(|t| t.1 == Tok::Str));
+        assert_eq!(end_state(Lang::JavaScript, src).kind, 0);
+        has(Lang::TypeScript, "const r = x.split(/,\\s*/);", &[("/,\\s*/", Tok::Str)]);
+    }
+
+    #[test]
+    fn csharp_calls_and_c_keywords() {
+        has(Lang::CSharp, "Console.WriteLine(\"hi\"); var l = new List<string>(); l.Add(x); var f = new Foo();", &[
+            ("Console", Tok::Type),
+            ("WriteLine", Tok::Func),
+            ("List", Tok::Type),
+            ("Add", Tok::Func),
+            ("Foo", Tok::Type),
+        ]);
+        // C isn't C++: `new` and `class` are names there
+        assert!(!toks(Lang::C, "struct node *new = class;", State::START).iter().any(|(s, _)| s == "new" || s == "class"));
+        has(Lang::Cpp, "auto p = new Foo;", &[("new", Tok::Keyword)]);
+        has(Lang::C, "_Bool b; _Static_assert(1, \"x\");", &[("_Bool", Tok::Type), ("_Static_assert", Tok::Keyword)]);
+    }
+
+    #[test]
+    fn dollar_brace_runs_cost_little() {
+        let t = "${".repeat(1 << 20);
+        let start = std::time::Instant::now();
+        for lang in [Lang::Shell, Lang::PowerShell, Lang::Php, Lang::Ruby] {
+            lex(lang, t.as_bytes(), State::START, None);
+        }
+        assert!(start.elapsed().as_secs_f64() < 2.0, "{:?}", start.elapsed());
     }
 }
