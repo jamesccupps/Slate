@@ -56,6 +56,8 @@ const COPYDATA_OPEN: usize = 0x51A7E;
 
 thread_local! {
     static APP: RefCell<Option<Cell>> = const { RefCell::new(None) };
+    /// Where the keyboard focus was when the window was deactivated (put back when it's active again).
+    static SAVED_FOCUS: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
 }
 
 pub fn app_cell() -> Option<Cell> {
@@ -343,17 +345,60 @@ fn handle(cell: &Cell, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<L
             None
         }
         WM_SETFOCUS => {
-            if let Ok(mut a) = cell.try_borrow_mut() {
-                a.focused = true;
-                a.restart_caret();
-                a.invalidate();
+            match cell.try_borrow_mut() {
+                Ok(mut a) => {
+                    a.focused = true;
+                    a.restart_caret();
+                    a.invalidate();
+                }
+                // (Focus moved by code that has the App borrowed: at least start blinking.)
+                Err(_) => unsafe {
+                    let blink = GetCaretBlinkTime();
+                    if blink != 0 && blink != u32::MAX {
+                        SetTimer(hwnd, actions::TIMER_CARET, blink.clamp(200, 2000), None);
+                    }
+                },
             }
             Some(LRESULT(0))
         }
         WM_KILLFOCUS => {
+            // No blinking (and repainting) while the keyboard is elsewhere.
+            unsafe {
+                let _ = KillTimer(hwnd, actions::TIMER_CARET);
+            }
             if let Ok(mut a) = cell.try_borrow_mut() {
                 a.focused = false;
+                a.caret_on = true;
                 a.invalidate();
+            }
+            Some(LRESULT(0))
+        }
+        WM_CAPTURECHANGED | WM_CANCELMODE => {
+            // The mouse capture went elsewhere (Alt+Tab, a menu, a dialog) before the button came up: end any drag,
+            // or moving the mouse would go on selecting (and scrolling) with no button held.
+            if let Ok(mut a) = cell.try_borrow_mut() {
+                a.cancel_drags();
+            }
+            // (DefWindowProc releases the capture for WM_CANCELMODE.)
+            if msg == WM_CANCELMODE { None } else { Some(LRESULT(0)) }
+        }
+        WM_SYSCOMMAND if (wp.0 & 0xFFF0) as u32 == SC_KEYMENU => {
+            // Alt on its own (lParam 0) gives Slate's menu bar the keyboard, rather than the window's hidden system
+            // menu; Alt+F and the other menu letters typed in a find box open that menu. Alt+Space (the window menu)
+            // and other letters keep Windows' handling.
+            let ch = lp.0 as u32;
+            let menu = char::from_u32(ch).filter(char::is_ascii_alphabetic).and_then(|c| commands::menu_for_letter(c.to_ascii_uppercase() as u16));
+            if ch != 0 && menu.is_none() {
+                return None;
+            }
+            if let Ok(mut a) = cell.try_borrow_mut() {
+                match menu {
+                    Some(i) => {
+                        a.disarm_menu_bar();
+                        a.pending.push(Deferred::Menu(i));
+                    }
+                    None => a.toggle_menu_bar(),
+                }
             }
             Some(LRESULT(0))
         }
@@ -426,15 +471,34 @@ fn handle(cell: &Cell, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<L
             Some(LRESULT(0))
         }
         WM_ACTIVATE => {
-            if loword(wp.0) != 0 {
+            if loword(wp.0) as u32 == WA_INACTIVE {
+                // Remember where the keyboard was (the find box or the text) for when the window comes back.
+                let f = unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetFocus() };
+                SAVED_FOCUS.with(|s| s.set(f.0 as isize));
                 if let Ok(mut a) = cell.try_borrow_mut() {
-                    a.check_disk();
-                    if a.find.open {
-                        // keep keyboard focus where it was
-                    }
+                    a.disarm_menu_bar();
                 }
+                return None;
             }
-            None
+            if let Ok(mut a) = cell.try_borrow_mut() {
+                a.check_disk();
+            }
+            if hiword(wp.0) != 0 {
+                return None; // minimized
+            }
+            // Put the focus back where it was; DefWindowProc would move it to the main window, out of the find box
+            // (and a Ctrl+V meant for the find box would paste into the text).
+            let saved = HWND(SAVED_FOCUS.with(|s| s.get()) as *mut _);
+            // (the box's own visibility: the bar may have switched to another box meanwhile)
+            let shown = |h: HWND| unsafe { GetWindowLongPtrW(h, GWL_STYLE) } as u32 & WS_VISIBLE.0 != 0;
+            let back = match cell.try_borrow() {
+                Ok(a) => a.find.open && a.find.is_edit(saved) && shown(saved),
+                Err(_) => false,
+            };
+            unsafe {
+                let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(if back { saved } else { hwnd });
+            }
+            Some(LRESULT(0))
         }
         WM_IME_STARTCOMPOSITION => {
             if let Ok(mut a) = cell.try_borrow_mut() {
@@ -599,17 +663,22 @@ pub fn register_class() -> HINSTANCE {
     }
 }
 
-/// Creates the main window (hidden) and its App.
+/// Creates the main window (hidden) and its App, where it was last time.
 pub fn create_window(hinst: HINSTANCE, s: &settings::Settings) -> HWND {
-    let (mut x, mut y, mut w, mut h) = (CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT);
-    if let Some(p) = s.window {
-        let r = RECT { left: p.x, top: p.y, right: p.x + p.w, bottom: p.y + p.h };
-        if unsafe { !MonitorFromRect(&r, MONITOR_DEFAULTTONULL).is_invalid() } && p.w > 200 && p.h > 150 {
-            (x, y, w, h) = (p.x, p.y, p.w, p.h);
-        }
-    }
+    // The saved place is in workspace coordinates (GetWindowPlacement's: they leave out a taskbar at the top or
+    // left of the monitor), which only SetWindowPlacement takes; creating the window right there first means it
+    // starts on that monitor, with that monitor's DPI. (A place on no monitor any more: Windows' default.)
+    let saved = s
+        .window
+        .filter(|p| p.w > 200 && p.h > 150)
+        .map(|p| RECT { left: p.x, top: p.y, right: p.x + p.w, bottom: p.y + p.h })
+        .filter(|&r| unsafe { !MonitorFromRect(&workspace_to_screen(r), MONITOR_DEFAULTTONULL).is_invalid() });
+    let (x, y, w, h) = match saved.map(workspace_to_screen) {
+        Some(r) => (r.left, r.top, r.right - r.left, r.bottom - r.top),
+        None => (CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT),
+    };
     unsafe {
-        CreateWindowExW(
+        let hwnd = CreateWindowExW(
             WS_EX_ACCEPTFILES,
             class(),
             w!("Slate"),
@@ -623,8 +692,31 @@ pub fn create_window(hinst: HINSTANCE, s: &settings::Settings) -> HWND {
             hinst,
             None,
         )
-        .expect("create window")
+        .expect("create window");
+        if let Some(r) = saved {
+            let wp = WINDOWPLACEMENT {
+                length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
+                showCmd: SW_HIDE.0 as u32,
+                ptMinPosition: POINT { x: -1, y: -1 },
+                ptMaxPosition: POINT { x: -1, y: -1 },
+                rcNormalPosition: r,
+                ..Default::default()
+            };
+            let _ = SetWindowPlacement(hwnd, &wp);
+        }
+        hwnd
     }
+}
+
+/// Workspace coordinates (relative to the work area of the monitor they're on) to screen coordinates.
+fn workspace_to_screen(r: RECT) -> RECT {
+    use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO};
+    let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+    if unsafe { !GetMonitorInfoW(MonitorFromRect(&r, MONITOR_DEFAULTTONEAREST), &mut mi).as_bool() } {
+        return r;
+    }
+    let (dx, dy) = (mi.rcWork.left - mi.rcMonitor.left, mi.rcWork.top - mi.rcMonitor.top);
+    RECT { left: r.left + dx, top: r.top + dy, right: r.right + dx, bottom: r.bottom + dy }
 }
 
 pub fn make_app(hwnd: HWND) -> Cell {

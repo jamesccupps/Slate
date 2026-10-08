@@ -694,9 +694,125 @@ pub fn char_class(c: char) -> CharClass {
     }
 }
 
+// ---- characters as people see them (a small part of Unicode's grapheme clusters, UAX #29) ----
+
+/// Marks that belong to the character before them: combining accents (the common blocks, Hebrew and Arabic points,
+/// the vowel signs of Indic scripts, Thai and Lao), variation selectors, emoji skin tones, the keycap mark, emoji
+/// tags and the zero-width non-joiner.
+fn is_extend(u: u32) -> bool {
+    match u {
+        // Devanagari … Malayalam share one layout: signs, nukta, vowel signs and virama, length marks
+        0x0900..=0x0D7F => matches!(u & 0x7F, 0x00..=0x03 | 0x3A..=0x3C | 0x3E..=0x4F | 0x51..=0x57 | 0x62..=0x63),
+        0x0300..=0x036F | 0x0483..=0x0489 | 0x0591..=0x05BD | 0x05BF | 0x05C1..=0x05C2 | 0x05C4..=0x05C5 | 0x05C7 => true,
+        0x0610..=0x061A | 0x064B..=0x065F | 0x0670 | 0x06D6..=0x06DC | 0x06DF..=0x06E4 | 0x06E7..=0x06E8 => true,
+        0x06EA..=0x06ED | 0x0E31 | 0x0E34..=0x0E3A | 0x0E47..=0x0E4E | 0x0EB1 | 0x0EB4..=0x0EBC | 0x0EC8..=0x0ECD => true,
+        0x1AB0..=0x1AFF | 0x1DC0..=0x1DFF | 0x200C | 0x20D0..=0x20FF | 0x3099..=0x309A | 0xFE00..=0xFE0F => true,
+        0xFE20..=0xFE2F | 0x1F3FB..=0x1F3FF | 0xE0020..=0xE007F | 0xE0100..=0xE01EF => true,
+        _ => false,
+    }
+}
+
+fn is_regional(u: u32) -> bool {
+    (0x1F1E6..=0x1F1FF).contains(&u)
+}
+
+/// A virama that joins the next consonant into a conjunct (क्ष is one character): Devanagari, Bengali, Gujarati,
+/// Oriya, Telugu, Malayalam.
+fn is_linker(u: u32) -> bool {
+    matches!(u, 0x094D | 0x09CD | 0x0ACD | 0x0B4D | 0x0C4D | 0x0D4D)
+}
+
+/// Length in bytes of the character as people see it at the start of `bytes`: a letter with its accents, an
+/// emoji with its skin tone or the ZWJ sequence it starts (👨‍👩‍👧), a flag (two regional letters), a keycap.
+/// Line breaks and invalid bytes stand alone.
+pub fn cluster_len_at(bytes: &[u8]) -> usize {
+    let (first, mut n) = decode_char(bytes);
+    if n == 0 || first == '\r' || first == '\n' || std::str::from_utf8(&bytes[..n]).is_err() {
+        return n;
+    }
+    let mut prev = first as u32;
+    let mut regional = is_regional(prev) as u32;
+    while n < bytes.len() {
+        let (c, len) = decode_char(&bytes[n..]);
+        let u = c as u32;
+        let joins = is_extend(u)
+            || u == 0x200D
+            // after a zero-width joiner, the next character is part of the sequence
+            || (prev == 0x200D && !c.is_control())
+            // a conjunct: the consonant after a virama, in the same script
+            || (is_linker(prev) && u >> 7 == prev >> 7)
+            // flags: regional letters go in pairs
+            || (is_regional(u) && regional % 2 == 1);
+        if !joins || std::str::from_utf8(&bytes[n..n + len]).is_err() {
+            break;
+        }
+        if is_regional(u) {
+            regional += 1;
+        }
+        prev = u;
+        n += len;
+    }
+    n
+}
+
+/// Length in bytes of the visible character that ends at the end of `bytes`; `bytes` should start where a
+/// character starts (at a line start, say), as it is worked out from there.
+pub fn cluster_len_before(bytes: &[u8]) -> usize {
+    let mut at = 0;
+    let mut last = 0;
+    while at < bytes.len() {
+        last = cluster_len_at(&bytes[at..]).max(1);
+        at += last;
+    }
+    // (a window that started in the middle of a character: what's left of it)
+    last.min(bytes.len())
+}
+
+/// What Backspace deletes before the caret: an emoji sequence or flag as a whole, but of a letter with accents
+/// only its last accent (as Windows does), and otherwise one character.
+pub fn backspace_len(bytes: &[u8]) -> usize {
+    if bytes.is_empty() {
+        return 0;
+    }
+    let n = cluster_len_before(bytes);
+    let cluster = &bytes[bytes.len() - n..];
+    let emoji = std::str::from_utf8(cluster).is_ok_and(|s| {
+        s.chars().any(|c| matches!(c as u32, 0x200D | 0xFE0F | 0x20E3 | 0x1F3FB..=0x1F3FF | 0xE0020..=0xE007F) || is_regional(c as u32))
+    });
+    if emoji { n } else { decode_char_before(bytes).1.max(1) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn visible_characters() {
+        let at = |s: &str| cluster_len_at(s.as_bytes());
+        let before = |s: &str| cluster_len_before(s.as_bytes());
+        assert_eq!(at("e\u{301}x"), 3); // e + combining acute
+        assert_eq!(at("\u{1F44D}\u{1F3FD}!"), 8); // 👍🏽
+        assert_eq!(at("\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}y"), 18); // 👨‍👩‍👧
+        assert_eq!(at("\u{1F1E9}\u{1F1EA}\u{1F1EB}\u{1F1F7}"), 8); // 🇩🇪 then 🇫🇷
+        assert_eq!(at("1\u{FE0F}\u{20E3}"), 7); // keycap 1️⃣
+        assert_eq!(at("\u{2764}\u{FE0F}"), 6); // ❤️
+        assert_eq!(at("\u{915}\u{94D}\u{937}\u{93F}x"), 12); // क्षि: a conjunct with its vowel sign
+        assert_eq!(at("\u{915}\u{93F}\u{915}"), 6); // कि then क
+        assert_eq!(at("\u{B95}\u{BCD}\u{BB7}"), 6); // Tamil's pulli shows: க் then ஷ
+        assert_eq!(at("ab"), 1);
+        assert_eq!(at("\r\n"), 1);
+        assert_eq!(at("\u{301}a"), 2); // a stray accent goes with nothing before it
+        assert_eq!(cluster_len_at(b"\xFFa"), 1);
+        assert_eq!(before("x\u{1F1E9}\u{1F1EA}\u{1F1EB}\u{1F1F7}"), 8);
+        assert_eq!(before("xe\u{301}"), 3);
+        assert_eq!(before("ab"), 1);
+        assert_eq!(before(""), 0);
+        // Backspace: the whole emoji or flag, but only the last accent of a letter
+        assert_eq!(backspace_len("x\u{1F44D}\u{1F3FD}".as_bytes()), 8);
+        assert_eq!(backspace_len("x\u{1F1E9}\u{1F1EA}".as_bytes()), 8);
+        assert_eq!(backspace_len("xe\u{301}".as_bytes()), 2);
+        assert_eq!(backspace_len(b"ab"), 1);
+    }
 
     #[test]
     fn detects_encodings() {

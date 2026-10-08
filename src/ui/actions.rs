@@ -17,7 +17,7 @@ use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
     DestroyMenu, DestroyWindow, GetCaretBlinkTime, GetSystemMetrics, KillTimer, SM_CXDOUBLECLK,
     SPI_GETWHEELSCROLLLINES, SW_SHOWNORMAL, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SetTimer, SystemParametersInfoW,
-    TPM_LEFTALIGN, TPM_RETURNCMD, TPM_TOPALIGN, TrackPopupMenuEx,
+    TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_TOPALIGN, TrackPopupMenuEx,
 };
 use windows::core::{HSTRING, PCWSTR, w};
 
@@ -50,10 +50,17 @@ pub const TIMER_SEARCH: usize = 5;
 pub const TIMER_SESSION: usize = 6;
 /// A while after starting: look for a new version (at most once a day).
 pub const TIMER_UPDATE: usize = 7;
+/// A status bar message has had its time: repaint without it (nothing else may repaint meanwhile).
+pub const TIMER_FLASH: usize = 8;
 
 /// Documents up to this size are searched on the UI thread (fast enough to feel instant).
 const SYNC_SEARCH: u64 = 32 << 20;
 const BIG_CLIPBOARD: u64 = 64 << 20;
+
+thread_local! {
+    /// Test mode: where the mouse pointer is (client DIPs), for scrolling while dragging.
+    pub static TEST_POINTER: std::cell::Cell<Option<(f32, f32)>> = const { std::cell::Cell::new(None) };
+}
 
 /// Output for a background transform: memory for small results, a self-deleting temp file for big ones.
 enum Sink {
@@ -239,8 +246,29 @@ impl App {
     pub fn restart_caret(&mut self) {
         self.caret_on = true;
         unsafe {
-            SetTimer(self.hwnd, TIMER_CARET, GetCaretBlinkTime().clamp(200, 2000), None);
+            let blink = GetCaretBlinkTime();
+            // Blinking turned off in Windows' settings (INFINITE), or the keyboard is elsewhere: a steady caret and no
+            // timer repainting the window.
+            if blink == 0 || blink == u32::MAX || GetFocus() != self.hwnd {
+                let _ = KillTimer(self.hwnd, TIMER_CARET);
+            } else {
+                SetTimer(self.hwnd, TIMER_CARET, blink.clamp(200, 2000), None);
+            }
         }
+    }
+
+    /// The mouse capture was lost before the button came up (Alt+Tab, a menu or a dialog took it): end every drag.
+    pub fn cancel_drags(&mut self) {
+        self.kill_timer(TIMER_SCROLL);
+        if let Some(t) = self.tabs.get_mut(self.active) {
+            t.view.drag = None;
+        }
+        self.tab_drag = None;
+        self.down = Hit::None;
+        if self.split_drag.take().is_some() {
+            self.settings.save();
+        }
+        self.invalidate();
     }
 
     pub fn timer(&self, id: usize, ms: u32) {
@@ -259,6 +287,34 @@ impl App {
         self.with_view(|v, cx| v.reveal(cx, v.sel.caret, center));
     }
 
+    // ---- indentation ----
+
+    /// How tab `i` is indented: what the user picked for it; tabs for TSV files and makefiles (where a tab means
+    /// something); what its text uses; else the settings' default.
+    pub fn indent_of(&self, i: usize) -> Indent {
+        let t = &self.tabs[i];
+        match t.indent {
+            Some(ind) if t.indent_picked => ind,
+            _ if needs_tabs(t) => Indent::Tabs,
+            Some(ind) => ind,
+            None if self.settings.use_spaces => Indent::Spaces(self.settings.tab_size),
+            None => Indent::Tabs,
+        }
+    }
+
+    pub fn indent_now(&self) -> Indent {
+        self.indent_of(self.active)
+    }
+
+    /// Looks at how tab `i`'s text is indented (after opening or loading it), unless the user picked it.
+    fn detect_indent(&mut self, i: usize) {
+        let t = &mut self.tabs[i];
+        if !t.indent_picked {
+            let head = t.doc.read(0, t.doc.len().min(256 << 10));
+            t.indent = editor::detect_indent(&head);
+        }
+    }
+
     // ---- tabs ----
 
     pub fn add_tab(&mut self, doc: Document) -> usize {
@@ -273,6 +329,7 @@ impl App {
         }
         self.tabs.push(tab);
         let i = self.tabs.len() - 1;
+        self.detect_indent(i);
         self.activate(i);
         self.session_dirty = true;
         i
@@ -302,7 +359,14 @@ impl App {
 
     pub fn update_title(&self) {
         let t = match self.tabs.get(self.active) {
-            Some(tab) => format!("{}{} - Slate", if tab.doc.is_dirty() { "*" } else { "" }, tab.title()),
+            Some(tab) => {
+                let dirty = if tab.doc.is_dirty() { "*" } else { "" };
+                // The file's folder is shown here (the tab has just the name): "*notes.txt - C:\work - Slate".
+                match tab.doc.path.as_deref().and_then(|p| p.parent()).filter(|_| tab.title_override.is_none()) {
+                    Some(dir) => format!("{dirty}{} - {} - Slate", tab.title(), dir.display()),
+                    None => format!("{dirty}{} - Slate", tab.title()),
+                }
+            }
             None => "Slate".into(),
         };
         unsafe {
@@ -379,6 +443,19 @@ impl App {
                 }
                 Err(e) => {
                     let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    if e.kind() == io::ErrorKind::NotFound && p.parent().is_some_and(Path::is_dir) {
+                        // A file that isn't there yet in a folder that is (`Slate todo.txt`): an empty tab that
+                        // becomes that file when it's saved (Notepad offers to create it).
+                        let mut doc = Document::new();
+                        doc.path = Some(p.clone());
+                        let i = self.add_tab(doc);
+                        if replace_blank && i == 1 {
+                            self.tabs.remove(0);
+                            self.active = 0;
+                        }
+                        self.flash(format!("{name} is a new file: saving creates it."), false);
+                        continue;
+                    }
                     self.flash(format!("Couldn't open {name}: {}", fileio::friendly_io(&e)), true);
                 }
             }
@@ -751,6 +828,7 @@ impl App {
                             let head = tab.doc.read(0, 4096);
                             let name = tab.doc.path.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned());
                             tab.lang = Lang::detect(name.as_deref(), &head);
+                            self.detect_indent(i);
                         }
                     }
                     Err(e) => {
@@ -845,10 +923,10 @@ impl App {
                         Some((s, e, wrapped)) => {
                             self.select_match(s, e);
                             if wrapped {
-                                self.flash("Search wrapped around", false);
+                                self.flash_search("Search wrapped around", false);
                             }
                         }
-                        None => self.flash("No results", true),
+                        None => self.flash_search("No results", true),
                     }
                 }
             } else {
@@ -1003,6 +1081,10 @@ impl App {
                     TaskKind::Lines(op) => lines_done(op, count),
                     TaskKind::Validate(_) => String::new(),
                 };
+                if matches!(task.kind, TaskKind::Format(_)) {
+                    // (now indented by the formatter's own rule)
+                    self.detect_indent(i);
+                }
                 if i == self.active {
                     self.after_edit();
                 }
@@ -1020,7 +1102,9 @@ impl App {
                 let tab = &mut self.tabs[i];
                 let off = offset.min(tab.doc.len());
                 let line = tab.doc.line_of(off);
-                let col = off - tab.doc.line_start_of(off) + 1;
+                let ls = tab.doc.line_start_of(off);
+                // in characters, like the status bar (bytes for a line too long to count)
+                let col = if off - ls <= 4 << 20 { bytecount::num_chars(&tab.doc.read(ls, off)) as u64 + 1 } else { off - ls + 1 };
                 let at = match line {
                     Some(l) => format!(" (line {}, column {})", group(l + 1), group(col)),
                     None => String::new(),
@@ -1240,8 +1324,20 @@ impl App {
         if s.is_empty() || !self.editable() {
             return;
         }
+        let width = match self.indent_now() {
+            Indent::Spaces(n) => n,
+            Indent::Tabs => self.settings.tab_size,
+        };
         let tab = &mut self.tabs[self.active];
         let sel = tab.view.sel;
+        if s == "}" || s == "]" {
+            // Closing a block that Enter indented: the bracket lines up with the line that opened it.
+            if let Some(new) = editor::close_bracket(&mut tab.doc, sel, s.as_bytes()[0], width) {
+                tab.view.sel = new;
+                self.after_edit();
+                return;
+            }
+        }
         // Each word is its own undo step.
         if s.starts_with(char::is_whitespace) && sel.is_empty() {
             let before = tab.doc.prev_char(sel.caret);
@@ -1250,8 +1346,9 @@ impl App {
                 tab.doc.seal();
             }
         }
-        let kind = if sel.is_empty() { EditKind::Typing } else { EditKind::Other };
-        tab.view.sel = editor::replace_selection(&mut tab.doc, sel, s.as_bytes(), kind);
+        // (Typing over a selection starts a typing run too, so undo takes back the selection and what replaced it
+        // in one step.)
+        tab.view.sel = editor::replace_selection(&mut tab.doc, sel, s.as_bytes(), EditKind::Typing);
         self.after_edit();
     }
 
@@ -1275,9 +1372,88 @@ impl App {
         self.type_text(&s);
     }
 
+    /// Alt pressed and released on its own: the menu bar takes the keyboard, File highlighted (like Notepad's).
+    /// Pressing Alt again leaves it.
+    pub fn toggle_menu_bar(&mut self) {
+        self.menu_armed = if self.menu_armed.is_some() { None } else { Some(0) };
+        self.invalidate();
+    }
+
+    pub fn disarm_menu_bar(&mut self) {
+        if self.menu_armed.take().is_some() {
+            self.invalidate();
+        }
+    }
+
+    /// A key while the menu bar has the keyboard: a menu's letter opens it, Left/Right move along the bar, Enter or
+    /// Down open the highlighted menu, Space the window menu. Anything else leaves the menu bar and then works as
+    /// usual (None).
+    fn menu_bar_key(&mut self, vk: u16, m: &Mods) -> Option<bool> {
+        let cur = self.menu_armed?;
+        let n = MENU_TITLES.len();
+        let k = VIRTUAL_KEY(vk);
+        let open = |a: &mut App, i: usize| {
+            a.menu_armed = None;
+            a.drop_typed_char();
+            a.pending.push(Deferred::Menu(i));
+            Some(true)
+        };
+        match k {
+            // Holding a modifier keeps the menu bar; Alt again leaves it (WM_SYSCOMMAND toggles it off).
+            VK_SHIFT | VK_CONTROL | VK_MENU | VK_LSHIFT | VK_RSHIFT | VK_LCONTROL | VK_RCONTROL | VK_LMENU | VK_RMENU => {
+                Some(false)
+            }
+            VK_LEFT | VK_RIGHT => {
+                self.menu_armed = Some(if k == VK_LEFT { (cur + n - 1) % n } else { (cur + 1) % n });
+                self.invalidate();
+                Some(true)
+            }
+            VK_RETURN | VK_DOWN | VK_UP => open(self, cur),
+            VK_ESCAPE | VK_F10 => {
+                self.disarm_menu_bar();
+                Some(true)
+            }
+            VK_SPACE => {
+                // The window menu (Restore, Move, Close...), as Alt+Space opens it.
+                self.disarm_menu_bar();
+                self.drop_typed_char();
+                unsafe {
+                    let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                        self.hwnd,
+                        windows::Win32::UI::WindowsAndMessaging::WM_SYSCOMMAND,
+                        windows::Win32::Foundation::WPARAM(windows::Win32::UI::WindowsAndMessaging::SC_KEYMENU as usize),
+                        windows::Win32::Foundation::LPARAM(b' ' as isize),
+                    );
+                }
+                Some(true)
+            }
+            _ => match menu_for_letter(vk) {
+                Some(i) if !m.ctrl && !m.alt => open(self, i),
+                _ => {
+                    self.disarm_menu_bar();
+                    None
+                }
+            },
+        }
+    }
+
+    /// A key that opens a menu typed a character too (TranslateMessage has queued it): drop it, or the menu would
+    /// take it as a choice (Alt, F would pick "Show in folder").
+    fn drop_typed_char(&self) {
+        use windows::Win32::UI::WindowsAndMessaging::{MSG, PM_REMOVE, PeekMessageW, WM_CHAR, WM_SYSCHAR};
+        unsafe {
+            let mut msg = MSG::default();
+            let _ = PeekMessageW(&mut msg, self.hwnd, WM_CHAR, WM_CHAR, PM_REMOVE);
+            let _ = PeekMessageW(&mut msg, self.hwnd, WM_SYSCHAR, WM_SYSCHAR, PM_REMOVE);
+        }
+    }
+
     /// Key presses in the text area. Returns whether the key was used.
     pub fn on_key(&mut self, vk: u16) -> bool {
         let m = mods();
+        if let Some(used) = self.menu_bar_key(vk, &m) {
+            return used;
+        }
         if let Some(cmd) = global_key(vk, &m) {
             self.pending.push(Deferred::Cmd(cmd));
             return true;
@@ -1285,6 +1461,7 @@ impl App {
         let k = VIRTUAL_KEY(vk);
         if m.alt && !m.ctrl && !m.shift {
             if let Some(i) = menu_for_letter(vk) {
+                self.drop_typed_char();
                 self.pending.push(Deferred::Menu(i));
                 return true;
             }
@@ -1319,9 +1496,9 @@ impl App {
                 } else if m.ctrl {
                     if right { tab.doc.word_right(sel.caret) } else { tab.doc.word_left(sel.caret) }
                 } else if right {
-                    tab.doc.next_char(sel.caret)
+                    editor::next_cluster(&tab.doc, sel.caret)
                 } else {
-                    tab.doc.prev_char(sel.caret)
+                    editor::prev_cluster(&tab.doc, sel.caret)
                 };
                 tab.view.set_caret(pos, ext);
                 tab.view.want_x = None;
@@ -1374,7 +1551,7 @@ impl App {
                     return false;
                 }
                 if self.editable() {
-                    let unit = self.settings.indent_unit();
+                    let unit = self.indent_now().unit();
                     let tab = self.tab_mut();
                     tab.doc.seal();
                     tab.view.sel = editor::newline(&mut tab.doc, tab.view.sel, &unit);
@@ -1389,21 +1566,22 @@ impl App {
                 self.tab_key(ext);
             }
             VK_ESCAPE => {
+                // Closing and deselecting come first: a save is cancelled only by an Esc meant for nothing else.
                 if self.find.open {
                     self.close_find();
                 } else if let Some(t) = &self.tab().task {
                     t.job.cancel();
-                } else if let Some(s) = &self.tab().save {
-                    s.job.cancel();
                 } else if self.tab().notice.is_some() {
                     self.tab_mut().notice = None;
                     self.layout();
                     self.invalidate();
-                } else {
+                } else if !self.tab().view.sel.is_empty() {
                     let tab = self.tab_mut();
                     let c = tab.view.sel.caret;
                     tab.view.sel = Sel::at(c);
                     self.invalidate();
+                } else if let Some(s) = &self.tab().save {
+                    s.job.cancel();
                 }
             }
             _ => return false,
@@ -1415,21 +1593,21 @@ impl App {
         if !self.editable() {
             return;
         }
-        let unit = self.settings.indent_unit();
-        let (tab_size, use_spaces) = (self.settings.tab_size, self.settings.use_spaces);
+        let ind = self.indent_now();
+        let tab_size = self.settings.tab_size;
         let tab = self.tab_mut();
         let sel = tab.view.sel;
         let multi = !sel.is_empty() && tab.doc.line_start_of(sel.start()) != tab.doc.line_start_of(sel.end().saturating_sub(1).max(sel.start()));
         if shift || multi {
-            match editor::indent_lines(&mut tab.doc, sel, &unit, tab_size, shift) {
-                Some(s) => tab.view.sel = s,
-                None => {
-                    self.flash("Too many lines selected for that.", true);
+            match editor::indent_lines(&mut tab.doc, sel, ind, tab_size, shift) {
+                Ok(s) => tab.view.sel = s,
+                Err(why) => {
+                    self.flash(why, true);
                     return;
                 }
             }
         } else {
-            let text = editor::tab_text(&tab.doc, sel.start(), tab_size, use_spaces);
+            let text = editor::tab_text(&tab.doc, sel.start(), ind, tab_size);
             tab.doc.seal();
             tab.view.sel = editor::replace_selection(&mut tab.doc, sel, &text, EditKind::Other);
         }
@@ -1496,6 +1674,8 @@ impl App {
             self.flash("Couldn't use the clipboard (another program may be holding it).", true);
             return false;
         }
+        // A whole line (nothing was selected): pasting it puts it back as a line.
+        self.line_clip = self.tab().view.sel.is_empty().then(win::clipboard_sequence);
         true
     }
 
@@ -1518,15 +1698,32 @@ impl App {
             return;
         }
         let Some(text) = win::get_clipboard(self.hwnd) else { return };
+        // A line copied with nothing selected goes in as a line, above the caret's (like VS Code).
+        let line = self.line_clip.is_some() && self.line_clip == Some(win::clipboard_sequence());
+        let i = self.active;
         let tab = self.tab_mut();
-        let text = editor::normalize_eols(&text, tab.doc.eol.as_bytes());
+        let mut text = editor::normalize_eols(&text, tab.doc.eol.as_bytes());
         // Pasted into an empty new tab: color it like what it looks like (JSON, XML, a script...).
         let guess = tab.doc.is_empty() && tab.doc.path.is_none() && tab.lang == Lang::Plain && !tab.lang_picked;
         tab.doc.seal();
-        tab.view.sel = editor::replace_selection(&mut tab.doc, tab.view.sel, &text, EditKind::Other);
+        let sel = tab.view.sel;
+        if line && sel.is_empty() {
+            if !text.ends_with(b"\n") {
+                text.extend_from_slice(tab.doc.eol.as_bytes());
+            }
+            let at = tab.doc.line_start_of(sel.caret);
+            let new = Sel::at(sel.caret + text.len() as u64);
+            tab.doc.begin(EditKind::Other, sel);
+            tab.doc.insert(at, &text);
+            tab.doc.end(new);
+            tab.view.sel = new;
+        } else {
+            tab.view.sel = editor::replace_selection(&mut tab.doc, sel, &text, EditKind::Other);
+        }
         tab.doc.seal();
         if guess {
             tab.lang = Lang::detect(None, &text[..text.len().min(4096)]);
+            self.detect_indent(i);
         }
         self.after_edit();
     }
@@ -1570,6 +1767,7 @@ impl App {
         unsafe {
             let _ = SetFocus(self.hwnd);
         }
+        self.restart_caret();
         self.invalidate();
     }
 
@@ -1580,10 +1778,19 @@ impl App {
         self.find.query.text = text;
         self.find.compile();
         if changed {
+            self.clear_search_flash();
             self.live_search();
         }
         self.schedule_count();
         self.invalidate();
+    }
+
+    /// The search changed: "No results" and the like were about the old one.
+    fn clear_search_flash(&mut self) {
+        if self.flash_search {
+            self.flash = None;
+            self.flash_search = false;
+        }
     }
 
     /// As you type, select the first match at or after where the search started.
@@ -1629,7 +1836,7 @@ impl App {
             return;
         }
         let Some(m) = self.find.matcher.clone() else {
-            self.flash(self.find.error.clone().unwrap_or_default(), true);
+            self.flash_search(self.find.error.clone().unwrap_or_default(), true);
             return;
         };
         let tab = self.tab();
@@ -1656,10 +1863,10 @@ impl App {
                 self.select_match(s, e);
                 self.find.origin = Some(s);
                 if wrapped {
-                    self.flash("Search wrapped around", false);
+                    self.flash_search("Search wrapped around", false);
                 }
             }
-            None => self.flash("No results", true),
+            None => self.flash_search("No results", true),
         }
     }
 
@@ -1740,10 +1947,12 @@ impl App {
 
     pub fn go_to_line_from_bar(&mut self) {
         let text = FindBar::text_of(self.find.goto_edit);
-        let t = text.trim();
-        let mut parts = t.split([':', ',', ' ']).filter(|s| !s.is_empty());
-        let line: Option<u64> = parts.next().and_then(|s| s.replace(['.', '\''], "").parse().ok());
-        let col: Option<u64> = parts.next().and_then(|s| s.parse().ok());
+        // "12,345" or "12.345" is line 12345 (as the hint writes it); only ':' gives a column ("120:5").
+        let digits = |s: &str| s.replace([',', '.', '\'', ' ', '\u{a0}', '\u{202f}'], "").parse::<u64>().ok();
+        let (line, col) = match text.trim().split_once(':') {
+            Some((l, c)) => (digits(l), digits(c)),
+            None => (digits(text.trim()), None),
+        };
         let Some(line) = line else {
             self.flash("Type a line number", true);
             return;
@@ -1792,6 +2001,7 @@ impl App {
                 }
                 self.find.compile();
                 self.tab_mut().search = Search::default();
+                self.clear_search_flash();
                 self.live_search();
                 self.schedule_count();
                 self.invalidate();
@@ -1808,6 +2018,9 @@ impl App {
     /// Keys typed in the find bar's edit boxes. Returns true if handled (the edit box doesn't see it).
     pub fn bar_key(&mut self, edit: HWND, vk: u16) -> bool {
         let m = mods();
+        if let Some(used) = self.menu_bar_key(vk, &m) {
+            return used;
+        }
         let k = VIRTUAL_KEY(vk);
         match k {
             VK_RETURN => {
@@ -1867,6 +2080,7 @@ impl App {
     // ---- mouse ----
 
     pub fn on_mouse_down(&mut self, x: f32, y: f32, button: u8) {
+        self.disarm_menu_bar();
         let hit = self.hit(x, y);
         self.down = hit;
         let capture = |h: HWND| unsafe {
@@ -2079,7 +2293,10 @@ impl App {
             }
             _ => {
                 let r = self.r_edit;
-                if y < r.y || y > r.bottom() {
+                let geom = self.editor_geom();
+                // (Without word wrap, past the left or right edge scrolls sideways.)
+                let sideways = !self.style.wrap && (x < geom.text_x || x > geom.text_x + geom.text_w);
+                if y < r.y || y > r.bottom() || sideways {
                     self.timer(TIMER_SCROLL, 40);
                 } else {
                     self.kill_timer(TIMER_SCROLL);
@@ -2161,7 +2378,16 @@ impl App {
     pub fn on_wheel(&mut self, delta: i32, horizontal: bool, x: f32, y: f32) {
         let m = mods();
         if m.ctrl && !horizontal {
-            self.exec(if delta > 0 { Cmd::ZoomIn } else { Cmd::ZoomOut });
+            // One zoom step per notch (120); a touchpad's pinch sends many small steps, which add up.
+            if (self.wheel_zoom > 0) != (delta > 0) {
+                self.wheel_zoom = 0;
+            }
+            self.wheel_zoom += delta;
+            while self.wheel_zoom.abs() >= 120 {
+                let zoom_in = self.wheel_zoom > 0;
+                self.wheel_zoom -= 120 * self.wheel_zoom.signum();
+                self.exec(if zoom_in { Cmd::ZoomIn } else { Cmd::ZoomOut });
+            }
             return;
         }
         if self.r_struct.w > 0.0 && self.r_struct.contains(x, y) {
@@ -2196,22 +2422,35 @@ impl App {
                 SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
             );
         }
-        let rows = if lines == u32::MAX {
+        let per_notch = if lines == u32::MAX {
             // "one screen at a time"
-            let n = ((self.r_edit.h / self.style.row_h) as i64 - 1).max(1);
-            if delta > 0 { -n } else { n }
+            ((self.r_edit.h / self.style.row_h) as i64 - 1).max(1) as f32
         } else {
-            let r = -(delta as i64) * lines.max(1) as i64 / 120;
-            if r == 0 { -(delta.signum() as i64) } else { r }
+            lines.max(1) as f32
         };
-        self.with_view(|v, cx| v.scroll_rows(cx, rows));
-        self.invalidate();
+        // Rows to scroll, fractions kept for the next message: a touchpad sends many small steps (and reversing
+        // drops what's left over).
+        let rows = -delta as f32 / 120.0 * per_notch;
+        if (self.wheel_rows > 0.0) != (rows > 0.0) {
+            self.wheel_rows = 0.0;
+        }
+        self.wheel_rows += rows;
+        let n = self.wheel_rows.trunc();
+        self.wheel_rows -= n;
+        if n != 0.0 {
+            self.with_view(|v, cx| v.scroll_rows(cx, n as i64));
+            self.invalidate();
+        }
     }
 
     pub fn on_timer(&mut self, id: usize) {
         match id {
             TIMER_CARET => {
                 self.caret_on = !self.caret_on;
+                self.invalidate();
+            }
+            TIMER_FLASH => {
+                self.kill_timer(TIMER_FLASH);
                 self.invalidate();
             }
             TIMER_JOBS => self.poll_jobs(),
@@ -2234,21 +2473,47 @@ impl App {
                     self.kill_timer(TIMER_SCROLL);
                     return;
                 };
-                let mut pt = POINT::default();
-                unsafe {
-                    let _ = windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut pt);
-                    let _ = windows::Win32::Graphics::Gdi::ScreenToClient(self.hwnd, &mut pt);
-                }
-                let (x, y) = (self.px_to_dip(pt.x), self.px_to_dip(pt.y));
+                let (x, y) = match TEST_POINTER.with(|p| p.get()) {
+                    Some(p) => p,
+                    None => {
+                        let mut pt = POINT::default();
+                        unsafe {
+                            let _ = windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut pt);
+                            let _ = windows::Win32::Graphics::Gdi::ScreenToClient(self.hwnd, &mut pt);
+                        }
+                        (self.px_to_dip(pt.x), self.px_to_dip(pt.y))
+                    }
+                };
                 let r = self.r_edit;
                 let dist = if y < r.y { y - r.y } else if y > r.bottom() { y - r.bottom() } else { 0.0 };
-                if dist != 0.0 {
-                    let n = ((dist.abs() / 20.0).ceil() as i64).clamp(1, 20) * dist.signum() as i64;
+                let geom = self.editor_geom();
+                let (left, right) = (geom.text_x, geom.text_x + geom.text_w);
+                let dx = if self.style.wrap {
+                    0.0
+                } else if x < left {
+                    x - left
+                } else if x > right {
+                    x - right
+                } else {
+                    0.0
+                };
+                if dist != 0.0 || dx != 0.0 {
+                    if dx != 0.0 {
+                        // faster the further out the pointer is
+                        let step = (dx.abs() / 2.0).clamp(4.0, 80.0) * dx.signum();
+                        let v = &mut self.tab_mut().view;
+                        let max = (v.content_w + 40.0 - geom.text_w).max(0.0);
+                        v.scroll_x = (v.scroll_x + step).clamp(0.0, max);
+                    }
+                    let n = if dist != 0.0 { ((dist.abs() / 20.0).ceil() as i64).clamp(1, 20) * dist.signum() as i64 } else { 0 };
                     self.with_view(|v, cx| {
-                        v.scroll_rows(cx, n);
+                        if n != 0 {
+                            v.scroll_rows(cx, n);
+                        }
                         // so the selection reaches what is under the pointer now, not before the scroll
                         v.layout_rows(cx);
                     });
+                    let x = x.max(left).min((right - 1.0).max(left));
                     self.extend_drag(drag, x, y.max(r.y).min((r.bottom() - 1.0).max(r.y)));
                 }
             }
@@ -2367,26 +2632,26 @@ impl App {
                 if !self.editable() {
                     return;
                 }
-                let unit = self.settings.indent_unit();
+                let ind = self.indent_now();
                 let ts = self.settings.tab_size;
                 let tab = self.tab_mut();
                 let sel = tab.view.sel;
                 tab.doc.seal();
                 let r = match cmd {
-                    Cmd::DuplicateLine => Some(editor::duplicate(&mut tab.doc, sel)),
-                    Cmd::DeleteLine => editor::delete_lines(&mut tab.doc, sel),
+                    Cmd::DuplicateLine => editor::duplicate(&mut tab.doc, sel),
+                    Cmd::DeleteLine => editor::delete_lines(&mut tab.doc, sel).ok_or(editor::TOO_MANY_LINES),
                     Cmd::MoveLineUp => editor::move_lines(&mut tab.doc, sel, false),
                     Cmd::MoveLineDown => editor::move_lines(&mut tab.doc, sel, true),
-                    Cmd::Indent => editor::indent_lines(&mut tab.doc, sel, &unit, ts, false),
-                    _ => editor::indent_lines(&mut tab.doc, sel, &unit, ts, true),
+                    Cmd::Indent => editor::indent_lines(&mut tab.doc, sel, ind, ts, false),
+                    _ => editor::indent_lines(&mut tab.doc, sel, ind, ts, true),
                 };
                 tab.doc.seal();
                 match r {
-                    Some(s) => {
+                    Ok(s) => {
                         tab.view.sel = s;
                         self.after_edit();
                     }
-                    None => self.flash("Too many lines selected for that.", true),
+                    Err(why) => self.flash(why, true),
                 }
             }
             Cmd::InsertDateTime => {
@@ -2605,10 +2870,25 @@ impl App {
                 self.invalidate();
             }
             Cmd::IndentSpaces(b) => {
+                // For this document (picked: not guessed again), and the default for new ones.
+                let ind = match (b, self.indent_now()) {
+                    (false, _) => Indent::Tabs,
+                    (true, Indent::Spaces(n)) => Indent::Spaces(n),
+                    (true, Indent::Tabs) => Indent::Spaces(self.settings.tab_size),
+                };
+                let tab = self.tab_mut();
+                tab.indent = Some(ind);
+                tab.indent_picked = true;
                 self.settings.use_spaces = b;
                 self.settings_changed();
             }
             Cmd::TabSize(n) => {
+                // How wide a tab shows, and a level of spaces (this document's too, when it's indented with them).
+                if let Indent::Spaces(_) = self.indent_now() {
+                    let tab = self.tab_mut();
+                    tab.indent = Some(Indent::Spaces(n));
+                    tab.indent_picked = true;
+                }
                 self.settings.tab_size = n;
                 self.settings_changed();
             }
@@ -2733,12 +3013,12 @@ impl App {
                     item(Cmd::SaveAs, "Save &as…", "Ctrl+Shift+S"),
                     item(Cmd::SaveAll, "Save a&ll", "Ctrl+Alt+S"),
                     Item::Sep,
-                    enabled(Cmd::Reload, "Re&load from disk", "", has_path),
+                    enabled(Cmd::Reload, "Reloa&d from disk", "", has_path),
                     enabled(Cmd::RevealFile, "Show in &folder", "", has_path),
                     enabled(Cmd::CopyPath, "Copy file &path", "", has_path),
                     Item::Sep,
                     item(Cmd::CloseTab, "&Close tab", "Ctrl+W"),
-                    item(Cmd::CloseOthers, "Close &other tabs", ""),
+                    item(Cmd::CloseOthers, "Close o&ther tabs", ""),
                     item(Cmd::Exit, "E&xit", "Alt+F4"),
                 ]
             }
@@ -2752,16 +3032,16 @@ impl App {
                 enabled(Cmd::Delete, "De&lete", "Del", sel),
                 Item::Sep,
                 item(Cmd::Find, "&Find…", "Ctrl+F"),
-                item(Cmd::FindNext, "Find &next", "F3"),
+                item(Cmd::FindNext, "Find ne&xt", "F3"),
                 item(Cmd::FindPrev, "Find pre&vious", "Shift+F3"),
                 item(Cmd::Replace, "R&eplace…", "Ctrl+H"),
                 item(Cmd::GoToLine, "&Go to line…", "Ctrl+G"),
                 Item::Sep,
                 item(Cmd::SelectAll, "Select &all", "Ctrl+A"),
                 Item::Sep,
-                item(Cmd::DuplicateLine, "&Duplicate line", "Ctrl+D"),
-                item(Cmd::DeleteLine, "Delete l&ine", "Ctrl+Shift+K"),
-                item(Cmd::MoveLineUp, "Move line u&p", "Alt+Up"),
+                item(Cmd::DuplicateLine, "Dupl&icate line", "Ctrl+D"),
+                item(Cmd::DeleteLine, "Delete li&ne", "Ctrl+Shift+K"),
+                item(Cmd::MoveLineUp, "M&ove line up", "Alt+Up"),
                 item(Cmd::MoveLineDown, "Move line do&wn", "Alt+Down"),
                 enabled(Cmd::ToggleComment, "Toggle co&mment", "Ctrl+/", tab.lang.comment().is_some()),
                 sub(
@@ -2839,6 +3119,11 @@ impl App {
                 let tab = self.tab();
                 let doc = &tab.doc;
                 let s = &self.settings;
+                let ind = self.indent_now();
+                let width = match ind {
+                    Indent::Spaces(n) => n,
+                    Indent::Tabs => s.tab_size,
+                };
                 let mut v = Vec::new();
                 let f = match tab.lang {
                     Lang::Json => Some("JSON"),
@@ -2848,7 +3133,7 @@ impl App {
                 if let Some(f) = f {
                     v.push(item(Cmd::Format, &format!("&Format {f}"), "Shift+Alt+F"));
                     v.push(item(Cmd::Minify, &format!("&Minify {f}"), ""));
-                    v.push(item(Cmd::Validate, &format!("&Check {f}"), ""));
+                    v.push(item(Cmd::Validate, &format!("Chec&k {f}"), ""));
                     v.push(Item::Sep);
                 }
                 v.extend([
@@ -2864,12 +3149,12 @@ impl App {
                     sub(
                         "&Indentation",
                         vec![
-                            check(Cmd::IndentSpaces(true), "&Spaces", "", s.use_spaces),
-                            check(Cmd::IndentSpaces(false), "&Tabs", "", !s.use_spaces),
+                            check(Cmd::IndentSpaces(true), "&Spaces", "", ind != Indent::Tabs),
+                            check(Cmd::IndentSpaces(false), "&Tabs", "", ind == Indent::Tabs),
                             Item::Sep,
-                            check(Cmd::TabSize(2), "Width &2", "", s.tab_size == 2),
-                            check(Cmd::TabSize(4), "Width &4", "", s.tab_size == 4),
-                            check(Cmd::TabSize(8), "Width &8", "", s.tab_size == 8),
+                            check(Cmd::TabSize(2), "Width &2", "", width == 2),
+                            check(Cmd::TabSize(4), "Width &4", "", width == 4),
+                            check(Cmd::TabSize(8), "Width &8", "", width == 8),
                         ],
                     ),
                 ]);
@@ -2884,11 +3169,11 @@ impl App {
                 };
                 vec![
                     item(Cmd::Shortcuts, "&Keyboard shortcuts", ""),
-                    item(Cmd::MakeDefault, "Open files with Slate…", ""),
+                    item(Cmd::MakeDefault, "Open files &with Slate…", ""),
                     item(Cmd::OpenDataFolder, "Open settings &folder", ""),
                     Item::Sep,
                     update,
-                    check(Cmd::ToggleAutoUpdate, "Check for updates a&utomatically", "", self.settings.check_updates),
+                    check(Cmd::ToggleAutoUpdate, "Check for updates auto&matically", "", self.settings.check_updates),
                     Item::Sep,
                     item(Cmd::About, "&About Slate", ""),
                 ]
@@ -2951,6 +3236,15 @@ fn lines_done(op: LineOp, n: u64) -> String {
         LineOp::RemoveBlank => format!("Removed {}", plural(n, "blank line", "blank lines")),
         LineOp::TrimTrailing => format!("Trimmed spaces from {}", plural(n, "line", "lines")),
     }
+}
+
+/// Files where Tab must insert a real tab: tab-separated data, and makefiles (a recipe line starts with one).
+fn needs_tabs(t: &Tab) -> bool {
+    if t.lang == Lang::Tsv {
+        return true;
+    }
+    let name = t.doc.path.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().to_ascii_lowercase());
+    name.is_some_and(|n| matches!(n.as_str(), "makefile" | "gnumakefile" | "bsdmakefile") || n.ends_with(".mk") || n.ends_with(".mak"))
 }
 
 fn nothing_to_clean(op: LineOp) -> &'static str {
@@ -3045,8 +3339,12 @@ fn client_to_screen(hwnd: HWND, x: i32, y: i32) -> POINT {
     p
 }
 
-/// Shows a popup menu at client DIPs (x, y); returns the chosen command.
-fn popup(cell: &Cell, items: Vec<Item>, x: f32, y: f32) -> Option<Cmd> {
+/// Shows a popup menu at client DIPs (x, y), below that point or (`up`) above it; returns the chosen command.
+/// `name` says which menu it is (test mode notes it instead of showing it).
+fn popup(cell: &Cell, name: &str, items: Vec<Item>, x: f32, y: f32, up: bool) -> Option<Cmd> {
+    if win::scripted_menu(name) {
+        return None;
+    }
     let (hwnd, px, py) = {
         let a = cell.borrow();
         (a.hwnd, a.dip_to_px(x), a.dip_to_px(y))
@@ -3055,7 +3353,8 @@ fn popup(cell: &Cell, items: Vec<Item>, x: f32, y: f32) -> Option<Cmd> {
     let menu = build_menu(&items, &mut ids);
     let p = client_to_screen(hwnd, px, py);
     TOP_MENU.with(|t| t.set(menu.0 as isize));
-    let id = unsafe { TrackPopupMenuEx(menu, (TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN).0, p.x, p.y, hwnd, None) };
+    let align = if up { TPM_BOTTOMALIGN } else { TPM_TOPALIGN };
+    let id = unsafe { TrackPopupMenuEx(menu, (TPM_RETURNCMD | TPM_LEFTALIGN | align).0, p.x, p.y, hwnd, None) };
     unsafe {
         let _ = DestroyMenu(menu);
     }
@@ -3092,7 +3391,7 @@ fn show_menu_bar(cell: &Cell, mut idx: usize) {
         MENU_BAR.with(|b| *b.borrow_mut() = (rects_screen, idx, false, false));
         MENU_SWITCH.with(|s| s.set(None));
         let hook = unsafe { SetWindowsHookExW(WH_MSGFILTER, Some(menu_hook), None, GetCurrentThreadId()) }.ok();
-        let chosen = popup(cell, items, rect.x, rect.bottom());
+        let chosen = popup(cell, MENU_TITLES[idx], items, rect.x, rect.bottom(), false);
         if let Some(h) = hook {
             unsafe {
                 let _ = UnhookWindowsHookEx(h);
@@ -3150,7 +3449,7 @@ pub fn run(cell: &Cell, d: Deferred) {
                 }
                 v
             };
-            if let Some(c) = popup(cell, items, x, y) {
+            if let Some(c) = popup(cell, "context", items, x, y, false) {
                 run_cmd(cell, c);
             }
         }
@@ -3166,7 +3465,7 @@ pub fn run(cell: &Cell, d: Deferred) {
                 enabled(Cmd::RevealFile, "Show in &folder", "", has_path),
             ];
             cell.borrow_mut().activate(i);
-            if let Some(c) = popup(cell, items, x, y) {
+            if let Some(c) = popup(cell, "tab", items, x, y, false) {
                 // Other things can happen while the menu is open: only act if that tab is still the active one.
                 if cell.borrow().tab().id == id {
                     run_cmd(cell, c);
@@ -3215,8 +3514,7 @@ pub fn run(cell: &Cell, d: Deferred) {
                 return;
             }
             // Open upwards from the status bar.
-            let n = items.len() as f32;
-            if let Some(c) = popup(cell, items, rect.x, (rect.y - n * 24.0 - 8.0).max(0.0)) {
+            if let Some(c) = popup(cell, "status bar", items, rect.x, rect.y, true) {
                 run_cmd(cell, c);
             }
         }
@@ -3244,15 +3542,31 @@ pub fn run_cmd(cell: &Cell, cmd: Cmd) {
             save_tab(cell, i, true, false);
         }
         Cmd::SaveAll => {
-            let ids: Vec<u64> = cell.borrow().tabs.iter().filter(|t| t.doc.is_dirty()).map(|t| t.id).collect();
+            let (ids, active) = {
+                let a = cell.borrow();
+                (a.tabs.iter().filter(|t| t.doc.is_dirty()).map(|t| t.id).collect::<Vec<u64>>(), a.tab().id)
+            };
             for id in ids {
                 let Some(i) = tab_index(cell, id) else { continue };
-                if !cell.borrow().tabs[i].doc.is_dirty() {
+                let (dirty, named) = {
+                    let t = &cell.borrow().tabs[i];
+                    (t.doc.is_dirty(), t.doc.path.is_some())
+                };
+                if !dirty {
                     continue;
                 }
-                cell.borrow_mut().activate(i);
+                if !named {
+                    // The Save As dialog is about this tab: show it.
+                    cell.borrow_mut().activate(i);
+                }
                 if !save_tab(cell, i, false, false) {
                     break;
+                }
+            }
+            // Back to the tab the user was in (what they type next belongs there).
+            if let Some(i) = tab_index(cell, active) {
+                if cell.borrow().active != i {
+                    cell.borrow_mut().activate(i);
                 }
             }
         }
@@ -3295,7 +3609,7 @@ pub fn run_cmd(cell: &Cell, cmd: Cmd) {
             if size > BIG_CLIPBOARD {
                 let q = format!("Copy {} to the clipboard?", format_size(size));
                 let detail = "That much text needs a lot of memory and can make other programs slow when they paste it.";
-                if win::ask(hwnd, "Slate", &q, detail, &["Copy", "Cancel"]) != Some(0) {
+                if win::ask(hwnd, "Slate", &q, detail, &["&Copy", "Cancel"]) != Some(0) {
                     return;
                 }
             }
@@ -3308,7 +3622,7 @@ pub fn run_cmd(cell: &Cell, cmd: Cmd) {
             };
             if dirty {
                 let q = format!("Reload {title} and lose your changes?");
-                if win::ask(hwnd, "Slate", &q, "", &["Reload", "Cancel"]) != Some(0) {
+                if win::ask(hwnd, "Slate", &q, "", &["&Reload", "Cancel"]) != Some(0) {
                     return;
                 }
             }
@@ -3324,8 +3638,21 @@ pub fn run_cmd(cell: &Cell, cmd: Cmd) {
             win::info(hwnd, "About Slate", &text);
         }
         Cmd::Shortcuts => {
-            let hwnd = cell.borrow().hwnd;
-            win::info(hwnd, "Keyboard shortcuts", SHORTCUTS);
+            // In a tab of their own, in the text's font: the columns line up, and Ctrl+F finds a key.
+            let mut a = cell.borrow_mut();
+            let title = "Keyboard shortcuts";
+            if let Some(i) = a.tabs.iter().position(|t| t.title_override.as_deref() == Some(title)) {
+                a.activate(i);
+                return;
+            }
+            let mut doc = Document::from_text(SHORTCUTS.as_bytes());
+            doc.eol = Eol::Lf;
+            let i = a.add_tab(doc);
+            let t = &mut a.tabs[i];
+            t.title_override = Some(title.into());
+            t.untitled = 0;
+            a.update_title();
+            a.invalidate();
         }
         Cmd::MakeDefault => super::install::make_default(cell),
         other => {
@@ -3423,7 +3750,7 @@ pub fn close_tab(cell: &Cell, i: usize) -> bool {
     if dirty {
         cell.borrow_mut().activate(i);
         let q = format!("Do you want to save changes to {title}?");
-        let choice = win::ask(hwnd, "Slate", &q, "", &["Save", "Don't save", "Cancel"]);
+        let choice = win::ask(hwnd, "Slate", &q, "", &["&Save", "Do&n't save", "Cancel"]);
         // The dialog let other things happen (tabs can close or move meanwhile): find the tab again.
         let Some(i) = tab_index(cell, id) else { return true };
         match choice {
@@ -3467,7 +3794,7 @@ pub fn close_window(cell: &Cell) {
             "This file is too big to keep unsaved changes for next time."
         };
         let q = format!("Do you want to save changes to {title}?");
-        let choice = win::ask(hwnd, "Slate", &q, detail, &["Save", "Don't save", "Cancel"]);
+        let choice = win::ask(hwnd, "Slate", &q, detail, &["&Save", "Do&n't save", "Cancel"]);
         let Some(i) = tab_index(cell, id) else { continue };
         match choice {
             Some(0) => {

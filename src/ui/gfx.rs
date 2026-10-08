@@ -138,6 +138,15 @@ pub struct Gfx {
     pub generation: u64,
     /// Drawing into an offscreen bitmap (test mode): don't create a window target.
     pub offscreen: bool,
+    /// The user's locale ("ja-JP"...): DirectWrite picks fallback fonts by it, so kanji look Japanese to a Japanese
+    /// user rather than Chinese.
+    locale: HSTRING,
+}
+
+fn user_locale() -> HSTRING {
+    let mut buf = [0u16; 85]; // LOCALE_NAME_MAX_LENGTH
+    let n = unsafe { windows::Win32::Globalization::GetUserDefaultLocaleName(&mut buf) };
+    if n > 1 { HSTRING::from_wide(&buf[..n as usize - 1]).unwrap_or_else(|_| HSTRING::from("en-us")) } else { HSTRING::from("en-us") }
 }
 
 impl Gfx {
@@ -154,6 +163,7 @@ impl Gfx {
                 dpi: 96.0,
                 generation: 1,
                 offscreen: false,
+                locale: user_locale(),
             })
         }
     }
@@ -387,7 +397,7 @@ impl Gfx {
                     DWRITE_FONT_STYLE_NORMAL,
                     DWRITE_FONT_STRETCH_NORMAL,
                     size,
-                    w!("en-us"),
+                    &self.locale,
                 )
                 .or_else(|_| {
                     self.dw.CreateTextFormat(
@@ -397,7 +407,7 @@ impl Gfx {
                         DWRITE_FONT_STYLE_NORMAL,
                         DWRITE_FONT_STRETCH_NORMAL,
                         size,
-                        w!("en-us"),
+                        &self.locale,
                     )
                 })
                 .expect("text format")
