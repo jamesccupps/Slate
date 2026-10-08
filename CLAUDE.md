@@ -113,6 +113,12 @@ Commits use the GitHub no-reply address (repo-local git config); GitHub refuses 
   cached by (bytes, state).
 - A general editor first: JSON and XML extras (format/minify/check, the path bar and structure panel) only appear in
   menus for those files; everything else gets the general tools (line tools, toggle comment, change case).
+- Indentation is per document (`Tab::indent`): detected from the text (tabs, or spaces and their step), always tabs
+  for TSV files and makefiles, else the settings' default; Format → Indentation sets the current document's (and
+  the default). Line operations over many lines (indent, comment) rewrite the lines as one replacement.
+- Keys: Ctrl+Alt shortcuts don't fire when the key types a character (AltGr is Ctrl+Alt: Polish AltGr+S is "ś");
+  Alt on its own gives the custom menu bar the keyboard (WM_SYSCOMMAND SC_KEYMENU); a key that opens a menu drops
+  the character it queued. Caret movement and Delete go by visible characters (`text::cluster_len_at`).
 - The App lives in `Rc<RefCell<App>>`. Anything that shows a dialog or menu runs from the `Deferred` queue outside
   the borrow. Dialogs run a modal loop in which timers and job messages still arrive (tabs can close, open or move),
   so code that shows one finds its tab again **by id** afterwards, never by an index taken before. The queue isn't
@@ -148,8 +154,10 @@ Commits use the GitHub no-reply address (repo-local git config); GitHub refuses 
 - `Slate.exe --test script.txt` drives the real app in a hidden window and renders frames offscreen into PNGs; the
   commands are listed at the top of `src/ui/testmode.rs` (`open:`, `type:`, `key:`, `cmd:`, `jobs`, `shot:`,
   `print:`, `expect:`, `answer:`, `lang:<name>` …; `print:menu0`…`menu4` lists a menu's items). In this mode
-  prompts are never shown (they take answers from `answer:` lines and are listed by `print:asked`), the clipboard
-  is a private one, and settings/session aren't written (unless `persist`, which needs `SLATE_DATA_DIR`).
+  prompts are never shown (they take answers from `answer:` lines and are listed by `print:asked`), nor are menus
+  (`print:opened` lists them), the clipboard is a private one, and settings/session aren't written (unless
+  `persist`, which needs `SLATE_DATA_DIR`). Mouse drags, raw wheel deltas, Alt, AltGr and window activation have
+  their own commands (`down:`/`move:`/`up:`, `wheelraw:`, `altkey`, `altgr:on`, `activate`…).
   `SLATE_DATA_DIR` sets the data folder, `SLATE_TEST_LOG` the log file; `session:save|soon|restore` writes the
   session now, writes it the way the timer does, or restores it. `SLATE_UPDATE_TEST_VERSION=0.1.0` makes Slate
   believe it's that version (to try the updater against the real latest release, in a scratch folder).
