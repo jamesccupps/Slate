@@ -57,20 +57,27 @@ Commits use the GitHub no-reply address (repo-local git config); GitHub refuses 
     writes the target in place). Stale temp files of dead processes are cleaned up.
   - `search.rs` — byte-regex search in windows (8 MB, 64 KB overlap, grows for long matches), find next/prev,
     count all, streaming replace-all.
-  - `json.rs` — one streaming tokenizer for pretty-print / minify / validate (JSON Lines OK), errors with offsets.
-  - `xml.rs` — the same for XML (well-formedness check; markup separated only by whitespace goes on its own line,
-    text is kept exactly, and nothing is added inside an element once it has text, so mixed content keeps its meaning).
-  - `lines.rs` — sort (natural, ignoring case), remove duplicate / blank lines, trim line ends, change case.
+  - `json.rs` — one streaming tokenizer for pretty-print / minify / validate (JSON Lines OK), errors with offsets;
+    comments (JSONC) are refused with a message saying so.
+  - `xml.rs` — the same for XML (well-formedness check; markup separated only by whitespace with a line break goes
+    on its own line, text is kept exactly, and nothing is added inside an element once it has text, so mixed content
+    keeps its meaning; whitespace-only elements, spaces between elements on one line and `xml:space="preserve"` stay).
+  - `lines.rs` — sort (natural: numbers with signs and decimals, case and accents ignored), remove duplicate / blank
+    lines, trim line ends, change case.
   - `jsonnav.rs` — lazy JSON structure: the children of one container (lists over 100,000 keep every 64th child
-    and rescan between them), the path at an offset (`data[1203].name`), previews.
+    and rescan between them; lists of containers inside a scanned one already over 1024), the path at an offset
+    (`data[1203].name`), previews. Comments are skipped; in a file cut short, open containers end at its end.
   - `text.rs` — encoding/EOL detection, UTF-16/ANSI codecs, display decoding (control chars → symbols), char classes.
   - `job.rs` — background jobs with progress/cancel, notify the UI by posting a window message.
 - `src/ui/` — the Win32 app (see the module docs at the top of each file).
   - `highlight.rs` (+ `highlight/code.rs`, `highlight/markup.rs`) — syntax coloring for ~30 languages: hand-written
     lexers that color one segment and return the `State` they end in (inside a block comment, a multi-line string, an
     XML tag, a Markdown code block...). `code.rs` is one configurable lexer for programming/scripting languages
-    (keyword tables + per-language extras: Rust raw strings, PowerShell here-strings, Batch labels...). Language is
-    picked by file name, then by content (`#!` lines, `<?xml`, JSON, log timestamps).
+    (keyword tables + per-language extras: Rust raw strings, PowerShell here-strings, Batch labels, heredocs, JS
+    regexes...); PHP files are HTML with PHP inside. Where a quote is easily a stray one (shell, SQL, PHP...), a
+    string left open gives up at a blank line or after 40 lines. Language is picked by file name, then by content
+    (`#!` lines, `<?xml`, JSON that reads as JSON, log timestamps). A test checks that lexing a text in two pieces
+    ends in the same state as lexing it whole.
   - `app.rs` state, layout and painting; `actions.rs` input, commands, background jobs, saving and closing;
     `editor.rs` the text view; `structure.rs` path bar + structure panel; `findbar.rs`; `session.rs` (tabs and
     unsaved text kept between runs); `settings.rs` (data folder, portable mode); `install.rs` ("Open with" entries
@@ -88,7 +95,8 @@ Commits use the GitHub no-reply address (repo-local git config); GitHub refuses 
   within 4 KiB before), so a 800 MB one-line JSON renders and scrolls instantly. Segments never need the index.
 - Scrollbar is proportional to bytes, not lines, so it needs no layout of the whole file.
 - Coloring across lines: documents up to 32 MiB keep lexer states at checkpoints (every ~16 KiB, at line starts) in
-  `editor::HlIndex`, plus the start state of segments already seen; an edit drops only what comes after it (the
+  `editor::HlIndex`, plus the start state of segments already seen (always worked out from the checkpoint before,
+  never from another segment start); an edit drops only what comes after it (the
   index applies the document's pending changes itself, as layout can run before `View::sync`). Measuring the scroll
   limit uses guessed states, so it never reads the whole file. Bigger files color each line on its own. Layouts are
   cached by (bytes, state).
