@@ -1156,38 +1156,41 @@ impl App {
         self.g.line(r.x, r.y + 0.5, r.right(), r.y + 0.5, t.border, 1.0);
         let fonts_ui = self.fonts.ui.clone();
         let StatusTexts { mut pos, pos_short, mut items, counts, size } = self.status_items();
-        // In a narrow window things give way, the least needed first: the counts, the selection's words and lines,
-        // the indentation, the line endings, the language.
-        let g = &self.g;
-        let w = |s: &str| g.measure(s, &fonts_ui).0;
-        let fits = |pos: &str, items: &[(StatusItem, String)], right: &str| {
-            6.0 + w(pos) + 40.0 + items.iter().map(|(_, l)| w(l) + 20.0).sum::<f32>() + w(right) + 24.0 <= r.w
-        };
+        let w = |s: &str| self.g.measure(s, &fonts_ui).0;
         let mut right = match &counts {
             Some(c) => format!("{c}  ·  {size}"),
             None => size.clone(),
         };
-        if !fits(&pos, &items, &right) {
+        let (mut pos_w, mut right_w) = (w(&pos), w(&right));
+        let mut item_ws: Vec<f32> = items.iter().map(|(_, l)| w(l)).collect();
+        // In a narrow window things give way, the least needed first: the counts, the selection's words and lines,
+        // the indentation, the line endings, the language.
+        let too_wide = |pos_w: f32, item_ws: &[f32], right_w: f32| {
+            6.0 + pos_w + 40.0 + item_ws.iter().map(|w| w + 20.0).sum::<f32>() + right_w + 24.0 > r.w
+        };
+        if too_wide(pos_w, &item_ws, right_w) && counts.is_some() {
             right = size;
+            right_w = w(&right);
         }
-        if !fits(&pos, &items, &right) {
+        if too_wide(pos_w, &item_ws, right_w) && pos_short != pos {
             pos = pos_short;
+            pos_w = w(&pos);
         }
         for less in [StatusItem::Indent, StatusItem::Eol, StatusItem::Lang] {
-            if !fits(&pos, &items, &right) {
-                items.retain(|(k, _)| *k != less);
+            if too_wide(pos_w, &item_ws, right_w) {
+                if let Some(k) = items.iter().position(|(i, _)| *i == less) {
+                    items.remove(k);
+                    item_ws.remove(k);
+                }
             }
         }
-        let (pw, _) = self.g.measure(&pos, &fonts_ui);
-        let pr = Rect::new(r.x + 6.0, r.y + 2.0, pw + 16.0, r.h - 4.0);
+        let pr = Rect::new(r.x + 6.0, r.y + 2.0, pos_w + 16.0, r.h - 4.0);
         // Right-aligned items, after the size (and the counts) at the end.
         let mut x = r.right() - 12.0;
         let mut rects = Vec::new();
-        let (sw, _) = self.g.measure(&right, &fonts_ui);
-        self.g.text(&right, &fonts_ui, Rect::new(x - sw, r.y, sw + 2.0, r.h), t.text_dim, Align::Left);
-        x -= sw + 12.0;
-        for (item, label) in items.iter().rev() {
-            let (w, _) = self.g.measure(label, &fonts_ui);
+        self.g.text(&right, &fonts_ui, Rect::new(x - right_w, r.y, right_w + 2.0, r.h), t.text_dim, Align::Left);
+        x -= right_w + 12.0;
+        for ((item, label), &w) in items.iter().zip(&item_ws).rev() {
             let br = Rect::new(x - w - 16.0, r.y + 2.0, w + 16.0, r.h - 4.0);
             if self.hover == Hit::Status(*item) {
                 self.g.fill_round(br, 4.0, t.hover);
