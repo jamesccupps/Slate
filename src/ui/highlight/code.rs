@@ -717,10 +717,11 @@ fn heredoc_open<'t>(sx: &Syntax, t: &'t [u8], i: usize) -> Option<(usize, &'t [u
         j += 1;
     }
     if sx.flavor == Flavor::Shell {
-        // `cat << EOF` is fine in a shell; `$(( x << y ))` is a shift
+        // `cat << EOF` is fine in a shell; `$(( x << y ))` is a shift (looked for in the 256 bytes before)
         j += t[j..].iter().take_while(|&&b| b == b' ' || b == b'\t').count();
-        let line = &t[t[..i].iter().rposition(|&b| b == b'\n').map_or(0, |p| p + 1)..i];
-        if line.windows(2).any(|w| w == b"((") {
+        let from = i.saturating_sub(256);
+        let line = &t[memchr::memrchr(b'\n', &t[from..i]).map_or(from, |p| from + p + 1)..i];
+        if memchr::memmem::find(line, b"((").is_some() {
             return None;
         }
         if at(t, j) == b'\\' {
