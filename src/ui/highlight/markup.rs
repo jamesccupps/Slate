@@ -396,15 +396,15 @@ fn md_line(l: &[u8], col0: bool, mut st: State, o: &mut Out) -> State {
     st
 }
 
-/// How far ahead the end of `code`, a [link] or a <tag> is looked for.
+/// How far ahead the end of `code`, a link's (url) or a <tag> is looked for.
 const MD_LOOK: usize = 2048;
-/// The same for *emphasis*, which is rarely longer than a sentence (a line of `*a *b *c…` looked 2 KB ahead for
-/// each star).
-const EMPHASIS_LOOK: usize = 256;
+/// The same for *emphasis* and a [link's text], which are rarely longer than a sentence (a line of `*a *b *c…`
+/// looked 2 KB ahead for each star).
+const SHORT_LOOK: usize = 256;
 
 /// The closing run of `k` `c` characters for emphasis opened before `from`.
 fn emphasis_close(l: &[u8], from: usize, c: u8, k: usize) -> Option<usize> {
-    let end = l.len().min(from + EMPHASIS_LOOK);
+    let end = l.len().min(from + SHORT_LOOK);
     let mut p = from;
     while let Some(q) = memchr::memchr(c, &l[p.min(end)..end]) {
         let s = p + q;
@@ -502,7 +502,7 @@ fn md_inline(l: &[u8], mut i: usize, o: &mut Out, st: &mut State) {
             b'[' | b'!' if c == b'[' || at(l, i + 1) == b'[' => {
                 // [text](url), ![image](src), [text][ref]
                 let s = if c == b'!' { i + 1 } else { i };
-                let look = n.min(s + MD_LOOK);
+                let look = n.min(s + SHORT_LOOK);
                 let mut depth = 0;
                 let mut close = None;
                 for (k, &b) in l[s..look].iter().enumerate() {
@@ -793,10 +793,11 @@ mod tests {
         assert_eq!(toks(Lang::Markdown, "y = 2", st), vec![("y = 2".into(), Tok::Str)]);
         let st = end_state(Lang::Markdown, "```\ncode\n```\n");
         assert_eq!(toks(Lang::Markdown, "# After", st), vec![("# After".into(), Tok::Heading)]);
-        // emphasis that never closes costs little to look for
-        let line = "*a ".repeat(300_000);
+        // emphasis or links that never close cost little to look for
         let start = std::time::Instant::now();
-        toks(Lang::Markdown, &line, super::super::State::START);
+        for p in ["*a ", "#["] {
+            toks(Lang::Markdown, &p.repeat(300_000), super::super::State::START);
+        }
         assert!(start.elapsed().as_secs_f64() < 2.0, "{:?}", start.elapsed());
     }
 
