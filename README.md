@@ -55,6 +55,11 @@ If you used *Open files with Slate…*: Windows Settings → Apps → Installed 
 Slate's folder, and `%LOCALAPPDATA%\Slate` (or the portable `data` folder) if you don't need your settings and
 unsaved text any more. Otherwise just delete `Slate.exe`.
 
+## License
+
+MIT: see [LICENSE](LICENSE). The libraries built into `Slate.exe` are listed, with their licenses, in
+[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
+
 ## Building
 
 Needs Rust (the GNU toolchain is enough; no Visual Studio). Run `build.cmd`, which produces `dist\Slate.exe`.

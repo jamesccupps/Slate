@@ -34,9 +34,9 @@ The details are in the [0.3.0 release notes](release-notes-0.3.0.md). In short:
    waits); give background readers their own file handle so a slow share doesn't make the window wait.
 3. **Accessibility (S, then L).** A high-contrast theme built from Windows' colors; a system caret so Magnifier and
    other tools can follow the cursor; then UI Automation, so screen readers can read the text.
-4. **Release basics (S–M).** A license (the owner's choice: MIT or Apache-2.0 are the usual ones for an app like
-   this); code signing (SignPath Foundation is free for open source; Azure Artifact Signing is about $10 a month) so
-   Windows stops warning, then the updater also checks the signature; winget and Scoop manifests.
+4. **Release basics (S–M).** Code signing (SignPath Foundation is free for open source; Azure Artifact Signing is
+   about $10 a month) so Windows stops warning, then the updater also checks the signature; winget and Scoop
+   manifests. (Licensed MIT since October 2026.)
 5. **Crash reports without telemetry (S–M).** A minidump on a native crash, and *Help → Report a problem* that
    opens a prefilled GitHub issue the user reviews and sends themselves. The commit hash in the version info and
    crash.log.
