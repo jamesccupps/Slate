@@ -50,8 +50,6 @@ enum At {
     StartTag,
     /// A quoted attribute value.
     Quote(u8),
-    /// A `/` in a start tag (`/>` ends an empty element).
-    Slash,
     /// An end tag's name, then up to its `>`.
     EndName,
     EndTag,
@@ -67,11 +65,22 @@ enum At {
     Decl(u32, u8),
 }
 
+/// An end tag closes the element it names only if that is among the innermost ones this many (a document left so
+/// broken is read as well as it can be, and stray end tags in a deep one cost little).
+const MAX_UNCLOSED: usize = 1024;
+
+const HASH_START: u32 = 0x811C_9DC5;
+
+fn hash_step(h: u32, c: u8) -> u32 {
+    (h ^ c as u32).wrapping_mul(0x0100_0193)
+}
+
 /// An element being read.
 struct Level {
     /// Its `<` (None: the document, or the place a rescan started).
     open: Option<u64>,
-    name: Vec<u8>,
+    /// Its name's hash (end tags are matched by it).
+    name: u32,
     tag_len: u64,
     /// Where its children start in the shared lists.
     items_from: usize,
@@ -84,7 +93,7 @@ struct Level {
 }
 
 impl Level {
-    fn new(open: Option<u64>, name: Vec<u8>, tag_len: u64, items_from: usize, nested: bool) -> Level {
+    fn new(open: Option<u64>, name: u32, tag_len: u64, items_from: usize, nested: bool) -> Level {
         Level {
             open,
             name,
@@ -120,9 +129,12 @@ struct Scanner {
     items: Vec<Child>,
     names: Vec<u32>,
     out: Vec<(Option<u64>, Children)>,
-    /// The tag being read: where its `<` is, and its name.
+    /// The tag being read: where its `<` is, its name's hash, and how many bytes of its name went into it.
     tag_start: u64,
-    tag_name: Vec<u8>,
+    tag_hash: u32,
+    tag_name_len: usize,
+    /// The last byte of the chunk before (for a `/>` cut between chunks).
+    last: u8,
     keep: u64,
     limit: u64,
     /// The element scanned (None: the document).
@@ -135,6 +147,26 @@ struct Scanner {
 }
 
 impl Scanner {
+    fn new(open: Option<u64>, keep: u64, limit: u64) -> Scanner {
+        Scanner {
+            at: At::Text,
+            stack: Vec::new(),
+            items: Vec::new(),
+            names: Vec::new(),
+            out: Vec::new(),
+            tag_start: open.unwrap_or(0),
+            tag_hash: HASH_START,
+            tag_name_len: 0,
+            last: 0,
+            keep,
+            limit,
+            scan_open: open,
+            root: false,
+            end: None,
+            broken: false,
+        }
+    }
+
     fn add_child(&mut self, c: Child, h: u32) {
         let lv = self.stack.last_mut().unwrap();
         if !lv.sparse && !lv.dense && lv.count >= if lv.nested { NESTED_MAX } else { DENSE_MAX } {
@@ -165,23 +197,22 @@ impl Scanner {
     fn finish(&mut self, end: u64, partial: bool) {
         let lv = self.stack.pop().unwrap();
         let open = lv.open.unwrap_or(0);
-        let mut names = self.names.split_off(lv.items_from);
-        let mut items = self.items.split_off(lv.items_from);
+        let names = self.names.split_off(lv.items_from);
+        let items = self.items.split_off(lv.items_from);
         if end - open >= self.keep {
-            self.out.push((lv.open, lv.list(std::mem::take(&mut items), std::mem::take(&mut names), end, partial)));
+            self.out.push((lv.open, lv.list(items, names, end, partial)));
         }
         let c = Child { start: open, end, key_back: 0, key_len: info(lv.tag_len, lv.count > 0) };
-        self.add_child(c, name_hash(&lv.name));
+        self.add_child(c, lv.name);
     }
 
     /// A start tag ended at `end` (after its `>`).
     fn start_tag(&mut self, end: u64, empty: bool) {
-        let name = std::mem::take(&mut self.tag_name);
         let tag_len = end - self.tag_start;
         if self.root {
             // the element being scanned
             self.root = false;
-            self.stack.push(Level::new(Some(self.tag_start), name, tag_len, 0, false));
+            self.stack.push(Level::new(Some(self.tag_start), self.tag_hash, tag_len, 0, false));
             if empty {
                 self.end = Some(end);
             }
@@ -189,17 +220,18 @@ impl Scanner {
         }
         if empty {
             let c = Child { start: self.tag_start, end, key_back: 0, key_len: info(tag_len, false) };
-            self.add_child(c, name_hash(&name));
+            self.add_child(c, self.tag_hash);
         } else {
             let from = self.items.len();
-            self.stack.push(Level::new(Some(self.tag_start), name, tag_len, from, true));
+            self.stack.push(Level::new(Some(self.tag_start), self.tag_hash, tag_len, from, true));
         }
     }
 
     /// An end tag (from `self.tag_start`, ending at `end`) closes the element it names, and what's open inside it.
     fn end_tag(&mut self, end: u64) {
-        let name = std::mem::take(&mut self.tag_name);
-        let Some(d) = self.stack.iter().rposition(|l| l.open.is_some() && l.name == name) else {
+        let h = self.tag_hash;
+        let found = self.stack.iter().rev().take(MAX_UNCLOSED).position(|l| l.open.is_some() && l.name == h);
+        let Some(d) = found.map(|k| self.stack.len() - 1 - k) else {
             // a stray end tag
             self.broken |= self.stack.len() == 1;
             return;
@@ -232,7 +264,7 @@ impl Scanner {
                     None => return true,
                 },
                 At::Lt => {
-                    self.tag_name.clear();
+                    (self.tag_hash, self.tag_name_len) = (HASH_START, 0);
                     self.at = match c {
                         b'/' => At::EndName,
                         b'!' => At::Bang(0),
@@ -242,30 +274,41 @@ impl Scanner {
                             At::Lt
                         }
                         c if name_start(c) => {
-                            self.tag_name.push(c);
+                            (self.tag_hash, self.tag_name_len) = (hash_step(HASH_START, c), 1);
                             At::StartName
                         }
                         _ => At::Text,
                     };
                 }
                 At::StartName | At::EndName => {
-                    if name_char(c) {
-                        if self.tag_name.len() < NAME_MAX {
-                            self.tag_name.push(c);
+                    // (names are short: byte by byte)
+                    let k = chunk[i..].iter().take_while(|&&b| name_char(b)).count();
+                    for &b in &chunk[i..i + k] {
+                        if self.tag_name_len < NAME_MAX {
+                            self.tag_hash = hash_step(self.tag_hash, b);
+                            self.tag_name_len += 1;
                         }
-                    } else {
+                    }
+                    i += k;
+                    if i < n {
                         self.at = if self.at == At::StartName { At::StartTag } else { At::EndTag };
+                    }
+                    continue;
+                }
+                At::StartTag => match memchr::memchr3(b'"', b'\'', b'>', &chunk[i..]) {
+                    Some(k) if chunk[i + k] == b'>' => {
+                        // `/>` ends an empty element
+                        let before = if i + k > 0 { chunk[i + k - 1] } else { self.last };
+                        self.at = At::Text;
+                        self.start_tag(p + k as u64 + 1, before == b'/');
+                        i += k;
+                    }
+                    Some(k) => {
+                        self.at = At::Quote(chunk[i + k]);
+                        i += k + 1;
                         continue;
                     }
-                }
-                At::StartTag => match c {
-                    b'"' | b'\'' => self.at = At::Quote(c),
-                    b'/' => self.at = At::Slash,
-                    b'>' => {
-                        self.at = At::Text;
-                        self.start_tag(p + 1, false);
-                    }
-                    _ => {}
+                    None => return true,
                 },
                 At::Quote(q) => match memchr::memchr(q, &chunk[i..]) {
                     Some(k) => {
@@ -275,15 +318,6 @@ impl Scanner {
                     }
                     None => return true,
                 },
-                At::Slash => {
-                    if c == b'>' {
-                        self.at = At::Text;
-                        self.start_tag(p + 1, true);
-                    } else {
-                        self.at = At::StartTag;
-                        continue;
-                    }
-                }
                 At::EndTag => match memchr::memchr(b'>', &chunk[i..]) {
                     Some(k) => {
                         self.at = At::Text;
@@ -363,23 +397,13 @@ impl Scanner {
 /// Scans the element whose `<` is at `open` (None = the whole document) in one pass. Returns its child list last,
 /// preceded by the lists of the elements inside it that are at least `keep` bytes long.
 pub fn scan(src: &dyn Chunked, open: Option<u64>, keep: u64, ctx: Option<&Ctx>) -> Vec<(Option<u64>, Children)> {
-    let mut sc = Scanner {
-        at: if open.is_some() { At::Lt } else { At::Text },
-        stack: Vec::new(),
-        items: Vec::new(),
-        names: Vec::new(),
-        out: Vec::new(),
-        tag_start: open.unwrap_or(0),
-        tag_name: Vec::new(),
-        keep,
-        limit: u64::MAX,
-        scan_open: open,
-        root: open.is_some(),
-        end: None,
-        broken: false,
-    };
-    if open.is_none() {
-        sc.stack.push(Level::new(None, Vec::new(), 0, 0, false));
+    let mut sc = Scanner::new(open, keep, u64::MAX);
+    if open.is_some() {
+        // its start tag opens it
+        sc.at = At::Lt;
+        sc.root = true;
+    } else {
+        sc.stack.push(Level::new(None, 0, 0, 0, false));
     }
     let start = open.map_or(0, |o| o + 1);
     run(&mut sc, src, start, ctx)
@@ -387,22 +411,10 @@ pub fn scan(src: &dyn Chunked, open: Option<u64>, keep: u64, ctx: Option<&Ctx>) 
 
 /// Up to `count` elements at one level from `from` (where one starts).
 pub fn rescan(src: &dyn Chunked, from: u64, count: u64) -> Vec<Child> {
-    let mut sc = Scanner {
-        at: At::Text,
-        stack: vec![Level::new(None, Vec::new(), 0, 0, false)],
-        items: Vec::new(),
-        names: Vec::new(),
-        out: Vec::new(),
-        tag_start: from,
-        tag_name: Vec::new(),
-        keep: u64::MAX,
-        limit: count,
-        scan_open: None,
-        root: false,
-        end: None,
-        broken: false,
-    };
-    sc.stack[0].dense = true;
+    let mut sc = Scanner::new(None, u64::MAX, count);
+    let mut lv = Level::new(None, 0, 0, 0, false);
+    lv.dense = true;
+    sc.stack.push(lv);
     run(&mut sc, src, from, None).pop().map(|(_, c)| c.items).unwrap_or_default()
 }
 
@@ -412,6 +424,9 @@ fn run(sc: &mut Scanner, src: &dyn Chunked, start: u64, ctx: Option<&Ctx>) -> Ve
     let mut since_check = 0u64;
     src.chunked(start, total, &mut |chunk: &[u8]| {
         let more = sc.feed(chunk, pos);
+        if let Some(&b) = chunk.last() {
+            sc.last = b;
+        }
         pos += chunk.len() as u64;
         since_check += chunk.len() as u64;
         if since_check >= 4 << 20 {
@@ -462,7 +477,8 @@ pub fn children(src: &dyn Chunked, open: Option<u64>, ctx: Option<&Ctx>) -> Chil
 
 /// The name of the element whose `<` is at `start`.
 pub fn name_at(src: &dyn Chunked, start: u64) -> String {
-    let head = src.bytes(start + 1, (start + 1 + NAME_MAX as u64 * 4).min(src.total()));
+    let total = src.total();
+    let head = src.bytes((start + 1).min(total), (start + 1 + NAME_MAX as u64 * 4).min(total));
     let n = head.iter().take_while(|&&b| name_char(b)).count();
     String::from_utf8_lossy(&head[..n]).into_owned()
 }
@@ -691,6 +707,59 @@ mod tests {
         assert_eq!(names(&d, &r), ["x", "y"]);
         assert!(r.partial && r.items[1].end == src.len() as u64);
         assert_eq!(path(&d, 14), "r › y");
+    }
+
+    /// Random markup: the same lists whatever the chunks, paths and previews anywhere, nothing that panics.
+    #[test]
+    fn odd_markup_reads_the_same_in_any_chunks() {
+        let parts: &[&str] = &[
+            "<a>", "</a>", "<b x=\"1\">", "</b>", "<c/>", "<a ", "/>", "<!--", "-->", "<![CDATA[", "]]>", "<?", "?>",
+            "<!DOCTYPE x [", "]>", "\"", "'", ">", "<", "</", "text", " ", "\n", "-", "]", "?", "<d k='>'>", "</d>",
+        ];
+        let mut r = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            r ^= r << 13;
+            r ^= r >> 7;
+            r ^= r << 17;
+            r
+        };
+        for _ in 0..300 {
+            let mut s = String::new();
+            for _ in 0..next() % 40 {
+                s.push_str(parts[(next() % parts.len() as u64) as usize]);
+            }
+            let whole = Bits(s.as_bytes().to_vec(), 1 << 20);
+            let lists = |src: &dyn Chunked, open| {
+                let ch = children(src, open, None);
+                (ch.count, ch.items.clone(), ch.names.clone(), ch.end, ch.partial)
+            };
+            let top = children(&whole, None, None);
+            let mut opens = vec![None];
+            opens.extend(top.items.iter().map(|c| Some(c.start)));
+            for k in [1, 2, 3, 5] {
+                let bits = Bits(s.as_bytes().to_vec(), k);
+                for &o in &opens {
+                    assert_eq!(lists(&bits, o), lists(&whole, o), "chunks of {k}, element at {o:?} in {s:?}");
+                }
+            }
+            for off in 0..=s.len() as u64 {
+                path(&whole, off);
+            }
+            for c in &top.items {
+                preview(&whole, c, 80);
+            }
+        }
+    }
+
+    #[test]
+    fn deep_and_stray_tags_cost_little() {
+        let n = 200_000;
+        let s = format!("<r>{}{}</r>", "<a>".repeat(n), "</b>".repeat(n));
+        let d = Document::from_text(s.as_bytes());
+        let start = std::time::Instant::now();
+        let top = children(&d, None, None);
+        assert_eq!(top.count, 1);
+        assert!(start.elapsed().as_secs_f64() < 2.0, "{:?}", start.elapsed());
     }
 
     #[test]
