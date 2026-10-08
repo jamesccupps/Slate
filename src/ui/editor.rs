@@ -169,8 +169,9 @@ struct CacheEntry {
     used: u64,
 }
 
-/// Lexer states at checkpoints through the document (and at recent segment starts), so coloring knows what a
-/// segment starts inside. An edit drops what comes after it; it is worked out again when needed.
+/// Lexer states at checkpoints through the document (and at recent segment starts, always worked out from the
+/// checkpoint before them), so coloring knows what a segment starts inside. An edit drops what comes after it; it
+/// is worked out again when needed.
 #[derive(Default)]
 struct HlIndex {
     lang: Option<Lang>,
@@ -215,14 +216,11 @@ impl HlIndex {
         if let Some(s) = self.memo.get(&off) {
             return *s;
         }
-        // Start from the closest known state before `off`.
+        // Start from the checkpoint before `off`, never from a remembered segment start: a long line's segments are
+        // cut wherever the grid says, and a lexer that looks ahead (to a line's end, say) can be off at such a cut;
+        // starting from it would carry that into everything after it.
         let k = self.checkpoints.partition_point(|c| c.0 <= off) - 1;
         let (mut pos, mut st) = self.checkpoints[k];
-        if let Some((&p, &s)) = self.memo.range(..off).next_back() {
-            if p > pos {
-                (pos, st) = (p, s);
-            }
-        }
         if off - pos > HL_CHECK && k + 1 == self.checkpoints.len() {
             // Far from anything known: keep checkpoints on the way, at line starts where possible.
             let (mut cp, mut cs) = self.checkpoints[k];
@@ -1035,12 +1033,13 @@ pub fn segment_in(buf: &[u8], w0: u64, len: u64, off: u64) -> Seg {
         }
         g
     };
-    // Where a grid point actually cuts: just after the last space, comma or closing bracket shortly before it, so
-    // the cut looks like an ordinary wrap; otherwise at the nearest character boundary.
+    // Where a grid point actually cuts: just after the last space, comma or `}` shortly before it, so the cut looks
+    // like an ordinary wrap; otherwise at the nearest character boundary. (Not after `]`: it would split the `]]>`
+    // ending XML's CDATA, or Lua's `]]`.)
     let cut = |g: u64| -> u64 {
         let lo = g.saturating_sub(CUT_BACK).max(w0);
         let (a, b) = ((lo - w0) as usize, (g.min(w1) - w0) as usize);
-        match buf[a..b].iter().rposition(|&c| matches!(c, b' ' | b'\t' | b',' | b'}' | b']')) {
+        match buf[a..b].iter().rposition(|&c| matches!(c, b' ' | b'\t' | b',' | b'}')) {
             Some(i) => lo + i as u64 + 1,
             None => snap(g),
         }
