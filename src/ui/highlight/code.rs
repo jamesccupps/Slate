@@ -37,6 +37,26 @@ const CPP_RAW: u8 = 14;
 /// An interpolated string on one line (C# `$"…{x}…"`, HCL `"…${x}…"`); `a`: bit 0 an escape pending, bit 1 inside
 /// a `{…}` hole, bit 2 inside a string in the hole, bit 3 an escape pending there; `b`: the hole's brace depth.
 const INTERP: u8 = 15;
+/// A Dart or Scala string, where `$name` and `${…}` holes may be (`IS_…` bits in `a`; `b`: the hole's brace depth,
+/// and `IS_PLAIN`).
+const ISTR: u8 = 16;
+
+// In `ISTR`'s `a`.
+const IS_ESC: u8 = 1;
+/// Inside a `${…}` hole.
+const IS_HOLE: u8 = 2;
+/// Inside a string in the hole (`IS_INNER_SQ`: its quote is `'`).
+const IS_INNER: u8 = 4;
+const IS_INNER_ESC: u8 = 8;
+/// The quote is `'` (else `"`).
+const IS_SQ: u8 = 16;
+const IS_TRIPLE: u8 = 32;
+/// No escapes (Dart's `r'…'`, Scala's `"""…"""`).
+const IS_NOESC: u8 = 64;
+const IS_INNER_SQ: u8 = 128;
+// In `ISTR`'s `b`: no holes either (Dart's `r'…'`, Scala's plain `"…"`), and the hole's depth.
+const IS_PLAIN: u16 = 0x8000;
+const IS_DEPTH: u16 = 0x0FFF;
 
 /// In `STR`'s `a`: a single quote with backslash escapes (shell `$'…'`, SQL `E'…'`).
 const ESC_QUOTE: u8 = 0x80 | b'\'';
@@ -70,6 +90,13 @@ pub(super) enum Flavor {
     R,
     Hcl,
     CMake,
+    Dart,
+    Scala,
+    ObjC,
+    ObjCpp,
+    /// Inno Setup's Pascal Script.
+    Pascal,
+    Nsis,
 }
 
 pub(super) struct Syntax {
@@ -109,6 +136,8 @@ pub(super) struct Syntax {
     regex: bool,
     /// `'` between digits separates them (`1'000'000` in C and C++).
     digit_sep: bool,
+    /// Names may hold dots (R's `is.na`, NSIS's `un.onInit`).
+    dots: bool,
 }
 
 const BASE: Syntax = Syntax {
@@ -137,6 +166,7 @@ const BASE: Syntax = Syntax {
     resync: false,
     regex: false,
     digit_sep: false,
+    dots: false,
 };
 
 static PLAIN: Syntax = BASE;
@@ -598,6 +628,7 @@ static R: Syntax = Syntax {
     ctl: &["break", "else", "for", "if", "next", "repeat", "return", "while"],
     lits: &["F", "FALSE", "Inf", "NA", "NA_character_", "NA_complex_", "NA_integer_", "NA_real_", "NULL", "NaN", "T", "TRUE"],
     resync: true,
+    dots: true,
     ..BASE
 };
 
@@ -643,6 +674,184 @@ static CMAKE: Syntax = Syntax {
     ..BASE
 };
 
+/// Dart: `'…'`, `"…"`, `'''…'''` with `$name` and `${…}` in them, raw `r'…'`, nested `/* */`, `@annotations`.
+static DART: Syntax = Syntax {
+    flavor: Flavor::Dart,
+    kw: &[
+        "abstract", "as", "async", "base", "class", "const", "covariant", "deferred", "enum", "export", "extends",
+        "extension", "external", "factory", "final", "get", "hide", "implements", "import", "in", "interface", "is",
+        "late", "library", "mixin", "new", "of", "on", "operator", "part", "required", "sealed", "set", "show",
+        "static", "super", "sync", "this", "typedef", "var", "with",
+    ],
+    ctl: &[
+        "assert", "await", "break", "case", "catch", "continue", "default", "do", "else", "finally", "for", "if",
+        "rethrow", "return", "switch", "throw", "try", "when", "while", "yield",
+    ],
+    types: &["bool", "double", "dynamic", "int", "num", "void"],
+    lits: &["false", "null", "true"],
+    // (strings are read in `extras`)
+    quotes: b"",
+    nested: true,
+    dollar_ident: true,
+    decorators: true,
+    cap_types: true,
+    ..BASE
+};
+
+/// Scala 2 and 3: `s"…$x ${y}…"` (any `name"…"`), `"""…"""`, `'c'`, nested `/* */`, `@annotations`.
+static SCALA: Syntax = Syntax {
+    flavor: Flavor::Scala,
+    kw: &[
+        "abstract", "as", "class", "def", "derives", "end", "enum", "export", "extends", "extension", "final",
+        "forSome", "given", "implicit", "import", "infix", "inline", "lazy", "macro", "new", "object", "opaque",
+        "open", "override", "package", "private", "protected", "sealed", "super", "this", "trait", "transparent",
+        "type", "using", "val", "var", "with",
+    ],
+    ctl: &[
+        "case", "catch", "do", "else", "finally", "for", "if", "match", "return", "then", "throw", "try", "while",
+        "yield",
+    ],
+    lits: &["false", "null", "true"],
+    // `'c'` (`"…"` strings are read in `extras`)
+    quotes: b"'",
+    nested: true,
+    decorators: true,
+    cap_types: true,
+    ..BASE
+};
+
+/// Objective-C: C with `@interface`-style keywords, `@"strings"`, `@42`, `YES`, `nil`, `self`.
+static OBJC: Syntax = Syntax {
+    flavor: Flavor::ObjC,
+    kw: &[
+        "IBAction", "IBOutlet", "_Alignas", "_Alignof", "_Atomic", "_Generic", "_Nonnull", "_Noreturn",
+        "_Null_unspecified", "_Nullable", "_Static_assert", "_Thread_local", "__autoreleasing", "__block", "__bridge",
+        "__bridge_retained", "__bridge_transfer", "__strong", "__unsafe_unretained", "__weak", "alignas", "alignof",
+        "atomic", "auto", "const", "constexpr", "enum", "extern", "inline", "nonatomic", "nonnull", "nullable",
+        "readonly", "readwrite", "register", "restrict", "signed", "sizeof", "static", "static_assert", "strong",
+        "struct", "thread_local", "typedef", "typeof", "typeof_unqual", "union", "unsigned", "volatile", "weak",
+    ],
+    ctl: &["break", "case", "continue", "default", "do", "else", "for", "goto", "if", "in", "return", "switch", "while"],
+    types: &[
+        "BOOL", "Class", "IMP", "SEL", "_Bool", "_Complex", "_Imaginary", "bool", "char", "char16_t", "char32_t",
+        "char8_t", "double", "float", "id", "instancetype", "int", "int16_t", "int32_t", "int64_t", "int8_t", "long",
+        "ptrdiff_t", "short", "size_t", "ssize_t", "uint16_t", "uint32_t", "uint64_t", "uint8_t", "uintptr_t", "void",
+        "wchar_t",
+    ],
+    lits: &["NO", "NULL", "Nil", "YES", "false", "nil", "nullptr", "true"],
+    vars: &["_cmd", "self", "super"],
+    preproc: true,
+    cap_types: true,
+    digit_sep: true,
+    ..BASE
+};
+
+/// Objective-C++ (`.mm`): the same on C++ (its keywords, raw strings).
+static OBJCPP: Syntax = Syntax {
+    flavor: Flavor::ObjCpp,
+    kw: &[
+        "IBAction", "IBOutlet", "_Nonnull", "_Null_unspecified", "_Nullable", "__autoreleasing", "__block", "__bridge",
+        "__bridge_retained", "__bridge_transfer", "__strong", "__unsafe_unretained", "__weak", "alignas", "alignof",
+        "atomic", "auto", "class", "concept", "const", "const_cast", "consteval", "constexpr", "constinit", "decltype",
+        "delete", "dynamic_cast", "enum", "explicit", "export", "extern", "final", "friend", "inline", "mutable",
+        "namespace", "new", "noexcept", "nonatomic", "nonnull", "nullable", "operator", "override", "private",
+        "protected", "public", "readonly", "readwrite", "register", "reinterpret_cast", "requires", "restrict",
+        "signed", "sizeof", "static", "static_assert", "static_cast", "strong", "struct", "template", "this",
+        "thread_local", "typedef", "typeid", "typename", "union", "unsigned", "using", "virtual", "volatile", "weak",
+    ],
+    ctl: &[
+        "break", "case", "catch", "co_await", "co_return", "co_yield", "continue", "default", "do", "else", "for",
+        "goto", "if", "in", "return", "switch", "throw", "try", "while",
+    ],
+    types: &[
+        "BOOL", "Class", "IMP", "SEL", "bool", "char", "char16_t", "char32_t", "char8_t", "double", "float", "id",
+        "instancetype", "int", "int16_t", "int32_t", "int64_t", "int8_t", "long", "ptrdiff_t", "short", "size_t",
+        "ssize_t", "uint16_t", "uint32_t", "uint64_t", "uint8_t", "uintptr_t", "void", "wchar_t",
+    ],
+    ..OBJC
+};
+
+/// Inno Setup's Pascal Script (its `[Code]` section): `{ }`, `(* *)` and `//` comments, `'it''s'`, `#13`, `$FF`,
+/// the preprocessor's `{#Name}`. (Its `#` lines are read by `config::inno`.)
+static PASCAL: Syntax = Syntax {
+    flavor: Flavor::Pascal,
+    block: Some((b"{", b"}")),
+    quotes: b"'",
+    esc: 0,
+    nocase: true,
+    kw: &[
+        "and", "array", "as", "class", "const", "constructor", "destructor", "div", "external", "forward", "function",
+        "in", "inherited", "is", "label", "mod", "not", "of", "or", "out", "procedure", "program", "property", "record",
+        "set", "shl", "shr", "type", "unit", "uses", "var", "xor",
+    ],
+    ctl: &[
+        "begin", "break", "case", "continue", "do", "downto", "else", "end", "except", "exit", "finally", "for", "goto",
+        "if", "raise", "repeat", "then", "to", "try", "until", "while", "with",
+    ],
+    types: &[
+        "ansichar", "ansistring", "boolean", "byte", "cardinal", "char", "currency", "double", "extended", "int64",
+        "integer", "longint", "longword", "pansichar", "pchar", "pointer", "shortint", "single", "smallint", "string",
+        "variant", "widechar", "widestring", "word",
+    ],
+    lits: &["false", "nil", "true"],
+    vars: &["result", "self"],
+    ..BASE
+};
+
+/// NSIS: commands (in any case) at a line's start, `!directives`, `$VAR`, `${DEFINE}` and `$(LangString)` (in strings
+/// too), `$\n` escapes, `;` and `#` comments, labels, `/flags`, a `\` at a line's end going on in the next line.
+static NSIS: Syntax = Syntax {
+    flavor: Flavor::Nsis,
+    line: &[b";", b"#"],
+    quotes: b"\"'`",
+    esc: 0,
+    nocase: true,
+    kw: &[
+        "addbrandingimage", "addsize", "allowrootdirinstall", "allowskipfiles", "autoclosewindow", "bgfont",
+        "bggradient", "brandingtext", "bringtofront", "callinstdll", "caption", "changeui", "checkbitmap",
+        "clearerrors", "completedtext", "componenttext", "copyfiles", "crccheck", "createdirectory", "createfont",
+        "createshortcut", "delete", "deleteinisec", "deleteinistr", "deleteregkey", "deleteregvalue", "detailprint",
+        "detailsbuttontext", "dirtext", "dirvar", "dirverify", "enablewindow", "enumregkey", "enumregvalue", "exch",
+        "exec", "execshell", "execshellwait", "execwait", "expandenvstrings", "file", "filebufsize", "fileclose",
+        "fileerrortext", "fileopen", "fileread", "filereadbyte", "filereadutf16le", "filereadword", "fileseek",
+        "filewrite", "filewritebyte", "filewriteutf16le", "filewriteword", "findclose", "findfirst", "findnext",
+        "findwindow", "flushini", "function", "functionend", "getcurinsttype", "getcurrentaddress", "getdlgitem",
+        "getdllversion", "getdllversionlocal", "geterrorlevel", "getfiletime", "getfiletimelocal", "getfullpathname",
+        "getfunctionaddress", "getinstdirerror", "getknownfolderpath", "getlabeladdress", "gettempfilename",
+        "getwinver", "hidewindow", "icon", "initpluginsdir", "installbuttontext", "installcolors", "installdir",
+        "installdirregkey", "instprogressflags", "insttype", "insttypegettext", "insttypesettext", "intfmt", "intop",
+        "intptrcmp", "intptrop", "iswindow", "langstring", "licensebkcolor", "licensedata", "licenseforceselection",
+        "licenselangstring", "licensetext", "loadandsetimage", "loadlanguagefile", "lockwindow", "logset", "logtext",
+        "manifestdpiaware", "manifestsupportedos", "messagebox", "miscbuttontext", "name", "nop", "outfile", "page",
+        "pagecallbacks", "pageex", "pageexend", "pop", "push", "readenvstr", "readinistr", "readregdword", "readregstr",
+        "reboot", "regdll", "rename", "requestexecutionlevel", "reservefile", "rmdir", "searchpath", "section",
+        "sectionend", "sectiongetflags", "sectiongetinsttypes", "sectiongetsize", "sectiongettext", "sectiongroup",
+        "sectiongroupend", "sectionin", "sectioninstype", "sectionsetflags", "sectionsetinsttypes", "sectionsetsize",
+        "sectionsettext", "sendmessage", "setautoclose", "setbrandingimage", "setcompress", "setcompressor",
+        "setcompressordictsize", "setctlcolors", "setcurinsttype", "setdatablockoptimize", "setdatesave",
+        "setdetailsprint", "setdetailsview", "seterrorlevel", "seterrors", "setfileattributes", "setfont", "setoutpath",
+        "setoverwrite", "setrebootflag", "setregview", "setshellvarcontext", "setsilent", "showinstdetails",
+        "showuninstdetails", "showwindow", "silentinstall", "silentuninstall", "sleep", "spacetexts", "strcpy",
+        "strlen", "subcaption", "target", "unicode", "uninstallbuttontext", "uninstallcaption", "uninstallicon",
+        "uninstallsubcaption", "uninstalltext", "uninstpage", "unregdll", "unsafestrcpy", "var", "viaddversionkey",
+        "vifileversion", "viproductversion", "windowicon", "writeinistr", "writeregbin", "writeregdword",
+        "writeregexpandstr", "writeregmultistr", "writeregnone", "writeregstr", "writeuninstaller", "xpstyle",
+    ],
+    ctl: &[
+        "abort", "call", "goto", "ifabort", "iferrors", "iffileexists", "ifrebootflag", "ifsilent", "intcmp", "intcmpu",
+        "quit", "return", "strcmp", "strcmps",
+    ],
+    lits: &[
+        "admin", "all", "bzip2", "current", "false", "force", "highest", "hkcc", "hkcr", "hkcu", "hkey_classes_root",
+        "hkey_current_config", "hkey_current_user", "hkey_local_machine", "hkey_users", "hklm", "hku", "idabort",
+        "idcancel", "idignore", "idno", "idok", "idretry", "idyes", "ifdiff", "ifnewer", "lzma", "none", "off", "on",
+        "shctx", "true", "try", "user", "zlib",
+    ],
+    calls: false,
+    dots: true,
+    ..BASE
+};
+
 pub(super) fn syntax(lang: Lang) -> &'static Syntax {
     match lang {
         Lang::C => &C,
@@ -670,6 +879,13 @@ pub(super) fn syntax(lang: Lang) -> &'static Syntax {
         Lang::R => &R,
         Lang::Hcl => &HCL,
         Lang::CMake => &CMAKE,
+        Lang::Dart => &DART,
+        Lang::Scala => &SCALA,
+        Lang::ObjC => &OBJC,
+        Lang::ObjCpp => &OBJCPP,
+        // (its `[Code]` section)
+        Lang::InnoSetup => &PASCAL,
+        Lang::Nsis => &NSIS,
         _ => &PLAIN,
     }
 }
@@ -687,12 +903,12 @@ const PS_OPS: [&[u8]; 36] = [
 ];
 
 fn ident_start(sx: &Syntax, c: u8) -> bool {
-    c.is_ascii_alphabetic() || c == b'_' || c >= 0x80 || (sx.dollar_ident && c == b'$') || (sx.flavor == Flavor::R && c == b'.')
+    c.is_ascii_alphabetic() || c == b'_' || c >= 0x80 || (sx.dollar_ident && c == b'$') || (sx.dots && c == b'.')
 }
 
-/// (R names may hold dots: `is.na`, `data.frame`.)
+/// (R names may hold dots: `is.na`, `data.frame`; NSIS names too: `un.onInit`, `.onInit`.)
 fn ident_char(sx: &Syntax, c: u8) -> bool {
-    c.is_ascii_alphanumeric() || c == b'_' || c >= 0x80 || (sx.dollar_ident && c == b'$') || (sx.flavor == Flavor::R && c == b'.')
+    c.is_ascii_alphanumeric() || c == b'_' || c >= 0x80 || (sx.dollar_ident && c == b'$') || (sx.dots && c == b'.')
 }
 
 fn ident_end(sx: &Syntax, t: &[u8], mut i: usize) -> usize {
@@ -790,6 +1006,9 @@ fn block_rest(sx: &Syntax, t: &[u8], s: usize, mut i: usize, mut depth: u8, st: 
 /// and `E'…'`); `b` is the state's (the escape pending, and with `resync` what `guarded_rest` keeps).
 #[allow(clippy::too_many_arguments)]
 fn string_rest(sx: &Syntax, t: &[u8], s: usize, i: usize, mark: u8, b: u16, st: State, o: &mut Out) -> Step {
+    if sx.flavor == Flavor::Nsis {
+        return nsis_str_rest(t, s, i, mark, b, st, o);
+    }
     let (q, esc) = match mark {
         ESC_QUOTE => (b'\'', b'\\'),
         q if sx.raw.contains(&q) => (q, 0),
@@ -1210,6 +1429,202 @@ fn interp_rest(sx: &Syntax, t: &[u8], s: usize, mut i: usize, a: u8, mut depth: 
     Err(State { kind: INTERP, a, b: depth, ..st })
 }
 
+/// A Dart or Scala string whose quote is at `q` (from `s`, which may be before it: `r'…'`, `s"…"`); `noesc`: no
+/// escapes, `holes`: `$name` and `${…}` are read.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn istr_open(sx: &Syntax, t: &[u8], s: usize, q: usize, noesc: bool, holes: bool, st: State, o: &mut Out) -> Step {
+    let c = t[q];
+    let triple = at(t, q + 1) == c && at(t, q + 2) == c;
+    let mut a = if c == b'\'' { IS_SQ } else { 0 };
+    if triple {
+        a |= IS_TRIPLE;
+    }
+    // (in Scala, """…""" has none)
+    if noesc || (triple && sx.flavor == Flavor::Scala) {
+        a |= IS_NOESC;
+    }
+    istr_rest(sx, t, s, q + if triple { 3 } else { 1 }, a, if holes { 0 } else { IS_PLAIN }, st, o)
+}
+
+/// The rest of a Dart or Scala string (see `ISTR`): `$name` and `${…}` colored as variables, a quote inside a
+/// hole starting a string of its own (`"${m["k"]}"`). One that isn't triple-quoted is over at the line's end.
+#[allow(clippy::too_many_arguments)]
+fn istr_rest(sx: &Syntax, t: &[u8], s: usize, mut i: usize, a: u8, b: u16, st: State, o: &mut Out) -> Step {
+    let n = t.len();
+    let q = if a & IS_SQ != 0 { b'\'' } else { b'"' };
+    let (triple, noesc, holes) = (a & IS_TRIPLE != 0, a & IS_NOESC != 0, b & IS_PLAIN == 0);
+    let scala = sx.flavor == Flavor::Scala;
+    let (mut esc, mut hole, mut inner, mut inner_esc) = (a & IS_ESC != 0, a & IS_HOLE != 0, a & IS_INNER != 0, a & IS_INNER_ESC != 0);
+    let mut inner_q = if a & IS_INNER_SQ != 0 { b'\'' } else { b'"' };
+    let mut depth = b & IS_DEPTH;
+    // where the span being colored starts (a hole's, or the text's)
+    let mut seg = s;
+    while i < n {
+        let c = t[i];
+        if c == b'\n' && !triple {
+            o.put(seg, i, if hole { Tok::Var } else { Tok::Str });
+            return Ok(i);
+        }
+        if hole {
+            if inner {
+                if inner_esc {
+                    inner_esc = false;
+                } else if c == b'\\' {
+                    inner_esc = true;
+                } else if c == inner_q || c == b'\n' {
+                    inner = false;
+                }
+            } else {
+                match c {
+                    b'"' | b'\'' => (inner, inner_q) = (true, c),
+                    b'{' => depth = (depth + 1).min(IS_DEPTH),
+                    b'}' if depth == 0 => {
+                        hole = false;
+                        o.put(seg, i + 1, Tok::Var);
+                        seg = i + 1;
+                    }
+                    b'}' => depth -= 1,
+                    _ => {}
+                }
+            }
+        } else if esc {
+            esc = false;
+        } else if c == b'\\' && !noesc && !(scala && holes && !matches!(at(t, i + 1), b'"' | b'\\')) {
+            // (in Scala's s"…" a `\` only pairs with a quote or a backslash: `raw"C:\dir\$name"`)
+            esc = true;
+        } else if c == q && (!triple || (at(t, i + 1) == q && at(t, i + 2) == q)) {
+            // (a Scala """ ends at the last three quotes of a run: `"""say "hi""""`)
+            let e = if !triple {
+                i + 1
+            } else if scala {
+                i + t[i..].iter().take_while(|&&b| b == q).count()
+            } else {
+                i + 3
+            };
+            o.put(seg, e, Tok::Str);
+            return Ok(e);
+        } else if c == b'$' && holes {
+            let nx = at(t, i + 1);
+            if scala && (nx == b'$' || nx == b'"') {
+                // `$$` is a dollar sign, `$"` a quote
+                i += 2;
+                continue;
+            }
+            if nx == b'{' {
+                o.put(seg, i, Tok::Str);
+                (seg, hole, depth) = (i, true, 0);
+                i += 2;
+                continue;
+            }
+            if nx.is_ascii_alphabetic() || nx == b'_' {
+                let e = i + 1 + t[i + 1..].iter().take_while(|b| b.is_ascii_alphanumeric() || **b == b'_').count();
+                o.put(seg, i, Tok::Str);
+                o.put(i, e, Tok::Var);
+                (seg, i) = (e, e);
+                continue;
+            }
+        }
+        i += 1;
+    }
+    o.put(seg, n, if hole { Tok::Var } else { Tok::Str });
+    let a = (esc as u8)
+        | (hole as u8) << 1
+        | (inner as u8) << 2
+        | (inner_esc as u8) << 3
+        | (a & (IS_SQ | IS_TRIPLE | IS_NOESC))
+        | if inner_q == b'\'' { IS_INNER_SQ } else { 0 };
+    Err(State { kind: ISTR, a, b: depth | (b & IS_PLAIN), ..st })
+}
+
+/// An NSIS variable at `i` (a `$`): `$INSTDIR`, `$0`, `$R1`, `${DEFINE}`, `$(LangString)`, `$(^Name)`. Its end.
+fn nsis_var(t: &[u8], i: usize) -> Option<usize> {
+    let c = at(t, i + 1);
+    if c == b'{' || c == b'(' {
+        let close = if c == b'{' { b'}' } else { b')' };
+        let k = t[i + 2..].iter().take(64).take_while(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'^')).count();
+        return (k > 0 && at(t, i + 2 + k) == close).then_some(i + 3 + k);
+    }
+    let k = t[i + 1..].iter().take_while(|b| b.is_ascii_alphanumeric() || **b == b'_').count();
+    (k > 0).then_some(i + 1 + k)
+}
+
+/// Whether the byte before `i` is part of a word, so that a quote or a comment character at `i` is just a
+/// character (NSIS: `Don't`, `a#b`).
+fn nsis_glued(t: &[u8], i: usize) -> bool {
+    i > 0 && (t[i - 1].is_ascii_alphanumeric() || matches!(t[i - 1], b'_' | b'.' | b'$' | b'\\' | b'/' | b':' | b'-' | b'%'))
+}
+
+/// Whether the line that ends at `i` (its `\n`) ends with a `\`, which goes on in the next line (NSIS).
+fn continues(t: &[u8], i: usize) -> bool {
+    let k = if i > 0 && t[i - 1] == b'\r' { i - 1 } else { i };
+    k > 0 && t[k - 1] == b'\\'
+}
+
+/// The rest of an NSIS string (from `s`, quote `q`, scanned from `i`): `$\"` and `$$` escape, variables are
+/// colored in it, and a `\` at a line's end goes on in the next line. `b`: 1 right after a `$`, 2 after `$\`.
+#[inline(never)]
+fn nsis_str_rest(t: &[u8], s: usize, mut i: usize, q: u8, b: u16, st: State, o: &mut Out) -> Step {
+    let n = t.len();
+    if b == 2 || (b == 1 && at(t, i) == b'$') {
+        i += 1;
+    } else if b == 1 && at(t, i) == b'\\' {
+        i += 2;
+    }
+    let mut seg = s;
+    let mut pending = 0;
+    while i < n {
+        let c = t[i];
+        if c == b'\n' && !continues(t, i) {
+            o.put(seg, i, Tok::Str);
+            return Ok(i);
+        }
+        if c == q {
+            o.put(seg, i + 1, Tok::Str);
+            return Ok(i + 1);
+        }
+        if c == b'$' {
+            match at(t, i + 1) {
+                _ if i + 1 >= n => pending = 1,
+                b'\\' if i + 2 >= n => pending = 2,
+                b'\\' => {
+                    i += 3;
+                    continue;
+                }
+                b'$' => {
+                    i += 2;
+                    continue;
+                }
+                _ => {
+                    if let Some(e) = nsis_var(t, i) {
+                        o.put(seg, i, Tok::Str);
+                        o.put(i, e, Tok::Var);
+                        (seg, i) = (e, e);
+                        continue;
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    o.put(seg, n, Tok::Str);
+    Err(State { kind: STR, a: q, b: pending, ..st })
+}
+
+/// A Pascal `(* … *)` comment from `s`, scanned from `i` (a `BLOCK_COMMENT` with `b` = 1).
+fn paren_comment_rest(t: &[u8], s: usize, i: usize, st: State, o: &mut Out) -> Step {
+    match memchr::memmem::find(&t[i.min(t.len())..], b"*)") {
+        Some(p) => {
+            o.put(s, i + p + 2, Tok::Comment);
+            Ok(i + p + 2)
+        }
+        None => {
+            o.put(s, t.len(), Tok::Comment);
+            Err(State { kind: BLOCK_COMMENT, a: 1, b: 1, ..st })
+        }
+    }
+}
+
 /// C#'s """raw strings""" have no escapes; other languages' triple-quoted strings do.
 fn triple_esc(sx: &Syntax) -> u8 {
     if sx.flavor == Flavor::CSharp { 0 } else { sx.esc }
@@ -1223,6 +1638,7 @@ fn resume(sx: &Syntax, t: &[u8], st: State, o: &mut Out) -> Step {
             o.put(0, e, Tok::Comment);
             if e == t.len() { Err(st) } else { Ok(e) }
         }
+        BLOCK_COMMENT if sx.flavor == Flavor::Pascal && st.b == 1 => paren_comment_rest(t, 0, 0, st, o),
         BLOCK_COMMENT => block_rest(sx, t, 0, 0, st.a.max(1), st, o),
         STR => string_rest(sx, t, 0, 0, st.a, st.b, st, o),
         TRIPLE => triple_rest(t, 0, 0, st.a, triple_esc(sx), st.b == 1, st, o),
@@ -1246,16 +1662,22 @@ fn resume(sx: &Syntax, t: &[u8], st: State, o: &mut Out) -> Step {
         QUOTE_LIKE => quote_like_rest(t, 0, 0, st.a, st.b, st, o),
         CPP_RAW => cpp_raw_rest(t, 0, 0, (st.a, st.b), st, o),
         INTERP => interp_rest(sx, t, 0, 0, st.a, st.b, st, o),
+        ISTR => istr_rest(sx, t, 0, 0, st.a, st.b, st, o),
         _ => Ok(0),
     }
 }
 
-/// Where a line comment starting at `i` ends: the line's end (or in PHP a `?>` before it, which ends PHP code).
+/// Where a line comment starting at `i` ends: the line's end (or in PHP a `?>` before it, which ends PHP code; in
+/// NSIS the end of the next line too when this one ends with a `\`).
 fn comment_end(sx: &Syntax, t: &[u8], i: usize) -> usize {
-    let e = line_end(t, i);
+    let mut e = line_end(t, i);
     if sx.flavor == Flavor::Php {
         if let Some(p) = memchr::memmem::find(&t[i..e], b"?>") {
             return i + p;
+        }
+    } else if sx.flavor == Flavor::Nsis {
+        while e < t.len() && e > i && continues(t, e) {
+            e = line_end(t, e + 1);
         }
     }
     e
@@ -1270,6 +1692,8 @@ fn line_comment(sx: &Syntax, t: &[u8], i: usize) -> bool {
             && !(sx.flavor == Flavor::Ahk && i > 0 && !matches!(t[i - 1], b' ' | b'\t' | b'\n' | b'\r'))
             // PHP 8 attributes: #[Route('/x')]
             && !(sx.flavor == Flavor::Php && t[i..].starts_with(b"#["))
+            // NSIS: not inside a word (`a#b`, `x;y`)
+            && !(sx.flavor == Flavor::Nsis && nsis_glued(t, i))
     })
 }
 
@@ -1412,13 +1836,18 @@ fn extras(sx: &Syntax, t: &[u8], i: usize, line_start: bool, regex_ok: &mut bool
     let c = t[i];
     let n = t.len();
     match sx.flavor {
-        Flavor::Cpp => {
-            if matches!(c, b'R' | b'u' | b'U' | b'L') {
+        Flavor::Cpp | Flavor::ObjC | Flavor::ObjCpp => {
+            if matches!(c, b'R' | b'u' | b'U' | b'L') && sx.flavor != Flavor::ObjC {
                 if let Some((from, h)) = cpp_raw_open(t, i) {
                     return Some(cpp_raw_rest(t, i, from, h, st, o));
                 }
             }
+            if c == b'@' && sx.flavor != Flavor::Cpp {
+                return objc_at(sx, t, i, st, o);
+            }
         }
+        Flavor::Dart | Flavor::Scala | Flavor::Pascal => return more_extras(sx, t, i, st, o),
+        Flavor::Nsis => return nsis_extras(t, i, line_start, st, o),
         Flavor::Vb => {
             // &HFF, &O17, &B101
             if c == b'&' && matches!(at(t, i + 1), b'h' | b'H' | b'o' | b'O' | b'b' | b'B') && at(t, i + 2).is_ascii_hexdigit() {
@@ -1688,6 +2117,143 @@ fn extras(sx: &Syntax, t: &[u8], i: usize, line_start: bool, regex_ok: &mut bool
     None
 }
 
+/// `extras` for Dart, Scala and Pascal. (The newer languages' extras are kept out of `code_run`'s loop, which
+/// stays as quick as it was for the others.)
+#[inline(never)]
+fn more_extras(sx: &Syntax, t: &[u8], i: usize, st: State, o: &mut Out) -> Option<Step> {
+    let c = t[i];
+    match sx.flavor {
+        Flavor::Dart => {
+            // 'a', "b", '''c''', r'raw'
+            if c == b'\'' || c == b'"' {
+                return Some(istr_open(sx, t, i, i, false, true, st, o));
+            }
+            if c == b'r' && matches!(at(t, i + 1), b'\'' | b'"') && (i == 0 || !ident_char(sx, t[i - 1])) {
+                return Some(istr_open(sx, t, i, i + 1, true, false, st, o));
+            }
+        }
+        // "plain" and """multi-line""" (s"…" is read with the name before it)
+        Flavor::Scala if c == b'"' => return Some(istr_open(sx, t, i, i, false, false, st, o)),
+        Flavor::Pascal => {
+            if c == b'(' && at(t, i + 1) == b'*' {
+                return Some(paren_comment_rest(t, i, i + 2, st, o));
+            }
+            // {#Name}: Inno Setup's preprocessor (left open, it reads on as a comment)
+            if c == b'{' && at(t, i + 1) == b'#' {
+                if let Some(p) = memchr::memchr(b'}', &t[i..]) {
+                    o.put(i, i + p + 1, Tok::Var);
+                    return Some(Ok(i + p + 1));
+                }
+            }
+            // #13, #$0D: characters by their code
+            if c == b'#' {
+                let s = i + 1 + (at(t, i + 1) == b'$') as usize;
+                let k = t[s..].iter().take_while(|b| if s > i + 1 { b.is_ascii_hexdigit() } else { b.is_ascii_digit() }).count();
+                if k > 0 {
+                    let e = s + k;
+                    o.put(i, e, Tok::Str);
+                    return Some(Ok(e));
+                }
+            }
+            // $FF
+            if c == b'$' && at(t, i + 1).is_ascii_hexdigit() {
+                let e = i + 1 + t[i + 1..].iter().take_while(|b| b.is_ascii_alphanumeric()).count();
+                o.put(i, e, Tok::Num);
+                return Some(Ok(e));
+            }
+        }
+        _ => {}
+    }
+    None
+}
+
+/// NSIS: what a word is (`e` its end, `tok` its keyword color) — a plugin's function (`nsDialogs::Create`), a label,
+/// a command only at the start of a line.
+#[inline(never)]
+fn nsis_word(sx: &Syntax, t: &[u8], e: usize, stmt_start: bool, tok: Option<Tok>) -> (usize, Option<Tok>) {
+    if at(t, e) == b':' && at(t, e + 1) == b':' && ident_start(sx, at(t, e + 2)) {
+        (ident_end(sx, t, e + 2), Some(Tok::Func))
+    } else if stmt_start && at(t, e) == b':' && matches!(at(t, e + 1), 0 | b' ' | b'\t' | b'\r' | b'\n') {
+        (e + 1, Some(Tok::Section))
+    } else if stmt_start {
+        // a command, also one that isn't in the list
+        (e, tok.or(Some(Tok::Keyword)))
+    } else if matches!(tok, Some(Tok::Keyword | Tok::Control)) {
+        // (commands are only at a line's start: `Var /GLOBAL name`, `Page license`)
+        (e, None)
+    } else {
+        (e, tok)
+    }
+}
+
+/// Whether the name at `i` follows `@interface`, `@implementation` or `@protocol` (so it's a class's).
+fn objc_class_name(t: &[u8], i: usize) -> bool {
+    let b = t[..i].trim_ascii_end();
+    [&b"@interface"[..], b"@implementation", b"@protocol"].iter().any(|w| b.ends_with(w))
+}
+
+/// Objective-C's `@` words and literals at `i`: `@interface`, `@try`, `@"string"`, `@42`, `@YES`.
+#[inline(never)]
+fn objc_at(sx: &Syntax, t: &[u8], i: usize, st: State, o: &mut Out) -> Option<Step> {
+    let c = at(t, i + 1);
+    if c == b'"' {
+        return Some(string_rest(sx, t, i, i + 2, b'"', 0, st, o));
+    }
+    if c.is_ascii_digit() {
+        let e = number_end(sx, t, i + 1);
+        o.put(i, e, Tok::Num);
+        return Some(Ok(e));
+    }
+    if !(c.is_ascii_alphabetic() || c == b'_') {
+        return None;
+    }
+    let e = ident_end(sx, t, i + 1);
+    let tok = match &t[i + 1..e] {
+        b"try" | b"catch" | b"finally" | b"throw" => Tok::Control,
+        b"YES" | b"NO" | b"true" | b"false" => Tok::Lit,
+        _ => Tok::Keyword,
+    };
+    o.put(i, e, tok);
+    Some(Ok(e))
+}
+
+/// NSIS at `i`: strings (not a quote inside a word: `Don't`), `$` variables and escapes, `!directives` at a line's
+/// start, `/flags`.
+#[inline(never)]
+fn nsis_extras(t: &[u8], i: usize, line_start: bool, st: State, o: &mut Out) -> Option<Step> {
+    let c = t[i];
+    match c {
+        b'"' | b'\'' | b'`' => {
+            if nsis_glued(t, i) {
+                return Some(Ok(i + 1));
+            }
+            Some(nsis_str_rest(t, i, i + 1, c, 0, st, o))
+        }
+        b'$' => match at(t, i + 1) {
+            // `$$` is a dollar sign, `$\n` a line break (a `\` at the line's end continues it)
+            b'$' => Some(Ok(i + 2)),
+            b'\\' if !matches!(at(t, i + 2), b'\n' | b'\r' | 0) => Some(Ok(i + 3)),
+            _ => {
+                let e = nsis_var(t, i)?;
+                o.put(i, e, Tok::Var);
+                Some(Ok(e))
+            }
+        },
+        b'!' if line_start && at(t, i + 1).is_ascii_alphabetic() => {
+            let e = i + 1 + t[i + 1..].iter().take_while(|b| b.is_ascii_alphanumeric() || **b == b'_').count();
+            o.put(i, e, Tok::Control);
+            Some(Ok(e))
+        }
+        // File /r, MessageBox /SD IDOK, Var /GLOBAL
+        b'/' if at(t, i + 1).is_ascii_alphabetic() && !nsis_glued(t, i) => {
+            let e = i + 1 + t[i + 1..].iter().take_while(|b| b.is_ascii_alphanumeric() || **b == b'_').count();
+            o.put(i, e, Tok::Attr);
+            Some(Ok(e))
+        }
+        _ => None,
+    }
+}
+
 /// After these words a `/` starts a regex rather than dividing (JavaScript; Perl).
 const REGEX_AFTER: [&[u8]; 14] =
     [b"await", b"case", b"delete", b"do", b"else", b"in", b"instanceof", b"new", b"of", b"return", b"throw", b"typeof", b"void", b"yield"];
@@ -1735,8 +2301,9 @@ fn code_run(sx: &Syntax, t: &[u8], st: State, o: &mut Out, close: &mut Option<us
     }
     let mut mid = State { kind: 0, a: 0, b: 0, ..st };
     let mut bol = st.bol && i == 0;
-    // Batch: at the start of a statement (where `rem` starts a comment); inside an echo (plain text).
-    let mut stmt = bol;
+    // Batch: at the start of a statement (where `rem` starts a comment); inside an echo (plain text). NSIS: where
+    // a command is (not on a line that goes on from the one before, which ended with a `\`: `a` says so).
+    let mut stmt = bol && !(sx.flavor == Flavor::Nsis && st.kind == 0 && st.a & 1 != 0);
     let mut echo = false;
     // After `def` / `class`: the next name is a function's (1) / a type's (2).
     let mut expect = 0u8;
@@ -1758,7 +2325,7 @@ fn code_run(sx: &Syntax, t: &[u8], st: State, o: &mut Out, close: &mut Option<us
         let c = t[i];
         match c {
             b'\n' => {
-                (bol, stmt, echo, expect) = (true, true, false, 0);
+                (bol, stmt, echo, expect) = (true, !(sx.flavor == Flavor::Nsis && continues(t, i)), false, 0);
                 i += 1;
                 if let Some((a, b)) = heredoc.take() {
                     regex_ok = true;
@@ -1859,8 +2426,8 @@ fn code_run(sx: &Syntax, t: &[u8], st: State, o: &mut Out, close: &mut Option<us
             continue;
         }
         if let Some((open, _)) = sx.block {
-            // (AutoHotkey's `/*` only at the start of a line)
-            if t[i..].starts_with(open) && (sx.flavor != Flavor::Ahk || line_start) {
+            // (AutoHotkey's `/*` only at the start of a line; NSIS's not inside a word: `File dir/*.txt`)
+            if t[i..].starts_with(open) && (sx.flavor != Flavor::Ahk || line_start) && !(sx.flavor == Flavor::Nsis && nsis_glued(t, i)) {
                 regex_ok = true;
                 step!(block_rest(sx, t, i, i + open.len(), 1, mid, o));
             }
@@ -1874,7 +2441,7 @@ fn code_run(sx: &Syntax, t: &[u8], st: State, o: &mut Out, close: &mut Option<us
             // #include <x.h>, #define, #region
             let w = i + 1 + t[i + 1..].iter().take_while(|&&b| b == b' ' || b == b'\t').count();
             let e = w + t[w..].iter().take_while(|b| b.is_ascii_alphabetic()).count();
-            if sx.flavor == Flavor::Cpp && w > i + 1 && at(t, e) == b'"' {
+            if matches!(sx.flavor, Flavor::Cpp | Flavor::ObjCpp) && w > i + 1 && at(t, e) == b'"' {
                 // `# R"(…` is a raw string after a stray `#`, as when the text is cut after the space
                 o.put(i, i + 1, Tok::Control);
                 i += 1;
@@ -1934,6 +2501,11 @@ fn code_run(sx: &Syntax, t: &[u8], st: State, o: &mut Out, close: &mut Option<us
         if ident_start(sx, c) {
             let mut e = ident_end(sx, t, i);
             let w = &t[i..e];
+            if sx.flavor == Flavor::Scala && at(t, e) == b'"' {
+                // an interpolated string: s"…", f"…", raw"…", sql"…"
+                regex_ok = false;
+                step!(istr_open(sx, t, i, e, false, true, mid, o));
+            }
             // after a '.', a keyword is a member name (`re.match`, `map.get`, `promise.catch`)
             let member = i > 0 && t[i - 1] == b'.' && !(i > 1 && t[i - 2] == b'.');
             let after: &[&[u8]] = if sx.flavor == Flavor::Perl { &PERL_REGEX_AFTER } else { &REGEX_AFTER };
@@ -1943,6 +2515,9 @@ fn code_run(sx: &Syntax, t: &[u8], st: State, o: &mut Out, close: &mut Option<us
                 continue;
             }
             let mut tok = if member { None } else { word_tok(sx, w) };
+            if sx.flavor == Flavor::Nsis {
+                (e, tok) = nsis_word(sx, t, e, stmt_start, tok);
+            }
             if matches!(sx.flavor, Flavor::Batch | Flavor::Vb) {
                 let ends = matches!(at(t, e), 0 | b' ' | b'\t' | b'\r' | b'\n');
                 if stmt_start && ends && w.eq_ignore_ascii_case(b"rem") {
@@ -1962,35 +2537,47 @@ fn code_run(sx: &Syntax, t: &[u8], st: State, o: &mut Out, close: &mut Option<us
                     Some(Tok::Func)
                 } else if expect == 2 {
                     Some(Tok::Type)
-                } else if sx.flavor == Flavor::Rust && at(t, e) == b'!' && at(t, e + 1) != b'=' {
-                    e += 1;
-                    Some(Tok::Func)
-                } else if sx.dash_ident && w.contains(&b'-') {
-                    Some(Tok::Func)
-                } else if sx.flavor == Flavor::CSharp && next == Some(b'(') {
-                    // C# methods are capitalized like types: `Console.WriteLine(…)`
-                    Some(Tok::Func)
-                } else if sx.flavor == Flavor::Ahk && w.len() > 2 && w[..2].eq_ignore_ascii_case(b"a_") {
-                    // built-in variables: A_ScriptDir, A_Now
-                    Some(Tok::Var)
-                } else if sx.flavor == Flavor::Ahk && stmt_start && next == Some(b',') {
-                    // a command in version 1's syntax: `MsgBox, Hello`
-                    Some(Tok::Func)
-                } else if sx.flavor == Flavor::Hcl && next == Some(b'=') && !matches!(at(t, np + 1), b'=' | b'>') {
-                    // an argument: `ami = "…"`
-                    Some(Tok::Attr)
-                } else if sx.cap_types && w[0].is_ascii_uppercase() && w.iter().any(|b| b.is_ascii_lowercase()) {
-                    Some(Tok::Type)
-                } else if sx.calls && next == Some(b'(') {
-                    Some(Tok::Func)
                 } else {
-                    None
+                    // (one jump on the flavor, however many languages have rules of their own)
+                    let special = match sx.flavor {
+                        Flavor::Rust if at(t, e) == b'!' && at(t, e + 1) != b'=' => {
+                            e += 1;
+                            Some(Tok::Func)
+                        }
+                        // Verb-Noun
+                        Flavor::PowerShell if sx.dash_ident && w.contains(&b'-') => Some(Tok::Func),
+                        // C# methods are capitalized like types: `Console.WriteLine(…)`; Objective-C's functions too
+                        // (`NSLog(…)`, but not the class of `@interface Name (Category)`)
+                        Flavor::CSharp if next == Some(b'(') => Some(Tok::Func),
+                        Flavor::ObjC | Flavor::ObjCpp if next == Some(b'(') && !objc_class_name(t, i) => Some(Tok::Func),
+                        // built-in variables: A_ScriptDir, A_Now
+                        Flavor::Ahk if w.len() > 2 && w[..2].eq_ignore_ascii_case(b"a_") => Some(Tok::Var),
+                        // a command in version 1's syntax: `MsgBox, Hello`
+                        Flavor::Ahk if stmt_start && next == Some(b',') => Some(Tok::Func),
+                        // an argument: `ami = "…"`
+                        Flavor::Hcl if next == Some(b'=') && !matches!(at(t, np + 1), b'=' | b'>') => Some(Tok::Attr),
+                        // MB_OK, SW_SHOWNORMAL, SF_SELECTED
+                        Flavor::Nsis if w.len() > 3 && w[2] == b'_' && matches!(&w[..2], b"MB" | b"SW" | b"SF") => Some(Tok::Lit),
+                        _ => None,
+                    };
+                    if special.is_some() {
+                        special
+                    } else if sx.cap_types && w[0].is_ascii_uppercase() && w.iter().any(|b| b.is_ascii_lowercase()) {
+                        Some(Tok::Type)
+                    } else if sx.calls && next == Some(b'(') {
+                        Some(Tok::Func)
+                    } else {
+                        None
+                    }
                 };
             }
             expect = 0;
             if tok == Some(Tok::Keyword) || (sx.flavor == Flavor::CMake && tok == Some(Tok::Control)) {
                 let lower = w.to_ascii_lowercase();
-                if FUNC_KW.contains(&lower.as_slice()) || (sx.flavor == Flavor::CMake && lower == b"macro") {
+                if FUNC_KW.contains(&lower.as_slice())
+                    || (sx.flavor == Flavor::CMake && lower == b"macro")
+                    || (sx.flavor == Flavor::Pascal && lower == b"procedure")
+                {
                     expect = 1;
                 } else if TYPE_KW.contains(&lower.as_slice()) || (sx.flavor == Flavor::CSharp && lower == b"new") {
                     expect = 2;
@@ -2014,6 +2601,14 @@ fn code_run(sx: &Syntax, t: &[u8], st: State, o: &mut Out, close: &mut Option<us
     }
     if sx.regex && !regex_ok {
         mid.a = 1;
+    }
+    if sx.flavor == Flavor::Nsis && bol {
+        // a line that goes on from the one before (as the text ends at its start, after whitespace at most)
+        let cont = match memchr::memrchr(b'\n', t) {
+            Some(p) => continues(t, p),
+            None => st.kind == 0 && st.a & 1 != 0,
+        };
+        mid.a = cont as u8;
     }
     mid
 }
@@ -2514,6 +3109,97 @@ mod tests {
             ("$\"{(ok ? \"yes\" : \"no\")} {{literal}} {d[\"k\"]}\"", Tok::Str),
             ("// c", Tok::Comment),
         ]);
+    }
+
+    #[test]
+    fn dart_strings_with_holes() {
+        let src = "import 'package:x/x.dart';\n/// Docs\n@override\nString greet(String name) => 'Hi $name, ${name.length > 3 ? \"long\" : 'short'}!';\nvar r = r'C:\\$x\\n'; /* a /* nested */ still */ int n = 0x1F;\nvar m = '''\nline $one\n${two} \\'''\n''' + \"\"\"x\"\"\";\n";
+        let v = view(Lang::Dart, src);
+        assert!(line_has(&v[0], "import", Tok::Keyword) && line_has(&v[0], "'package:x/x.dart'", Tok::Str));
+        assert!(line_has(&v[1], "/// Docs", Tok::Comment) && line_has(&v[2], "@override", Tok::Func));
+        assert!(line_has(&v[3], "String", Tok::Type) && line_has(&v[3], "greet", Tok::Func) && line_has(&v[3], "'Hi ", Tok::Str));
+        assert!(line_has(&v[3], "$name", Tok::Var) && line_has(&v[3], "${name.length > 3 ? \"long\" : 'short'}", Tok::Var) && line_has(&v[3], "!'", Tok::Str));
+        assert!(line_has(&v[4], "r'C:\\$x\\n'", Tok::Str) && line_has(&v[4], "/* a /* nested */ still */", Tok::Comment));
+        assert!(line_has(&v[4], "int", Tok::Type) && line_has(&v[4], "0x1F", Tok::Num));
+        assert!(line_has(&v[6], "line ", Tok::Str) && line_has(&v[6], "$one", Tok::Var));
+        assert!(line_has(&v[7], "${two}", Tok::Var) && line_has(&v[7], " \\'''", Tok::Str));
+        assert!(line_has(&v[8], "'''", Tok::Str) && line_has(&v[8], "\"\"\"x\"\"\"", Tok::Str));
+        assert_eq!(end_state(Lang::Dart, src), State::START);
+    }
+
+    #[test]
+    fn scala_strings_and_keywords() {
+        let src = "package app\n@main def run(): Unit =\n  val who = \"wor\\\"ld\"\n  println(s\"Hello, $who! ${who.length + 1} $$5 $\" x\")\n  val q = sql\"SELECT * FROM t WHERE id = $id\"\n  val doc = \"\"\"Multi $x\n  line \\ \"quoted\"\"\"\"\n  val c = 'x' /* a /* b */ c */\n  given Ordering[Int] = Ordering.Int\n";
+        let v = view(Lang::Scala, src);
+        assert!(line_has(&v[0], "package", Tok::Keyword) && line_has(&v[1], "@main", Tok::Func));
+        assert!(line_has(&v[1], "def", Tok::Keyword) && line_has(&v[1], "run", Tok::Func) && line_has(&v[1], "Unit", Tok::Type));
+        assert!(line_has(&v[2], "val", Tok::Keyword) && line_has(&v[2], "\"wor\\\"ld\"", Tok::Str));
+        assert!(line_has(&v[3], "s\"Hello, ", Tok::Str) && line_has(&v[3], "$who", Tok::Var) && line_has(&v[3], "${who.length + 1}", Tok::Var));
+        assert!(line_has(&v[3], " $$5 $\" x\"", Tok::Str), "{:?}", v[3]);
+        assert!(line_has(&v[4], "sql\"SELECT * FROM t WHERE id = ", Tok::Str) && line_has(&v[4], "$id", Tok::Var));
+        // a plain """…""" has no holes nor escapes, and ends at the last three quotes of a run
+        assert!(line_has(&v[5], "\"\"\"Multi $x", Tok::Str));
+        assert_eq!(v[6], vec![("  line \\ \"quoted\"\"\"\"".into(), Tok::Str)]);
+        assert!(line_has(&v[7], "'x'", Tok::Str) && line_has(&v[7], "/* a /* b */ c */", Tok::Comment));
+        assert!(line_has(&v[8], "given", Tok::Keyword) && line_has(&v[8], "Ordering", Tok::Type));
+        has(Lang::Scala, "final case class Greeter(name: String)", &[("class", Tok::Keyword), ("Greeter", Tok::Type)]);
+        has(Lang::Scala, r#"println(raw"C:\dir\$name \" ok") // c"#, &[("$name", Tok::Var), (r#" \" ok""#, Tok::Str), ("// c", Tok::Comment)]);
+        assert_eq!(end_state(Lang::Scala, src), State::START);
+    }
+
+    #[test]
+    fn objective_c() {
+        let src = "#import <Foundation/Foundation.h>\n@interface Greeter : NSObject\n@property (nonatomic, strong) NSString *name;\n- (instancetype)initWithName:(NSString *)name;\n@end\n- (void)greet { NSLog(@\"Hi %@\", self.name); if (YES && _cmd != nil) { @try { } @catch (id e) { } } }\n";
+        let v = view(Lang::ObjC, src);
+        assert!(line_has(&v[0], "#import", Tok::Control) && line_has(&v[0], "<Foundation/Foundation.h>", Tok::Str));
+        assert!(line_has(&v[1], "@interface", Tok::Keyword) && line_has(&v[1], "Greeter", Tok::Type) && line_has(&v[1], "NSObject", Tok::Type));
+        has(Lang::ObjC, "@interface Greeter () @end @interface NSString (Extras)", &[("Greeter", Tok::Type), ("NSString", Tok::Type)]);
+        assert!(line_has(&v[2], "@property", Tok::Keyword) && line_has(&v[2], "nonatomic", Tok::Keyword) && line_has(&v[2], "NSString", Tok::Type));
+        assert!(line_has(&v[3], "instancetype", Tok::Type) && line_has(&v[4], "@end", Tok::Keyword));
+        assert!(line_has(&v[5], "void", Tok::Type) && line_has(&v[5], "NSLog", Tok::Func) && line_has(&v[5], "@\"Hi %@\"", Tok::Str));
+        assert!(line_has(&v[5], "self", Tok::Var) && line_has(&v[5], "YES", Tok::Lit) && line_has(&v[5], "_cmd", Tok::Var));
+        assert!(line_has(&v[5], "nil", Tok::Lit) && line_has(&v[5], "@try", Tok::Control) && line_has(&v[5], "@catch", Tok::Control) && line_has(&v[5], "id", Tok::Type));
+        has(Lang::ObjC, "NSNumber *n = @42; BOOL b = @YES; for (id x in list) {}", &[("@42", Tok::Num), ("@YES", Tok::Lit), ("BOOL", Tok::Type), ("in", Tok::Control)]);
+        // C underneath (`new` and `class` are messages), C++ in .mm files
+        assert!(!toks(Lang::ObjC, "[Foo new]; [x class];", State::START).iter().any(|t| t.1 == Tok::Keyword));
+        has(Lang::ObjCpp, "auto s = R\"(it's)\"; @autoreleasepool { [x class]; } std::vector<int> v;", &[
+            ("auto", Tok::Keyword),
+            ("R\"(it's)\"", Tok::Str),
+            ("@autoreleasepool", Tok::Keyword),
+            ("class", Tok::Keyword),
+            ("int", Tok::Type),
+        ]);
+    }
+
+    #[test]
+    fn nsis_scripts() {
+        let src = "!include \"MUI2.nsh\"\n!define APP \"Demo\"\nName \"${APP} $(^Name)\"\nOutFile setup.exe ; output\nInstallDir \"$PROGRAMFILES64\\${APP}\"\nSection \"Main\" SecMain\n  SetOutPath $INSTDIR\n  File /r \"bin\\*.*\"\n  WriteRegStr HKLM \"Software\\${APP}\" \"Path\" \"$INSTDIR\"\n  MessageBox MB_YESNO \"Say $\\\"hi$\\\"? \\\n    still it\" IDYES done\n  nsDialogs::Create 1018\ndone:\n  # a comment \\\n  goes on\n  StrCmp $0 \"\" 0 +2\nSectionEnd\n/* block\ncomment */\nFunction .onInit\n  DetailPrint Don't\n  Var /GLOBAL name\nFunctionEnd\n";
+        let v = view(Lang::Nsis, src);
+        assert!(line_has(&v[0], "!include", Tok::Control) && line_has(&v[0], "\"MUI2.nsh\"", Tok::Str));
+        assert!(line_has(&v[1], "!define", Tok::Control) && line_has(&v[1], "\"Demo\"", Tok::Str));
+        assert!(line_has(&v[2], "Name", Tok::Keyword) && line_has(&v[2], "${APP}", Tok::Var) && line_has(&v[2], "$(^Name)", Tok::Var));
+        assert!(line_has(&v[3], "OutFile", Tok::Keyword) && line_has(&v[3], "; output", Tok::Comment));
+        assert!(line_has(&v[4], "$PROGRAMFILES64", Tok::Var) && line_has(&v[4], "${APP}", Tok::Var));
+        assert!(line_has(&v[5], "Section", Tok::Keyword) && line_has(&v[5], "\"Main\"", Tok::Str));
+        assert!(line_has(&v[6], "SetOutPath", Tok::Keyword) && line_has(&v[6], "$INSTDIR", Tok::Var));
+        assert!(line_has(&v[7], "File", Tok::Keyword) && line_has(&v[7], "/r", Tok::Attr) && line_has(&v[7], "\"bin\\*.*\"", Tok::Str));
+        assert!(line_has(&v[8], "WriteRegStr", Tok::Keyword) && line_has(&v[8], "HKLM", Tok::Lit) && line_has(&v[8], "\"Path\"", Tok::Str));
+        // `$\"` in a string, which a `\` at the line's end continues
+        assert!(line_has(&v[9], "MB_YESNO", Tok::Lit) && line_has(&v[9], "\"Say $\\\"hi$\\\"? \\", Tok::Str));
+        assert!(line_has(&v[10], "    still it\"", Tok::Str) && line_has(&v[10], "IDYES", Tok::Lit) && !line_has(&v[10], "done", Tok::Keyword));
+        assert!(line_has(&v[11], "nsDialogs::Create", Tok::Func) && line_has(&v[11], "1018", Tok::Num));
+        assert!(line_has(&v[12], "done:", Tok::Section));
+        assert!(line_has(&v[13], "# a comment \\", Tok::Comment) && line_has(&v[14], "  goes on", Tok::Comment));
+        assert!(line_has(&v[15], "StrCmp", Tok::Control) && line_has(&v[15], "$0", Tok::Var) && line_has(&v[15], "\"\"", Tok::Str));
+        assert!(line_has(&v[16], "SectionEnd", Tok::Keyword) && line_has(&v[18], "comment */", Tok::Comment));
+        assert!(line_has(&v[19], "Function", Tok::Keyword) && line_has(&v[19], ".onInit", Tok::Func));
+        // an apostrophe in a word starts nothing; a command's name later on the line is just a word
+        assert!(!v[20].iter().any(|t| t.1 == Tok::Str));
+        assert!(line_has(&v[21], "/GLOBAL", Tok::Attr) && !line_has(&v[21], "name", Tok::Keyword));
+        assert_eq!(end_state(Lang::Nsis, src), State::START);
+        // a line continued with `\` doesn't start with a command
+        let v = view(Lang::Nsis, "MessageBox MB_OK \\\n    Delete\nDelete x\n");
+        assert!(v[1].is_empty() && line_has(&v[2], "Delete", Tok::Keyword));
     }
 
     #[test]

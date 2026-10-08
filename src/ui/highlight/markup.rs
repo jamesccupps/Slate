@@ -404,6 +404,13 @@ fn fence_lang(info: &[u8]) -> Option<Lang> {
         b"srt" | b"vtt" | b"webvtt" => Subtitles,
         b"ics" | b"ical" | b"icalendar" | b"vcard" | b"vcf" => Calendar,
         b"sln" => Sln,
+        b"dart" => Dart,
+        b"scala" | b"sc" | b"sbt" => Scala,
+        b"objc" | b"objective-c" | b"objectivec" | b"obj-c" => ObjC,
+        b"objc++" | b"objective-c++" | b"objectivec++" | b"obj-c++" | b"objcpp" | b"mm" => ObjCpp,
+        b"gcode" | b"g-code" | b"gco" | b"nc" | b"ngc" => GCode,
+        b"iss" | b"isl" | b"inno" | b"innosetup" | b"inno-setup" => InnoSetup,
+        b"nsis" | b"nsi" | b"nsh" => Nsis,
         b"md" | b"markdown" => Markdown,
         _ => return None,
     })

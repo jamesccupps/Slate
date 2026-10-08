@@ -1,8 +1,8 @@
 //! Configuration and other line-based formats: TOML, nginx and Apache configuration, Java `.properties`, subtitles
-//! (SRT, WebVTT), calendars and contacts (iCalendar, vCard) and Visual Studio solutions.
+//! (SRT, WebVTT), calendars and contacts (iCalendar, vCard), Visual Studio solutions, G-code and Inno Setup scripts.
 
 use super::code;
-use super::{Out, State, Tok, at, is_num_word, line_end, scan_str};
+use super::{Lang, Out, State, Tok, at, find, is_num_word, line_end, scan_str};
 
 fn is_ws(b: u8) -> bool {
     matches!(b, b' ' | b'\t' | b'\r' | 0x0C)
@@ -895,6 +895,400 @@ pub(super) fn sln_line(l: &[u8], _col0: bool, bol: bool, o: &mut Out) {
     }
 }
 
+// ---- G-code ----
+
+/// A line of G-code (3D printers, CNC machines): `N` line numbers, `G` and `M` codes, `T` tools, parameter words
+/// (`X10.5`, `F1200`), `;` and `( … )` comments, `%` and `O` program numbers, `#` variables, `*` checksums,
+/// Klipper's `COMMAND KEY=value` lines, the message of `M117` (and `M118`).
+pub(super) fn gcode_line(l: &[u8], _col0: bool, bol: bool, o: &mut Out) {
+    let n = l.len();
+    let mut i = 0;
+    // before the line's first word (a line number aside); after an `O` word (LinuxCNC's `o100 sub`); inside
+    // `[…]` (an expression)
+    let (mut first, mut after_o, mut depth) = (bol, false, 0u32);
+    while i < n {
+        let c = l[i];
+        match c {
+            b';' => {
+                o.put(i, n, Tok::Comment);
+                return;
+            }
+            b'[' | b']' => {
+                depth = if c == b'[' { depth + 1 } else { depth.saturating_sub(1) };
+                i += 1;
+            }
+            b'(' => {
+                let e = l[i..].iter().position(|&b| b == b')').map_or(n, |p| i + p + 1);
+                o.put(i, e, Tok::Comment);
+                i = e;
+            }
+            b'%' if first => {
+                o.put(i, i + 1, Tok::Section);
+                first = false;
+                i += 1;
+            }
+            b'"' => {
+                // RepRapFirmware's M550 P"name"
+                let e = l[i + 1..].iter().position(|&b| b == b'"').map_or(n, |p| i + p + 2);
+                o.put(i, e, Tok::Str);
+                i = e;
+            }
+            b'#' => {
+                // #100, #<_name>
+                let e = if at(l, i + 1) == b'<' {
+                    l[i..].iter().position(|&b| b == b'>').map_or(i + 1, |p| i + p + 1)
+                } else {
+                    i + 1 + l[i + 1..].iter().take_while(|b| b.is_ascii_digit()).count()
+                };
+                if e > i + 1 {
+                    o.put(i, e, Tok::Var);
+                }
+                i = e;
+            }
+            // a checksum: N10 G1 X1*45
+            b'*' if depth == 0 && at(l, i + 1).is_ascii_digit() => {
+                let e = i + 1 + l[i + 1..].iter().take_while(|b| b.is_ascii_digit()).count();
+                o.put(i, e, Tok::Dim);
+                i = e;
+            }
+            c if c.is_ascii_alphabetic() => {
+                let up = c.to_ascii_uppercase();
+                let e = gcode_num_end(l, i + 1);
+                if e > i + 1 {
+                    match up {
+                        b'G' => o.put(i, e, Tok::Keyword),
+                        b'M' => o.put(i, e, Tok::Control),
+                        b'T' => o.put(i, e, Tok::Type),
+                        b'N' if first => o.put(i, e, Tok::Dim),
+                        b'O' if first => o.put(i, e, Tok::Section),
+                        _ => {
+                            o.put(i, i + 1, Tok::Attr);
+                            o.put(i + 1, e, Tok::Num);
+                        }
+                    }
+                    let message = up == b'M' && matches!(&l[i + 1..e], b"117" | b"118");
+                    after_o = up == b'O' && first;
+                    first &= up == b'N';
+                    i = e;
+                    if message {
+                        // its text, up to a comment
+                        let s = i + l[i..].iter().take_while(|&&b| b == b' ' || b == b'\t').count();
+                        let ce = memchr::memchr(b';', &l[s..]).map_or(n, |p| s + p);
+                        o.put(s, ce, Tok::Str);
+                        i = ce;
+                    }
+                    continue;
+                }
+                if first && up == b'O' && at(l, i + 1) == b'<' {
+                    // o<name> sub
+                    let e = l[i..].iter().position(|&b| b == b'>').map_or(n, |p| i + p + 1);
+                    o.put(i, e, Tok::Section);
+                    (first, after_o) = (false, true);
+                    i = e;
+                    continue;
+                }
+                // a word: Klipper's `SET_FAN_SPEED FAN=part SPEED=0.5`, LinuxCNC's `o100 sub`; `X#1`, `X[#2 * 2]`
+                let e = i + l[i..].iter().take_while(|b| b.is_ascii_alphanumeric() || **b == b'_').count();
+                if at(l, e) == b'=' || (e == i + 1 && matches!(at(l, e), b'#' | b'[')) {
+                    o.put(i, e, Tok::Attr);
+                } else if first {
+                    o.put(i, e, Tok::Func);
+                } else if after_o {
+                    o.put(i, e, Tok::Keyword);
+                }
+                (first, after_o) = (false, false);
+                i = e;
+            }
+            c if c.is_ascii_digit() || (matches!(c, b'-' | b'+' | b'.') && gcode_num_end(l, i) > i) => {
+                let e = gcode_num_end(l, i).max(i + 1);
+                o.put(i, e, Tok::Num);
+                i = e;
+            }
+            _ => i += 1,
+        }
+    }
+}
+
+/// Where a G-code number from `i` ends (`10`, `-1.5`, `.5`), or `i` when there is none.
+fn gcode_num_end(l: &[u8], i: usize) -> usize {
+    let s = i + matches!(at(l, i), b'+' | b'-') as usize;
+    let d = l[s..].iter().take_while(|b| b.is_ascii_digit() || **b == b'.').count();
+    if l[s..s + d].iter().any(u8::is_ascii_digit) { s + d } else { i }
+}
+
+// ---- Inno Setup ----
+
+/// In `State::kind`: inside the `[Code]` section, where the low bits (and `a`, `b`) are the Pascal lexer's state.
+pub(super) const I_CODE: u8 = 0x80;
+/// In `State::kind`: in a preprocessor line (`#define …`) cut off by the end of a text.
+const I_PP: u8 = 0x40;
+
+/// Inno Setup scripts (and its `.isl` message files): `[Section]` headers, `Name: value; Name: value` lines and
+/// `Key=value` lines, `{app}`-style constants, `;` comment lines, the preprocessor's `#define …` lines and `{#Name}`;
+/// the `[Code]` section is Pascal Script.
+pub(super) fn inno(t: &[u8], mut st: State, o: &mut Out) -> State {
+    let mut start = 0;
+    let mut bol = st.bol;
+    loop {
+        let end = line_end(t, start);
+        let nl = end < t.len();
+        st = inno_line(&t[start..end + nl as usize], bol, st, &mut o.at(start));
+        if !nl {
+            return st;
+        }
+        start = end + 1;
+        bol = true;
+    }
+}
+
+/// One line of an Inno Setup script (`full`: with its line break, if any; `bol`: only whitespace before it).
+fn inno_line(full: &[u8], bol: bool, st: State, o: &mut Out) -> State {
+    let nl = full.last() == Some(&b'\n');
+    let l = &full[..full.len() - nl as usize];
+    // a preprocessor line, which may go on in the next text
+    let pp = |st: State| State { kind: if nl { st.kind & !I_PP } else { st.kind | I_PP }, ..st };
+    if st.kind & I_PP != 0 {
+        if o.on() {
+            ispp_line(l, 0, false, o);
+        }
+        return pp(st);
+    }
+    let s = if bol { l.iter().take_while(|&&b| is_ws(b)).count() } else { 0 };
+    if bol && s < l.len() {
+        // [Files], [Code] on a line of their own (in Pascal a line may start with a set: `[wpReady] then`)
+        if l[s] == b'[' {
+            let k = l[s + 1..].iter().take_while(|b| b.is_ascii_alphabetic()).count();
+            let e = s + k + 2;
+            if k > 0 && at(l, e - 1) == b']' && l[e..].iter().all(|&b| is_ws(b)) {
+                o.put(s, e, Tok::Section);
+                let code = l[s + 1..e - 1].eq_ignore_ascii_case(b"code");
+                return State { kind: if code { I_CODE } else { 0 }, a: 0, b: 0, ..st };
+            }
+        }
+        // #define, #include, #if … (anywhere, [Code] too)
+        if l[s] == b'#' && at(l, s + 1).is_ascii_alphabetic() {
+            if o.on() {
+                ispp_line(l, s, true, o);
+            }
+            return pp(st);
+        }
+    }
+    inno_body(full, bol, st, o)
+}
+
+/// A line of the current section, or what is left of it.
+fn inno_body(full: &[u8], bol: bool, st: State, o: &mut Out) -> State {
+    if st.kind & I_CODE != 0 {
+        let s = code::code(code::syntax(Lang::InnoSetup), full, State { kind: st.kind & !I_CODE, col0: bol, bol, ..st }, o);
+        return State { kind: s.kind | I_CODE, a: s.a, b: s.b, ..st };
+    }
+    // (the other sections' lines leave nothing open)
+    if !o.on() {
+        return st;
+    }
+    let l = full.strip_suffix(b"\n").unwrap_or(full);
+    let n = l.len();
+    if !bol {
+        inno_value(l, 0, n, o);
+        return st;
+    }
+    let s = l.iter().take_while(|&&b| is_ws(b)).count();
+    if s == n {
+        return st;
+    }
+    if l[s] == b';' || l[s..].starts_with(b"//") {
+        o.put(s, n, Tok::Comment);
+        return st;
+    }
+    let w = s + l[s..].iter().take_while(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.')).count();
+    let p = w + l[w..].iter().take_while(|&&b| is_ws(b)).count();
+    match at(l, p) {
+        // Key=Value ([Setup], [Messages], .isl files)
+        b'=' if w > s => {
+            o.put(s, w, Tok::Key);
+            o.put(p, p + 1, Tok::Punct);
+            let v = p + 1 + l[p + 1..].iter().take_while(|&&b| is_ws(b)).count();
+            let val = l[v..].trim_ascii_end();
+            if is_num_word(val) {
+                o.put(v, v + val.len(), Tok::Num);
+            } else if [&b"yes"[..], b"no", b"true", b"false"].iter().any(|w| val.eq_ignore_ascii_case(w)) {
+                o.put(v, v + val.len(), Tok::Lit);
+            } else {
+                inno_value(l, v, n, o);
+            }
+        }
+        // Name: value; Name: value
+        b':' if w > s => inno_params(l, s, o),
+        _ => inno_value(l, s, n, o),
+    }
+    st
+}
+
+/// `Name: "value"; Flags: a b; MinVersion: 6.1` from `i`.
+fn inno_params(l: &[u8], mut i: usize, o: &mut Out) {
+    const WORDS: [&[u8]; 6] = [b"attribs", b"flags", b"permissions", b"root", b"type", b"valuetype"];
+    let n = l.len();
+    loop {
+        i += l[i..].iter().take_while(|&&b| is_ws(b)).count();
+        let w = i + l[i..].iter().take_while(|b| b.is_ascii_alphanumeric() || **b == b'_').count();
+        let p = w + l[w..].iter().take_while(|&&b| is_ws(b)).count();
+        if w == i || at(l, p) != b':' {
+            inno_value(l, i, n, o);
+            return;
+        }
+        o.put(i, w, Tok::Key);
+        o.put(p, p + 1, Tok::Punct);
+        // flags and the like are words from a list
+        let words = WORDS.iter().any(|k| l[i..w].eq_ignore_ascii_case(k));
+        let mut j = p + 1 + l[p + 1..].iter().take_while(|&&b| is_ws(b)).count();
+        if at(l, j) == b'"' {
+            // "quoted" ("" is a quote)
+            let mut k = j + 1;
+            let e = loop {
+                match l[k..].iter().position(|&b| b == b'"') {
+                    Some(q) if at(l, k + q + 1) == b'"' => k += q + 2,
+                    Some(q) => break k + q + 1,
+                    None => break n,
+                }
+            };
+            inno_str(l, j, e, o);
+            j = e;
+        }
+        let e = l[j..].iter().position(|&b| b == b';').map_or(n, |p| j + p);
+        let v = l[j..e].trim_ascii_end();
+        if words && !v.is_empty() && v.iter().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b' ' | b'\t')) {
+            o.put(j, j + v.len(), Tok::Lit);
+        } else if is_num_word(v) {
+            o.put(j, j + v.len(), Tok::Num);
+        } else {
+            inno_value(l, j, e, o);
+        }
+        if e >= n {
+            return;
+        }
+        o.put(e, e + 1, Tok::Punct);
+        i = e + 1;
+    }
+}
+
+/// Constants (`{app}`, `{cm:Launch,{#AppName}}`, `{#Name}`; `{{` is a brace), `"strings"` and `%1` in a value.
+fn inno_value(l: &[u8], mut i: usize, to: usize, o: &mut Out) {
+    while i < to {
+        match l[i] {
+            b'{' if at(l, i + 1) == b'{' => i += 2,
+            b'{' => match inno_const_end(l, i, to) {
+                Some(e) => {
+                    o.put(i, e, Tok::Var);
+                    i = e;
+                }
+                None => i += 1,
+            },
+            b'"' => {
+                let e = l[i + 1..to].iter().position(|&b| b == b'"').map_or(to, |p| i + p + 2);
+                inno_str(l, i, e, o);
+                i = e;
+            }
+            b'%' if at(l, i + 1).is_ascii_digit() || at(l, i + 1) == b'n' => {
+                o.put(i, i + 2, Tok::Var);
+                i += 2;
+            }
+            _ => i += 1,
+        }
+    }
+}
+
+/// A `"string"` from `s` to `e`, its constants colored.
+fn inno_str(l: &[u8], s: usize, e: usize, o: &mut Out) {
+    let (mut seg, mut i) = (s, s + 1);
+    while i < e {
+        if l[i] == b'{' && at(l, i + 1) == b'{' {
+            i += 2;
+            continue;
+        }
+        if l[i] == b'{' {
+            if let Some(ce) = inno_const_end(l, i, e) {
+                o.put(seg, i, Tok::Str);
+                o.put(i, ce, Tok::Var);
+                (seg, i) = (ce, ce);
+                continue;
+            }
+        }
+        i += 1;
+    }
+    o.put(seg, e, Tok::Str);
+}
+
+/// Where an Inno Setup constant at `i` (a `{`) ends, before `to`: `{app}`, `{cm:Launch,{#Name}}`.
+fn inno_const_end(l: &[u8], i: usize, to: usize) -> Option<usize> {
+    let mut depth = 0;
+    for (k, &b) in l[i..to.min(i + 256)].iter().enumerate() {
+        if b == b'{' {
+            depth += 1;
+        } else if b == b'}' {
+            depth -= 1;
+            if depth == 0 {
+                return Some(i + k + 1);
+            }
+        }
+    }
+    None
+}
+
+/// A preprocessor line from `i` (`#define Name "value"`, `#include "file"`, `#if Ver < 0x06000000`); `start`:
+/// whether `i` is its `#` (else it goes on from the text before).
+fn ispp_line(l: &[u8], mut i: usize, start: bool, o: &mut Out) {
+    let n = l.len();
+    // a name comes next (`#define Name`), colored as a variable
+    let mut name = false;
+    if start {
+        let e = i + 1 + l[i + 1..].iter().take_while(|b| b.is_ascii_alphanumeric() || **b == b'_').count();
+        o.put(i, e, Tok::Control);
+        const NAMED: [&[u8]; 7] = [b"define", b"undef", b"ifdef", b"ifndef", b"sub", b"dim", b"redim"];
+        name = NAMED.iter().any(|w| l[i + 1..e].eq_ignore_ascii_case(w));
+        i = e;
+    }
+    while i < n {
+        let c = l[i];
+        match c {
+            b'"' | b'\'' => {
+                let e = l[i + 1..].iter().position(|&b| b == c).map_or(n, |p| i + p + 2);
+                o.put(i, e, Tok::Str);
+                i = e;
+            }
+            b'{' if at(l, i + 1) == b'#' => {
+                let e = l[i..].iter().position(|&b| b == b'}').map_or(n, |p| i + p + 1);
+                o.put(i, e, Tok::Var);
+                i = e;
+            }
+            b'/' if at(l, i + 1) == b'/' => {
+                o.put(i, n, Tok::Comment);
+                return;
+            }
+            b'/' if at(l, i + 1) == b'*' => {
+                let e = find(l, i + 2, b"*/").map_or(n, |p| p + 2);
+                o.put(i, e, Tok::Comment);
+                i = e;
+            }
+            c if c.is_ascii_digit() => {
+                let e = i + l[i..].iter().take_while(|b| b.is_ascii_alphanumeric()).count();
+                o.put(i, e, Tok::Num);
+                i = e;
+            }
+            c if c.is_ascii_alphabetic() || c == b'_' => {
+                let e = i + l[i..].iter().take_while(|b| b.is_ascii_alphanumeric() || **b == b'_').count();
+                if name {
+                    o.put(i, e, Tok::Var);
+                    name = false;
+                } else if at(l, e) == b'(' {
+                    o.put(i, e, Tok::Func);
+                }
+                i = e;
+            }
+            _ => i += 1,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::tests::{end_state, has, toks, view};
@@ -1004,5 +1398,50 @@ mod tests {
         assert!(line_has(&v[3], "Project", Tok::Keyword) && line_has(&v[3], "\"{FAE04EC0-301F}\"", Tok::Num) && line_has(&v[3], "\"App\"", Tok::Str));
         assert!(line_has(&v[6], "SolutionConfigurationPlatforms", Tok::Type) && line_has(&v[6], "preSolution", Tok::Lit));
         assert!(line_has(&v[7], "{1234}", Tok::Num) && line_has(&v[7], ".Debug|Any CPU.ActiveCfg", Tok::Key));
+    }
+
+    #[test]
+    fn gcode_programs() {
+        let src = ";FLAVOR:Marlin\nM104 S200 ; heat\nG28 ; home\nN10 G1 X10.5 Y-2 E.5 F1200*45\nM117 Printing layer 1\nT1\nG1 X#1 (note) Z[#2*2]\nSET_FAN_SPEED FAN=part SPEED=0.5\n%\nO1001\no100 sub\ng1x5y6\n";
+        let v = view(Lang::GCode, src);
+        assert_eq!(v[0], vec![(";FLAVOR:Marlin".into(), Tok::Comment)]);
+        assert!(line_has(&v[1], "M104", Tok::Control) && line_has(&v[1], "S", Tok::Attr) && line_has(&v[1], "200", Tok::Num));
+        assert!(line_has(&v[1], "; heat", Tok::Comment) && line_has(&v[2], "G28", Tok::Keyword));
+        assert!(line_has(&v[3], "N10", Tok::Dim) && line_has(&v[3], "G1", Tok::Keyword) && line_has(&v[3], "10.5", Tok::Num));
+        assert!(line_has(&v[3], "-2", Tok::Num) && line_has(&v[3], ".5", Tok::Num) && line_has(&v[3], "*45", Tok::Dim));
+        assert!(line_has(&v[4], "M117", Tok::Control) && line_has(&v[4], "Printing layer 1", Tok::Str) && line_has(&v[5], "T1", Tok::Type));
+        assert!(line_has(&v[6], "X", Tok::Attr) && line_has(&v[6], "#1", Tok::Var) && line_has(&v[6], "(note)", Tok::Comment));
+        assert!(line_has(&v[6], "#2", Tok::Var) && line_has(&v[6], "2", Tok::Num));
+        assert!(line_has(&v[7], "SET_FAN_SPEED", Tok::Func) && line_has(&v[7], "SPEED", Tok::Attr) && line_has(&v[7], "0.5", Tok::Num));
+        assert!(line_has(&v[8], "%", Tok::Section) && line_has(&v[9], "O1001", Tok::Section));
+        assert!(line_has(&v[10], "o100", Tok::Section) && line_has(&v[10], "sub", Tok::Keyword));
+        assert!(line_has(&v[11], "g1", Tok::Keyword) && line_has(&v[11], "x", Tok::Attr) && line_has(&v[11], "6", Tok::Num));
+    }
+
+    #[test]
+    fn inno_setup_scripts() {
+        let src = "; Script\n#define MyAppName \"Demo\"\n[Setup]\nAppName={#MyAppName}\nDefaultDirName={autopf}\\Demo\nSolidCompression=yes\n\n[Files]\nSource: \"bin\\*\"; DestDir: \"{app}\"; Flags: ignoreversion recursesubdirs\n[Registry]\nRoot: HKLM; Subkey: \"Software\\Demo\"; ValueType: string; ValueData: \"{{x}\"\n[Code]\n{ a comment\n  [still] }\nfunction InitializeSetup(): Boolean;\nvar S: String;\nbegin\n  S := 'it''s' + #13#10 + IntToStr($FF); (* note *)\n  Result := MsgBox('{#MyAppName}', mbInformation, MB_OK) = IDOK; // ok\n  if CurPageID in\n    [wpReady] then Exit;\nend;\n[Run]\nFilename: \"{app}\\demo.exe\"; Flags: nowait postinstall\n";
+        let v = view(Lang::InnoSetup, src);
+        assert_eq!(v[0], vec![("; Script".into(), Tok::Comment)]);
+        assert!(line_has(&v[1], "#define", Tok::Control) && line_has(&v[1], "MyAppName", Tok::Var) && line_has(&v[1], "\"Demo\"", Tok::Str));
+        assert!(line_has(&v[2], "[Setup]", Tok::Section) && line_has(&v[3], "AppName", Tok::Key) && line_has(&v[3], "{#MyAppName}", Tok::Var));
+        assert!(line_has(&v[4], "{autopf}", Tok::Var) && line_has(&v[5], "yes", Tok::Lit));
+        assert!(line_has(&v[8], "Source", Tok::Key) && line_has(&v[8], "\"bin\\*\"", Tok::Str) && line_has(&v[8], "DestDir", Tok::Key));
+        assert!(line_has(&v[8], "{app}", Tok::Var) && line_has(&v[8], "ignoreversion recursesubdirs", Tok::Lit));
+        assert!(line_has(&v[10], "HKLM", Tok::Lit) && line_has(&v[10], "string", Tok::Lit) && line_has(&v[10], "\"{{x}\"", Tok::Str));
+        assert!(line_has(&v[11], "[Code]", Tok::Section) && line_has(&v[12], "{ a comment", Tok::Comment) && line_has(&v[13], "  [still] }", Tok::Comment));
+        assert!(line_has(&v[14], "function", Tok::Keyword) && line_has(&v[14], "InitializeSetup", Tok::Func) && line_has(&v[14], "Boolean", Tok::Type));
+        assert!(line_has(&v[15], "var", Tok::Keyword) && line_has(&v[15], "String", Tok::Type) && line_has(&v[16], "begin", Tok::Control));
+        assert!(line_has(&v[17], "'it'", Tok::Str) && line_has(&v[17], "'s'", Tok::Str) && line_has(&v[17], "#13", Tok::Str));
+        assert!(line_has(&v[17], "$FF", Tok::Num) && line_has(&v[17], "IntToStr", Tok::Func) && line_has(&v[17], "(* note *)", Tok::Comment));
+        assert!(line_has(&v[18], "Result", Tok::Var) && line_has(&v[18], "MsgBox", Tok::Func) && line_has(&v[18], "// ok", Tok::Comment));
+        // a line that starts with a set isn't a section
+        assert!(line_has(&v[20], "then", Tok::Control) && !line_has(&v[20], "[wpReady]", Tok::Section));
+        assert!(line_has(&v[22], "[Run]", Tok::Section) && line_has(&v[23], "Filename", Tok::Key) && line_has(&v[23], "nowait postinstall", Tok::Lit));
+        assert_eq!(end_state(Lang::InnoSetup, src), State::START);
+        // the preprocessor in [Code], and a comment left open there by a section's start
+        let v = view(Lang::InnoSetup, "[Code]\n#ifdef X\n{ open\n[Files]\nSource: x\n");
+        assert!(line_has(&v[1], "#ifdef", Tok::Control) && line_has(&v[1], "X", Tok::Var));
+        assert!(line_has(&v[3], "[Files]", Tok::Section) && line_has(&v[4], "Source", Tok::Key));
     }
 }
