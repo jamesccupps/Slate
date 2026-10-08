@@ -3,6 +3,7 @@
 //! memory). Pieces are grouped in leaves of at most `LEAF_MAX` with cached byte and newline totals, so lookups by
 //! offset or by line stay fast even after millions of edits, and nothing ever copies the original file.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use super::source::Source;
@@ -573,6 +574,67 @@ impl Buffer {
         old
     }
 
+    /// After `saved`'s text was written to `src` from `start` on (a save): what the pieces have of `saved` is read
+    /// from `src` from now on (the same bytes), also when the text changed since; the rest (typed since, or put
+    /// back by undo) stays where it is.
+    pub fn move_onto(&mut self, saved: &Snapshot, src: Arc<Source>, start: u64) {
+        // Per source: the parts `saved` has of it, (start, end, where in `saved`), by start, and the furthest end
+        // up to each (parts can overlap: the same text twice).
+        type Spans = (Vec<(u64, u64, u64)>, Vec<u64>);
+        let mut spans: HashMap<u32, Spans> = HashMap::new();
+        for &(off, p) in saved.pieces() {
+            spans.entry(p.src).or_default().0.push((p.start, p.start + p.len, off));
+        }
+        for (v, reach) in spans.values_mut() {
+            v.sort_unstable();
+            let mut m = 0;
+            *reach = v.iter().map(|s| { m = m.max(s.1); m }).collect();
+        }
+        let id = self.push_source(src);
+        let mut out: Vec<Piece> = Vec::new();
+        for p in self.pieces().copied().collect::<Vec<_>>() {
+            let Some((v, reach)) = spans.get(&p.src) else {
+                out.push(p);
+                continue;
+            };
+            let (mut x, end) = (p.start, p.start + p.len);
+            let first = out.len();
+            while x < end {
+                let k = v.partition_point(|s| s.0 <= x);
+                let part = if k > 0 && reach[k - 1] > x {
+                    let &(c, d, o) = v[..k].iter().rev().find(|s| s.1 > x).unwrap();
+                    let e = d.min(end);
+                    Piece { src: id, start: start + o + (x - c), len: e - x, nl: 0 }
+                } else {
+                    let e = v.get(k).map_or(end, |s| s.0.min(end));
+                    Piece { src: p.src, start: x, len: e - x, nl: 0 }
+                };
+                x += part.len;
+                out.push(part);
+            }
+            // (the same bytes: the same count, unless the piece was cut up)
+            if out.len() == first + 1 {
+                out[first].nl = p.nl;
+            } else {
+                for q in &mut out[first..] {
+                    q.nl = self.src_count(q.src, q.start, q.start + q.len);
+                }
+            }
+        }
+        // Parts now next to each other in `src` are one piece again.
+        let mut joined: Vec<Piece> = Vec::with_capacity(out.len());
+        for p in out {
+            match joined.last_mut() {
+                Some(last) if p.src == id && last.src == id && last.start + last.len == p.start => {
+                    last.len += p.len;
+                    last.nl += p.nl;
+                }
+                _ => joined.push(p),
+            }
+        }
+        self.replace_all(&joined);
+    }
+
     /// Freezes the add buffer so the current content can be shared with other threads.
     pub fn snapshot(&mut self) -> Snapshot {
         if !self.add.is_empty() {
@@ -867,5 +929,61 @@ mod tests {
         assert_eq!(b.line_end_of(12), 14);
         assert_eq!(b.line_start_of(12), 9);
         assert_eq!(b.line_start(5), 14);
+    }
+
+    #[test]
+    fn a_saved_text_moves_onto_the_saved_file_also_after_more_edits() {
+        let mut r = Rng(0x2545_F491_4F6C_DD1D);
+        let base = text(&mut r, 200_000);
+        let src = Arc::new(Source::from_vec(base.clone()));
+        let mut b = Buffer::from_source(src.clone(), bytecount::count(&base, b'\n') as u64);
+        let mut model = base;
+        let edit = |b: &mut Buffer, model: &mut Vec<u8>, r: &mut Rng| {
+            let len = model.len() as u64;
+            let a = r.below(len + 1);
+            if r.below(2) == 0 {
+                let n = 1 + r.below(50) as usize;
+                let t = text(r, n);
+                b.insert(a, &t);
+                model.splice(a as usize..a as usize, t);
+            } else {
+                let e = (a + r.below(3000)).min(len);
+                b.delete(a, e);
+                model.drain(a as usize..e as usize);
+            }
+        };
+        for _ in 0..200 {
+            edit(&mut b, &mut model, &mut r);
+        }
+        // the same text twice (copy and paste of the file's own text)
+        let twice = b.delete(1000, 1500);
+        b.insert_pieces(1000, &twice);
+        b.insert_pieces(5000, &twice);
+        model.splice(5000..5000, model[1000..1500].to_vec());
+        let saved = b.snapshot();
+        let file = saved_bytes(&saved);
+        assert_eq!(file, model);
+        // more edits while it saves, then: the file with a BOM in front, like a saved one
+        for _ in 0..50 {
+            edit(&mut b, &mut model, &mut r);
+        }
+        let on_disk = Arc::new(Source::from_vec([b"BOM".as_slice(), &file].concat()));
+        b.move_onto(&saved, on_disk.clone(), 3);
+        check(&b, &model);
+        // what came from the old text now reads the saved one (only what the edits since brought back stays)
+        let from = |s: &Arc<Source>| -> u64 {
+            b.pieces().filter(|p| Arc::ptr_eq(&b.sources[p.src as usize], s)).map(|p| p.len).sum()
+        };
+        assert_eq!(from(&src), 0);
+        assert!(from(&on_disk) > model.len() as u64 / 2);
+    }
+
+    fn saved_bytes(s: &Snapshot) -> Vec<u8> {
+        let mut out = Vec::new();
+        s.chunks(0, s.len(), &mut |c| {
+            out.extend_from_slice(c);
+            true
+        });
+        out
     }
 }

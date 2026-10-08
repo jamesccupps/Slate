@@ -60,7 +60,9 @@ Commits use the GitHub no-reply address (repo-local git config); GitHub refuses 
     `changed_in_place` tells another program writing into that file (the text read from it isn't the user's any
     more) from a file that only grew or was replaced by a new one (the handle keeps reading the old one). Bulk
     reads (index, hashing, big ranges for search and save, the stamp checks) go through a second handle on the same
-    file (`ReOpenFile`), so the window's block reads don't queue behind them on a slow share.
+    file (`ReOpenFile`), so the window's block reads don't queue behind them on a slow share. A source whose file
+    isn't at its path any more (a save put a new one there, or the disk check found another file or none) is `gone`:
+    a later run couldn't read it, so the session copies what's used of it.
   - `buffer.rs` — piece table in leaves of ≤256 pieces with cached byte/newline totals. Add buffer for typing;
     big inserts (≥1 MiB) get their own source. `snapshot()` freezes it for worker threads.
   - `document.rs` — undo/redo steps (typing/backspace runs coalesce; `seal()` ends a run), dirty state, change log
@@ -165,8 +167,10 @@ Commits use the GitHub no-reply address (repo-local git config); GitHub refuses 
   so code that shows one finds its tab again **by id** afterwards, never by an index taken before. The queue isn't
   drained again from inside such a loop: what was queued meanwhile (an Exit, another prompt) waits until it's closed.
 - Never lose work: closing the window keeps unsaved documents in the session (like Windows 11 Notepad); only those
-  it can't keep are asked about: big ones that read from a self-deleting temp file (Format, Replace all or a
-  conversion of a file over 64 MiB), or all if the session can't be written. A tab closed while it is saving closes
+  it can't keep are asked about (saying why): big ones that would have to copy over 64 MiB from files (Format,
+  Replace all or a conversion of a file over 64 MiB; a file replaced while the text still reads the old one), or all
+  if the session can't be written; with the session turned off, also big tabs from last time that aren't back yet.
+  Reload is refused while the tab is being saved. A tab closed while it is saving closes
   once the save is done — unless the text changed meanwhile. On shutdown, unsaved work that can't be kept blocks it
   with a reason (`ShutdownBlockReasonCreate`), so Windows asks the user. Saving in ANSI never turns characters into
   "?" without asking first (Save as UTF-8 / ANSI anyway / Cancel), and a tab or window never closes after such a save.
@@ -184,12 +188,18 @@ Commits use the GitHub no-reply address (repo-local git config); GitHub refuses 
   caught and the session set aside. While editing it's written on another thread; closing writes it in place.
   Documents up to 64 MiB are backed up as a copy. Bigger ones as their pieces: `<name>.pieces` (the piece list, with
   the `Identity` of each file of the user's it reads: stamp, file id, sample hashes; rewritten when the text
-  changed, small) and `<name>.data` (the bytes Slate added — typed, pasted — each source appended once and flushed
-  before the list that refers to it replaces the old one). Putting one back runs on another thread behind a tab that
+  changed, small) and `<name>.data` (what a later run couldn't read otherwise: typed and pasted text, each source
+  once, and the parts used of a self-deleting temp file or a `gone` file, up to 64 MiB; appended with a hash per
+  write, flushed before the list that refers to it replaces the old one; written anew under another name with only
+  what's used once most of it isn't). After saving a big file the text reads the saved file, also if it changed
+  during the save (`Buffer::move_onto`). A write that fails waits longer each time; a disk without room for it isn't
+  written to. Putting one back runs on another thread behind a tab that
   waits (`session::Restoring`): only if each file is the same one, not shorter, and unchanged or only grown (a log),
-  with the same sample hashes; otherwise the added text comes back on its own in a new tab (and the files go into
-  `damaged\`), never laid over something else. A tab whose file doesn't answer (a share that's gone, a file another
-  program holds) waits too and looks again now and then; until a tab is back, the session keeps its entry as read.
+  with the same sample hashes; otherwise the added text comes back on its own in a new tab, read from `<name>.data`
+  where it is (and the files go into `damaged\`, kept 30 days), never laid over something else. A tab whose file
+  doesn't answer (a share that's gone, a file another program holds, a drive or folder that isn't there: only "not
+  found" in a folder that is means gone) waits too and looks again, less often each time, as long as it's one of
+  those; until a tab is back, the session keeps its entry as read.
 - One Slate per user session: a second start hands its files to the running one. A Slate running as administrator
   is separate (its own lock, window class and session), as Windows doesn't let the two talk.
 - Updates: the version being replaced starts the new one with `--updated` and waits ~15 s; if it can't start or ends

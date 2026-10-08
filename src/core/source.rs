@@ -37,6 +37,7 @@ pub const BLOCK: u64 = 64 * 1024;
 const CACHE_BLOCKS: usize = 512; // 32 MiB per file source
 const SHARE_ALL: u32 = 0x1 | 0x2 | 0x4; // FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
 const FILE_FLAG_DELETE_ON_CLOSE: u32 = 0x0400_0000;
+const FILE_READ_ATTRIBUTES: u32 = 0x80;
 const FILE_ATTRIBUTE_TEMPORARY: u32 = 0x100;
 const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
 /// Complete blocks a fingerprint samples, spread over the file (plus its last complete block).
@@ -154,6 +155,9 @@ pub struct Source {
     verified: Mutex<Option<Stamp>>,
     /// Why building the index stopped: the file couldn't be read, or changed while it was read.
     index_error: Mutex<Option<String>>,
+    /// Its file isn't at its path any more (a save or another program put a new file there, or it was moved or
+    /// deleted): only this handle can still read it, so a later run can't (see `mark_gone`).
+    gone: AtomicBool,
 }
 
 /// What a file looks like through a handle: its size, and its last-write and change times. Another program
@@ -250,6 +254,66 @@ pub fn stable_hash(data: &[u8]) -> u64 {
 
 fn hash_bytes(data: &[u8]) -> u64 {
     stable_hash(data)
+}
+
+/// A hash like `stable_hash` (not the same values) of bytes fed a part at a time: for text written in parts, whose
+/// hash is kept in sessions too, so it never changes either.
+#[derive(Clone)]
+pub struct StableHasher {
+    h: u64,
+    len: u64,
+    tail: [u8; 8],
+    n: usize,
+}
+
+impl Default for StableHasher {
+    fn default() -> Self {
+        StableHasher { h: 0x243F_6A88_85A3_08D3, len: 0, tail: [0; 8], n: 0 }
+    }
+}
+
+impl StableHasher {
+    const M: u64 = 0x9E37_79B9_7F4A_7C15;
+
+    fn word(&mut self, w: u64) {
+        self.h = (self.h ^ w).wrapping_mul(Self::M).rotate_left(29);
+    }
+
+    pub fn update(&mut self, mut data: &[u8]) {
+        self.len += data.len() as u64;
+        if self.n > 0 {
+            let k = (8 - self.n).min(data.len());
+            self.tail[self.n..self.n + k].copy_from_slice(&data[..k]);
+            self.n += k;
+            data = &data[k..];
+            if self.n < 8 {
+                return;
+            }
+            self.word(u64::from_le_bytes(self.tail));
+            self.n = 0;
+        }
+        let (words, rest) = data.as_chunks::<8>();
+        for w in words {
+            self.word(u64::from_le_bytes(*w));
+        }
+        self.tail[..rest.len()].copy_from_slice(rest);
+        self.n = rest.len();
+    }
+
+    pub fn finish(&self) -> u64 {
+        let mut s = self.clone();
+        if s.n > 0 {
+            let mut last = [0u8; 8];
+            last[..s.n].copy_from_slice(&s.tail[..s.n]);
+            s.word(u64::from_le_bytes(last));
+        }
+        let mut h = s.h ^ s.len.wrapping_mul(Self::M);
+        h ^= h >> 30;
+        h = h.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        h ^= h >> 27;
+        h = h.wrapping_mul(0x94D0_49BB_1331_11EB);
+        h ^ (h >> 31)
+    }
 }
 
 /// What the session keeps of a file a document is read from, to tell in a later run whether the file still holds
@@ -376,6 +440,7 @@ impl Source {
             reused: Mutex::new(Vec::new()),
             verified: Mutex::new(None),
             index_error: Mutex::new(None),
+            gone: AtomicBool::new(false),
         }
     }
 
@@ -403,6 +468,12 @@ impl Source {
         Ok(Source::wrap(file, len, path.to_path_buf(), SourceKind::Session, None))
     }
 
+    /// A file of Slate's session folder (see `open_session_file`) whose first `len` bytes were already read for
+    /// `index`.
+    pub fn session_file(file: File, len: u64, path: PathBuf, index: NlIndex) -> Source {
+        Source::wrap(file, len, path, SourceKind::Session, Some(index))
+    }
+
     fn wrap(file: File, len: u64, path: PathBuf, kind: SourceKind, index: Option<NlIndex>) -> Source {
         let indexed = index.as_ref().is_some_and(|i| i.complete);
         let opened = stamp_of(&file);
@@ -428,6 +499,9 @@ impl Source {
         let Store::File { path, kind: SourceKind::File, opened: Some((stamp, id)), .. } = &self.store else {
             return None;
         };
+        if self.is_gone() {
+            return None;
+        }
         let fp = self.fingerprint.lock().unwrap().clone()?;
         Some(Identity {
             path: path.clone(),
@@ -456,8 +530,10 @@ impl Source {
             return Err("it is shorter now".into());
         }
         // Same size but written to: rewritten in place (that a few samples can't rule out). Grown: a log, if the
-        // samples (and what was its last, incomplete block) say so.
-        if stamp.size == id.size && stamp.written != id.written {
+        // samples (and what was its last, incomplete block) say so. Exactly an hour apart is a FAT drive (local
+        // times) across a daylight saving change: the samples tell then.
+        const HOUR: i64 = 3600 * 10_000_000;
+        if stamp.size == id.size && stamp.written != id.written && (stamp.written - id.written).abs() != HOUR {
             return Err("another program changed it".into());
         }
         let fp = Fingerprint { len: id.len, samples: id.samples.clone(), tail: id.tail };
@@ -465,6 +541,36 @@ impl Source {
             return Err("another program changed it".into());
         }
         Ok(())
+    }
+
+    /// Its file isn't at its path any more (see `gone`): a save put a new file there, or `look_at_path` found
+    /// another one (or none).
+    pub fn mark_gone(&self) {
+        self.gone.store(true, Ordering::Relaxed);
+    }
+
+    pub fn is_gone(&self) -> bool {
+        self.gone.load(Ordering::Relaxed)
+    }
+
+    /// Looks whether the file at this source's path is still the one it reads (asks the file system: for another
+    /// thread). Marks it gone when another file is there, or none in a folder that is; says nothing when the path
+    /// doesn't answer (a network drive, a drive that isn't there).
+    pub fn look_at_path(&self) {
+        let Store::File { path, kind: SourceKind::File, opened: Some((_, id)), .. } = &self.store else { return };
+        if self.is_gone() || id.index == 0 {
+            return;
+        }
+        // (attributes only: no sharing conflicts with anyone)
+        match OpenOptions::new().access_mode(FILE_READ_ATTRIBUTES).share_mode(SHARE_ALL).open(path) {
+            Ok(f) => {
+                if stamp_of(&f).is_some_and(|(_, now)| now.index != 0 && now != *id) {
+                    self.mark_gone();
+                }
+            }
+            Err(e) if e.raw_os_error() == Some(2) && path.parent().is_some_and(Path::is_dir) => self.mark_gone(),
+            Err(_) => {}
+        }
     }
 
     /// The fingerprint of the first `len` bytes, read straight from the file (None if a read failed).
@@ -1240,6 +1346,70 @@ mod tests {
         assert!(bulk.get().is_some_and(Option::is_some));
         drop((s, gone, temp));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_put_in_its_place_or_deleted_is_gone() {
+        let dir = test_dir("gone");
+        let data = sample(200_000, 13);
+        let (path, s) = indexed(&dir, "a.txt", &data);
+        s.look_at_path();
+        assert!(!s.is_gone() && s.identity().is_some());
+        // another file renamed over it (as a save does)
+        std::fs::write(dir.join("b.txt"), b"another").unwrap();
+        std::fs::rename(dir.join("b.txt"), &path).unwrap();
+        s.look_at_path();
+        assert!(s.is_gone() && s.identity().is_none());
+        // deleted (its folder is there)
+        let (path, s) = indexed(&dir, "c.txt", &data);
+        std::fs::remove_file(&path).unwrap();
+        s.look_at_path();
+        assert!(s.is_gone());
+        // a folder that isn't there (a drive that went away): can't tell
+        let sub = dir.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let (_, s) = indexed(&sub, "d.txt", &data);
+        std::fs::remove_dir_all(&sub).unwrap();
+        s.look_at_path();
+        assert!(!s.is_gone());
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_an_hour_off_is_looked_at_closer() {
+        // FAT drives keep local times: across a daylight saving change an unchanged file is an hour off
+        let dir = test_dir("fat-hour");
+        let data = sample(300_000, 21);
+        let (path, s) = indexed(&dir, "a.txt", &data);
+        let id = s.identity().unwrap();
+        let at = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let set = |t| OpenOptions::new().write(true).share_mode(0x7).open(&path).unwrap().set_modified(t).unwrap();
+        set(at + Duration::from_secs(3600));
+        assert_eq!(Source::open_file(&path).unwrap().same_as(&id), Ok(()));
+        set(at - Duration::from_secs(3600));
+        assert_eq!(Source::open_file(&path).unwrap().same_as(&id), Ok(()));
+        set(at + Duration::from_secs(7200));
+        assert!(Source::open_file(&path).unwrap().same_as(&id).is_err());
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hashes_of_parts_stay_the_same() {
+        // (kept in sessions, like `stable_hash`)
+        let data = sample(70_003, 2);
+        let mut h = StableHasher::default();
+        h.update(&data);
+        assert_eq!(h.finish(), 0xb551_f775_56c7_69c8);
+        // in any parts, the same
+        for cut in [1, 7, 8, 9, 4096, 70_000] {
+            let mut p = StableHasher::default();
+            p.update(&data[..cut]);
+            p.update(&data[cut..]);
+            assert_eq!(p.finish(), h.finish(), "cut at {cut}");
+        }
+        assert_ne!(StableHasher::default().finish(), h.finish());
     }
 
     #[test]

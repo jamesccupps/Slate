@@ -818,13 +818,16 @@ fn restore_session(app: &mut App) -> Option<u64> {
     let mut active_id = None;
     let (mut missing, mut unreachable, mut damaged) = (Vec::new(), Vec::new(), Vec::new());
     let mut big = Vec::new();
+    // Files of the session's tabs being read: waited for once, together.
+    let mut reading = Vec::new();
+    session::prune_damaged();
     if let Some(s) = session::load() {
         let there = exist_all(&s.tabs);
         for (k, st) in s.tabs.iter().enumerate() {
             let before = app.tabs.len();
             let name = || st.path.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned());
             big.extend(st.pieces.clone());
-            match restore_tab(app, st, there[k].clone()) {
+            match restore_tab(app, st, there[k].clone(), &mut reading) {
                 Restored::Yes => {}
                 Restored::Missing => missing.extend(name()),
                 Restored::Unreachable => unreachable.extend(name()),
@@ -835,9 +838,14 @@ fn restore_session(app: &mut App) -> Option<u64> {
             }
         }
     }
+    app.settle(&reading);
     // Big documents whose lists of pieces session.json doesn't refer to (Slate stopped in between).
     for st in session::big_orphans(&big) {
-        restore_tab(app, &st, (Some(true), None));
+        restore_tab(app, &st, (Some(true), None), &mut Vec::new());
+    }
+    // Added text of a big document too big for a copy, with no list at all (Slate stopped before the first one).
+    for (st, list) in session::data_orphans() {
+        app.add_restoring(st, Some(list));
     }
     let claimed: Vec<String> = app.tabs.iter().filter_map(|t| t.backup_name.clone()).collect();
     let found = session::orphans(&claimed);
@@ -912,7 +920,13 @@ fn exist_all(tabs: &[session::SessionTab]) -> Vec<(Option<bool>, Option<PathBuf>
 }
 
 /// Puts back one tab of the session. `there`: whether its file is there (see `exist_all`), and its canonical path.
-fn restore_tab(app: &mut App, st: &session::SessionTab, (there, canon): (Option<bool>, Option<PathBuf>)) -> Restored {
+/// A tab whose file is being read goes into `reading` (see `App::settle`).
+fn restore_tab(
+    app: &mut App,
+    st: &session::SessionTab,
+    (there, canon): (Option<bool>, Option<PathBuf>),
+    reading: &mut Vec<u64>,
+) -> Restored {
     use crate::core::document::Document;
     // A big document: put back from its pieces on another thread (it reads its files again); its tab waits.
     let mut set_aside = false;
@@ -922,8 +936,13 @@ fn restore_tab(app: &mut App, st: &session::SessionTab, (there, canon): (Option<
                 app.add_restoring(st.clone(), Some(list));
                 return Restored::Yes;
             }
-            Err(_) => {
-                // Kept for a look (never deleted); the file as it is, if any.
+            // (another program has it just now: read when it's put back, which waits for it)
+            Err(session::ListErr::Busy(_)) => {
+                app.add_restoring(st.clone(), None);
+                return Restored::Yes;
+            }
+            Err(session::ListErr::Damaged(_)) => {
+                // Kept for a look; the file as it is, if any.
                 session::set_aside_big(name);
                 set_aside = true;
             }
@@ -966,7 +985,7 @@ fn restore_tab(app: &mut App, st: &session::SessionTab, (there, canon): (Option<
             }
         }
         // (back where it was once it's read)
-        app.open_from_session(st);
+        reading.extend(app.open_from_session(st));
         return outcome(Restored::Yes);
     }
     let Some(i) = i else { return outcome(Restored::Yes) };
@@ -991,28 +1010,15 @@ pub fn place_tab(tab: &mut app::Tab, st: &session::SessionTab) {
     }
     // The text may not be what the session describes (a backup written after it): keep positions on characters.
     let doc = &tab.doc;
-    let mut top = char_start(doc, st.top);
+    let mut top = editor::char_start(doc, st.top);
     if top != st.top.min(doc.len()) {
         let ls = doc.line_start_of(top);
         if top - ls <= 64 << 10 {
             top = ls;
         }
     }
-    tab.view.sel = Sel::new(char_start(doc, st.anchor), char_start(doc, st.caret));
+    tab.view.sel = Sel::new(editor::char_start(doc, st.anchor), editor::char_start(doc, st.caret));
     tab.view.top = top;
-}
-
-/// `pos`, moved back to the start of the character it falls in (and to the `\r` of a `\r\n`).
-fn char_start(doc: &crate::core::document::Document, pos: u64) -> u64 {
-    let pos = pos.min(doc.len());
-    let mut p = pos;
-    while p > 0 && pos - p < 3 && doc.byte_at(p).is_some_and(|b| b & 0xC0 == 0x80) {
-        p -= 1;
-    }
-    if p > 0 && doc.byte_at(p) == Some(b'\n') && doc.byte_at(p - 1) == Some(b'\r') {
-        p -= 1;
-    }
-    p
 }
 
 pub fn run(args: Vec<String>) -> i32 {
