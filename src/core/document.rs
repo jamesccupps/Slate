@@ -130,6 +130,9 @@ pub struct Document {
     /// Changes on every edit. Unique across all documents of the process, so a cache keyed on it can't confuse
     /// a reloaded document with the old one.
     pub version: u64,
+    /// Which document this is (unique too, and kept through edits): a save that finishes after its tab got another
+    /// document (a reload) leaves that one alone.
+    id: u64,
     changes: Vec<Change>,
     pub path: Option<PathBuf>,
     pub encoding: Encoding,
@@ -164,6 +167,7 @@ impl Document {
             next_state: 1,
             saved: Some(0),
             version: next_version(),
+            id: next_version(),
             changes: Vec::new(),
             path: None,
             encoding: Encoding::Utf8,
@@ -253,6 +257,9 @@ impl Document {
     }
     pub fn state_id(&self) -> u64 {
         self.state
+    }
+    pub fn id(&self) -> u64 {
+        self.id
     }
     pub fn can_undo(&self) -> bool {
         !self.undo.is_empty()
@@ -639,6 +646,14 @@ impl Document {
         let new = if len > 0 { vec![Piece { src: id, start, len, nl }] } else { Vec::new() };
         self.buf.replace_all(&new);
         // Same text, same offsets: `version` stays so caches remain valid.
+        self.release_unused();
+    }
+
+    /// After `saved` (an earlier snapshot of this text) was written to `src` from `start` on, while the text
+    /// changed: what's still of `saved` reads from `src` from now on (`Buffer::move_onto`). Same text, so `version`
+    /// stays; undo history keeps its own references.
+    pub fn rebase_after_save(&mut self, saved: &Snapshot, src: Arc<Source>, start: u64) {
+        self.buf.move_onto(saved, src, start);
         self.release_unused();
     }
 

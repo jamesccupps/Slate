@@ -43,6 +43,10 @@ pub struct SaveTask {
     pub job: Job<Result<Saved, SaveError>>,
     pub state: u64,
     pub version: u64,
+    /// The text being saved, and which document it is (`Document::id`): a big file's text moves onto the saved
+    /// file afterwards, also if it changed meanwhile, but only in that document.
+    pub snap: crate::core::buffer::Snapshot,
+    pub doc: u64,
     pub path: PathBuf,
     pub encoding: Encoding,
     /// Close the tab when done (unless the text changed meanwhile).
@@ -424,9 +428,6 @@ pub struct App {
     pub gfx_generation: u64,
     /// Alt was pressed and released on its own: the menu bar has the keyboard, with this title highlighted.
     pub menu_armed: Option<usize>,
-    /// Set while opening files named on a command line (`open_command_line`): one that isn't there yet becomes an
-    /// empty tab that saving creates. Elsewhere (Open recent, a drop) a missing file is an error.
-    pub create_missing: bool,
     /// Mouse wheel movement not scrolled yet (in rows; touchpads send small steps), and for Ctrl+wheel zoom (in
     /// wheel units).
     pub wheel_rows: f32,
@@ -525,7 +526,6 @@ impl App {
             mouse_tracking: false,
             gfx_generation: 0,
             menu_armed: None,
-            create_missing: false,
             wheel_rows: 0.0,
             wheel_zoom: 0,
             line_clip: None,

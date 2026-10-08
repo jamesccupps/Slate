@@ -72,13 +72,41 @@ pub fn disk_info(path: &Path) -> Option<DiskInfo> {
 }
 
 /// `disk_info`, telling a file that isn't there (Some(None): its folder says so) from one that doesn't answer (None:
-/// a network share that dropped, access denied for a moment).
+/// a network share that dropped, access denied for a moment, a drive or folder that isn't there).
 pub fn disk_answer(path: &Path) -> Option<Option<DiskInfo>> {
     match fs::metadata(path) {
         Ok(m) => m.modified().ok().map(|t| Some(DiskInfo { len: m.len(), modified: t })),
-        Err(e) if matches!(e.raw_os_error(), Some(2 | 3)) => Some(None),
+        Err(e) if not_there(path, &e) => Some(None),
         Err(_) => None,
     }
+}
+
+/// Whether `e` (from opening `path`) means the file isn't there any more: not found in a folder that is. A drive or
+/// folder that isn't there (a USB stick, a VHD that isn't attached, a share) may come back, so that doesn't count.
+pub fn not_there(path: &Path, e: &io::Error) -> bool {
+    e.raw_os_error() == Some(2) && path.parent().is_some_and(Path::is_dir)
+}
+
+/// Whether opening `path` failed (`e`) for something that may pass by itself: another program has the file, a
+/// network drive doesn't answer, a drive or folder isn't there (a USB stick that isn't plugged in).
+pub fn transient(path: &Path, e: &io::Error) -> bool {
+    match e.raw_os_error() {
+        Some(2) => !not_there(path, e),
+        // path not found, invalid drive, not ready, sharing / lock violation
+        Some(3 | 15 | 21 | 32 | 33) => true,
+        // the network ones
+        Some(51 | 53..=55 | 59 | 64 | 65 | 67 | 121 | 1203 | 1222 | 1231 | 1232 | 1236 | 2250) => true,
+        _ => matches!(e.kind(), io::ErrorKind::TimedOut | io::ErrorKind::Interrupted),
+    }
+}
+
+/// Bytes free for this user on the drive of `dir` (None if it doesn't say).
+pub fn free_space(dir: &Path) -> Option<u64> {
+    let w = wide(dir);
+    let mut free = 0u64;
+    unsafe { windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW(PCWSTR(w.as_ptr()), Some(&mut free), None, None) }
+        .ok()?;
+    Some(free)
 }
 
 /// Opening reports its progress in these steps (`Ctx::set`): the file's size isn't known before it starts.
@@ -86,6 +114,8 @@ pub const OPEN_STEPS: u64 = 1000;
 
 /// What opening a file came to (`open`, `reload`).
 pub struct Opened {
+    /// The file it read (see `open_either`).
+    pub path: PathBuf,
     pub loading: io::Result<Loading>,
     /// The file's canonical path (to tell whether a tab has it open already under another name).
     pub canon: Option<PathBuf>,
@@ -97,7 +127,8 @@ pub struct Opened {
 
 impl Failure for Opened {
     fn failure(msg: &str) -> Opened {
-        Opened { loading: Err(io::Error::other(msg.to_string())), canon: None, binary: false, creatable: false }
+        let loading = Err(io::Error::other(msg.to_string()));
+        Opened { path: PathBuf::new(), loading, canon: None, binary: false, creatable: false }
     }
 }
 
@@ -108,6 +139,7 @@ pub fn open(path: &Path, notify: Notify, create: bool, ctx: &Ctx) -> Opened {
     let there = loading.is_ok();
     let missing = matches!(&loading, Err(e) if e.kind() == io::ErrorKind::NotFound);
     Opened {
+        path: path.to_path_buf(),
         loading,
         canon: if there { fs::canonicalize(path).ok() } else { None },
         binary: there && looks_binary(path),
@@ -115,9 +147,20 @@ pub fn open(path: &Path, notify: Notify, create: bool, ctx: &Ctx) -> Opened {
     }
 }
 
+/// `open`, and if `path` isn't there, `or` instead (`notes.txt:120` from a command line: `notes.txt`, at line 120;
+/// `create` is for that one).
+pub fn open_either(path: &Path, or: &Path, notify: Notify, create: bool, ctx: &Ctx) -> Opened {
+    let o = open(path, notify.clone(), false, ctx);
+    match &o.loading {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => open(or, notify, create, ctx),
+        _ => o,
+    }
+}
+
 /// Reads `path` again (see `open_with`), on another thread like `open`.
 pub fn reload(path: &Path, notify: Notify, prev: Option<Arc<Source>>, force: Option<Encoding>, ctx: &Ctx) -> Opened {
-    Opened { loading: open_with(path, notify, prev, force, ctx), canon: None, binary: false, creatable: false }
+    let loading = open_with(path, notify, prev, force, ctx);
+    Opened { path: path.to_path_buf(), loading, canon: None, binary: false, creatable: false }
 }
 
 /// Opens `path`. `prev` is the source of the same file opened earlier (a reload): if the file only grew, its
@@ -135,8 +178,10 @@ pub fn open_with(
         return Err(io::Error::other("That is a folder, not a file."));
     }
     let disk = disk_info(path);
-    if meta.len() <= MEM_LIMIT {
-        let data = read_whole(path, ctx)?;
+    // (a file that grew past the limit meanwhile, or was replaced by a big one, is read as a big one)
+    if meta.len() <= MEM_LIMIT
+        && let Some(data) = read_whole(path, MEM_LIMIT, ctx)?
+    {
         let mut doc = document_from_bytes_as(data, force);
         doc.path = Some(path.to_path_buf());
         doc.disk = disk;
@@ -194,19 +239,29 @@ pub fn open_with(
 }
 
 /// All of a file's bytes, read a part at a time (for progress, and to stop when the tab is closed meanwhile).
-fn read_whole(path: &Path, ctx: &Ctx) -> io::Result<Vec<u8>> {
+/// None: it's bigger than `limit` (now).
+fn read_whole(path: &Path, limit: u64, ctx: &Ctx) -> io::Result<Option<Vec<u8>>> {
     use std::io::Read;
     let mut f = File::open(path)?;
-    let len = f.metadata()?.len().max(1);
-    let mut data = Vec::with_capacity(len as usize);
+    let len = f.metadata()?.len();
+    if len > limit {
+        return Ok(None);
+    }
+    let mut data = Vec::new();
+    data.try_reserve_exact(len as usize).map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
     loop {
         if ctx.cancelled() {
             return Err(io::ErrorKind::Interrupted.into());
         }
-        if (&mut f).take(CHUNK).read_to_end(&mut data)? == 0 {
-            return Ok(data);
+        // (no more than the limit, and one byte to tell it grew past it)
+        let room = (limit + 1).saturating_sub(data.len() as u64).min(CHUNK);
+        if room == 0 {
+            return Ok(None);
         }
-        ctx.set((data.len() as u64).saturating_mul(OPEN_STEPS) / len);
+        if (&mut f).take(room).read_to_end(&mut data)? == 0 {
+            return Ok(Some(data));
+        }
+        ctx.set((data.len() as u64).saturating_mul(OPEN_STEPS) / len.max(1));
     }
 }
 
@@ -790,8 +845,38 @@ mod tests {
         c.cancel.store(true, Ordering::Relaxed);
         assert!(open(&path, notify.clone(), false, &c).loading.is_err());
         // a reload looks at nothing else
-        let o = reload(&path, notify, None, Some(Encoding::Utf8), &ctx());
+        let o = reload(&path, notify.clone(), None, Some(Encoding::Utf8), &ctx());
         assert!(matches!(o.loading, Ok(Loading::Ready(_))) && o.canon.is_none());
+        // `notes.txt:120` from a command line: the name as given if there is such a file, else the one before ':'
+        let o = open_either(&dir.join("notes.txt:120"), &path, notify.clone(), true, &ctx());
+        assert_eq!(o.path, path);
+        assert!(o.loading.is_ok());
+        let o = open_either(&dir.join("new.txt:7"), &dir.join("new.txt"), notify, true, &ctx());
+        assert!(o.creatable && o.path == dir.join("new.txt"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn small_files_stay_small_while_read() {
+        let dir = test_dir("whole");
+        let path = dir.join("a.txt");
+        fs::write(&path, vec![b'a'; 5000]).unwrap();
+        assert_eq!(read_whole(&path, 5000, &ctx()).unwrap().map(|d| d.len()), Some(5000));
+        // bigger than the limit by now (it grew, or another file is there): read as a big one instead
+        assert!(read_whole(&path, 4999, &ctx()).unwrap().is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_what_may_pass_by_itself_is_waited_for() {
+        let dir = test_dir("transient");
+        let here = dir.join("x.txt");
+        let away = dir.join("gone").join("x.txt");
+        let os = io::Error::from_raw_os_error;
+        assert!(!transient(&here, &os(2)) && not_there(&here, &os(2)));
+        assert!(transient(&away, &os(2)) && !not_there(&away, &os(2)));
+        assert!(transient(&here, &os(3)) && transient(&here, &os(32)) && transient(&here, &os(53)));
+        assert!(!transient(&here, &os(5)) && !transient(&here, &io::Error::other("That is a folder, not a file.")));
         let _ = fs::remove_dir_all(&dir);
     }
 

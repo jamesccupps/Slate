@@ -1592,11 +1592,15 @@ fn bracket_partner(doc: &Document, at: u64, open: u8, close: u8, forward: bool) 
     None
 }
 
-/// `pos`, moved back to the start of the character it falls in.
+/// `pos`, moved back to the start of the character it falls in (and to the `\r` of a `\r\n`): a place from another
+/// version of the text (a reopened tab, the session) never splits a character or a line break.
 pub fn char_start(doc: &Document, pos: u64) -> u64 {
     let pos = pos.min(doc.len());
     let mut p = pos;
     while p > 0 && pos - p < 3 && doc.byte_at(p).is_some_and(is_continuation) {
+        p -= 1;
+    }
+    if p > 0 && doc.byte_at(p) == Some(b'\n') && doc.byte_at(p - 1) == Some(b'\r') {
         p -= 1;
     }
     p
@@ -2177,6 +2181,16 @@ pub fn move_lines(doc: &mut Document, sel: Sel, down: bool) -> Result<Sel, &'sta
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn places_from_another_text_never_split_a_character_or_a_line_break() {
+        let d = Document::from_text("abcd\r\nefgh é\r\n".as_bytes());
+        assert_eq!(char_start(&d, 5), 4);
+        assert_eq!(char_start(&d, 4), 4);
+        assert_eq!(char_start(&d, 6), 6);
+        assert_eq!(char_start(&d, 12), 11);
+        assert_eq!(char_start(&d, 99), d.len());
+    }
 
     fn segs(text: &[u8]) -> Vec<Seg> {
         let len = text.len() as u64;
