@@ -972,7 +972,7 @@ pub fn run(args: Vec<String>) -> i32 {
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
     }
     if args.first().map(String::as_str) == Some("--uninstall") {
-        install::uninstall();
+        install::uninstall(args.iter().any(|a| a == "--quiet"));
         return 0;
     }
     if args.first().map(String::as_str) == Some("--test") {
@@ -1010,6 +1010,7 @@ pub fn run(args: Vec<String>) -> i32 {
         // (Right after an update the copy before it stays: it goes back in place if the new one fails to start.)
         install::clean_old_copies();
     }
+    install::refresh_version();
     crate::core::source::set_temp_dir(settings::temp_dir());
     let hinst = register_class();
     let s = settings::Settings::load();

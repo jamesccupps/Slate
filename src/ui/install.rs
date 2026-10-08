@@ -167,7 +167,7 @@ fn register(exe: &Path) -> bool {
     ok &= set(r"Software\Slate\Capabilities", Some("ApplicationDescription"), "A fast, simple text editor that opens files of any size.");
     ok &= set(r"Software\RegisteredApplications", Some("Slate"), r"Software\Slate\Capabilities");
     // Apps & features entry so it can be found later.
-    let un = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\Slate";
+    let un = UNINSTALL;
     ok &= set(un, Some("DisplayName"), "Slate");
     ok &= set(un, Some("DisplayIcon"), &icon);
     ok &= set(un, Some("DisplayVersion"), env!("CARGO_PKG_VERSION"));
@@ -175,10 +175,61 @@ fn register(exe: &Path) -> bool {
     let loc = exe.parent().map(|p| p.display().to_string()).unwrap_or_default();
     ok &= set(un, Some("InstallLocation"), &loc);
     ok &= set(un, Some("UninstallString"), &format!("\"{e}\" --uninstall"));
+    ok &= set(un, Some("QuietUninstallString"), &format!("\"{e}\" --uninstall --quiet"));
+    let kb = std::fs::metadata(exe).map_or(0, |m| m.len().div_ceil(1024)) as u32;
+    ok &= set_dword(un, "EstimatedSize", kb);
+    // Win+R "slate"
+    ok &= set(APP_PATH, None, &e);
     unsafe {
         SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, None, None);
     }
     ok
+}
+
+const UNINSTALL: &str = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\Slate";
+const APP_PATH: &str = r"Software\Microsoft\Windows\CurrentVersion\App Paths\Slate.exe";
+
+fn set_dword(path: &str, name: &str, value: u32) -> bool {
+    use windows::Win32::System::Registry::REG_DWORD;
+    unsafe {
+        let mut key = HKEY::default();
+        if RegCreateKeyExW(HKEY_CURRENT_USER, &HSTRING::from(path), 0, None, REG_OPTION_NON_VOLATILE, KEY_WRITE, None, &mut key, None)
+            .is_err()
+        {
+            return false;
+        }
+        let ok = RegSetValueExW(key, &HSTRING::from(name), 0, REG_DWORD, Some(&value.to_le_bytes())).is_ok();
+        let _ = RegCloseKey(key);
+        ok
+    }
+}
+
+/// After an update: the version Windows shows under Installed apps is this one's, if this is the Slate that was set
+/// up there.
+pub fn refresh_version() {
+    use windows::Win32::System::Registry::{RRF_RT_REG_SZ, RegGetValueW};
+    let read = |name: &str| -> Option<String> {
+        let mut buf = [0u16; 1024];
+        let mut len = (buf.len() * 2) as u32;
+        let ok = unsafe {
+            RegGetValueW(
+                HKEY_CURRENT_USER,
+                &HSTRING::from(UNINSTALL),
+                &HSTRING::from(name),
+                RRF_RT_REG_SZ,
+                None,
+                Some(buf.as_mut_ptr() as *mut _),
+                Some(&mut len),
+            )
+        }
+        .is_ok();
+        ok.then(|| String::from_utf16_lossy(&buf[..(len as usize / 2).saturating_sub(1)]))
+    };
+    let Some(here) = super::settings::exe_dir() else { return };
+    let ours = read("InstallLocation").is_some_and(|l| Path::new(&l) == here);
+    if ours && read("DisplayVersion").as_deref() != Some(env!("CARGO_PKG_VERSION")) {
+        set(UNINSTALL, Some("DisplayVersion"), env!("CARGO_PKG_VERSION"));
+    }
 }
 
 pub fn make_default(cell: &Cell) {
@@ -214,8 +265,8 @@ pub fn make_default(cell: &Cell) {
 }
 
 /// `Slate.exe --uninstall` (Settings → Apps → Slate → Uninstall): removes what `make_default` added. Slate's folder
-/// and its data folder stay; the message says where they are.
-pub fn uninstall() {
+/// and its data folder stay; the message says where they are (`quiet`: no message, for `--uninstall --quiet`).
+pub fn uninstall(quiet: bool) {
     use windows::Win32::System::Registry::RegDeleteTreeW;
     unsafe {
         for k in [
@@ -223,7 +274,8 @@ pub fn uninstall() {
             r"Software\Classes\Applications\Slate.exe".to_string(),
             r"Software\Classes\*\shell\Slate".to_string(),
             r"Software\Slate".to_string(),
-            r"Software\Microsoft\Windows\CurrentVersion\Uninstall\Slate".to_string(),
+            UNINSTALL.to_string(),
+            APP_PATH.to_string(),
         ] {
             let _ = RegDeleteTreeW(HKEY_CURRENT_USER, &HSTRING::from(k));
         }
@@ -246,6 +298,9 @@ pub fn uninstall() {
             let _ = std::fs::remove_file(PathBuf::from(appdata).join(r"Microsoft\Windows\Start Menu\Programs\Slate.lnk"));
         }
         SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, None, None);
+        if quiet {
+            return;
+        }
         let folder = super::settings::exe_dir().map(|d| d.display().to_string()).unwrap_or_default();
         let data = super::settings::data_dir().display().to_string();
         win::info(
