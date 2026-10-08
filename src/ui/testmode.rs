@@ -86,6 +86,8 @@ fn busy(cell: &Cell) -> bool {
     let a = cell.borrow();
     a.tabs.iter().any(|t| {
         t.load_job.is_some()
+            // (a tab waiting for its file isn't busy between looks)
+            || t.restore.as_ref().is_some_and(|r| r.running())
             || t.index_job.is_some()
             || t.save.is_some()
             || t.task.is_some()

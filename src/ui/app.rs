@@ -133,6 +133,10 @@ pub enum NoticeAction {
     SaveUtf8,
     GoTo(u64),
     Dismiss,
+    /// A tab from the session waiting for its file: look again now.
+    Retry,
+    /// A big document from the session waiting for its file: stop waiting, and get the text that was added to it.
+    Recover,
 }
 
 pub struct Notice {
@@ -181,6 +185,10 @@ pub struct Tab {
     pub canon: Option<(PathBuf, Option<PathBuf>)>,
     /// Where to go once the document is ready and its tab is shown (`slate file.txt:120`, a reopened tab).
     pub goto: Option<Goto>,
+    /// What the session holds of this document if it's too big for a copy (session.rs, "Big documents").
+    pub big: Option<super::session::BigBackup>,
+    /// A tab from the session that isn't back yet (being put back, or its file doesn't answer): see session.rs.
+    pub restore: Option<super::session::Restoring>,
 }
 
 /// A place to go in a document that may not be ready yet (see `App::apply_goto`).
@@ -228,6 +236,8 @@ impl Tab {
             ask_lossy: None,
             canon: None,
             goto: None,
+            big: None,
+            restore: None,
         }
     }
 
@@ -242,12 +252,25 @@ impl Tab {
         }
     }
 
+    /// How far opening (or putting back from the session) is, while it is.
+    pub fn opening(&self) -> Option<f32> {
+        match (&self.load_job, self.restore.as_ref().and_then(|r| r.job.as_ref())) {
+            (Some(j), _) => Some(j.fraction()),
+            (None, Some(super::session::RestoreJob::Big(j))) => Some(j.fraction()),
+            _ => None,
+        }
+    }
+
     pub fn busy(&self) -> bool {
-        self.load_job.is_some() || self.save.is_some() || self.task.is_some()
+        self.load_job.is_some() || self.restore.is_some() || self.save.is_some() || self.task.is_some()
     }
 
     pub fn is_blank(&self) -> bool {
-        self.doc.path.is_none() && self.doc.is_empty() && !self.doc.is_dirty() && self.load_job.is_none()
+        self.doc.path.is_none()
+            && self.doc.is_empty()
+            && !self.doc.is_dirty()
+            && self.load_job.is_none()
+            && self.restore.is_none()
     }
 }
 
@@ -1100,8 +1123,8 @@ impl App {
             }
         }
         // Loading / converting overlay.
-        if let Some(job) = &tab.load_job {
-            let msg = format!("Opening… {:.0}%", job.fraction() * 100.0);
+        if let Some(f) = tab.opening() {
+            let msg = format!("Opening… {:.0}%", f * 100.0);
             self.g.text(&msg, &self.fonts.ui, Rect::new(geom.text_x, geom.rect.y + 8.0, 400.0, 24.0), self.theme.text_dim, Align::Left);
         }
         // Scrollbars.
@@ -1407,8 +1430,8 @@ pub struct StatusTexts {
 }
 
 pub fn tab_progress(tab: &Tab) -> Option<f32> {
-    if let Some(j) = &tab.load_job {
-        return Some(j.fraction());
+    if let Some(f) = tab.opening() {
+        return Some(f);
     }
     if let Some(s) = &tab.save {
         return Some(s.job.fraction());

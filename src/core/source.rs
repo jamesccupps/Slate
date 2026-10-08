@@ -22,6 +22,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
+use serde::{Deserialize, Serialize};
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, FILE_BASIC_INFO, FileBasicInfo, GetFileInformationByHandle,
@@ -112,7 +113,20 @@ struct BlockCache {
 enum Store {
     Mem(Box<[u8]>),
     /// `opened`: the file's stamp and identity through `file` when this source was made.
-    File { file: File, cache: Mutex<BlockCache>, path: PathBuf, temp: bool, opened: Option<(Stamp, FileId)> },
+    File { file: File, cache: Mutex<BlockCache>, path: PathBuf, kind: SourceKind, opened: Option<(Stamp, FileId)> },
+}
+
+/// Where a source's bytes are (and so what keeping a document for a later run takes, see session.rs).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SourceKind {
+    /// Memory: typed or pasted text, small files.
+    Memory,
+    /// A file of the user's, read where it is.
+    File,
+    /// A self-deleting temp file: a big file converted from UTF-16 or ANSI, the result of a big transform.
+    Temp,
+    /// A file in Slate's session folder (unsaved text kept from an earlier run): Slate's own, nobody writes it.
+    Session,
 }
 
 pub struct Source {
@@ -200,11 +214,48 @@ fn thin(v: &mut Vec<(u64, u64)>, max: usize) {
     }
 }
 
+/// A 64-bit hash that stays the same across runs and versions (the session keeps fingerprints for later runs),
+/// for telling whether bytes changed: not meant to withstand someone trying to fool it.
+pub fn stable_hash(data: &[u8]) -> u64 {
+    const M: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut h = (data.len() as u64).wrapping_mul(M) ^ 0x243F_6A88_85A3_08D3;
+    let (words, rest) = data.as_chunks::<8>();
+    for w in words {
+        h = (h ^ u64::from_le_bytes(*w)).wrapping_mul(M).rotate_left(29);
+    }
+    if !rest.is_empty() {
+        let mut last = [0u8; 8];
+        last[..rest.len()].copy_from_slice(rest);
+        h = (h ^ u64::from_le_bytes(last)).wrapping_mul(M).rotate_left(29);
+    }
+    // (splitmix64's finish)
+    h ^= h >> 30;
+    h = h.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    h ^= h >> 27;
+    h = h.wrapping_mul(0x94D0_49BB_1331_11EB);
+    h ^ (h >> 31)
+}
+
 fn hash_bytes(data: &[u8]) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    data.hash(&mut h);
-    h.finish()
+    stable_hash(data)
+}
+
+/// What the session keeps of a file a document is read from, to tell in a later run whether the file still holds
+/// the same bytes (see `Source::same_as`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Identity {
+    pub path: PathBuf,
+    /// How much of the file the document reads (the file's size when it was opened).
+    pub len: u64,
+    /// The file's stamp and identity then.
+    pub size: u64,
+    pub written: i64,
+    pub changed: i64,
+    pub volume: u32,
+    pub index: u64,
+    /// `stable_hash`es of sample blocks of `[0, len)` and of its incomplete last block.
+    pub samples: Vec<(u64, u64)>,
+    pub tail: Option<u64>,
 }
 
 /// Reads all of `buf` at `off` (an error if the file ends first). Counts nothing.
@@ -319,14 +370,81 @@ impl Source {
 
     /// Wraps an already written file (a temp file, or a file just saved) whose index is known.
     pub fn from_file(file: File, len: u64, path: PathBuf, temp: bool, index: Option<NlIndex>) -> Source {
+        let kind = if temp { SourceKind::Temp } else { SourceKind::File };
+        Source::wrap(file, len, path, kind, index)
+    }
+
+    /// Opens the first `len` bytes of a file of Slate's session folder (text kept from an earlier run; nobody else
+    /// writes it, and Slate only ever adds to its end). The index starts empty, as for `open_file`.
+    pub fn open_session_file(path: &Path, len: u64) -> io::Result<Source> {
+        let file = OpenOptions::new().read(true).share_mode(SHARE_ALL).open(path)?;
+        if file.metadata()?.len() < len {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "the session file is shorter than its list says"));
+        }
+        Ok(Source::wrap(file, len, path.to_path_buf(), SourceKind::Session, None))
+    }
+
+    fn wrap(file: File, len: u64, path: PathBuf, kind: SourceKind, index: Option<NlIndex>) -> Source {
         let indexed = index.as_ref().is_some_and(|i| i.complete);
         let opened = stamp_of(&file);
         let cache = Mutex::new(BlockCache { map: HashMap::new(), tick: 0 });
-        let s = Source::new(Store::File { file, cache, path, temp, opened }, len, index.unwrap_or_else(NlIndex::empty));
-        if indexed && !temp {
+        let s = Source::new(Store::File { file, cache, path, kind, opened }, len, index.unwrap_or_else(NlIndex::empty));
+        if indexed && kind == SourceKind::File {
             *s.fingerprint.lock().unwrap() = s.take_fingerprint(s.len);
         }
         s
+    }
+
+    pub fn kind(&self) -> SourceKind {
+        match &self.store {
+            Store::Mem(_) => SourceKind::Memory,
+            Store::File { kind, .. } => *kind,
+        }
+    }
+
+    /// What a later run needs to tell whether this file still holds what the document reads from it (a file of the
+    /// user's whose index is done; None otherwise).
+    pub fn identity(&self) -> Option<Identity> {
+        let Store::File { path, kind: SourceKind::File, opened: Some((stamp, id)), .. } = &self.store else {
+            return None;
+        };
+        let fp = self.fingerprint.lock().unwrap().clone()?;
+        Some(Identity {
+            path: path.clone(),
+            len: fp.len,
+            size: stamp.size,
+            written: stamp.written,
+            changed: stamp.changed,
+            volume: id.volume,
+            index: id.index,
+            samples: fp.samples,
+            tail: fp.tail,
+        })
+    }
+
+    /// Whether this source (the file `id` names, opened again in a later run) is still that file with the same
+    /// bytes in `[0, id.len)`: the same file, not shorter, and either not written to since (same size and last-write
+    /// time) or only grown (a log), and the same at the sampled places. Err says why not, for the user.
+    pub fn same_as(&self, id: &Identity) -> Result<(), String> {
+        let Store::File { opened: Some((stamp, fid)), .. } = &self.store else {
+            return Err("Slate couldn't tell which file it is".into());
+        };
+        if id.index != 0 && fid.index != 0 && (fid.volume, fid.index) != (id.volume, id.index) {
+            return Err("another file was put in its place".into());
+        }
+        if stamp.size < id.len {
+            return Err("it is shorter now".into());
+        }
+        // Same size but written to: rewritten in place (that a few samples can't rule out). Grown: a log, if the
+        // samples (and what was its last, incomplete block) say so.
+        if stamp.size == id.size && stamp.written != id.written {
+            return Err("another program changed it".into());
+        }
+        let fp = Fingerprint { len: id.len, samples: id.samples.clone(), tail: id.tail };
+        if !self.matches(&fp) {
+            return Err("another program changed it".into());
+        }
+        Ok(())
     }
 
     /// The fingerprint of the first `len` bytes, read straight from the file (None if a read failed).
@@ -368,7 +486,9 @@ impl Source {
     /// ours (renamed over it) doesn't count either: the handle still reads the old one. Memory and temp files are
     /// never changed by others.
     pub fn changed_in_place(&self) -> bool {
-        let Store::File { file, temp: false, opened: Some((then, _)), .. } = &self.store else { return false };
+        let Store::File { file, kind: SourceKind::File, opened: Some((then, _)), .. } = &self.store else {
+            return false;
+        };
         let Some((now, _)) = stamp_of(file) else { return false };
         if now == *then || *self.verified.lock().unwrap() == Some(now) {
             return false;
@@ -403,10 +523,10 @@ impl Source {
     pub fn is_file(&self) -> bool {
         matches!(self.store, Store::File { .. })
     }
-    /// The file this source reads from, unless it is a temp file.
+    /// The file of the user's this source reads from (not for temp files and Slate's session files).
     pub fn file_path(&self) -> Option<&Path> {
         match &self.store {
-            Store::File { path, temp: false, .. } => Some(path),
+            Store::File { path, kind: SourceKind::File, .. } => Some(path),
             _ => None,
         }
     }
@@ -748,6 +868,11 @@ impl Source {
     /// a read that kept failing (a guessed count would let line commands run over text they shouldn't), or the
     /// file was written over while it was read. Either way the index is never marked complete.
     pub fn build_index(&self, cancel: &AtomicBool, progress: &AtomicU64) -> bool {
+        self.build_index_at(cancel, progress, 0)
+    }
+
+    /// `build_index`, counting progress from `base` (several files read one after the other).
+    pub fn build_index_at(&self, cancel: &AtomicBool, progress: &AtomicU64, base: u64) -> bool {
         let Store::File { file, opened, .. } = &self.store else {
             return true;
         };
@@ -801,7 +926,7 @@ impl Source {
                 }
             }
             pos += n as u64;
-            progress.store(pos, Ordering::Relaxed);
+            progress.store(base + pos, Ordering::Relaxed);
             let mut idx = self.index.write().unwrap();
             idx.cum.append(&mut pending);
         }
@@ -817,7 +942,7 @@ impl Source {
         }
         *self.fingerprint.lock().unwrap() = Some(fp);
         self.index.write().unwrap().complete = true;
-        progress.store(self.len, Ordering::Relaxed);
+        progress.store(base + self.len, Ordering::Relaxed);
         true
     }
 
@@ -1050,6 +1175,15 @@ mod tests {
         assert!(s.read_errors() > 0);
         drop(s);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stable_hashes_stay_the_same() {
+        // (kept in sessions: if this changed, every big document's file would look changed to the next version)
+        assert_eq!(stable_hash(b""), 0xe9e0_033e_3bad_af36);
+        assert_eq!(stable_hash(b"Slate"), 0x0d4e_8e8c_c4af_5df3);
+        assert_eq!(stable_hash(&sample(70_000, 1)), 0x3726_030c_d0a4_959a);
+        assert_ne!(stable_hash(b"Slate"), stable_hash(b"slate"));
     }
 
     #[test]

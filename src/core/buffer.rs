@@ -96,6 +96,25 @@ impl Buffer {
         b
     }
 
+    /// A buffer of `pieces`: (index into `sources`, start, length) each, in order (a document kept by the session).
+    /// The sources' indexes must be complete. None if a piece is outside its source.
+    pub fn from_pieces(sources: Vec<Arc<Source>>, pieces: &[(u32, u64, u64)]) -> Option<Buffer> {
+        let mut b = Buffer::new();
+        let first = b.sources.len() as u32;
+        let mut list = Vec::with_capacity(pieces.len());
+        for &(s, start, len) in pieces {
+            let src = sources.get(s as usize)?;
+            if len == 0 || start.checked_add(len)? > src.len() {
+                return None;
+            }
+            list.push(Piece { src: first + s, start, len, nl: src.count_nl(start, start + len) });
+        }
+        b.sources.extend(sources);
+        b.leaves = vec![Leaf { pieces: list, len: 0, nl: 0 }];
+        b.rebalance();
+        Some(b)
+    }
+
     pub fn push_source(&mut self, src: Arc<Source>) -> u32 {
         self.sources.push(src);
         (self.sources.len() - 1) as u32
@@ -595,6 +614,13 @@ impl Buffer {
     pub fn read_errors(&self) -> u64 {
         self.with_used(|used| {
             used.iter().filter(|&&s| s != self.add_id).map(|&s| self.sources[s as usize].read_errors()).sum()
+        })
+    }
+
+    /// The sources the current content is read from (the open add buffer aside: memory).
+    pub fn sources_in_use(&self) -> Vec<Arc<Source>> {
+        self.with_used(|used| {
+            used.iter().filter(|&&s| s != self.add_id).map(|&s| self.sources[s as usize].clone()).collect()
         })
     }
 

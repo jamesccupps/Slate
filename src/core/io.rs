@@ -70,6 +70,16 @@ pub fn disk_info(path: &Path) -> Option<DiskInfo> {
     Some(DiskInfo { len: m.len(), modified: m.modified().ok()? })
 }
 
+/// `disk_info`, telling a file that isn't there (Some(None): its folder says so) from one that doesn't answer (None:
+/// a network share that dropped, access denied for a moment).
+pub fn disk_answer(path: &Path) -> Option<Option<DiskInfo>> {
+    match fs::metadata(path) {
+        Ok(m) => m.modified().ok().map(|t| Some(DiskInfo { len: m.len(), modified: t })),
+        Err(e) if matches!(e.raw_os_error(), Some(2 | 3)) => Some(None),
+        Err(_) => None,
+    }
+}
+
 pub fn open(path: &Path, notify: Notify) -> io::Result<Loading> {
     open_with(path, notify, None, None)
 }

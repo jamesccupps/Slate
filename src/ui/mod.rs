@@ -816,24 +816,28 @@ pub fn restore(app: &mut App, paths: &[PathBuf]) {
 fn restore_session(app: &mut App) -> Option<u64> {
     use crate::core::document::Document;
     let mut active_id = None;
-    let (mut missing, mut unreachable) = (Vec::new(), Vec::new());
+    let (mut missing, mut unreachable, mut damaged) = (Vec::new(), Vec::new(), Vec::new());
+    let mut big = Vec::new();
     if let Some(s) = session::load() {
         let there = exist_all(&s.tabs);
         for (k, st) in s.tabs.iter().enumerate() {
             let before = app.tabs.len();
             let name = || st.path.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned());
+            big.extend(st.pieces.clone());
             match restore_tab(app, st, there[k]) {
                 Restored::Yes => {}
                 Restored::Missing => missing.extend(name()),
-                Restored::Unreachable => {
-                    session::carry(st);
-                    unreachable.extend(name());
-                }
+                Restored::Unreachable => unreachable.extend(name()),
+                Restored::Damaged => damaged.push(name().unwrap_or_else(|| "an untitled tab".into())),
             }
             if k == s.active && app.tabs.len() > before {
                 active_id = Some(app.tabs[app.tabs.len() - 1].id);
             }
         }
+    }
+    // Big documents whose lists of pieces session.json doesn't refer to (Slate stopped in between).
+    for st in session::big_orphans(&big) {
+        restore_tab(app, &st, Some(true));
     }
     let claimed: Vec<String> = app.tabs.iter().filter_map(|t| t.backup_name.clone()).collect();
     let found = session::orphans(&claimed);
@@ -855,10 +859,17 @@ fn restore_session(app: &mut App) -> Option<u64> {
         msg.push(format!("Not found any more: {}.", missing.join(", ")));
     }
     if !unreachable.is_empty() {
-        msg.push(format!("Couldn't be reached (network?), tried again next time: {}.", unreachable.join(", ")));
+        msg.push(format!("Doesn't answer (network?), opened as soon as it does: {}.", unreachable.join(", ")));
+    }
+    if !damaged.is_empty() {
+        msg.push(format!(
+            "Unsaved changes from last time couldn't be read back for: {} (kept in {}).",
+            damaged.join(", "),
+            session::dir().join("damaged").display()
+        ));
     }
     if !msg.is_empty() {
-        app.flash(msg.join(" "), !missing.is_empty() || !unreachable.is_empty());
+        app.flash(msg.join(" "), !missing.is_empty() || !unreachable.is_empty() || !damaged.is_empty());
     }
     active_id
 }
@@ -867,12 +878,15 @@ enum Restored {
     Yes,
     /// Its file isn't there any more (and it had no unsaved text).
     Missing,
-    /// Its file (on a network share) didn't answer in time.
+    /// Its file (on a network share) didn't answer in time: a tab that waits for it.
     Unreachable,
+    /// Its unsaved changes (a big document's pieces) can't be read back: set aside, the file opened as it is.
+    Damaged,
 }
 
-/// Whether each tab's file exists, all looked at together; None for one that doesn't answer within 2 s (a network
-/// share that's gone: Windows can take half a minute to give up, and this runs before the window shows).
+/// Whether each tab's file exists, all looked at together (`session::probe`); None for one that doesn't answer
+/// within 2 s (a network share that's gone: Windows can take half a minute to give up, and this runs before the
+/// window shows) or answers with something other than "not there".
 fn exist_all(tabs: &[session::SessionTab]) -> Vec<Option<bool>> {
     let (tx, rx) = std::sync::mpsc::channel();
     let mut out = vec![None; tabs.len()];
@@ -882,21 +896,37 @@ fn exist_all(tabs: &[session::SessionTab]) -> Vec<Option<bool>> {
             let tx = tx.clone();
             asked += 1;
             std::thread::spawn(move || {
-                let _ = tx.send((i, p.exists()));
+                let _ = tx.send((i, session::probe(&p)));
             });
         }
     }
     let until = std::time::Instant::now() + std::time::Duration::from_secs(2);
     while asked > 0 {
         let Ok((i, there)) = rx.recv_timeout(until.saturating_duration_since(std::time::Instant::now())) else { break };
-        out[i] = Some(there);
+        out[i] = there;
         asked -= 1;
     }
     out
 }
 
 fn restore_tab(app: &mut App, st: &session::SessionTab, there: Option<bool>) -> Restored {
-    use crate::core::document::{Document, Sel};
+    use crate::core::document::Document;
+    // A big document: put back from its pieces on another thread (it reads its files again); its tab waits.
+    let mut set_aside = false;
+    if let Some(name) = &st.pieces {
+        match session::read_big(name) {
+            Ok(list) => {
+                app.add_restoring(st.clone(), Some(list));
+                return Restored::Yes;
+            }
+            Err(_) => {
+                // Kept for a look (never deleted); the file as it is, if any.
+                session::set_aside_big(name);
+                set_aside = true;
+            }
+        }
+    }
+    let outcome = |r: Restored| if set_aside { Restored::Damaged } else { r };
     let mut i = None;
     if let Some(name) = &st.backup {
         if let Some(bytes) = session::read_backup(name) {
@@ -923,8 +953,12 @@ fn restore_tab(app: &mut App, st: &session::SessionTab, there: Option<bool>) -> 
         if let Some(p) = &st.path {
             match there {
                 Some(true) => {}
-                Some(false) => return Restored::Missing,
-                None => return Restored::Unreachable,
+                Some(false) => return outcome(Restored::Missing),
+                None => {
+                    // A tab that waits for its file, opening it as soon as it answers.
+                    app.add_restoring(session::SessionTab { backup: None, pieces: None, ..st.clone() }, None);
+                    return outcome(Restored::Unreachable);
+                }
             }
             let before = app.tabs.len();
             app.open_paths(std::slice::from_ref(p));
@@ -933,12 +967,20 @@ fn restore_tab(app: &mut App, st: &session::SessionTab, there: Option<bool>) -> 
             }
         }
     }
-    let Some(i) = i else { return Restored::Yes };
+    let Some(i) = i else { return outcome(Restored::Yes) };
     let tab = &mut app.tabs[i];
     if st.untitled > 0 && tab.doc.path.is_none() {
         tab.untitled = st.untitled;
         app.untitled_counter = app.untitled_counter.max(st.untitled);
     }
+    place_tab(&mut app.tabs[i], st);
+    outcome(Restored::Yes)
+}
+
+/// Gives a tab back what the session says of it: the language if the user picked it, and the selection and scroll
+/// position.
+pub fn place_tab(tab: &mut app::Tab, st: &session::SessionTab) {
+    use crate::core::document::Sel;
     // Picked by the user: keep it. Otherwise it was worked out from the file (again now, so a newer Slate's
     // detection applies to tabs from an older one).
     if st.lang_picked {
@@ -956,7 +998,6 @@ fn restore_tab(app: &mut App, st: &session::SessionTab, there: Option<bool>) -> 
     }
     tab.view.sel = Sel::new(char_start(doc, st.anchor), char_start(doc, st.caret));
     tab.view.top = top;
-    Restored::Yes
 }
 
 /// `pos`, moved back to the start of the character it falls in (and to the `\r` of a `\r\n`).

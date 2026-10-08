@@ -36,7 +36,7 @@ use super::commands::*;
 use super::editor::{self, Ctx, DragMode, View};
 use super::findbar::{FindBar, Mode as BarMode, Part};
 use super::highlight::Lang;
-use super::session;
+use super::session::{self, RestoreJob, Restoring, SessionTab};
 use super::update::{self, Release, Version};
 use super::settings::{ThemeMode, data_dir};
 use super::win;
@@ -201,6 +201,11 @@ fn guarded(snap: &crate::core::buffer::Snapshot, f: impl FnOnce() -> TaskResult)
         );
     }
     r
+}
+
+/// A file's name, for messages.
+fn name_of(p: &Path) -> String {
+    p.file_name().map_or_else(|| p.display().to_string(), |n| n.to_string_lossy().into_owned())
 }
 
 /// Whether tab `t` has the file `p` (whose canonical form is `canon`) open. Its own path is canonicalized once
@@ -533,6 +538,11 @@ impl App {
 
     /// Re-reads tab `i` from disk (keeping the view where it was).
     pub fn reload(&mut self, i: usize, force: Option<Encoding>) {
+        // A tab from the session that isn't back yet: that's what to try again.
+        if self.tabs[i].restore.is_some() {
+            self.start_restore(i);
+            return;
+        }
         let Some(path) = self.tabs[i].doc.path.clone() else { return };
         let prev = self.tabs[i].doc.buffer().sources().iter().find(|s| s.file_path() == Some(path.as_path())).cloned();
         let at_end = self.tabs[i].view.sel.caret >= self.tabs[i].doc.len() && self.tabs[i].doc.len() > 0;
@@ -586,6 +596,254 @@ impl App {
         self.invalidate();
     }
 
+    // ---- tabs from the session that aren't back yet ----
+
+    /// A tab for a session entry that isn't back yet (session.rs, `Restoring`): a big document put back from its
+    /// pieces on another thread (`big`), or a file that doesn't answer yet (tried again now and then). Returns its
+    /// index.
+    pub fn add_restoring(&mut self, st: SessionTab, big: Option<session::BigList>) -> usize {
+        let mut doc = Document::new();
+        doc.path = st.path.clone();
+        doc.encoding = st.encoding;
+        doc.bom = st.bom;
+        doc.eol = st.eol;
+        doc.disk = session::disk_from(&st);
+        let i = self.add_tab(doc);
+        let tab = &mut self.tabs[i];
+        if st.untitled > 0 && st.path.is_none() {
+            tab.untitled = st.untitled;
+            self.untitled_counter = self.untitled_counter.max(st.untitled);
+        }
+        if st.lang_picked {
+            tab.lang = st.lang;
+            tab.lang_picked = true;
+        }
+        let waiting = big.is_none();
+        let tab = &mut self.tabs[i];
+        tab.restore = Some(Restoring::new(st, big));
+        if waiting {
+            self.wait_for_file(i, None);
+        } else {
+            self.start_restore(i);
+        }
+        i
+    }
+
+    /// Starts putting tab `i` back (a big document), or looking whether its file answers yet.
+    fn start_restore(&mut self, i: usize) {
+        let notify = self.notify.clone();
+        let Some(r) = self.tabs[i].restore.as_mut() else { return };
+        if r.running() {
+            return;
+        }
+        r.retry_at = None;
+        match (r.big.clone(), r.st.pieces.clone(), r.st.path.clone()) {
+            (Some(list), Some(name), _) => {
+                let total = list.total();
+                let job = Job::spawn(total, notify, move |ctx| session::restore_big(&name, &list, ctx));
+                r.job = Some(RestoreJob::Big(job));
+            }
+            (_, _, Some(path)) => {
+                r.job = Some(RestoreJob::Probe(Job::spawn(0, notify, move |_| session::probe(&path))));
+            }
+            _ => return,
+        }
+        self.timer(TIMER_JOBS, 100);
+    }
+
+    /// Tab `i`'s file doesn't answer (`why`, if known): look again later, and say so.
+    fn wait_for_file(&mut self, i: usize, why: Option<String>) {
+        let tab = &mut self.tabs[i];
+        let Some(r) = tab.restore.as_mut() else { return };
+        r.wait();
+        let name = r.st.path.as_deref().map(name_of).unwrap_or_else(|| "Its file".into());
+        // ("Another program is using the file." → " (another program is using the file)")
+        let why = why
+            .map(|w| {
+                let w = w.trim_end_matches('.');
+                let mut c = w.chars();
+                let first = c.next().map(|f| f.to_lowercase().collect::<String>()).unwrap_or_default();
+                format!(" ({first}{})", c.as_str())
+            })
+            .unwrap_or_default();
+        tab.notice = Some(if r.big.is_some() {
+            Notice {
+                kind: NoticeKind::Warn,
+                text: format!(
+                    "Unsaved changes from last time wait for {name}, which can't be read just now{why}. Slate puts \
+                     them back as soon as it can."
+                ),
+                actions: vec![
+                    ("Try now".into(), NoticeAction::Retry),
+                    ("Get the added text now".into(), NoticeAction::Recover),
+                ],
+            }
+        } else {
+            Notice {
+                kind: NoticeKind::Info,
+                text: format!("{name} doesn't answer (a network drive?). Slate opens it as soon as it does."),
+                actions: vec![("Try now".into(), NoticeAction::Retry)],
+            }
+        });
+        self.layout();
+    }
+
+    /// Looks again for files that didn't answer, when it's time (from `check_disk`).
+    fn retry_restores(&mut self) {
+        let now = Instant::now();
+        for i in 0..self.tabs.len() {
+            if self.tabs[i].restore.as_ref().is_some_and(|r| !r.running() && r.retry_at.is_some_and(|at| now >= at)) {
+                self.start_restore(i);
+            }
+        }
+    }
+
+    /// Takes a finished restore or look of tab `i`; returns whether one is still running.
+    fn poll_restore(&mut self, i: usize) -> bool {
+        let Some(r) = self.tabs[i].restore.as_mut() else { return false };
+        match r.job.as_mut() {
+            Some(RestoreJob::Big(job)) => match job.take() {
+                None => true,
+                Some(back) => {
+                    r.job = None;
+                    self.finish_restore(i, back);
+                    false
+                }
+            },
+            Some(RestoreJob::Probe(job)) => match job.take() {
+                None => true,
+                Some(answer) => {
+                    r.job = None;
+                    self.finish_probe(i, answer);
+                    false
+                }
+            },
+            None => false,
+        }
+    }
+
+    /// A big document's tab, put back (or not) from its pieces.
+    fn finish_restore(&mut self, i: usize, back: session::Restored) {
+        let Some(r) = self.tabs[i].restore.as_ref() else { return };
+        let st = r.st.clone();
+        let name = st.pieces.clone().unwrap_or_default();
+        let file = st.path.as_deref().map(name_of).unwrap_or_else(|| self.tabs[i].title());
+        match back {
+            session::Restored::Ready { mut doc, data, data_len } => {
+                doc.path = st.path.clone();
+                doc.encoding = st.encoding;
+                doc.bom = st.bom;
+                doc.eol = st.eol;
+                doc.disk = session::disk_from(&st);
+                doc.mark_dirty();
+                let tab = &mut self.tabs[i];
+                tab.big = Some(session::BigBackup::restored(name, data.as_ref(), data_len, doc.version));
+                tab.restore = None;
+                tab.notice = None;
+                tab.doc = doc;
+                tab.backup_version = u64::MAX;
+                tab.view.forget_text();
+                let head = tab.doc.read(0, 4096);
+                tab.lang = Lang::detect(st.path.as_ref().and_then(|p| p.file_name()).and_then(|n| n.to_str()), &head);
+                self.detect_indent(i);
+                super::place_tab(&mut self.tabs[i], &st);
+            }
+            session::Restored::Recovered { doc, why, there } => self.recovered(i, &name, &file, doc, &why, there),
+            session::Restored::Unreachable(why) => self.wait_for_file(i, Some(why)),
+            session::Restored::Damaged(why) => {
+                // Kept for a look, never deleted; the file as it is in this tab.
+                let kept = session::set_aside_big(&name);
+                self.tabs[i].restore = None;
+                self.reopen_as_it_is(i);
+                self.tabs[i].notice = Some(Notice {
+                    kind: NoticeKind::Error,
+                    text: format!(
+                        "Unsaved changes to {file} from last time couldn't be read back ({why}). Slate kept them in \
+                         {}.",
+                        kept.display()
+                    ),
+                    actions: vec![("Dismiss".into(), NoticeAction::Dismiss)],
+                });
+                self.layout();
+            }
+        }
+        self.session_dirty = true;
+        self.update_title();
+        self.invalidate();
+    }
+
+    /// A big document's changes can't be laid over its file any more (`why`): tab `i` becomes the text that was
+    /// added to it, on its own (the session's copy goes into `damaged\`), and the file, if it's `there`, opens in a
+    /// tab as it is now.
+    fn recovered(&mut self, i: usize, name: &str, file: &str, mut doc: Document, why: &str, there: bool) {
+        let kept = session::set_aside_big(name);
+        let path = self.tabs[i].restore.take().and_then(|r| r.st.path);
+        let added = !doc.is_empty();
+        doc.mark_dirty();
+        let tab = &mut self.tabs[i];
+        tab.doc = doc;
+        tab.big = None;
+        tab.view.forget_text();
+        tab.view.sel = Sel::at(0);
+        tab.view.top = 0;
+        let used: Vec<u32> = self.tabs.iter().filter(|t| t.doc.path.is_none()).map(|t| t.untitled).collect();
+        let tab = &mut self.tabs[i];
+        tab.untitled = (1..).find(|n| !used.contains(n)).unwrap_or(1);
+        tab.notice = Some(Notice {
+            kind: NoticeKind::Warn,
+            text: if added {
+                format!(
+                    "Unsaved changes to {file} from last time couldn't be put back: {why}. This is the text that was \
+                     added to it, each part with where it was; Slate also kept its copy of the changes in {}.",
+                    kept.display()
+                )
+            } else {
+                format!(
+                    "Unsaved changes to {file} from last time couldn't be put back: {why}. Slate kept them in {}.",
+                    kept.display()
+                )
+            },
+            actions: vec![("Dismiss".into(), NoticeAction::Dismiss)],
+        });
+        self.layout();
+        // (and the file as it is now, if it's there)
+        if let Some(p) = path.filter(|_| there) {
+            let id = self.tabs[i].id;
+            self.open_paths(&[p]);
+            if let Some(k) = self.tabs.iter().position(|t| t.id == id) {
+                self.activate(k);
+            }
+        }
+    }
+
+    /// A waiting tab's file answered: open it there (or say it's gone).
+    fn finish_probe(&mut self, i: usize, answer: Option<bool>) {
+        match answer {
+            Some(true) => {
+                let Some(r) = self.tabs[i].restore.take() else { return };
+                self.tabs[i].notice = None;
+                self.reopen_as_it_is(i);
+                super::place_tab(&mut self.tabs[i], &r.st);
+            }
+            Some(false) => {
+                let name = self.tabs[i].title();
+                self.tabs[i].restore = None;
+                self.remove_tab(i);
+                self.flash(format!("{name} isn't there any more."), true);
+            }
+            None => self.wait_for_file(i, None),
+        }
+        self.session_dirty = true;
+        self.invalidate();
+    }
+
+    /// Opens tab `i`'s file into it, as it is on disk (a tab that was waiting for it), or leaves the tab empty.
+    fn reopen_as_it_is(&mut self, i: usize) {
+        if self.tabs[i].doc.path.is_some() {
+            self.reload(i, None);
+        }
+    }
+
     /// Starts saving tab `i`. Returns false if it can't be saved now.
     pub fn start_save(&mut self, i: usize, path: PathBuf, encoding: Encoding, close_after: bool) -> bool {
         self.start_save_lossy(i, path, encoding, close_after, false)
@@ -613,7 +871,7 @@ impl App {
             self.flash("Still saving — try again when it's done.", true);
             return false;
         }
-        if !tab.doc.is_ready() || tab.load_job.is_some() {
+        if !tab.doc.is_ready() || tab.load_job.is_some() || tab.restore.is_some() {
             self.flash("Still opening the file — try saving again in a moment.", true);
             return false;
         }
@@ -634,12 +892,14 @@ impl App {
     /// network drive that went away can take half a minute to answer, which mustn't freeze the window);
     /// `poll_disk` acts on what it finds.
     pub fn check_disk(&mut self) {
+        // (and tabs from the session whose files didn't answer: look again when it's time)
+        self.retry_restores();
         if self.disk_job.is_some() {
             return; // the last look hasn't finished (a slow drive): the next one waits for it
         }
         let mut asks = Vec::new();
         for tab in &self.tabs {
-            if tab.save.is_some() || tab.load_job.is_some() || tab.task.is_some() {
+            if tab.busy() {
                 continue;
             }
             let (Some(path), Some(old)) = (tab.doc.path.clone(), tab.doc.disk) else { continue };
@@ -651,12 +911,11 @@ impl App {
             return;
         }
         self.disk_job = Some(Job::spawn(0, self.notify.clone(), move |_| {
+            // (a file that doesn't answer just now says nothing: it isn't taken for one that was deleted)
             asks.into_iter()
-                .map(|(id, path, old, sources)| DiskCheck {
-                    id,
-                    old,
-                    now: fileio::disk_info(&path),
-                    in_place: sources.iter().any(|s| s.changed_in_place()),
+                .filter_map(|(id, path, old, sources)| {
+                    let now = fileio::disk_answer(&path)?;
+                    Some(DiskCheck { id, old, now, in_place: sources.iter().any(|s| s.changed_in_place()) })
                 })
                 .collect()
         }));
@@ -671,7 +930,7 @@ impl App {
             let Some(i) = self.tabs.iter().position(|t| t.id == c.id) else { continue };
             let tab = &self.tabs[i];
             // Saved, reloaded or busy since the look started: the next look is what counts.
-            if tab.doc.disk != Some(c.old) || tab.save.is_some() || tab.load_job.is_some() || tab.task.is_some() {
+            if tab.doc.disk != Some(c.old) || tab.busy() {
                 continue;
             }
             if (c.now == Some(c.old) && !c.in_place) || tab.seen_disk == Some(c.now) {
@@ -881,6 +1140,12 @@ impl App {
     /// Handles finished jobs of tab `i`; returns whether any job is still running.
     fn poll_tab(&mut self, i: usize) -> bool {
         let mut running = false;
+        // A tab from the session being put back, or looking whether its file answers (it may close).
+        let id = self.tabs[i].id;
+        running |= self.poll_restore(i);
+        if self.tabs.get(i).map(|t| t.id) != Some(id) {
+            return running;
+        }
         // Loading (conversion of a big UTF-16 / ANSI file).
         if let Some(job) = self.tabs[i].load_job.as_mut() {
             if let Some(r) = job.take() {
@@ -1344,7 +1609,9 @@ impl App {
     /// Whether the active document can be edited right now (tells the user why not).
     pub fn editable(&mut self) -> bool {
         let tab = self.tab();
-        let why = if tab.load_job.is_some() {
+        let why = if tab.restore.is_some() {
+            Some("This tab from last time isn't back yet (see the note above the text).")
+        } else if tab.load_job.is_some() {
             Some("Still opening the file…")
         } else if !tab.doc.is_ready() && tab.doc.index_error().is_some() {
             Some("Part of this file couldn't be read, so it can't be edited. Reload it to try again.")
@@ -2643,6 +2910,22 @@ impl App {
             }
             NoticeAction::GoTo(off) => self.go_to(off, true),
             NoticeAction::Dismiss => self.tab_mut().notice = None,
+            NoticeAction::Retry => {
+                let i = self.active;
+                self.start_restore(i);
+            }
+            NoticeAction::Recover => {
+                let i = self.active;
+                let Some(r) = self.tabs[i].restore.as_ref() else { return };
+                if r.running() {
+                    // (a look that's still going: when it ends, its answer counts)
+                    self.flash("Still looking for the file — try again in a moment.", false);
+                    return;
+                }
+                let (Some(list), Some(name)) = (r.big.clone(), r.st.pieces.clone()) else { return };
+                let back = session::recover_big(&name, &list);
+                self.finish_restore(i, back);
+            }
         }
         self.layout();
         self.invalidate();
@@ -3960,12 +4243,25 @@ pub fn save_tab(cell: &Cell, i: usize, ask_name: bool, close_after: bool) -> boo
 
 /// Closes tab `i`, asking about unsaved changes. Returns false if the user cancelled.
 pub fn close_tab(cell: &Cell, i: usize) -> bool {
-    let (id, dirty, saving_same, title, hwnd) = {
+    let (id, dirty, saving_same, title, hwnd, waiting) = {
         let a = cell.borrow();
         let Some(t) = a.tabs.get(i) else { return true };
         let dirty = t.doc.is_dirty() && !(t.doc.is_empty() && t.doc.path.is_none());
-        (t.id, dirty, t.save.as_ref().is_some_and(|s| s.version == t.doc.version), t.title(), a.hwnd)
+        let waiting = t.restore.as_ref().is_some_and(|r| r.big.is_some());
+        (t.id, dirty, t.save.as_ref().is_some_and(|s| s.version == t.doc.version), t.title(), a.hwnd, waiting)
     };
+    if waiting {
+        // Unsaved changes from last time that aren't back yet: closing loses them.
+        let q = format!("Close {title} and lose its unsaved changes from last time?");
+        let detail = "They aren't back yet: Slate is putting them back, or waiting for the file to answer.";
+        if win::ask(hwnd, "Slate", &q, detail, &["&Close and lose them", "Cancel"]) != Some(0) {
+            return false;
+        }
+        if let Some(i) = tab_index(cell, id) {
+            cell.borrow_mut().remove_tab(i);
+        }
+        return true;
+    }
     if saving_same {
         // Being saved, nothing changed since: close once that's done.
         let mut a = cell.borrow_mut();
@@ -4021,7 +4317,8 @@ pub fn close_window(cell: &Cell) {
         } else if !session_ok {
             "Slate couldn't keep unsaved changes for next time (the settings folder can't be written)."
         } else {
-            "This file is too big to keep unsaved changes for next time."
+            "Slate can't keep these changes for next time: they come from Format, Replace all or a conversion of a big \
+             file, which Slate doesn't copy."
         };
         let q = format!("Do you want to save changes to {title}?");
         let choice = win::ask(hwnd, "Slate", &q, detail, &["&Save", "Do&n't save", "Cancel"]);
