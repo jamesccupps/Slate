@@ -19,20 +19,21 @@ fn main() {
     println!("cargo:rerun-if-changed=res/slate.ico");
     println!("cargo:rerun-if-changed=Cargo.toml");
     // The commit it's built from (crash reports, About): empty outside a git checkout.
-    let commit = std::process::Command::new("git")
-        .args(["rev-parse", "--short=7", "HEAD"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default();
-    println!("cargo:rustc-env=SLATE_COMMIT={commit}");
-    if let Ok(head) = fs::read_to_string(".git/HEAD") {
-        println!("cargo:rerun-if-changed=.git/HEAD");
-        if let Some(r) = head.trim().strip_prefix("ref: ") {
-            if std::path::Path::new(".git").join(r).exists() {
-                println!("cargo:rerun-if-changed=.git/{r}");
-            }
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    };
+    println!("cargo:rustc-env=SLATE_COMMIT={}", git(&["rev-parse", "--short=7", "HEAD"]).unwrap_or_default());
+    // Built again when HEAD moves (also in a worktree, and when the branch is in packed-refs).
+    let branch = git(&["rev-parse", "--symbolic-full-name", "HEAD"]).filter(|r| r.starts_with("refs/"));
+    let watched = [Some("HEAD".to_string()), branch, Some("packed-refs".to_string())];
+    for p in watched.iter().flatten().filter_map(|p| git(&["rev-parse", "--git-path", p])) {
+        if std::path::Path::new(&p).exists() {
+            println!("cargo:rerun-if-changed={p}");
         }
     }
 

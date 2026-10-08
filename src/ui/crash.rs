@@ -5,9 +5,9 @@
 
 use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 
-use windows::Win32::Foundation::HANDLE;
+use windows::Win32::Foundation::{BOOL, HANDLE};
 use windows::Win32::System::Diagnostics::Debug::{
-    EXCEPTION_POINTERS, MINIDUMP_EXCEPTION_INFORMATION, MiniDumpWithThreadInfo, MiniDumpWriteDump,
+    EXCEPTION_POINTERS, MINIDUMP_EXCEPTION_INFORMATION, MINIDUMP_TYPE, MiniDumpWithThreadInfo,
     SetUnhandledExceptionFilter,
 };
 use windows::Win32::System::Threading::{
@@ -45,8 +45,11 @@ pub fn install() {
         DONE.store(done.0, Ordering::SeqCst);
         let spawned = std::thread::Builder::new().name("slate-crash".into()).spawn(move || {
             let (go, done) = (HANDLE(GO.load(Ordering::SeqCst)), HANDLE(DONE.load(Ordering::SeqCst)));
+            // Loaded now, on this thread: a crash may hold the loader's lock, and Slate.exe doesn't import dbghelp
+            // (Windows would look for it next to the exe first, e.g. in Downloads).
+            let dump = dump_function();
             WaitForSingleObject(go, INFINITE);
-            write_dump(INFO.load(Ordering::SeqCst), THREAD.load(Ordering::SeqCst));
+            write_dump(dump, INFO.load(Ordering::SeqCst), THREAD.load(Ordering::SeqCst));
             let _ = SetEvent(done);
         });
         if spawned.is_ok() {
@@ -70,7 +73,28 @@ unsafe extern "system" fn on_crash(info: *const EXCEPTION_POINTERS) -> i32 {
     0
 }
 
-fn write_dump(info: *mut EXCEPTION_POINTERS, thread: u32) {
+type DumpFn = unsafe extern "system" fn(
+    HANDLE,
+    u32,
+    HANDLE,
+    MINIDUMP_TYPE,
+    *const MINIDUMP_EXCEPTION_INFORMATION,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+) -> BOOL;
+
+/// dbghelp's MiniDumpWriteDump, from System32 only.
+fn dump_function() -> Option<DumpFn> {
+    use windows::Win32::System::LibraryLoader::{GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW};
+    use windows::core::{s, w};
+    unsafe {
+        let module = LoadLibraryExW(w!("dbghelp.dll"), None, LOAD_LIBRARY_SEARCH_SYSTEM32).ok()?;
+        let f = GetProcAddress(module, s!("MiniDumpWriteDump"))?;
+        Some(std::mem::transmute::<unsafe extern "system" fn() -> isize, DumpFn>(f))
+    }
+}
+
+fn write_dump(dump: Option<DumpFn>, info: *mut EXCEPTION_POINTERS, thread: u32) {
     let dir = data_dir();
     let _ = std::fs::create_dir_all(&dir);
     let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
@@ -80,21 +104,24 @@ fn write_dump(info: *mut EXCEPTION_POINTERS, thread: u32) {
             .and_then(|i| i.ExceptionRecord.as_ref())
             .map_or((0, std::ptr::null_mut()), |r| (r.ExceptionCode.0 as u32, r.ExceptionAddress))
     };
-    let written = std::fs::File::create(dir.join(&name)).is_ok_and(|f| {
-        use std::os::windows::io::AsRawHandle;
-        let ex = MINIDUMP_EXCEPTION_INFORMATION { ThreadId: thread, ExceptionPointers: info, ClientPointers: false.into() };
-        unsafe {
-            MiniDumpWriteDump(
-                GetCurrentProcess(),
-                GetCurrentProcessId(),
-                HANDLE(f.as_raw_handle()),
-                MiniDumpWithThreadInfo,
-                (!info.is_null()).then_some(&ex as *const _),
-                None,
-                None,
-            )
-        }
-        .is_ok()
+    let written = dump.is_some_and(|dump| {
+        std::fs::File::create(dir.join(&name)).is_ok_and(|f| {
+            use std::os::windows::io::AsRawHandle;
+            let ex = MINIDUMP_EXCEPTION_INFORMATION { ThreadId: thread, ExceptionPointers: info, ClientPointers: false.into() };
+            let ex_ptr = if info.is_null() { std::ptr::null() } else { &ex as *const _ };
+            unsafe {
+                dump(
+                    GetCurrentProcess(),
+                    GetCurrentProcessId(),
+                    HANDLE(f.as_raw_handle()),
+                    MiniDumpWithThreadInfo,
+                    ex_ptr,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            }
+            .as_bool()
+        })
     });
     if !written {
         let _ = std::fs::remove_file(dir.join(&name));
