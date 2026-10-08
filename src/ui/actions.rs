@@ -321,7 +321,7 @@ impl App {
         let id = self.new_tab_id();
         let mut tab = Tab::new(id, doc);
         let head = tab.doc.read(0, 4096);
-        let name = tab.doc.path.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned());
+        let name = tab.doc.path.as_ref().map(|p| p.to_string_lossy().into_owned());
         tab.lang = Lang::detect(name.as_deref(), &head);
         if tab.doc.path.is_none() {
             let used: Vec<u32> = self.tabs.iter().filter(|t| t.doc.path.is_none()).map(|t| t.untitled).collect();
@@ -833,7 +833,7 @@ impl App {
                             tab.backup_version = u64::MAX;
                             tab.view.forget_text();
                             let head = tab.doc.read(0, 4096);
-                            let name = tab.doc.path.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned());
+                            let name = tab.doc.path.as_ref().map(|p| p.to_string_lossy().into_owned());
                             tab.lang = Lang::detect(name.as_deref(), &head);
                             self.detect_indent(i);
                         }
@@ -963,7 +963,7 @@ impl App {
                 }
                 if renamed {
                     let head = tab.doc.read(0, 4096);
-                    let name = st.path.file_name().map(|n| n.to_string_lossy().into_owned());
+                    let name = Some(st.path.to_string_lossy().into_owned());
                     tab.lang = Lang::detect(name.as_deref(), &head);
                     tab.lang_picked = false;
                 }

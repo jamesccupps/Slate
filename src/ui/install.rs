@@ -21,15 +21,18 @@ const EXTENSIONS: &[&str] = &[
     // text, data and config
     ".txt", ".log", ".json", ".jsonl", ".ndjson", ".geojson", ".md", ".markdown", ".csv", ".tsv", ".xml", ".ini",
     ".cfg", ".conf", ".config", ".yaml", ".yml", ".toml", ".properties", ".env", ".nfo", ".diz", ".out", ".srt",
-    ".sql", ".reg", ".inf", ".editorconfig", ".gitignore", ".gitattributes", ".diff", ".patch",
+    ".vtt", ".ics", ".vcf", ".sql", ".reg", ".inf", ".editorconfig", ".gitignore", ".gitattributes", ".npmrc",
+    ".htaccess", ".diff", ".patch", ".j2", ".jinja",
     // scripts
-    ".ps1", ".psm1", ".psd1", ".bat", ".cmd", ".sh", ".bash", ".py", ".pyw", ".rb", ".lua", ".pl", ".vbs",
+    ".ps1", ".psm1", ".psd1", ".bat", ".cmd", ".sh", ".bash", ".py", ".pyw", ".rb", ".lua", ".pl", ".pm", ".vbs",
+    ".vba", ".bas", ".cls", ".ahk", ".ah2", ".r",
     // web
     ".html", ".htm", ".xhtml", ".css", ".scss", ".less", ".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx", ".vue",
     ".svg", ".php",
     // code and project files
     ".c", ".h", ".cpp", ".hpp", ".cc", ".cxx", ".ino", ".cs", ".csproj", ".sln", ".props", ".targets", ".xaml",
-    ".resx", ".java", ".kt", ".kts", ".gradle", ".swift", ".go", ".rs", ".dart",
+    ".resx", ".java", ".kt", ".kts", ".gradle", ".groovy", ".swift", ".go", ".rs", ".dart", ".vb", ".tf",
+    ".tfvars", ".hcl", ".cmake",
 ];
 
 fn set(path: &str, name: Option<&str>, value: &str) -> bool {

@@ -24,12 +24,29 @@ const REGEX: u8 = 9;
 /// A shell or Ruby heredoc's lines (`<<EOF` … `EOF`); `a`: 1 if the end line may be indented, +2 while the line
 /// that starts it isn't over yet, and bits 2..7 with `b` hold a hash of the end word.
 const HEREDOC: u8 = 10;
+/// Perl documentation, `=head1` … `=cut`.
+const POD: u8 = 11;
+/// Perl: everything after `__END__` / `__DATA__`.
+const DATA: u8 = 12;
+/// Perl's `q(…)`, `qw[…]`, `m{…}`, `s/…/…/`, `tr/…/…/`…; `a`: the closing delimiter (0 between the two parts of
+/// `s{…}{…}`), `b`: the nesting depth of bracket delimiters (bits 0-5), another part to come (bit 6), an escape
+/// pending (bit 7), and the lines so far (bits 8-15).
+const QUOTE_LIKE: u8 = 13;
+/// A C++ raw string `R"delim(…)delim"`; `a` and `b` hold a hash of `delim` (as for heredocs).
+const CPP_RAW: u8 = 14;
+/// An interpolated string on one line (C# `$"…{x}…"`, HCL `"…${x}…"`); `a`: bit 0 an escape pending, bit 1 inside
+/// a `{…}` hole, bit 2 inside a string in the hole, bit 3 an escape pending there; `b`: the hole's brace depth.
+const INTERP: u8 = 15;
 
 /// In `STR`'s `a`: a single quote with backslash escapes (shell `$'…'`, SQL `E'…'`).
 const ESC_QUOTE: u8 = 0x80 | b'\'';
 /// In SQL's `State::mode`: the text is MySQL's (`\` escapes in strings, `#` comments), as seen from a backtick,
 /// a `/*!` comment or a comment that names it.
 const MYSQL: u8 = 1;
+/// In AutoHotkey's `State::mode`: the script is for version 2 (`#Requires AutoHotkey v2`), where `'` quotes too.
+const AHK_V2: u8 = 1;
+/// A Perl quote-like construct gives up after this many lines (a misread `s` or `y` mustn't color the whole file).
+const MAX_QUOTE_LINES: u8 = 200;
 /// A string that may span lines in a language where a stray quote is easily mistaken for one (shell, SQL...) ends
 /// at a blank line or after this many lines, so a wrong guess can't recolor the rest of the file.
 const MAX_STR_LINES: u16 = 40;
@@ -37,6 +54,7 @@ const MAX_STR_LINES: u16 = 40;
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Flavor {
     Plain,
+    Cpp,
     Rust,
     CSharp,
     Lua,
@@ -46,6 +64,12 @@ pub(super) enum Flavor {
     Shell,
     Ruby,
     Php,
+    Vb,
+    Ahk,
+    Perl,
+    R,
+    Hcl,
+    CMake,
 }
 
 pub(super) struct Syntax {
@@ -83,6 +107,8 @@ pub(super) struct Syntax {
     resync: bool,
     /// `/regex/` literals (JavaScript).
     regex: bool,
+    /// `'` between digits separates them (`1'000'000` in C and C++).
+    digit_sep: bool,
 }
 
 const BASE: Syntax = Syntax {
@@ -110,6 +136,7 @@ const BASE: Syntax = Syntax {
     calls: true,
     resync: false,
     regex: false,
+    digit_sep: false,
 };
 
 static PLAIN: Syntax = BASE;
@@ -129,10 +156,12 @@ static C: Syntax = Syntax {
     ],
     lits: &["NULL", "false", "nullptr", "true"],
     preproc: true,
+    digit_sep: true,
     ..BASE
 };
 
 static CPP: Syntax = Syntax {
+    flavor: Flavor::Cpp,
     kw: &[
         "alignas", "alignof", "auto", "class", "concept", "const", "const_cast", "consteval", "constexpr", "constinit",
         "decltype", "delete", "dynamic_cast", "enum", "explicit", "export", "extern", "final", "friend", "inline",
@@ -152,6 +181,7 @@ static CPP: Syntax = Syntax {
     ],
     lits: &["NULL", "false", "nullptr", "true"],
     preproc: true,
+    digit_sep: true,
     ..BASE
 };
 
@@ -482,6 +512,137 @@ static DOCKERFILE: Syntax = Syntax {
     ..SHELL
 };
 
+/// VBScript, VBA and Visual Basic: `'` and `Rem` comments, `""` inside strings, `&HFF`, `#1/2/2026#`.
+static VB: Syntax = Syntax {
+    flavor: Flavor::Vb,
+    line: &[b"'"],
+    block: None,
+    quotes: b"\"",
+    esc: 0,
+    nocase: true,
+    kw: &[
+        "addhandler", "addressof", "alias", "and", "andalso", "as", "byref", "byval", "class", "const", "declare",
+        "delegate", "dim", "enum", "erase", "event", "explicit", "friend", "function", "get", "global", "handles",
+        "implements", "imports", "inherits", "interface", "is", "isnot", "let", "lib", "like", "mod", "module",
+        "mustinherit", "mustoverride", "namespace", "new", "not", "of", "option", "optional", "or", "orelse",
+        "overloads", "overridable", "overrides", "paramarray", "preserve", "private", "property", "protected",
+        "ptrsafe", "public", "raiseevent", "readonly", "redim", "removehandler", "set", "shadows", "shared", "static",
+        "structure", "sub", "type", "typeof", "withevents", "writeonly", "xor",
+    ],
+    ctl: &[
+        "call", "case", "catch", "continue", "do", "each", "else", "elseif", "end", "exit", "finally", "for", "goto",
+        "if", "in", "loop", "next", "on", "resume", "return", "select", "step", "stop", "then", "throw", "to", "try",
+        "until", "wend", "when", "while", "with",
+    ],
+    types: &[
+        "boolean", "byte", "char", "currency", "date", "decimal", "double", "integer", "long", "longlong", "longptr",
+        "object", "sbyte", "short", "single", "string", "uinteger", "ulong", "ushort", "variant",
+    ],
+    lits: &["empty", "false", "nothing", "null", "true"],
+    vars: &["me", "mybase", "myclass"],
+    // #If, #Const, #Region
+    preproc: true,
+    ..BASE
+};
+
+/// AutoHotkey v1 and v2: `;` comments after a space, `/* */` from a line's start, backtick escapes, hotkeys and
+/// hotstrings (`^!s::`, `::btw::by the way`), `%var%`.
+static AHK: Syntax = Syntax {
+    flavor: Flavor::Ahk,
+    line: &[b";"],
+    quotes: b"\"",
+    esc: b'`',
+    nocase: true,
+    kw: &["and", "class", "extends", "global", "in", "is", "local", "new", "not", "or", "static", "super", "this"],
+    ctl: &[
+        "break", "case", "catch", "continue", "default", "else", "finally", "for", "gosub", "goto", "if", "loop",
+        "return", "switch", "throw", "try", "until", "while",
+    ],
+    lits: &["false", "true", "unset"],
+    // #Requires, #Include, #SingleInstance
+    preproc: true,
+    ..BASE
+};
+
+static PERL: Syntax = Syntax {
+    flavor: Flavor::Perl,
+    line: &[b"#"],
+    block: None,
+    quotes: b"\"'`",
+    multi: b"\"'`",
+    kw: &[
+        "and", "bless", "chomp", "chop", "close", "cmp", "defined", "delete", "die", "each", "eq", "eval", "exists",
+        "ge", "gt", "keys", "le", "local", "lt", "my", "ne", "no", "not", "open", "or", "our", "package", "pop", "print",
+        "printf", "push", "ref", "require", "say", "scalar", "shift", "sort", "splice", "split", "sprintf", "state",
+        "sub", "unshift", "use", "values", "wantarray", "warn", "xor",
+    ],
+    ctl: &[
+        "default", "do", "else", "elsif", "for", "foreach", "given", "goto", "if", "last", "next", "redo", "return",
+        "unless", "until", "when", "while",
+    ],
+    lits: &["__DATA__", "__END__", "__FILE__", "__LINE__", "__PACKAGE__", "__SUB__", "undef"],
+    sigils: b"$@%",
+    resync: true,
+    regex: true,
+    ..BASE
+};
+
+static R: Syntax = Syntax {
+    flavor: Flavor::R,
+    line: &[b"#"],
+    block: None,
+    // (`backtick names` are colored like strings)
+    quotes: b"\"'`",
+    multi: b"\"'",
+    kw: &["function", "in"],
+    ctl: &["break", "else", "for", "if", "next", "repeat", "return", "while"],
+    lits: &["F", "FALSE", "Inf", "NA", "NA_character_", "NA_complex_", "NA_integer_", "NA_real_", "NULL", "NaN", "T", "TRUE"],
+    resync: true,
+    ..BASE
+};
+
+/// Terraform and other HCL: `#`, `//` and `/* */` comments, `"…${x}…"`, heredocs, `name = value`.
+static HCL: Syntax = Syntax {
+    flavor: Flavor::Hcl,
+    line: &[b"#", b"//"],
+    quotes: b"\"",
+    kw: &[
+        "check", "data", "dynamic", "import", "locals", "module", "moved", "output", "provider", "removed", "resource",
+        "terraform", "variable",
+    ],
+    ctl: &["else", "endfor", "endif", "for", "if", "in"],
+    types: &["any", "bool", "list", "map", "number", "object", "set", "string", "tuple"],
+    lits: &["false", "null", "true"],
+    vars: &["count", "each", "local", "path", "self", "var"],
+    ..BASE
+};
+
+/// CMake: commands (in any case) with their arguments, `#[[bracket comments]]`, `[[bracket arguments]]`, `${VAR}`,
+/// `$<generator:expressions>`; the uppercase keywords are colored as written.
+static CMAKE: Syntax = Syntax {
+    flavor: Flavor::CMake,
+    line: &[b"#"],
+    block: None,
+    quotes: b"\"",
+    multi: b"\"",
+    kw: &[
+        "AND", "APPEND", "BOOL", "CACHE", "COMMAND", "COMPONENTS", "CONFIGURE_DEPENDS", "DEFINED", "DEPENDS",
+        "DESTINATION", "DIRECTORY", "EQUAL", "EXISTS", "FATAL_ERROR", "FILES", "FORCE", "GLOB", "GLOB_RECURSE",
+        "GREATER", "INTERFACE", "IN_LIST", "LESS", "MATCHES", "NAMES", "NOT", "OPTIONAL", "OR", "OUTPUT",
+        "PARENT_SCOPE", "PATH", "PATHS", "PRIVATE", "PROPERTIES", "PUBLIC", "QUIET", "REQUIRED", "SEND_ERROR",
+        "SOURCES", "STATUS", "STREQUAL", "STRING", "TARGET", "TARGETS", "TYPE", "VERSION", "VERSION_GREATER",
+        "VERSION_LESS", "WARNING", "WORKING_DIRECTORY",
+    ],
+    ctl: &[
+        "block", "break", "continue", "else", "elseif", "endblock", "endforeach", "endfunction", "endif", "endmacro",
+        "endwhile", "foreach", "function", "if", "macro", "return", "while",
+    ],
+    lits: &["FALSE", "NO", "OFF", "ON", "TRUE", "YES"],
+    sigils: b"$",
+    resync: true,
+    ..BASE
+};
+
 pub(super) fn syntax(lang: Lang) -> &'static Syntax {
     match lang {
         Lang::C => &C,
@@ -503,6 +664,12 @@ pub(super) fn syntax(lang: Lang) -> &'static Syntax {
         Lang::Batch => &BATCH,
         Lang::Shell => &SHELL,
         Lang::Dockerfile => &DOCKERFILE,
+        Lang::Vb => &VB,
+        Lang::AutoHotkey => &AHK,
+        Lang::Perl => &PERL,
+        Lang::R => &R,
+        Lang::Hcl => &HCL,
+        Lang::CMake => &CMAKE,
         _ => &PLAIN,
     }
 }
@@ -520,11 +687,12 @@ const PS_OPS: [&[u8]; 36] = [
 ];
 
 fn ident_start(sx: &Syntax, c: u8) -> bool {
-    c.is_ascii_alphabetic() || c == b'_' || c >= 0x80 || (sx.dollar_ident && c == b'$')
+    c.is_ascii_alphabetic() || c == b'_' || c >= 0x80 || (sx.dollar_ident && c == b'$') || (sx.flavor == Flavor::R && c == b'.')
 }
 
+/// (R names may hold dots: `is.na`, `data.frame`.)
 fn ident_char(sx: &Syntax, c: u8) -> bool {
-    c.is_ascii_alphanumeric() || c == b'_' || c >= 0x80 || (sx.dollar_ident && c == b'$')
+    c.is_ascii_alphanumeric() || c == b'_' || c >= 0x80 || (sx.dollar_ident && c == b'$') || (sx.flavor == Flavor::R && c == b'.')
 }
 
 fn ident_end(sx: &Syntax, t: &[u8], mut i: usize) -> usize {
@@ -572,18 +740,21 @@ fn word_tok(sx: &Syntax, w: &[u8]) -> Option<Tok> {
     }
 }
 
-fn number_end(t: &[u8], i: usize) -> usize {
+fn number_end(sx: &Syntax, t: &[u8], i: usize) -> usize {
     let hex = t[i] == b'0' && matches!(at(t, i + 1), b'x' | b'X');
     let mut j = i + 1;
     while j < t.len() {
         let b = t[j];
-        if b.is_ascii_alphanumeric() || b == b'_' || (b == b'.' && at(t, j + 1).is_ascii_digit()) {
-            j += 1;
-        } else if matches!(b, b'+' | b'-') && !hex && matches!(t[j - 1], b'e' | b'E') {
-            j += 1;
-        } else {
+        let more = b.is_ascii_alphanumeric()
+            || b == b'_'
+            || (b == b'.' && at(t, j + 1).is_ascii_digit())
+            || (matches!(b, b'+' | b'-') && !hex && matches!(t[j - 1], b'e' | b'E'))
+            // 1'000'000, 0xFF'FF
+            || (b == b'\'' && sx.digit_sep && t[j - 1].is_ascii_alphanumeric() && at(t, j + 1).is_ascii_alphanumeric());
+        if !more {
             break;
         }
+        j += 1;
     }
     j
 }
@@ -849,6 +1020,196 @@ fn long_rest(t: &[u8], s: usize, mut i: usize, level: u8, comment: bool, st: Sta
     Err(State { kind: LONG, a: level, b: comment as u16, ..st })
 }
 
+/// Perl's POD documentation from `i` up to and including its `=cut` line; `line_start`: whether `i` starts a line.
+fn pod_rest(t: &[u8], mut i: usize, mut line_start: bool, st: State, o: &mut Out) -> Step {
+    loop {
+        let e = line_end(t, i);
+        o.put(i, e, Tok::Comment);
+        if line_start && t[i..e].starts_with(b"=cut") && matches!(at(t, i + 4), b' ' | b'\t' | b'\r' | b'\n' | 0) {
+            return Ok(e);
+        }
+        if e >= t.len() {
+            break;
+        }
+        i = e + 1;
+        line_start = true;
+    }
+    Err(State { kind: POD, a: 0, b: 0, ..st })
+}
+
+/// The closing delimiter for an opening one (brackets pair up; anything else closes itself).
+fn closing(open: u8) -> u8 {
+    match open {
+        b'(' => b')',
+        b'[' => b']',
+        b'{' => b'}',
+        b'<' => b'>',
+        c => c,
+    }
+}
+
+/// A Perl quote-like operator at `i` (`q`, `qq`, `qw`, `qr`, `qx`, `m`, `s`, `tr`, `y` right before its delimiter):
+/// where its body starts, the closing delimiter, and whether it has two parts (`s/a/b/`).
+fn perl_quote_open(t: &[u8], i: usize) -> Option<(usize, u8, bool)> {
+    if i > 0 && (t[i - 1].is_ascii_alphanumeric() || matches!(t[i - 1], b'_' | b'$' | b'@' | b'%' | b'&' | b'*' | b'-' | b'>' | b':')) {
+        return None;
+    }
+    let e = i + t[i..].iter().take(3).take_while(|b| b.is_ascii_alphanumeric() || **b == b'_').count();
+    let two = match &t[i..e] {
+        b"q" | b"qq" | b"qw" | b"qr" | b"qx" | b"m" => false,
+        b"s" | b"tr" | b"y" => true,
+        _ => return None,
+    };
+    // the delimiter right after the word (`s => 1`, `y = 2`, `qw;` and `q,` aren't quotes)
+    let d = at(t, e);
+    if d == 0 || d.is_ascii_alphanumeric() || d.is_ascii_whitespace() || matches!(d, b'_' | b'=' | b',' | b';' | b')' | b']' | b'}' | b'>' | b'-') {
+        return None;
+    }
+    Some((e + 1, closing(d), two))
+}
+
+/// The rest of a Perl quote-like construct from `i` (see `QUOTE_LIKE` for `close` and `b`).
+fn quote_like_rest(t: &[u8], s: usize, mut i: usize, mut close: u8, b: u16, st: State, o: &mut Out) -> Step {
+    let n = t.len();
+    let (mut depth, mut more, mut esc, mut lines) = (b & 0x3F, b & 0x40 != 0, b & 0x80 != 0, (b >> 8) as u8);
+    let set_open = |close: u8| match close {
+        b')' => b'(',
+        b']' => b'[',
+        b'}' => b'{',
+        b'>' => b'<',
+        _ => 0,
+    };
+    let mut open = set_open(close);
+    while i < n {
+        let c = t[i];
+        if c == b'\n' {
+            lines = lines.saturating_add(1);
+            if lines >= MAX_QUOTE_LINES {
+                o.put(s, i, Tok::Str);
+                return Ok(i);
+            }
+        }
+        if close == 0 {
+            // between the parts of s{…}{…}: whitespace, then the second part's own delimiter
+            if !c.is_ascii_whitespace() {
+                close = closing(c);
+                open = set_open(close);
+                depth = 0;
+                more = false;
+            }
+            i += 1;
+            continue;
+        }
+        if esc {
+            esc = false;
+        } else if c == b'\\' {
+            esc = true;
+        } else if c == open && open != 0 {
+            depth = (depth + 1).min(0x3F);
+        } else if c == close {
+            if depth > 0 {
+                depth -= 1;
+            } else if more {
+                more = false;
+                if open != 0 {
+                    close = 0;
+                }
+            } else {
+                // modifiers: s/a/b/gi
+                let e = i + 1 + t[i + 1..].iter().take_while(|b| b.is_ascii_alphabetic()).count();
+                o.put(s, e, Tok::Str);
+                return Ok(e);
+            }
+        }
+        i += 1;
+    }
+    o.put(s, n, Tok::Str);
+    let b = depth | (more as u16) << 6 | (esc as u16) << 7 | (lines as u16) << 8;
+    Err(State { kind: QUOTE_LIKE, a: close, b, ..st })
+}
+
+/// A C++ raw string `R"delim(` at `i` (also `u8R"`, `LR"`…): where its body starts and the hash of `delim`.
+fn cpp_raw_open(t: &[u8], i: usize) -> Option<(usize, (u8, u16))> {
+    if i > 0 && (t[i - 1].is_ascii_alphanumeric() || t[i - 1] == b'_') {
+        return None;
+    }
+    let r = [&b"R\""[..], b"u8R\"", b"uR\"", b"UR\"", b"LR\""].into_iter().find(|p| t[i..].starts_with(p))?.len();
+    let d = t[i + r..].iter().take(17).take_while(|b| b.is_ascii_alphanumeric() || **b == b'_').count();
+    (d <= 16 && at(t, i + r + d) == b'(').then(|| (i + r + d + 1, word_hash(&t[i + r..i + r + d])))
+}
+
+/// The rest of a C++ raw string: up to `)delim"`, `delim` given by its hash.
+fn cpp_raw_rest(t: &[u8], s: usize, mut i: usize, (a, b): (u8, u16), st: State, o: &mut Out) -> Step {
+    while let Some(p) = memchr::memchr(b')', &t[i..]) {
+        i += p + 1;
+        let d = t[i..].iter().take(17).take_while(|c| c.is_ascii_alphanumeric() || **c == b'_').count();
+        if at(t, i + d) == b'"' && word_hash(&t[i..i + d]) == (a, b) {
+            o.put(s, i + d + 1, Tok::Str);
+            return Ok(i + d + 1);
+        }
+    }
+    o.put(s, t.len(), Tok::Str);
+    Err(State { kind: CPP_RAW, a, b, ..st })
+}
+
+/// The rest of an interpolated string (see `INTERP`): a `"` inside a `{…}` hole starts a string of its own instead
+/// of ending this one (`$"{(ok ? "yes" : "no")}"`). Over at the line's end, closed or not.
+#[allow(clippy::too_many_arguments)]
+fn interp_rest(sx: &Syntax, t: &[u8], s: usize, mut i: usize, a: u8, mut depth: u16, st: State, o: &mut Out) -> Step {
+    let hcl = sx.flavor == Flavor::Hcl;
+    let (mut esc, mut hole, mut inner, mut inner_esc) = (a & 1 != 0, a & 2 != 0, a & 4 != 0, a & 8 != 0);
+    while i < t.len() {
+        let c = t[i];
+        if c == b'\n' {
+            o.put(s, i, Tok::Str);
+            return Ok(i);
+        }
+        if inner {
+            if inner_esc {
+                inner_esc = false;
+            } else if c == b'\\' {
+                inner_esc = true;
+            } else if c == b'"' {
+                inner = false;
+            }
+        } else if hole {
+            match c {
+                b'"' => inner = true,
+                b'{' => depth = depth.saturating_add(1),
+                b'}' if depth == 0 => hole = false,
+                b'}' => depth -= 1,
+                _ => {}
+            }
+        } else if esc {
+            esc = false;
+        } else if c == b'\\' {
+            esc = true;
+        } else if c == b'"' {
+            o.put(s, i + 1, Tok::Str);
+            return Ok(i + 1);
+        } else if hcl && matches!(c, b'$' | b'%') && at(t, i + 1) == c && at(t, i + 2) == b'{' {
+            // `$${` is a literal `${`
+            i += 3;
+            continue;
+        } else if hcl && matches!(c, b'$' | b'%') && at(t, i + 1) == b'{' {
+            (hole, depth) = (true, 0);
+            i += 2;
+            continue;
+        } else if !hcl && c == b'{' {
+            if at(t, i + 1) == b'{' {
+                // `{{` is a brace
+                i += 2;
+                continue;
+            }
+            (hole, depth) = (true, 0);
+        }
+        i += 1;
+    }
+    o.put(s, t.len(), Tok::Str);
+    let a = esc as u8 | (hole as u8) << 1 | (inner as u8) << 2 | (inner_esc as u8) << 3;
+    Err(State { kind: INTERP, a, b: depth, ..st })
+}
+
 /// C#'s """raw strings""" have no escapes; other languages' triple-quoted strings do.
 fn triple_esc(sx: &Syntax) -> u8 {
     if sx.flavor == Flavor::CSharp { 0 } else { sx.esc }
@@ -877,6 +1238,14 @@ fn resume(sx: &Syntax, t: &[u8], st: State, o: &mut Out) -> Step {
             o.put(0, e, Tok::Str);
             if e == t.len() { Err(st) } else { heredoc_rest(t, e + 1, st.a, st.b, st, o) }
         }
+        POD => pod_rest(t, 0, st.col0, st, o),
+        DATA => {
+            o.put(0, t.len(), Tok::Comment);
+            Err(st)
+        }
+        QUOTE_LIKE => quote_like_rest(t, 0, 0, st.a, st.b, st, o),
+        CPP_RAW => cpp_raw_rest(t, 0, 0, (st.a, st.b), st, o),
+        INTERP => interp_rest(sx, t, 0, 0, st.a, st.b, st, o),
         _ => Ok(0),
     }
 }
@@ -897,6 +1266,8 @@ fn line_comment(sx: &Syntax, t: &[u8], i: usize) -> bool {
         t[i..].starts_with(lc)
             // shells: `#` starts a comment only at the start of a word (not in `a#b` or `${#x}`)
             && !(sx.flavor == Flavor::Shell && i > 0 && !matches!(t[i - 1], b' ' | b'\t' | b'\n' | b'\r' | b';' | b'|' | b'&' | b'('))
+            // AutoHotkey: `;` after a space or at the line's start (`Send a;b` sends "a;b")
+            && !(sx.flavor == Flavor::Ahk && i > 0 && !matches!(t[i - 1], b' ' | b'\t' | b'\n' | b'\r'))
             // PHP 8 attributes: #[Route('/x')]
             && !(sx.flavor == Flavor::Php && t[i..].starts_with(b"#["))
     })
@@ -936,6 +1307,44 @@ fn sigil_var(sx: &Syntax, t: &[u8], i: usize) -> Option<usize> {
         j += 1;
     }
     let c = at(t, j);
+    if sx.flavor == Flavor::Perl && t[i] == b'$' {
+        // $#array (the last index, not a comment), $_, $1, $', $", $/ and the other punctuation variables
+        if c == b'#' && at(t, j + 1) == b'$' {
+            return Some(j + 1);
+        } else if c == b'#' && (ident_start(sx, at(t, j + 1)) || at(t, j + 1) == b'{') {
+            j += 1;
+        } else if c == b'^' && at(t, j + 1).is_ascii_uppercase() {
+            return Some(j + 2);
+        } else if c.is_ascii_digit() {
+            return Some(j + t[j..].iter().take_while(|b| b.is_ascii_digit()).count());
+        } else if matches!(c, b'&' | b'`' | b'\'' | b'"' | b'+' | b'!' | b'@' | b'/' | b'\\' | b',' | b';' | b'.' | b'0' | b'<' | b'>' | b'$') {
+            return Some(j + 1);
+        }
+    }
+    let c = at(t, j);
+    if sx.flavor == Flavor::CMake && c == b'<' {
+        // a generator expression, $<TARGET_FILE:app> (nested ones too; not past a quote, which starts a string)
+        let mut depth = 0;
+        for (k, &b) in t[j..t.len().min(j + 256)].iter().enumerate() {
+            match b {
+                b'<' => depth += 1,
+                b'>' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(j + k + 1);
+                    }
+                }
+                b'"' | b'\n' => return None,
+                _ => {}
+            }
+        }
+        return None;
+    }
+    if c == b'{' && sx.flavor == Flavor::Php {
+        // `${name}` (nothing more: `${ … ?>` must not hide the end of the PHP code)
+        let e = j + 1 + t[j + 1..].iter().take(64).take_while(|b| b.is_ascii_alphanumeric() || **b == b'_').count();
+        return (at(t, e) == b'}').then_some(e + 1);
+    }
     if c == b'{' {
         // `${name}` (looked for in the next 64 bytes only: `${${${…` must not cost a scan each)
         let e = memchr::memchr2(b'}', b'\n', &t[j..t.len().min(j + 64)])?;
@@ -958,14 +1367,148 @@ fn sigil_var(sx: &Syntax, t: &[u8], i: usize) -> Option<usize> {
             e += 1;
         }
     }
+    // CMake: $ENV{PATH}, $CACHE{X}
+    if sx.flavor == Flavor::CMake && at(t, e) == b'{' {
+        let k = t[e + 1..].iter().take(64).take_while(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-')).count();
+        if at(t, e + 1 + k) == b'}' {
+            e += k + 2;
+        }
+    }
     Some(e)
 }
 
-/// Per-language extras at `i` that come before the general rules. Some(step) when one applied.
-fn extras(sx: &Syntax, t: &[u8], i: usize, st: State, o: &mut Out) -> Option<Step> {
+/// An AutoHotkey hotkey (`^!s::`, `#n::`, `~LButton & RButton::`), hotstring (`:*:btw::`) or label (`Start:`) at
+/// the start of a line (`i`): where it ends, and whether what follows is a hotstring's replacement text.
+fn ahk_label(t: &[u8], i: usize) -> Option<(usize, bool)> {
+    let l = &t[i..line_end(t, i)];
+    if l.starts_with(b";") || l.starts_with(b"/*") {
+        return None;
+    }
+    if l.first() == Some(&b':') {
+        let opts = 1 + l[1..].iter().take(16).position(|&b| b == b':')?;
+        let p = opts + 1 + memchr::memmem::find(&l[opts + 1..], b"::")?;
+        return Some((i + p + 2, true));
+    }
+    let Some(p) = memchr::memmem::find(l, b"::") else {
+        // Label:
+        let w = l.iter().take_while(|b| b.is_ascii_alphanumeric() || **b == b'_').count();
+        let rest = l.get(w + 1..).unwrap_or(b"").trim_ascii();
+        return (w > 0 && at(l, w) == b':' && (rest.is_empty() || rest.starts_with(b";"))).then_some((i + w + 1, false));
+    };
+    let key = |w: &[u8]| w.iter().all(|&b| b > b' ' && b < 0x7F && !matches!(b, b'"' | b'\'' | b'(' | b')' | b'=' | b',' | b'%'));
+    let words: Vec<&[u8]> = l[..p].split(|&b| b == b' ' || b == b'\t').filter(|w| !w.is_empty()).collect();
+    let ok = match words.as_slice() {
+        [k] => key(k),
+        [a, b"&", b] => key(a) && key(b),
+        [k, up] => key(k) && up.eq_ignore_ascii_case(b"up"),
+        _ => false,
+    };
+    (ok && p <= 40).then_some((i + p + 2, false))
+}
+
+/// Per-language extras at `i` that come before the general rules (`line_start`: only whitespace before it on its
+/// line; `regex_ok` as in `code_run`, for what follows). Some(step) when one applied.
+fn extras(sx: &Syntax, t: &[u8], i: usize, line_start: bool, regex_ok: &mut bool, st: State, o: &mut Out) -> Option<Step> {
     let c = t[i];
     let n = t.len();
     match sx.flavor {
+        Flavor::Cpp => {
+            if matches!(c, b'R' | b'u' | b'U' | b'L') {
+                if let Some((from, h)) = cpp_raw_open(t, i) {
+                    return Some(cpp_raw_rest(t, i, from, h, st, o));
+                }
+            }
+        }
+        Flavor::Vb => {
+            // &HFF, &O17, &B101
+            if c == b'&' && matches!(at(t, i + 1), b'h' | b'H' | b'o' | b'O' | b'b' | b'B') && at(t, i + 2).is_ascii_hexdigit() {
+                let e = i + 2 + t[i + 2..].iter().take_while(|b| b.is_ascii_hexdigit()).count();
+                let e = e + matches!(at(t, e), b'&' | b'%') as usize;
+                o.put(i, e, Tok::Num);
+                return Some(Ok(e));
+            }
+            // #10/8/2026# dates
+            if c == b'#' && at(t, i + 1).is_ascii_digit() {
+                if let Some(p) = t[i + 1..n.min(i + 40)].iter().position(|&b| b == b'#' || b == b'\n').filter(|&p| t[i + 1 + p] == b'#') {
+                    o.put(i, i + p + 2, Tok::Num);
+                    return Some(Ok(i + p + 2));
+                }
+            }
+        }
+        Flavor::Ahk => {
+            if line_start {
+                if let Some((e, hotstring)) = ahk_label(t, i) {
+                    o.put(i, e, Tok::Section);
+                    if hotstring {
+                        let le = line_end(t, e);
+                        o.put(e, le, Tok::Str);
+                        return Some(Ok(le));
+                    }
+                    return Some(Ok(e));
+                }
+            }
+            // %var%
+            if c == b'%' {
+                let e = i + 1 + t[i + 1..].iter().take(64).take_while(|b| b.is_ascii_alphanumeric() || **b == b'_' || **b >= 0x80).count();
+                if e > i + 1 && at(t, e) == b'%' {
+                    o.put(i, e + 1, Tok::Var);
+                    return Some(Ok(e + 1));
+                }
+            }
+            // version 2 quotes with ' too
+            if c == b'\'' && st.mode & AHK_V2 != 0 {
+                return Some(string_rest(sx, t, i, i + 1, b'\'', 0, st, o));
+            }
+        }
+        Flavor::Perl => {
+            let col0 = if i == 0 { st.col0 } else { t[i - 1] == b'\n' };
+            // =head1 … =cut (where a statement starts after it, as when it's continued from the text before)
+            if col0 && c == b'=' && at(t, i + 1).is_ascii_alphabetic() {
+                *regex_ok = true;
+                return Some(pod_rest(t, i, true, st, o));
+            }
+            if col0 && c == b'_' {
+                for w in [&b"__END__"[..], b"__DATA__"] {
+                    if t[i..].starts_with(w) && !ident_char(sx, at(t, i + w.len())) {
+                        o.put(i, n, Tok::Comment);
+                        return Some(Err(State { kind: DATA, ..st }));
+                    }
+                }
+            }
+            if matches!(c, b'q' | b'm' | b's' | b't' | b'y') {
+                if let Some((from, close, two)) = perl_quote_open(t, i) {
+                    *regex_ok = false;
+                    o.put(i, from - 1, Tok::Keyword);
+                    return Some(quote_like_rest(t, from - 1, from, close, (two as u16) << 6, st, o));
+                }
+            }
+        }
+        Flavor::R => {
+            // %in%, %>%, %%
+            if c == b'%' {
+                let e = i + 1 + t[i + 1..].iter().take(16).take_while(|b| !matches!(b, b'%' | b'\n' | b' ' | b'"' | b'\'' | b'`' | b'#')).count();
+                if at(t, e) == b'%' {
+                    o.put(i, e + 1, Tok::Keyword);
+                    return Some(Ok(e + 1));
+                }
+            }
+        }
+        Flavor::Hcl => {
+            if c == b'"' {
+                return Some(interp_rest(sx, t, i, i + 1, 0, 0, st, o));
+            }
+        }
+        Flavor::CMake => {
+            // #[[bracket comments]], [=[bracket arguments]=]
+            if c == b'#' {
+                if let Some((level, len)) = long_open(t, i + 1) {
+                    return Some(long_rest(t, i, i + 1 + len, level, true, st, o));
+                }
+            }
+            if let Some((level, len)) = long_open(t, i) {
+                return Some(long_rest(t, i, i + len, level, false, st, o));
+            }
+        }
         Flavor::Rust => {
             // raw strings r"…", r#"…"#, br"…"
             let r = if c == b'r' { i + 1 } else if c == b'b' && at(t, i + 1) == b'r' { i + 2 } else { 0 };
@@ -978,7 +1521,11 @@ fn extras(sx: &Syntax, t: &[u8], i: usize, st: State, o: &mut Out) -> Option<Ste
             if c == b'\'' {
                 // a char literal ('a', '\n', '日') or a lifetime ('a, 'static)
                 if at(t, i + 1) == b'\\' {
-                    // '\n', '\'', '\u{1F600}'
+                    // '\n', '\'', '\u{1F600}' (never past the line's end)
+                    if matches!(at(t, i + 2), b'\n' | 0) {
+                        o.put(i, i + 2, Tok::Str);
+                        return Some(Ok(i + 2));
+                    }
                     let from = (i + 3).min(n);
                     let e = t[from..]
                         .iter()
@@ -990,7 +1537,7 @@ fn extras(sx: &Syntax, t: &[u8], i: usize, st: State, o: &mut Out) -> Option<Ste
                     return Some(Ok(e));
                 }
                 let len = crate::core::text::char_len_at(&t[i + 1..]).max(1);
-                if at(t, i + 1 + len) == b'\'' {
+                if at(t, i + 1 + len) == b'\'' && at(t, i + 1) != b'\n' {
                     o.put(i, i + 2 + len, Tok::Str);
                     return Some(Ok(i + 2 + len));
                 }
@@ -1033,7 +1580,7 @@ fn extras(sx: &Syntax, t: &[u8], i: usize, st: State, o: &mut Out) -> Option<Ste
                 if t[i + 1..].starts_with(b"\"\"\"") {
                     return Some(triple_rest(t, i, i + 4, b'"', 0, false, st, o));
                 }
-                return Some(string_rest(sx, t, i, i + 2, b'"', 0, st, o));
+                return Some(interp_rest(sx, t, i, i + 2, 0, 0, st, o));
             }
         }
         Flavor::Lua => {
@@ -1048,8 +1595,11 @@ fn extras(sx: &Syntax, t: &[u8], i: usize, st: State, o: &mut Out) -> Option<Ste
         }
         Flavor::PowerShell => {
             // here-strings: @" or @' at the end of a line
-            if c == b'@' && matches!(at(t, i + 1), b'"' | b'\'') && t[i + 2..line_end(t, i)].trim_ascii().is_empty() {
-                return Some(here_rest(t, i, i + 2, t[i + 1], false, st, o));
+            if c == b'@' && matches!(at(t, i + 1), b'"' | b'\'') {
+                let k = i + 2 + t[i + 2..].iter().take_while(|&&b| matches!(b, b' ' | b'\t' | b'\r' | 0x0C)).count();
+                if k == n || t[k] == b'\n' {
+                    return Some(here_rest(t, i, i + 2, t[i + 1], false, st, o));
+                }
             }
             // -eq, -like (operators) and -Path, -Force (parameters)
             if c == b'-' && at(t, i + 1).is_ascii_alphabetic() && (i == 0 || matches!(t[i - 1], b' ' | b'\t' | b'(' | b'{' | b',' | b'|' | b'=')) {
@@ -1138,9 +1688,11 @@ fn extras(sx: &Syntax, t: &[u8], i: usize, st: State, o: &mut Out) -> Option<Ste
     None
 }
 
-/// After these words a `/` starts a regex rather than dividing (JavaScript).
+/// After these words a `/` starts a regex rather than dividing (JavaScript; Perl).
 const REGEX_AFTER: [&[u8]; 14] =
     [b"await", b"case", b"delete", b"do", b"else", b"in", b"instanceof", b"new", b"of", b"return", b"throw", b"typeof", b"void", b"yield"];
+const PERL_REGEX_AFTER: [&[u8]; 14] =
+    [b"and", b"grep", b"if", b"join", b"map", b"not", b"or", b"push", b"return", b"split", b"unless", b"until", b"when", b"while"];
 
 fn contains_ci(hay: &[u8], needle: &[u8]) -> bool {
     hay.windows(needle.len()).any(|w| w.eq_ignore_ascii_case(needle))
@@ -1161,10 +1713,11 @@ pub(super) fn php_code(t: &[u8], st: State, o: &mut Out) -> (State, Option<usize
 fn code_run(sx: &Syntax, t: &[u8], st: State, o: &mut Out, close: &mut Option<usize>) -> State {
     let n = t.len();
     let mut i = 0;
-    // JavaScript: a `/` here starts a regex (a value may come) rather than dividing; kept in `a` (1: dividing).
+    // JavaScript, Perl: a `/` here starts a regex (a value may come) rather than dividing; kept in `a` (1:
+    // dividing). After a comment, POD or a heredoc's lines it may; after a string or a regex it doesn't.
     let mut regex_ok = match st.kind {
         0 => st.a == 0,
-        LINE_COMMENT | BLOCK_COMMENT => true,
+        LINE_COMMENT | BLOCK_COMMENT | POD | HEREDOC => true,
         _ => false,
     };
     // A heredoc opened on this line: its lines start after it (its state's `a` and `b`), unless something else
@@ -1208,6 +1761,7 @@ fn code_run(sx: &Syntax, t: &[u8], st: State, o: &mut Out, close: &mut Option<us
                 (bol, stmt, echo, expect) = (true, true, false, 0);
                 i += 1;
                 if let Some((a, b)) = heredoc.take() {
+                    regex_ok = true;
                     step!(heredoc_rest(t, i, a, b, mid, o));
                 }
                 continue;
@@ -1228,9 +1782,15 @@ fn code_run(sx: &Syntax, t: &[u8], st: State, o: &mut Out, close: &mut Option<us
             *close = Some(i + 2);
             return mid;
         }
-        if (sx.flavor == Flavor::Shell && c == b'\\') || (sx.flavor == Flavor::PowerShell && c == b'`') {
+        if (sx.flavor == Flavor::Shell && c == b'\\') || (matches!(sx.flavor, Flavor::PowerShell | Flavor::Ahk) && c == b'`') {
             // an escaped character outside quotes (`It\'s`), or a line continuation
             i += if matches!(at(t, i + 1), b'\n' | 0) { 1 } else { 2 };
+            continue;
+        }
+        if sx.flavor == Flavor::Vb && c == b':' {
+            // a new statement (where `Rem` starts a comment)
+            stmt = true;
+            i += 1;
             continue;
         }
         if sx.flavor == Flavor::Batch {
@@ -1262,12 +1822,15 @@ fn code_run(sx: &Syntax, t: &[u8], st: State, o: &mut Out, close: &mut Option<us
                 continue;
             }
         }
-        if matches!(sx.flavor, Flavor::Shell | Flavor::Ruby) && c == b'<' {
+        if matches!(sx.flavor, Flavor::Shell | Flavor::Ruby | Flavor::Perl | Flavor::Hcl) && c == b'<' {
             if let Some((e, word, indent)) = heredoc_open(sx, t, i) {
                 o.put(i, e, Tok::Str);
                 let (a, b) = word_hash(word);
                 heredoc = Some((a | indent as u8, b));
-                heredoc_line_end = line_end(t, e);
+                // (once per line: `<<A <<B <<C …` mustn't look for the line's end each time)
+                if e > heredoc_line_end {
+                    heredoc_line_end = line_end(t, e);
+                }
                 i = e;
                 continue;
             }
@@ -1275,7 +1838,7 @@ fn code_run(sx: &Syntax, t: &[u8], st: State, o: &mut Out, close: &mut Option<us
         if sx.flavor == Flavor::Sql && mid.mode & MYSQL == 0 && (c == b'`' || t[i..].starts_with(b"/*!")) {
             mid.mode |= MYSQL;
         }
-        if let Some(r) = extras(sx, t, i, mid, o) {
+        if let Some(r) = extras(sx, t, i, line_start, &mut regex_ok, mid, o) {
             step!(r);
         }
         // MySQL's # comments (and `# note` at a line's start in any SQL; `#temp` is a T-SQL table)
@@ -1296,7 +1859,8 @@ fn code_run(sx: &Syntax, t: &[u8], st: State, o: &mut Out, close: &mut Option<us
             continue;
         }
         if let Some((open, _)) = sx.block {
-            if t[i..].starts_with(open) {
+            // (AutoHotkey's `/*` only at the start of a line)
+            if t[i..].starts_with(open) && (sx.flavor != Flavor::Ahk || line_start) {
                 regex_ok = true;
                 step!(block_rest(sx, t, i, i + open.len(), 1, mid, o));
             }
@@ -1310,7 +1874,16 @@ fn code_run(sx: &Syntax, t: &[u8], st: State, o: &mut Out, close: &mut Option<us
             // #include <x.h>, #define, #region
             let w = i + 1 + t[i + 1..].iter().take_while(|&&b| b == b' ' || b == b'\t').count();
             let e = w + t[w..].iter().take_while(|b| b.is_ascii_alphabetic()).count();
+            if sx.flavor == Flavor::Cpp && w > i + 1 && at(t, e) == b'"' {
+                // `# R"(…` is a raw string after a stray `#`, as when the text is cut after the space
+                o.put(i, i + 1, Tok::Control);
+                i += 1;
+                continue;
+            }
             o.put(i, e, Tok::Control);
+            if sx.flavor == Flavor::Ahk && t[w..e].eq_ignore_ascii_case(b"requires") && contains_ci(&t[e..line_end(t, e)], b"v2") {
+                mid.mode |= AHK_V2;
+            }
             if matches!(&t[w..e], b"include" | b"import") {
                 let s = e + t[e..].iter().take_while(|&&b| b == b' ' || b == b'\t').count();
                 if at(t, s) == b'<' {
@@ -1337,6 +1910,7 @@ fn code_run(sx: &Syntax, t: &[u8], st: State, o: &mut Out, close: &mut Option<us
         if sx.sigils.contains(&c) {
             if let Some(e) = sigil_var(sx, t, i) {
                 o.put(i, e, Tok::Var);
+                regex_ok = false;
                 i = e;
                 continue;
             }
@@ -1350,7 +1924,7 @@ fn code_run(sx: &Syntax, t: &[u8], st: State, o: &mut Out, close: &mut Option<us
             step!(string_rest(sx, t, i, i + 1, c, 0, mid, o));
         }
         if c.is_ascii_digit() || (c == b'.' && at(t, i + 1).is_ascii_digit() && (i == 0 || !ident_char(sx, t[i - 1]))) {
-            let e = number_end(t, i);
+            let e = number_end(sx, t, i);
             o.put(i, e, Tok::Num);
             expect = 0;
             regex_ok = false;
@@ -1362,13 +1936,14 @@ fn code_run(sx: &Syntax, t: &[u8], st: State, o: &mut Out, close: &mut Option<us
             let w = &t[i..e];
             // after a '.', a keyword is a member name (`re.match`, `map.get`, `promise.catch`)
             let member = i > 0 && t[i - 1] == b'.' && !(i > 1 && t[i - 2] == b'.');
-            regex_ok = !member && REGEX_AFTER.contains(&w);
-            if !o.on() && sx.flavor != Flavor::Batch {
+            let after: &[&[u8]] = if sx.flavor == Flavor::Perl { &PERL_REGEX_AFTER } else { &REGEX_AFTER };
+            regex_ok = !member && after.contains(&w);
+            if !o.on() && !matches!(sx.flavor, Flavor::Batch | Flavor::Vb) {
                 i = e;
                 continue;
             }
             let mut tok = if member { None } else { word_tok(sx, w) };
-            if sx.flavor == Flavor::Batch {
+            if matches!(sx.flavor, Flavor::Batch | Flavor::Vb) {
                 let ends = matches!(at(t, e), 0 | b' ' | b'\t' | b'\r' | b'\n');
                 if stmt_start && ends && w.eq_ignore_ascii_case(b"rem") {
                     let le = line_end(t, i);
@@ -1376,12 +1951,13 @@ fn code_run(sx: &Syntax, t: &[u8], st: State, o: &mut Out, close: &mut Option<us
                     i = le;
                     continue;
                 }
-                if w.eq_ignore_ascii_case(b"echo") {
+                if sx.flavor == Flavor::Batch && w.eq_ignore_ascii_case(b"echo") {
                     echo = true;
                 }
             }
             if tok.is_none() {
-                let next = t[e..].iter().copied().find(|&b| b != b' ' && b != b'\t');
+                let np = e + t[e..].iter().take_while(|&&b| b == b' ' || b == b'\t').count();
+                let next = t.get(np).copied();
                 tok = if expect == 1 {
                     Some(Tok::Func)
                 } else if expect == 2 {
@@ -1394,6 +1970,15 @@ fn code_run(sx: &Syntax, t: &[u8], st: State, o: &mut Out, close: &mut Option<us
                 } else if sx.flavor == Flavor::CSharp && next == Some(b'(') {
                     // C# methods are capitalized like types: `Console.WriteLine(…)`
                     Some(Tok::Func)
+                } else if sx.flavor == Flavor::Ahk && w.len() > 2 && w[..2].eq_ignore_ascii_case(b"a_") {
+                    // built-in variables: A_ScriptDir, A_Now
+                    Some(Tok::Var)
+                } else if sx.flavor == Flavor::Ahk && stmt_start && next == Some(b',') {
+                    // a command in version 1's syntax: `MsgBox, Hello`
+                    Some(Tok::Func)
+                } else if sx.flavor == Flavor::Hcl && next == Some(b'=') && !matches!(at(t, np + 1), b'=' | b'>') {
+                    // an argument: `ami = "…"`
+                    Some(Tok::Attr)
                 } else if sx.cap_types && w[0].is_ascii_uppercase() && w.iter().any(|b| b.is_ascii_lowercase()) {
                     Some(Tok::Type)
                 } else if sx.calls && next == Some(b'(') {
@@ -1403,9 +1988,9 @@ fn code_run(sx: &Syntax, t: &[u8], st: State, o: &mut Out, close: &mut Option<us
                 };
             }
             expect = 0;
-            if tok == Some(Tok::Keyword) {
+            if tok == Some(Tok::Keyword) || (sx.flavor == Flavor::CMake && tok == Some(Tok::Control)) {
                 let lower = w.to_ascii_lowercase();
-                if FUNC_KW.contains(&lower.as_slice()) {
+                if FUNC_KW.contains(&lower.as_slice()) || (sx.flavor == Flavor::CMake && lower == b"macro") {
                     expect = 1;
                 } else if TYPE_KW.contains(&lower.as_slice()) || (sx.flavor == Flavor::CSharp && lower == b"new") {
                     expect = 2;
@@ -1417,8 +2002,9 @@ fn code_run(sx: &Syntax, t: &[u8], st: State, o: &mut Out, close: &mut Option<us
             i = e;
             continue;
         }
-        // punctuation: after `)` or `]` a `/` divides (after `<` it closes a JSX tag)
-        regex_ok = !matches!(c, b')' | b']' | b'<');
+        // punctuation: after `)` or `]` a `/` divides (after `<` it closes a JSX tag; in Perl after `}`, which more
+        // often ends `$h{key}` than a block)
+        regex_ok = !matches!(c, b')' | b']' | b'<') && !(sx.flavor == Flavor::Perl && c == b'}');
         expect = 0;
         i += 1;
     }
@@ -1436,6 +2022,8 @@ fn code_run(sx: &Syntax, t: &[u8], st: State, o: &mut Out, close: &mut Option<us
 
 const CSS_COMMENT: u8 = 1;
 const CSS_STR: u8 = 2;
+/// A `//` comment (SCSS, LESS) cut off by the end of a text.
+const CSS_LINE_COMMENT: u8 = 3;
 
 fn css_ident_char(c: u8) -> bool {
     c.is_ascii_alphanumeric() || c == b'-' || c == b'_' || c >= 0x80
@@ -1472,8 +2060,17 @@ pub(super) fn css(t: &[u8], st: State, o: &mut Out) -> State {
             }
             i = e;
         }
+        CSS_LINE_COMMENT => {
+            i = line_end(t, 0);
+            o.put(0, i, Tok::Comment);
+            if i == n {
+                return st;
+            }
+        }
         _ => {}
     }
+    // after a property outside braces (indented Sass), up to the line's end
+    let mut value = false;
     while i < n {
         let c = t[i];
         let next = at(t, i + 1);
@@ -1489,9 +2086,12 @@ pub(super) fn css(t: &[u8], st: State, o: &mut Out) -> State {
                 }
             },
             // SCSS / LESS line comments (not the `//` of a URL)
-            b'/' if next == b'/' && (i == 0 || matches!(t[i - 1], b' ' | b'\t' | b'\n' | b'\r' | b';' | b'{' | b'}')) => {
+            b'/' if next == b'/' && (i == 0 || t[i - 1] != b':') => {
                 let e = line_end(t, i);
                 o.put(i, e, Tok::Comment);
+                if e == n {
+                    return State { kind: CSS_LINE_COMMENT, a: 0, b: depth, ..st };
+                }
                 i = e;
             }
             b'"' | b'\'' => {
@@ -1504,10 +2104,16 @@ pub(super) fn css(t: &[u8], st: State, o: &mut Out) -> State {
             }
             b'{' => {
                 depth = depth.saturating_add(1);
+                value = false;
                 i += 1;
             }
             b'}' => {
                 depth = depth.saturating_sub(1);
+                value = false;
+                i += 1;
+            }
+            b'\n' | b';' => {
+                value = false;
                 i += 1;
             }
             b'@' if css_ident_char(next) => {
@@ -1532,7 +2138,7 @@ pub(super) fn css(t: &[u8], st: State, o: &mut Out) -> State {
             b'#' if css_ident_char(next) => {
                 // a color inside rules, an id in selectors
                 let e = css_ident_end(t, i + 1);
-                o.put(i, e, if depth > 0 { Tok::Num } else { Tok::Func });
+                o.put(i, e, if depth > 0 || value { Tok::Num } else { Tok::Func });
                 i = e;
             }
             b'.' if !next.is_ascii_digit() && css_ident_char(next) && next != b'-' => {
@@ -1575,8 +2181,15 @@ pub(super) fn css(t: &[u8], st: State, o: &mut Out) -> State {
                         continue;
                     }
                     o.put(i, e, Tok::Func);
-                } else if depth == 0 {
-                    o.put(i, e, Tok::Tag);
+                } else if depth == 0 && !value {
+                    // a property outside braces is indented Sass's (`color: red`), or a media feature's
+                    // (`(max-width: 600px)`); otherwise it's a selector
+                    if at(t, e) == b':' && matches!(at(t, e + 1), b' ' | b'\t' | b'\r' | b'\n' | 0) {
+                        o.put(i, e, Tok::Attr);
+                        value = true;
+                    } else {
+                        o.put(i, e, Tok::Tag);
+                    }
                 } else {
                     let after = t[e..].iter().copied().find(|&b| b != b' ' && b != b'\t');
                     o.put(i, e, if after == Some(b':') && at(t, e + 1) != b':' { Tok::Attr } else { Tok::Str });
@@ -1732,7 +2345,12 @@ mod tests {
         assert_eq!(st.b, 1);
         let st = end_state(Lang::Css, "@media print {\n  body {\n");
         assert!(toks(Lang::Css, "    color: red;", st).contains(&("color".into(), Tok::Attr)));
-        assert!(toks(Lang::Css, "    color: red;", State::START).contains(&("color".into(), Tok::Tag)));
+        assert!(toks(Lang::Css, "    color red", State::START).contains(&("color".into(), Tok::Tag)));
+        // indented Sass: properties without braces
+        let v = view(Lang::Css, ".btn\n  color: red\n  &:hover\n    background: #fff\n");
+        assert!(line_has(&v[1], "color", Tok::Attr) && line_has(&v[1], "red", Tok::Str));
+        assert!(line_has(&v[2], ":hover", Tok::Control) && line_has(&v[3], "#fff", Tok::Num));
+        has(Lang::Css, "@media (max-width: 600px) {", &[("max-width", Tok::Attr), ("600px", Tok::Num)]);
     }
 
     fn line_has(line: &[(String, Tok)], s: &str, tok: Tok) -> bool {
@@ -1824,6 +2442,78 @@ mod tests {
         assert!(!toks(Lang::C, "struct node *new = class;", State::START).iter().any(|(s, _)| s == "new" || s == "class"));
         has(Lang::Cpp, "auto p = new Foo;", &[("new", Tok::Keyword)]);
         has(Lang::C, "_Bool b; _Static_assert(1, \"x\");", &[("_Bool", Tok::Type), ("_Static_assert", Tok::Keyword)]);
+    }
+
+    #[test]
+    fn visual_basic_and_autohotkey() {
+        let v = view(Lang::Vb, "Option Explicit\nDim s As String: s = \"say \"\"hi\"\"\" ' it's a note\nRem don't\nx = &HFF + #10/8/2026#\nPrivate Sub Main() : Rem it\"s\n#If VBA7 Then\n");
+        assert!(line_has(&v[0], "Option", Tok::Keyword) && line_has(&v[1], "String", Tok::Type));
+        assert!(line_has(&v[1], "\"say \"", Tok::Str) && line_has(&v[1], "' it's a note", Tok::Comment));
+        assert_eq!(v[2], vec![("Rem don't".into(), Tok::Comment)]);
+        assert!(line_has(&v[3], "&HFF", Tok::Num) && line_has(&v[3], "#10/8/2026#", Tok::Num));
+        assert!(line_has(&v[4], "Main", Tok::Func) && line_has(&v[4], "Rem it\"s", Tok::Comment));
+        assert!(line_has(&v[5], "#If", Tok::Control));
+        let src = "#Requires AutoHotkey v2.0\n^!s::Send \"x\" ; note\n:*:btw::by the way\nStart:\n/* block\n*/\nx := 'it' ; v2 quotes\nSend a;b\n";
+        let v = view(Lang::AutoHotkey, src);
+        assert!(line_has(&v[0], "#Requires", Tok::Control) && line_has(&v[1], "^!s::", Tok::Section) && line_has(&v[1], "; note", Tok::Comment));
+        assert!(line_has(&v[2], ":*:btw::", Tok::Section) && line_has(&v[2], "by the way", Tok::Str) && line_has(&v[3], "Start:", Tok::Section));
+        assert!(line_has(&v[4], "/* block", Tok::Comment) && line_has(&v[5], "*/", Tok::Comment));
+        assert!(line_has(&v[6], "'it'", Tok::Str) && !v[7].iter().any(|t| t.1 == Tok::Comment));
+        // version 1: commands with a comma, and an apostrophe is just a character
+        let v = view(Lang::AutoHotkey, "MsgBox, Don't %name%\n");
+        assert!(line_has(&v[0], "MsgBox", Tok::Func) && line_has(&v[0], "%name%", Tok::Var) && !v[0].iter().any(|t| t.1 == Tok::Str));
+    }
+
+    #[test]
+    fn perl_scripts() {
+        let src = "my @a = qw(\n  one two\n);\nprint $#a if $s =~ /a#b/;\n$s =~ s{x}{y}g; # done\nmy $t = <<\"EOF\";\nit's\nEOF\n\n=head1 NAME\n\nit's pod\n\n=cut\nmy $q = $' . $h{x} / 2;\n__END__\nit's data\n";
+        let v = view(Lang::Perl, src);
+        assert!(line_has(&v[0], "qw", Tok::Keyword) && line_has(&v[1], "  one two", Tok::Str) && line_has(&v[2], ")", Tok::Str));
+        assert!(line_has(&v[3], "$#a", Tok::Var) && line_has(&v[3], "/a#b/", Tok::Str) && !v[3].iter().any(|t| t.1 == Tok::Comment));
+        assert!(line_has(&v[4], "{x}{y}g", Tok::Str) && line_has(&v[4], "# done", Tok::Comment));
+        assert_eq!(v[6], vec![("it's".into(), Tok::Str)]);
+        assert!(line_has(&v[9], "=head1 NAME", Tok::Comment) && line_has(&v[11], "it's pod", Tok::Comment) && line_has(&v[13], "=cut", Tok::Comment));
+        assert!(line_has(&v[14], "$'", Tok::Var) && !v[14].iter().any(|t| t.1 == Tok::Str), "{:?}", v[14]);
+        assert!(line_has(&v[16], "it's data", Tok::Comment));
+        // `s => 1` and `-s $file` aren't substitutions
+        assert!(!toks(Lang::Perl, "my %h = (s => 1); -s $file;", State::START).iter().any(|t| t.1 == Tok::Str));
+    }
+
+    #[test]
+    fn r_terraform_and_cmake() {
+        has(Lang::R, "df <- data.frame(x = c(1L, NA)) %>% filter(is.na(x)) # note", &[
+            ("data.frame", Tok::Func),
+            ("1L", Tok::Num),
+            ("NA", Tok::Lit),
+            ("%>%", Tok::Keyword),
+            ("is.na", Tok::Func),
+            ("# note", Tok::Comment),
+        ]);
+        let src = "resource \"aws_instance\" \"web\" {\n  ami = \"${var.ami}-${lookup(var.m, \"k\")}\" # id\n  tags = { Name = \"x\" }\n  policy = <<-EOT\n    it's text\n    EOT\n}\n";
+        let v = view(Lang::Hcl, src);
+        assert!(line_has(&v[0], "resource", Tok::Keyword) && line_has(&v[0], "\"aws_instance\"", Tok::Str));
+        assert!(line_has(&v[1], "ami", Tok::Attr) && line_has(&v[1], "\"${var.ami}-${lookup(var.m, \"k\")}\"", Tok::Str) && line_has(&v[1], "# id", Tok::Comment));
+        assert!(line_has(&v[2], "Name", Tok::Attr) && line_has(&v[4], "    it's text", Tok::Str) && line_has(&v[5], "    EOT", Tok::Str));
+        assert_eq!(end_state(Lang::Hcl, src), State::START);
+        let src = "cmake_minimum_required(VERSION 3.20)\n#[[ a\nbracket comment ]]\nset(SRC [=[\nraw ]] text]=] \"${X}\")\nif(WIN32 AND NOT MSVC) # c\ntarget_link_libraries(app PRIVATE $<TARGET_FILE:lib> $ENV{HOME})\nendif()\n";
+        let v = view(Lang::CMake, src);
+        assert!(line_has(&v[0], "cmake_minimum_required", Tok::Func) && line_has(&v[0], "VERSION", Tok::Keyword));
+        assert!(line_has(&v[2], "bracket comment ]]", Tok::Comment) && line_has(&v[4], "raw ]] text]=]", Tok::Str));
+        assert!(line_has(&v[5], "if", Tok::Control) && line_has(&v[5], "AND", Tok::Keyword) && line_has(&v[5], "# c", Tok::Comment));
+        assert!(line_has(&v[6], "PRIVATE", Tok::Keyword) && line_has(&v[6], "$<TARGET_FILE:lib>", Tok::Var) && line_has(&v[6], "$ENV{HOME}", Tok::Var));
+        assert!(line_has(&v[7], "endif", Tok::Control));
+    }
+
+    #[test]
+    fn cpp_raw_strings_and_digit_separators_and_csharp_holes() {
+        let v = view(Lang::Cpp, "auto n = 1'000'000; char c = 'x';\nauto s = R\"sql(\nSELECT \"it's\" )\" here\n)sql\"; // done\n");
+        assert!(line_has(&v[0], "1'000'000", Tok::Num) && line_has(&v[0], "'x'", Tok::Str));
+        assert!(line_has(&v[1], "R\"sql(", Tok::Str) && line_has(&v[2], "SELECT \"it's\" )\" here", Tok::Str));
+        assert!(line_has(&v[3], ")sql\"", Tok::Str) && line_has(&v[3], "// done", Tok::Comment));
+        has(Lang::CSharp, "var s = $\"{(ok ? \"yes\" : \"no\")} {{literal}} {d[\"k\"]}\"; // c", &[
+            ("$\"{(ok ? \"yes\" : \"no\")} {{literal}} {d[\"k\"]}\"", Tok::Str),
+            ("// c", Tok::Comment),
+        ]);
     }
 
     #[test]
