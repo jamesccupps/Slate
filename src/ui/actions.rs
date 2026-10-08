@@ -2680,8 +2680,8 @@ impl App {
             }
             Cmd::ToggleStructure => {
                 self.settings.structure_panel = !self.settings.structure_panel;
-                if self.settings.structure_panel && self.tab().lang != Lang::Json {
-                    self.flash("The structure panel shows JSON files (Format → Language → JSON).", false);
+                if self.settings.structure_panel && !self.tab().lang.has_structure() {
+                    self.flash("The structure panel shows JSON and XML files (Format → Language).", false);
                 }
                 self.tab_mut().structure.mark_dirty();
                 self.settings_changed();
@@ -2694,16 +2694,18 @@ impl App {
                 let notify = self.notify.clone();
                 let tab = &mut self.tabs[self.active];
                 let caret = tab.view.sel.caret;
+                tab.structure.set_lang(tab.lang);
                 let p = tab.structure.path_at_caret(&mut tab.doc, caret, &notify);
                 let busy = tab.structure.busy();
+                let what = if tab.structure.is_xml() { "XML" } else { "JSON" };
                 match p {
                     Some(p) if !p.is_empty() => {
-                        let s = crate::core::jsonnav::path_string(&p);
+                        let s = tab.structure.path_text(&p);
                         win::set_clipboard(self.hwnd, s.as_bytes());
                         self.flash(format!("Copied {s}"), false);
                     }
-                    Some(_) => self.flash("No JSON path here", true),
-                    None => self.flash("Still reading the JSON structure — try again in a moment.", true),
+                    Some(_) => self.flash(format!("No {what} path here"), true),
+                    None => self.flash(format!("Still reading the {what} structure — try again in a moment."), true),
                 }
                 if busy {
                     self.timer(TIMER_JOBS, 100);
@@ -2985,7 +2987,7 @@ impl App {
         let step = self.tab().structure.path.as_ref().and_then(|p| p.get(i)).cloned();
         if let Some(st) = step {
             let first = self.tab().doc.byte_at(st.start).unwrap_or(0);
-            self.jump_to_value(st.start, st.end, matches!(first, b'{' | b'['));
+            self.jump_to_value(st.start, st.end, matches!(first, b'{' | b'[' | b'<'));
         }
     }
 
@@ -3108,15 +3110,16 @@ impl App {
                     ));
                 }
                 let s = &self.settings;
-                let json = self.tab().lang == Lang::Json;
+                let lang = self.tab().lang;
                 let mut v = vec![
                     check(Cmd::ToggleWrap, "&Word wrap", "Alt+Z", s.wrap),
                     check(Cmd::ToggleLineNumbers, "&Line numbers", "", s.line_numbers),
                 ];
-                if json {
+                if lang.has_structure() {
+                    let what = if lang == Lang::Xml { "XML" } else { "JSON" };
                     v.push(Item::Sep);
-                    v.push(check(Cmd::ToggleStructure, "JSON &structure panel", "Ctrl+Shift+O", s.structure_panel));
-                    v.push(check(Cmd::TogglePathBar, "JSON &path bar", "", s.path_bar));
+                    v.push(check(Cmd::ToggleStructure, &format!("{what} &structure panel"), "Ctrl+Shift+O", s.structure_panel));
+                    v.push(check(Cmd::TogglePathBar, &format!("{what} &path bar"), "", s.path_bar));
                 }
                 v.extend([
                     Item::Sep,
@@ -3471,6 +3474,8 @@ pub fn run(cell: &Cell, d: Deferred) {
                 }
                 if tab.lang == Lang::Json {
                     v.push(item(Cmd::CopyJsonPath, "Copy JSON pat&h", ""));
+                } else if tab.lang == Lang::Xml {
+                    v.push(item(Cmd::CopyJsonPath, "Copy XML pat&h (XPath)", ""));
                 }
                 v
             };

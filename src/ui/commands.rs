@@ -352,7 +352,7 @@ View
   Alt+Z                         Word wrap
   Ctrl+Plus / Ctrl+Minus        Zoom in / out (or Ctrl+mouse wheel)
   Ctrl+0                        Reset zoom
-  Ctrl+Shift+O                  JSON structure panel
+  Ctrl+Shift+O                  JSON and XML structure panel
 
 Menus
   Alt, then a letter            Open a menu (or Alt+F, Alt+E, Alt+V, Alt+O, Alt+H)

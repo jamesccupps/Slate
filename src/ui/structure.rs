@@ -1,9 +1,11 @@
-//! JSON structure, shown only for JSON documents: the path bar above the text (where the caret is:
-//! `data › [1203] › name`) and the structure panel (a tree of the document). Both use `core::jsonnav`'s lazy child
-//! lists, cached per document version. Containers with more than 100 children are grouped into ranges
-//! (`[0 … 99]`, `[100 … 199]`, and ranges of ranges), like browser JSON viewers, so even millions of items stay
-//! easy to browse. Tree nodes are known by their path (keys and indexes), so what's open stays open across edits,
-//! and while a big document is read again after an edit the tree and the path bar keep showing what they had.
+//! JSON and XML structure, shown only for those documents: the path bar above the text (where the caret is:
+//! `data › [1203] › name`, `catalog › book[3] › title`) and the structure panel (a tree of the document). Both use
+//! the lazy child lists of `core::jsonnav` (or `core::xmlnav`, which fills in the same lists for elements), cached
+//! per document version. Containers with more than 100 children are grouped into ranges (`[0 … 99]`,
+//! `[100 … 199]`, and ranges of ranges), like browser JSON viewers, so even millions of items stay easy to browse.
+//! Tree nodes are known by their path (keys and indexes; for XML the elements' places), so what's open stays open
+//! across edits, and while a big document is read again after an edit the tree and the path bar keep showing what
+//! they had.
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
@@ -12,8 +14,10 @@ use std::sync::Arc;
 use crate::core::document::Document;
 use crate::core::job::{Job, Notify};
 use crate::core::jsonnav::{self, Children, Kind, Step};
+use crate::core::xmlnav;
 
 use super::gfx::{Align, Gfx, Rect};
+use super::highlight::Lang;
 use super::theme::Theme;
 
 /// Containers up to this size are scanned right away on the UI thread; bigger ones in the background.
@@ -89,6 +93,10 @@ pub struct Structure {
     /// Reveal the caret's node in the tree after the next path update.
     pub follow: bool,
     pub broken: bool,
+    /// The document is XML (else JSON).
+    xml: bool,
+    /// An XML document's root element was opened when the tree was first shown.
+    root_opened: bool,
 }
 
 fn bucket_size(n: u64) -> u64 {
@@ -100,6 +108,28 @@ fn bucket_size(n: u64) -> u64 {
 }
 
 impl Structure {
+    /// Reads the document as `lang` (JSON or XML): everything known about it is forgotten when that changes.
+    pub fn set_lang(&mut self, lang: Lang) {
+        let xml = lang == Lang::Xml;
+        if xml != self.xml {
+            *self = Structure { xml, ..Default::default() };
+        }
+    }
+
+    pub fn is_xml(&self) -> bool {
+        self.xml
+    }
+
+    /// The path as text to copy: `data[1203].name` for JSON, XPath (`/catalog/book[3]/title`) for XML.
+    pub fn path_text(&self, path: &[Step]) -> String {
+        if self.xml { xmlnav::xpath(path) } else { jsonnav::path_string(path) }
+    }
+
+    /// A child's node id (an XML element by its place, as names repeat).
+    fn child_id(&self, parent: u64, key: Option<&str>, index: u64) -> u64 {
+        node_id(parent, if self.xml { None } else { key }, index)
+    }
+
     /// Forgets what was read if the document changed. The rows and the path stay until new ones are worked out (for
     /// a big document that takes a background scan), and what's open stays open.
     pub fn sync(&mut self, doc: &Document) {
@@ -142,7 +172,8 @@ impl Structure {
             return Some(c);
         }
         if size <= SYNC_SCAN && doc.is_ready() {
-            let ch = Arc::new(jsonnav::children(&*doc, open, None));
+            let ch = if self.xml { xmlnav::children(&*doc, open, None) } else { jsonnav::children(&*doc, open, None) };
+            let ch = Arc::new(ch);
             self.cache.insert(open, ch.clone());
             return Some(ch);
         }
@@ -152,7 +183,10 @@ impl Structure {
                 None => snap.len(),
                 Some(o) => size.max(1) + o,
             };
-            let job = Job::spawn(total, notify.clone(), move |ctx| jsonnav::scan(&snap, open, KEEP, Some(ctx)));
+            let xml = self.xml;
+            let job = Job::spawn(total, notify.clone(), move |ctx| {
+                if xml { xmlnav::scan(&snap, open, KEEP, Some(ctx)) } else { jsonnav::scan(&snap, open, KEEP, Some(ctx)) }
+            });
             self.scanning = Some((open, job));
         }
         None
@@ -189,7 +223,8 @@ impl Structure {
         }
         for _ in 0..64 {
             let cache = &self.cache;
-            let r = jsonnav::path_at(&*doc, caret, &mut |o| cache.get(&o).cloned());
+            let get = &mut |o: Option<u64>| cache.get(&o).cloned();
+            let r = if self.xml { xmlnav::path_at(&*doc, caret, get) } else { jsonnav::path_at(&*doc, caret, get) };
             match r {
                 Ok(p) => {
                     let changed = self.path.as_ref() != Some(&p);
@@ -253,7 +288,7 @@ impl Structure {
                     b = e;
                 }
             }
-            id = node_id(id, st.key.as_deref(), st.index);
+            id = self.child_id(id, st.key.as_deref(), st.index);
             self.selected = Some(NodeKey::Value(id));
             if n + 1 < path.len() {
                 self.open_by_reveal(NodeKey::Value(id));
@@ -269,8 +304,12 @@ impl Structure {
     }
 
     /// The container whose children form the tree's first level (the root object or array of a normal JSON
-    /// document, also when the file is cut short; None for JSON Lines).
+    /// document, also when the file is cut short; None for JSON Lines, and for XML, whose root element has a name to
+    /// show).
     fn root_open(&self, doc: &Document) -> Option<u64> {
+        if self.xml {
+            return None;
+        }
         let top = self.get(None)?;
         let root = top.items.first().filter(|_| top.count == 1)?;
         matches!(doc.byte_at(root.start), Some(b'{' | b'[')).then_some(root.start)
@@ -312,6 +351,13 @@ impl Structure {
             }
             None => (None, top),
         };
+        if self.xml && !self.root_opened && list.count == 1 {
+            // the root element starts open
+            self.root_opened = true;
+            if list.items.first().is_some_and(xmlnav::has_elements) {
+                self.expanded.insert(NodeKey::Value(self.child_id(TOP, None, 0)));
+            }
+        }
         let n = list.count;
         let mut out = Vec::new();
         self.add(doc, notify, open, TOP, &list, 0, n, 0, &mut out);
@@ -364,18 +410,25 @@ impl Structure {
         }
         for (k, c) in list.range(&*doc, a, b).into_iter().enumerate() {
             let i = a + k as u64;
-            let (kind, preview) = jsonnav::preview(&*doc, &c, 80);
-            let name = c.key_range().map(|(ka, kb)| jsonnav::key_text(&doc.read(ka, kb)));
+            let ((kind, preview), name) = if self.xml {
+                (xmlnav::preview(&*doc, &c, 80), Some(xmlnav::name_at(&*doc, c.start)))
+            } else {
+                (jsonnav::preview(&*doc, &c, 80), c.key_range().map(|(ka, kb)| jsonnav::key_text(&doc.read(ka, kb))))
+            };
             let (label, is_key) = match &name {
                 Some(k) => (jsonnav::key_label(k), true),
                 None => (format!("[{i}]"), false),
             };
-            let child = node_id(id, name.as_deref(), i);
+            let child = self.child_id(id, name.as_deref(), i);
             let key = NodeKey::Value(child);
             let expandable = kind.is_container();
             let expanded = expandable && self.expanded.contains(&key);
             let size = c.end - c.start;
-            let preview = if kind.is_container() && size > 64 * 1024 { super::app::format_size(size) } else { preview };
+            let preview = match () {
+                _ if !kind.is_container() || size <= 64 * 1024 => preview,
+                _ if self.xml && !preview.is_empty() => format!("{preview}  {}", super::app::format_size(size)),
+                _ => super::app::format_size(size),
+            };
             out.push(Row {
                 key,
                 depth,
@@ -427,7 +480,7 @@ impl Structure {
         let segs: Vec<String> = match &self.path {
             Some(p) if p.is_empty() => vec!["(top)".into()],
             Some(p) => p.iter().map(|s| label(&s.label())).collect(),
-            None if self.broken => vec!["Not valid JSON here".into()],
+            None if self.broken => vec![if self.xml { "Not well-formed XML here" } else { "Not valid JSON here" }.into()],
             None => vec!["…".into()],
         };
         // When it doesn't fit, show the end of the path.
@@ -498,7 +551,11 @@ impl Structure {
                 g.text(&format!("Reading the structure… {:.0}%", p * 100.0), ui, Rect::new(body.x + 14.0, body.y + 6.0, body.w - 20.0, ROW_H), t.text_dim, Align::Left);
             }
         } else if self.rows.is_empty() {
-            let msg = if self.broken { "This doesn't look like valid JSON." } else { "Nothing to show." };
+            let msg = match (self.broken, self.xml) {
+                (true, false) => "This doesn't look like valid JSON.",
+                (true, true) => "This doesn't look like well-formed XML.",
+                _ => "Nothing to show.",
+            };
             g.text(msg, ui, Rect::new(body.x + 14.0, body.y + 6.0, body.w - 20.0, ROW_H), t.text_dim, Align::Left);
         }
         let max_scroll = (self.rows.len() as f32 * ROW_H - body.h + ROW_H).max(0.0);
@@ -521,6 +578,8 @@ impl Structure {
             let tx = x0 + 18.0;
             let label_color = if row.loading || row.kind.is_none() && !row.expandable {
                 t.text_dim
+            } else if row.is_key && matches!(row.kind, Some(Kind::Element | Kind::Leaf)) {
+                t.syn_tag
             } else if row.is_key {
                 t.syn_key
             } else {
@@ -537,6 +596,9 @@ impl Structure {
                 Some(Kind::Number) => (row.preview.clone(), t.syn_number),
                 Some(Kind::Bool) | Some(Kind::Null) => (row.preview.clone(), t.syn_literal),
                 Some(Kind::Other) => (row.preview.clone(), t.text_dim),
+                // an element's attributes; one without elements inside shows its text too
+                Some(Kind::Element) => (row.preview.clone(), t.syn_attr),
+                Some(Kind::Leaf) => (row.preview.clone(), t.syn_string),
                 None => (String::new(), t.text_dim),
             };
             if !ptext.is_empty() && px < rr.right() - 12.0 {
@@ -671,6 +733,56 @@ mod tests {
         assert_eq!(s.rows.iter().map(|r| r.label.as_str()).collect::<Vec<_>>(), ["a", "b"]);
         s.update_path(&mut d, 18, &n);
         assert_eq!(jsonnav::path_string(s.path.as_ref().unwrap()), "b[1]");
+    }
+
+    fn labels(s: &Structure) -> Vec<&str> {
+        s.rows.iter().map(|r| r.label.as_str()).collect()
+    }
+
+    #[test]
+    fn xml_documents_show_their_elements() {
+        let n = notify();
+        let text = "<?xml version=\"1.0\"?>\n<catalog>\n  <book id=\"1\"><title>A</title></book>\n  <book id=\"2\"><title>B</title></book>\n</catalog>\n";
+        let mut d = Document::from_text(text.as_bytes());
+        let mut s = Structure::default();
+        s.set_lang(Lang::Xml);
+        s.rows(&mut d, &n);
+        // the root element starts open
+        assert_eq!(labels(&s), ["catalog", "book", "book"]);
+        assert_eq!((s.rows[1].kind, s.rows[1].preview.as_str()), (Some(Kind::Element), "id=\"1\""));
+        s.follow = true;
+        s.update_path(&mut d, text.find("B<").unwrap() as u64, &n);
+        assert_eq!(s.path_text(s.path.as_ref().unwrap()), "/catalog/book[2]/title");
+        s.rows(&mut d, &n);
+        assert_eq!(labels(&s), ["catalog", "book", "book", "title"]);
+        assert_eq!((s.rows[3].kind, s.rows[3].preview.as_str()), (Some(Kind::Leaf), "B"));
+        assert_eq!(s.selected, Some(s.rows[3].key));
+        // the root closed by the user stays closed
+        s.toggle(s.rows[0].key);
+        s.rows(&mut d, &n);
+        assert_eq!(labels(&s), ["catalog"]);
+        // read as JSON, it's another document
+        s.set_lang(Lang::Json);
+        assert!(s.rows.is_empty() && s.path.is_none());
+    }
+
+    #[test]
+    fn a_big_xml_document_is_read_in_the_background() {
+        let n = notify();
+        let items: String = (0..150_000).map(|i| format!("<item n=\"{i}\">text {i}</item>\n")).collect();
+        let text = format!("<items>\n{items}</items>\n");
+        assert!(text.len() as u64 > SYNC_SCAN);
+        let mut d = Document::from_text(text.as_bytes());
+        let mut s = Structure::default();
+        s.set_lang(Lang::Xml);
+        let caret = text.find("text 123456<").unwrap() as u64;
+        while s.path.is_none() || s.rows.is_empty() {
+            s.update_path(&mut d, caret, &n);
+            s.rows(&mut d, &n);
+            wait(&mut s);
+        }
+        assert_eq!(s.path_text(s.path.as_ref().unwrap()), "/items/item[123457]");
+        assert_eq!(labels(&s)[..3], ["items", "[0 … 9999]", "[10000 … 19999]"]);
     }
 
     #[test]
