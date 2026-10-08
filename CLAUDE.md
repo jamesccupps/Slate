@@ -88,12 +88,16 @@ Commits use the GitHub no-reply address (repo-local git config); GitHub refuses 
     lines, trim line ends, change case.
   - `jsonnav.rs` — lazy JSON structure: the children of one container (lists over 100,000 keep every 64th child
     and rescan between them; lists of containers inside a scanned one already over 1024), the path at an offset
-    (`data[1203].name`), previews. Comments are skipped; in a file cut short, open containers end at its end.
+    (`data[1203].name`), previews. Comments are skipped; in a file cut short, open containers end at its end. A scan
+    can also keep the lists of every container holding an offset (`path_to`): the path to the caret, however deep,
+    then needs one scan, and a walk takes the last path's steps as they are where it goes the same way.
   - `xmlnav.rs` — the same for XML, filling in jsonnav's lists: the elements inside one element (names hashed as
     they're read, ~270 MB/s), the path (`catalog › book[3] › title`, the index among siblings of that name; XPath
     to copy), previews (attributes, and the text of an element without elements inside). Comments, CDATA, PIs and
-    the DOCTYPE are skipped; an end tag closes the element it names (among the 1024 innermost), a stray one is
-    ignored; in a file cut short, what's open ends at its end.
+    the DOCTYPE are skipped (in its subset, comments and PIs as they are: their quotes are just characters); an end
+    tag closes the element it names (among the 1024 innermost), a stray one is ignored; in a file cut short, what's
+    open ends at its end. An element scanned on its own stops where its parent's list says it ends, and a rescan
+    where the list's content ends (`Children::content_end`), so malformed markup reads the same either way.
   - `text.rs` — encoding/EOL detection (mostly-UTF-8 with a few bad bytes stays UTF-8), UTF-16/ANSI codecs (ANSI
     = the system code page, Windows-1252 under the UTF-8 code page option), display decoding (control chars →
     symbols), char classes.
