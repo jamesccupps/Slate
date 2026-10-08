@@ -2,9 +2,11 @@
 //! `data › [1203] › name`) and the structure panel (a tree of the document). Both use `core::jsonnav`'s lazy child
 //! lists, cached per document version. Containers with more than 100 children are grouped into ranges
 //! (`[0 … 99]`, `[100 … 199]`, and ranges of ranges), like browser JSON viewers, so even millions of items stay
-//! easy to browse.
+//! easy to browse. Tree nodes are known by their path (keys and indexes), so what's open stays open across edits,
+//! and while a big document is read again after an edit the tree and the path bar keep showing what they had.
 
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use crate::core::document::Document;
@@ -25,10 +27,25 @@ pub const HEADER_H: f32 = 34.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum NodeKey {
-    /// A value, by where it starts.
+    /// A value, by its path (`node_id`).
     Value(u64),
-    /// Children `a..b` of the container at `parent` (None = top level).
-    Bucket(Option<u64>, u64, u64),
+    /// Children `a..b` of the container with that id (`TOP`: the top level, or the root of a normal document).
+    Bucket(u64, u64, u64),
+}
+
+/// The id of the top level (and of the root value of a normal document, whose children form the tree's first
+/// level).
+const TOP: u64 = 0;
+
+/// The id of a child of the container with id `parent`: by its key in an object, by its index in an array.
+fn node_id(parent: u64, key: Option<&str>, index: u64) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    parent.hash(&mut h);
+    match key {
+        Some(k) => k.hash(&mut h),
+        None => index.hash(&mut h),
+    }
+    h.finish() | 1
 }
 
 #[derive(Clone, Debug)]
@@ -57,6 +74,8 @@ pub struct Structure {
     pub path: Option<Vec<Step>>,
     path_for: Option<(u64, u64)>,
     pub expanded: HashSet<NodeKey>,
+    /// What following the caret opened (and the user hasn't touched since): closed again by the next reveal.
+    revealed: Vec<NodeKey>,
     pub rows: Vec<Row>,
     rows_dirty: bool,
     pub scroll: f32,
@@ -77,14 +96,14 @@ fn bucket_size(n: u64) -> u64 {
 }
 
 impl Structure {
-    /// Forgets everything if the document changed.
+    /// Forgets what was read if the document changed. The rows and the path stay until new ones are worked out (for
+    /// a big document that takes a background scan), and what's open stays open.
     pub fn sync(&mut self, doc: &Document) {
         if self.version != doc.version || self.len != doc.len() {
             self.version = doc.version;
             self.len = doc.len();
             self.cache.clear();
             self.scanning = None;
-            self.path = None;
             self.path_for = None;
             self.rows_dirty = true;
             self.broken = false;
@@ -197,46 +216,56 @@ impl Structure {
         }
     }
 
-    /// Expands the tree down to the caret's node and selects it.
+    /// Expands the tree down to the caret's node and selects it. What the last reveal opened closes again (unless the
+    /// user opened or closed it since), so following the caret through thousands of records doesn't leave them all
+    /// open (and the tree slow to rebuild).
     fn reveal_path(&mut self) {
         let Some(path) = self.path.clone() else { return };
-        let mut parent: Option<u64> = self.root_open();
-        for st in &path {
+        for k in std::mem::take(&mut self.revealed) {
+            self.expanded.remove(&k);
+        }
+        let mut id = TOP;
+        for (n, st) in path.iter().enumerate() {
             if let Some(ch) = self.get(st.parent) {
                 // ranges containing this index
-                let n = ch.count;
-                let (mut a, mut b) = (0u64, n);
-                while b - a > BUCKET {
+                let (mut a, mut b) = (0u64, ch.count);
+                while b - a > BUCKET && st.index < b {
                     let size = bucket_size(b - a);
                     let s = a + (st.index - a) / size * size;
                     let e = (s + size).min(b);
-                    self.expanded.insert(NodeKey::Bucket(st.parent, s, e));
+                    self.open_by_reveal(NodeKey::Bucket(id, s, e));
                     a = s;
                     b = e;
                 }
             }
-            self.selected = Some(NodeKey::Value(st.start));
-            if Some(st.start) != parent {
-                parent = Some(st.start);
+            id = node_id(id, st.key.as_deref(), st.index);
+            self.selected = Some(NodeKey::Value(id));
+            if n + 1 < path.len() {
+                self.open_by_reveal(NodeKey::Value(id));
             }
-        }
-        for st in path.iter().take(path.len().saturating_sub(1)) {
-            self.expanded.insert(NodeKey::Value(st.start));
         }
         self.rows_dirty = true;
     }
 
+    fn open_by_reveal(&mut self, key: NodeKey) {
+        if self.expanded.insert(key) {
+            self.revealed.push(key);
+        }
+    }
+
     /// The container whose children form the tree's first level (the root object or array of a normal JSON
-    /// document; None for JSON Lines).
-    fn root_open(&self) -> Option<u64> {
+    /// document, also when the file is cut short; None for JSON Lines).
+    fn root_open(&self, doc: &Document) -> Option<u64> {
         let top = self.get(None)?;
-        if top.count == 1 && !top.partial { top.items.first().map(|c| c.start) } else { None }
+        let root = top.items.first().filter(|_| top.count == 1)?;
+        matches!(doc.byte_at(root.start), Some(b'{' | b'[')).then_some(root.start)
     }
 
     pub fn toggle(&mut self, key: NodeKey) {
         if !self.expanded.remove(&key) {
             self.expanded.insert(key);
         }
+        self.revealed.retain(|k| *k != key);
         self.rows_dirty = true;
     }
 
@@ -244,19 +273,18 @@ impl Structure {
         self.rows_dirty = true;
     }
 
-    /// Rebuilds the visible rows of the tree if anything changed.
+    /// Rebuilds the visible rows of the tree if anything changed (the old rows stay until the new ones are ready).
     pub fn rows(&mut self, doc: &mut Document, notify: &Notify) {
         self.sync(doc);
         if !self.rows_dirty {
             return;
         }
         self.rows_dirty = false;
-        self.rows.clear();
         let Some(top) = self.ensure(doc, None, doc.len(), notify) else {
             self.rows_dirty = true;
             return;
         };
-        let (open, list) = match self.root_open() {
+        let (open, list) = match self.root_open(doc) {
             Some(r) => {
                 let size = top.items.first().map_or(0, |c| c.end) - r;
                 match self.ensure(doc, Some(r), size, notify) {
@@ -271,16 +299,18 @@ impl Structure {
         };
         let n = list.count;
         let mut out = Vec::new();
-        self.add(doc, notify, open, &list, 0, n, 0, &mut out);
+        self.add(doc, notify, open, TOP, &list, 0, n, 0, &mut out);
         self.rows = out;
     }
 
+    /// Adds the rows of children `a..b` of the container at `open` (whose node id is `id`).
     #[allow(clippy::too_many_arguments)]
     fn add(
         &mut self,
         doc: &mut Document,
         notify: &Notify,
         open: Option<u64>,
+        id: u64,
         list: &Arc<Children>,
         a: u64,
         b: u64,
@@ -292,7 +322,7 @@ impl Structure {
             let mut s = a;
             while s < b {
                 let e = (s + size).min(b);
-                let key = NodeKey::Bucket(open, s, e);
+                let key = NodeKey::Bucket(id, s, e);
                 let expanded = self.expanded.contains(&key);
                 let start = list.get(&*doc, s).map_or(0, |c| c.first());
                 let end = list.get(&*doc, e - 1).map_or(start, |c| c.end);
@@ -310,7 +340,7 @@ impl Structure {
                     loading: false,
                 });
                 if expanded {
-                    self.add(doc, notify, open, list, s, e, depth + 1, out);
+                    self.add(doc, notify, open, id, list, s, e, depth + 1, out);
                 }
                 s = e;
             }
@@ -319,11 +349,13 @@ impl Structure {
         for (k, c) in list.range(&*doc, a, b).into_iter().enumerate() {
             let i = a + k as u64;
             let (kind, preview) = jsonnav::preview(&*doc, &c, 80);
-            let (label, is_key) = match c.key_range() {
-                Some((ka, kb)) => (jsonnav::key_text(&doc.read(ka, kb)), true),
+            let name = c.key_range().map(|(ka, kb)| jsonnav::key_text(&doc.read(ka, kb)));
+            let (label, is_key) = match &name {
+                Some(k) => (jsonnav::key_label(k), true),
                 None => (format!("[{i}]"), false),
             };
-            let key = NodeKey::Value(c.start);
+            let child = node_id(id, name.as_deref(), i);
+            let key = NodeKey::Value(child);
             let expandable = kind.is_container();
             let expanded = expandable && self.expanded.contains(&key);
             let size = c.end - c.start;
@@ -348,7 +380,7 @@ impl Structure {
                         if n == 0 {
                             out.push(empty_row(depth + 1, if kind == Kind::Object { "(no keys)" } else { "(empty)" }));
                         }
-                        self.add(doc, notify, Some(c.start), &sub, 0, n, depth + 1, out);
+                        self.add(doc, notify, Some(c.start), child, &sub, 0, n, depth + 1, out);
                     }
                     None => {
                         let mut r = empty_row(depth + 1, "Reading…");
@@ -433,6 +465,10 @@ impl Structure {
         g.line(r.x + 0.5, r.y, r.x + 0.5, r.bottom(), t.border, 1.0);
         let head = Rect::new(r.x, r.y, r.w, HEADER_H);
         g.text("Structure", bold, Rect::new(r.x + 14.0, r.y, r.w - 60.0, HEADER_H), t.text, Align::Left);
+        if let Some(p) = self.progress().filter(|_| !self.rows.is_empty()) {
+            // reading the document again after an edit; the rows shown are from before it
+            g.text(&format!("Updating… {:.0}%", p * 100.0), ui, Rect::new(r.x + 14.0, r.y, r.w - 60.0, HEADER_H), t.text_faint, Align::Right);
+        }
         let close = close_rect(r);
         if close_hover {
             g.fill_round(close, 4.0, t.hover);
@@ -523,7 +559,7 @@ impl Structure {
 
 fn empty_row(depth: u16, text: &str) -> Row {
     Row {
-        key: NodeKey::Bucket(None, u64::MAX, u64::MAX),
+        key: NodeKey::Bucket(u64::MAX, u64::MAX, u64::MAX),
         depth,
         label: text.into(),
         is_key: false,
@@ -547,4 +583,103 @@ pub fn close_rect(panel: Rect) -> Rect {
 
 pub fn body_rect(panel: Rect) -> Rect {
     Rect::new(panel.x + 1.0, panel.y + HEADER_H, panel.w - 1.0, panel.h - HEADER_H)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::document::{EditKind, Sel};
+
+    fn notify() -> Notify {
+        Arc::new(|| {})
+    }
+
+    fn row(s: &Structure, label: &str) -> Option<Row> {
+        s.rows.iter().find(|r| r.label == label).cloned()
+    }
+
+    fn edit(d: &mut Document, at: u64, text: &[u8]) {
+        d.begin(EditKind::Other, Sel::at(at));
+        d.insert(at, text);
+        d.end(Sel::at(at));
+    }
+
+    fn wait(s: &mut Structure) {
+        while s.busy() {
+            s.poll();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    #[test]
+    fn open_nodes_stay_open_across_edits() {
+        let n = notify();
+        let mut d = Document::from_text(br#"{"meta": {"n": 3}, "data": [{"id": 1}, {"id": 2}]}"#);
+        let mut s = Structure::default();
+        s.rows(&mut d, &n);
+        s.toggle(row(&s, "data").unwrap().key);
+        s.rows(&mut d, &n);
+        assert!(row(&s, "[1]").is_some());
+        // everything after the edit moves, but "data" is still the same node
+        edit(&mut d, 15, b"12");
+        s.rows(&mut d, &n);
+        assert!(row(&s, "data").unwrap().expanded);
+        assert_eq!(row(&s, "[1]").unwrap().start, d.len() - 11);
+    }
+
+    #[test]
+    fn following_the_caret_doesnt_leave_everything_open() {
+        let n = notify();
+        let text: String = (0..500).map(|i| format!("{{\"i\":{i},\"v\":[1,2]}}\n")).collect();
+        let mut d = Document::from_text(text.as_bytes());
+        let mut s = Structure { follow: true, ..Default::default() };
+        let user = NodeKey::Value(node_id(TOP, None, 7));
+        s.toggle(user);
+        for i in [3, 250, 499] {
+            let caret = text.find(&format!("\"i\":{i},")).unwrap() + 5;
+            s.update_path(&mut d, caret as u64, &n);
+            assert_eq!(jsonnav::path_string(s.path.as_ref().unwrap()), format!("[{i}].i"));
+        }
+        // the last record and the range holding it, and what the user opened
+        let want: HashSet<NodeKey> = [user, NodeKey::Value(node_id(TOP, None, 499)), NodeKey::Bucket(TOP, 400, 500)].into();
+        assert_eq!(s.expanded, want);
+        assert_eq!(s.selected, Some(NodeKey::Value(node_id(node_id(TOP, None, 499), Some("i"), 0))));
+    }
+
+    #[test]
+    fn a_file_cut_short_still_shows_its_tree() {
+        let n = notify();
+        let mut d = Document::from_text(br#"{"a": 1, "b": [1, 2"#);
+        let mut s = Structure::default();
+        s.rows(&mut d, &n);
+        assert_eq!(s.rows.iter().map(|r| r.label.as_str()).collect::<Vec<_>>(), ["a", "b"]);
+        s.update_path(&mut d, 18, &n);
+        assert_eq!(jsonnav::path_string(s.path.as_ref().unwrap()), "b[1]");
+    }
+
+    #[test]
+    fn rows_and_path_stay_while_a_big_document_is_read_again() {
+        let n = notify();
+        let items: Vec<String> = (0..200_000).map(|i| format!("{{\"id\": {i}, \"name\": \"n{i}\"}}")).collect();
+        let text = format!("{{\"meta\": 1, \"data\": [{}]}}", items.join(", "));
+        assert!(text.len() as u64 > SYNC_SCAN);
+        let mut d = Document::from_text(text.as_bytes());
+        let mut s = Structure::default();
+        let caret = text.find("\"n7\"").unwrap() as u64 + 1;
+        while s.path.is_none() || s.rows.is_empty() {
+            s.update_path(&mut d, caret, &n);
+            s.rows(&mut d, &n);
+            wait(&mut s);
+        }
+        let before = (s.rows.clone().len(), s.path.clone());
+        edit(&mut d, 10, b"0");
+        s.update_path(&mut d, caret + 1, &n);
+        s.rows(&mut d, &n);
+        assert!(s.busy(), "a big document is read again in the background");
+        assert_eq!((s.rows.len(), s.path.clone()), before);
+        wait(&mut s);
+        s.update_path(&mut d, caret + 1, &n);
+        s.rows(&mut d, &n);
+        assert_eq!(jsonnav::path_string(s.path.as_ref().unwrap()), "data[7].name");
+    }
 }
