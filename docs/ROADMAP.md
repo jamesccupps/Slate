@@ -76,7 +76,11 @@ The details are in the [0.3.0 release notes](release-notes-0.3.0.md). In short:
   several lines, C++ `1'000'000` and raw strings, C# nested interpolation); a misdetected heredoc should end sooner
   than at its end word; exact states for lexers with look-ahead at the 8 KiB cuts of very long lines (S each).
 - Sort lines: `1.10` after `1.9` when the lines look like versions; `ß` as `ss` (S).
-- Line tools keep mixed line endings instead of using the most common one (S).
+- Line tools keep mixed line endings instead of using the most common one (S). Indenting or commenting a selection
+  whose last line ends in a lone CR treats it like the other lines (S).
+- Updates: when closing is cancelled after an update was put in place, the next start should still be watched (and
+  undone if it fails), and a setting a newer version wrote that this one can't read should survive this one saving
+  (it matters when an update is undone) (S each).
 
 ## Infrastructure
 

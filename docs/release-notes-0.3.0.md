@@ -11,7 +11,7 @@ A reliability release: the whole app was audited (the engine, file formats and c
 - A UTF-8 file with a few bad bytes stays UTF-8, byte for byte, instead of opening as garbled ANSI.
 - Read errors while Slate counts a big file's lines (a network blip, a locked file) are retried and reported, never turned into wrong line numbers.
 - Big files on network shares and FAT drives can be saved.
-- A Slate running as administrator keeps its own window and tabs, apart from the normal one.
+- A Slate running as administrator keeps its own window and tabs, apart from the normal one. If Slate is too busy to take a file you open, the file opens in a window of its own that says it doesn't keep its tabs, instead of a second Slate sharing (and overwriting) the first one's unsaved text.
 
 ### Editing
 - Each file's indentation is detected (tabs or spaces, and how many); TSV files and makefiles always get real tabs. *Format → Indentation* changes it.
