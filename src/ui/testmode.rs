@@ -23,6 +23,11 @@
 //! scrolling). More `print:` values: `focus` (main, find, replace, goto), `armed` (menu bar title with the
 //! keyboard), `opened` (menus that would have opened: native menus are never shown in this mode), `keys0`…`keys4`
 //! (each menu item's access key), `scrollx`, `zoom`, `topline`, `drag`, `wintitle`, `tabnames`, `indent`.
+//!
+//! Also: `lang:<name>` (pick the language), `hit:<x>,<y>` / `hover:<x>,<y>` (what's at a point / move the mouse
+//! there), `scrollto:<0..1>`, `endsession` (what a Windows shutdown asks), `t:<label>` (a timing mark), `temp:<dir>`,
+//! `persist` (write settings and the session; only with `SLATE_DATA_DIR` set, never into the real data folder),
+//! `session:save|soon|restore` (write the session now / on another thread as the timer does / restore it).
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
