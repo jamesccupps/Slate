@@ -37,6 +37,76 @@ const HL_EXACT_MAX: u64 = 32 << 20;
 const HL_CHECK: u64 = 16 << 10;
 /// Line-based operations (indent, move lines...) refuse selections covering more lines than this.
 pub const MAX_LINE_OPS: u64 = 200_000;
+/// Duplicating and moving lines copy them: they refuse more text than this (a 300 MB line would otherwise be
+/// copied into memory, and running out of it ends the program).
+pub const COPY_MAX: u64 = 16 << 20;
+/// Indenting rewrites the lines as one replacement up to this much text (bigger: line by line, in place).
+const INDENT_AT_ONCE_MAX: u64 = 64 << 20;
+pub const TOO_MANY_LINES: &str = "Too many lines selected for that.";
+pub const TOO_MUCH_TEXT: &str = "That's too much text for this (more than 16 MB).";
+
+/// What Tab and the automatic indentation insert: a tab character, or this many spaces per level.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Indent {
+    Tabs,
+    Spaces(u32),
+}
+
+impl Indent {
+    /// The text of one level.
+    pub fn unit(self) -> Vec<u8> {
+        match self {
+            Indent::Tabs => b"\t".to_vec(),
+            Indent::Spaces(n) => vec![b' '; n.max(1) as usize],
+        }
+    }
+}
+
+/// How a text is indented, judged from (up to) its first 10,000 lines: by tabs, or by spaces in steps of how many
+/// columns (the most common step between neighbouring lines). None when it has no indented lines, or as many of
+/// each kind.
+pub fn detect_indent(text: &[u8]) -> Option<Indent> {
+    let (mut tabs, mut spaces) = (0u32, 0u32);
+    let mut steps = [0u32; 9];
+    // (The start of the text counts as a line at column 0.)
+    let mut prev: Option<usize> = Some(0);
+    for line in text.split(|&b| b == b'\n').take(10_000) {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let ws = line.iter().take_while(|&&b| b == b' ' || b == b'\t').count();
+        if ws == line.len() {
+            continue; // blank
+        }
+        if line[0] == b'\t' {
+            tabs += 1;
+            prev = None;
+            continue;
+        }
+        if line[..ws].contains(&b'\t') {
+            prev = None;
+            continue;
+        }
+        if ws > 1 {
+            spaces += 1;
+        }
+        if let Some(p) = prev {
+            // (A step of one is alignment, like the " * " of a block comment, not a level.)
+            let d = ws.abs_diff(p);
+            if (2..=8).contains(&d) {
+                steps[d] += 1;
+            }
+        }
+        prev = Some(ws);
+    }
+    if tabs > spaces {
+        return Some(Indent::Tabs);
+    }
+    if spaces > tabs {
+        // the most common step; on a tie the smaller one
+        let (w, n) = (2..=8).map(|d| (d, steps[d])).fold((0, 0), |best, x| if x.1 > best.1 { x } else { best });
+        return (n > 0).then_some(Indent::Spaces(w as u32));
+    }
+    None
+}
 
 /// A display segment: `[start, end)` is text without the line break; `eol` is the length of the line break after
 /// `end` (0 when the segment continues the line, or at the end of the document).
@@ -1160,12 +1230,23 @@ pub fn delete_forward(doc: &mut Document, sel: Sel, word: bool) -> Sel {
 }
 
 /// Enter: a line break plus the current line's indentation (one level more after `{` or `[`, and the closing
-/// bracket moves to its own line).
+/// bracket moves to its own line). On a line holding nothing but indentation, that indentation moves to the new
+/// line instead of staying behind as trailing spaces.
 pub fn newline(doc: &mut Document, sel: Sel, indent_unit: &[u8]) -> Sel {
     let a = sel.start();
     let ls = doc.line_start_of(a);
     let head = doc.read(ls, a.min(ls + 4096));
     let indent: Vec<u8> = head.iter().copied().take_while(|&b| b == b' ' || b == b'\t').collect();
+    if !indent.is_empty() && indent.len() as u64 == a - ls && doc.line_end_of(sel.end()) == sel.end() {
+        let mut text = eol(doc).to_vec();
+        text.extend_from_slice(&indent);
+        let new = Sel::at(ls + text.len() as u64);
+        doc.begin(EditKind::Other, sel);
+        doc.delete(ls, sel.end());
+        doc.insert(ls, &text);
+        doc.end(new);
+        return new;
+    }
     let before = head.iter().rev().find(|&&b| b != b' ' && b != b'\t').copied();
     let after = doc.byte_at(sel.end());
     let mut text = eol(doc).to_vec();
@@ -1183,6 +1264,70 @@ pub fn newline(doc: &mut Document, sel: Sel, indent_unit: &[u8]) -> Sel {
     }
     let new = replace_selection(doc, sel, &text, EditKind::Other);
     Sel::at(new.caret - caret_back)
+}
+
+/// Typing `}` or `]` with only indentation before it on the line (where Enter after `{` put one level more): the
+/// line gets the indentation of the line with the matching `{` or `[`, or one level less when that isn't found
+/// nearby. Done with the bracket as one step; None when there's nothing to change.
+pub fn close_bracket(doc: &mut Document, sel: Sel, close: u8, width: u32) -> Option<Sel> {
+    let pos = sel.caret;
+    let ls = doc.line_start_of(pos);
+    if !sel.is_empty() || pos == ls || pos - ls > 4096 {
+        return None;
+    }
+    let head = doc.read(ls, pos);
+    if !head.iter().all(|&b| b == b' ' || b == b'\t') {
+        return None;
+    }
+    let open = if close == b'}' { b'{' } else { b'[' };
+    let indent: Vec<u8> = match matching_open(doc, ls, open, close) {
+        Some(o) => {
+            let ols = doc.line_start_of(o);
+            doc.read(ols, o.min(ols + 4096)).into_iter().take_while(|&b| b == b' ' || b == b'\t').collect()
+        }
+        None => {
+            // one level less: a tab, or the spaces back to the previous multiple of the width
+            let mut h = head.clone();
+            if h.last() == Some(&b'\t') {
+                h.pop();
+            } else {
+                let spaces = h.iter().rev().take_while(|&&b| b == b' ').count();
+                let n = ((h.len() - 1) % width.max(1) as usize + 1).min(spaces);
+                h.truncate(h.len() - n);
+            }
+            h
+        }
+    };
+    if indent == head {
+        return None;
+    }
+    let mut text = indent;
+    text.push(close);
+    let new = Sel::at(ls + text.len() as u64);
+    doc.begin(EditKind::Other, sel);
+    doc.delete(ls, pos);
+    doc.insert(ls, &text);
+    doc.end(new);
+    Some(new)
+}
+
+/// The `open` bracket that a `close` typed at `before` would match (looking back up to 256 KB; brackets inside
+/// strings or comments count too, which is good enough for indenting).
+fn matching_open(doc: &Document, before: u64, open: u8, close: u8) -> Option<u64> {
+    let from = before.saturating_sub(256 << 10);
+    let text = doc.read(from, before);
+    let mut depth = 0usize;
+    for (i, &b) in text.iter().enumerate().rev() {
+        if b == close {
+            depth += 1;
+        } else if b == open {
+            if depth == 0 {
+                return Some(from + i as u64);
+            }
+            depth -= 1;
+        }
+    }
+    None
 }
 
 /// Line starts of the lines touched by the selection (a selection ending at a line start doesn't include that
@@ -1228,6 +1373,11 @@ pub fn replace_range(doc: &mut Document, before: Sel, a: u64, b: u64, text: &[u8
 /// Comments out the selected lines (or the caret's), or uncomments them when they all are. Says why not when it
 /// can't (too many lines; a block comment can't go around text that has a comment end in it).
 pub fn toggle_comment(doc: &mut Document, sel: Sel, style: CommentStyle) -> Result<Sel, String> {
+    toggle_comment_with(doc, sel, style, INDENT_AT_ONCE_MAX)
+}
+
+/// `toggle_comment`, rewriting up to `at_once_max` bytes of lines as one replacement (more: line by line).
+fn toggle_comment_with(doc: &mut Document, sel: Sel, style: CommentStyle, at_once_max: u64) -> Result<Sel, String> {
     let lines = selected_lines(doc, sel).ok_or("Too many lines selected for that.")?;
     let (mut anchor, mut caret) = (sel.anchor, sel.caret);
     let start = sel.start();
@@ -1246,6 +1396,12 @@ pub fn toggle_comment(doc: &mut Document, sel: Sel, style: CommentStyle) -> Resu
     match style {
         CommentStyle::Line(tok) => {
             let core = tok.trim_end().as_bytes();
+            let a = lines[0];
+            let b = doc.line_end_of(*lines.last().unwrap_or(&a)).max(a);
+            if b - a <= at_once_max {
+                // one replacement: quick even for 200,000 lines (and so is its undo)
+                return Ok(line_comment_at_once(doc, sel, a, b, core));
+            }
             let wordy = core.last().is_some_and(|c| c.is_ascii_alphanumeric());
             // (line start, indentation, already commented) for each line that isn't blank
             let mut info = Vec::with_capacity(lines.len());
@@ -1344,9 +1500,157 @@ pub fn toggle_comment(doc: &mut Document, sel: Sel, style: CommentStyle) -> Resu
     Ok(new)
 }
 
-/// Indents (or outdents) the selected lines. Returns None if the selection covers too many lines.
-pub fn indent_lines(doc: &mut Document, sel: Sel, unit: &[u8], tab_size: u32, outdent: bool) -> Option<Sel> {
-    let lines = selected_lines(doc, sel)?;
+/// Line comments added to (or taken from) the whole lines in `[a, b)`, as one replacement of their text (see
+/// `toggle_comment`).
+fn line_comment_at_once(doc: &mut Document, sel: Sel, a: u64, b: u64, core: &[u8]) -> Sel {
+    let text = doc.read(a, b);
+    let wordy = core.last().is_some_and(|c| c.is_ascii_alphanumeric());
+    // (offset in `text`, indentation, already commented) for each line that isn't blank
+    let mut info = Vec::new();
+    let mut off = 0usize;
+    for line in text.split(|&c| c == b'\n') {
+        let content = line.strip_suffix(b"\r").unwrap_or(line);
+        let head = &content[..content.len().min(4096)];
+        let ind = head.iter().take_while(|&&c| c == b' ' || c == b'\t').count();
+        if ind < head.len() {
+            let rest = &head[ind..];
+            let commented = rest.len() >= core.len()
+                && rest[..core.len()].eq_ignore_ascii_case(core)
+                && !(wordy && rest.get(core.len()).is_some_and(|c| !c.is_ascii_whitespace()));
+            info.push((off, ind, commented));
+        }
+        off += line.len() + 1;
+    }
+    if info.is_empty() {
+        return sel;
+    }
+    let remove = info.iter().all(|x| x.2);
+    let col = info.iter().map(|x| x.1).min().unwrap_or(0);
+    // the new text, and where in the document it grows or shrinks by how much
+    let mut out = Vec::with_capacity(text.len() + if remove { 0 } else { info.len() * (core.len() + 1) });
+    let mut edits: Vec<(u64, i64)> = Vec::with_capacity(info.len());
+    let mut copied = 0usize;
+    for &(off, ind, _) in &info {
+        if remove {
+            let at = off + ind;
+            let n = core.len() + (text.get(at + core.len()) == Some(&b' ')) as usize;
+            out.extend_from_slice(&text[copied..at]);
+            copied = at + n;
+            edits.push((a + at as u64, -(n as i64)));
+        } else {
+            let at = off + col;
+            out.extend_from_slice(&text[copied..at]);
+            out.extend_from_slice(core);
+            out.push(b' ');
+            copied = at;
+            edits.push((a + at as u64, core.len() as i64 + 1));
+        }
+    }
+    out.extend_from_slice(&text[copied..]);
+    let keep = (!sel.is_empty()).then_some(sel.start());
+    let new = Sel::new(map_through(&edits, sel.anchor, keep), map_through(&edits, sel.caret, keep));
+    doc.begin(EditKind::Other, sel);
+    doc.delete(a, b);
+    doc.insert(a, &out);
+    doc.end(new);
+    new
+}
+
+/// Where position `p` ends up after `edits` ((where, size change), in order, not overlapping): inside removed
+/// text it moves to where that was; at an insertion it moves past it, unless it's `keep` (where a selection
+/// starts, which stays before what's inserted there).
+fn map_through(edits: &[(u64, i64)], p: u64, keep: Option<u64>) -> u64 {
+    let k = edits.partition_point(|e| e.0 < p);
+    let mut shift: i64 = edits[..k].iter().map(|e| e.1).sum();
+    if let Some(&(at, d)) = k.checked_sub(1).map(|j| &edits[j]) {
+        if d < 0 && p < at + d.unsigned_abs() {
+            return (at as i64 + shift - d) as u64;
+        }
+    }
+    if let Some(&(at, d)) = edits.get(k) {
+        if at == p && d > 0 && keep != Some(p) {
+            shift += d;
+        }
+    }
+    (p as i64 + shift) as u64
+}
+
+/// Indents (or outdents) the selected lines by one level of `ind` (outdent removes a tab, or up to that many
+/// spaces). The lines are rewritten as one replacement, so even 200,000 lines take one quick step (and one quick
+/// undo).
+pub fn indent_lines(doc: &mut Document, sel: Sel, ind: Indent, tab_size: u32, outdent: bool) -> Result<Sel, &'static str> {
+    let lines = selected_lines(doc, sel).ok_or(TOO_MANY_LINES)?;
+    let unit = ind.unit();
+    let width = match ind {
+        Indent::Spaces(n) => n,
+        Indent::Tabs => tab_size,
+    }
+    .max(1) as usize;
+    let a = lines[0];
+    let b = doc.line_end_of(*lines.last().unwrap()).max(a);
+    if b - a > INDENT_AT_ONCE_MAX {
+        // (Huge lines: change each one where it is instead of copying them all.)
+        return Ok(indent_each(doc, sel, &lines, &unit, width, outdent));
+    }
+    let text = doc.read(a, b);
+    let mut out = Vec::with_capacity(text.len() + if outdent { 0 } else { lines.len() * unit.len() });
+    // Each line's start in the document and how much the line grows (or shrinks) there.
+    let mut starts = Vec::with_capacity(lines.len());
+    let mut deltas: Vec<i64> = Vec::with_capacity(lines.len());
+    let mut off = a;
+    for line in text.split(|&c| c == b'\n') {
+        starts.push(off);
+        off += line.len() as u64 + 1;
+        let delta = if outdent {
+            let n = if line.first() == Some(&b'\t') { 1 } else { line.iter().take(width).take_while(|&&c| c == b' ').count() };
+            out.extend_from_slice(&line[n..]);
+            -(n as i64)
+        } else if lines.len() > 1 && matches!(line, [] | [b'\r']) {
+            // empty lines stay empty
+            out.extend_from_slice(line);
+            0
+        } else {
+            out.extend_from_slice(&unit);
+            out.extend_from_slice(line);
+            unit.len() as i64
+        };
+        deltas.push(delta);
+        out.push(b'\n');
+    }
+    out.pop();
+    if deltas.iter().all(|&d| d == 0) {
+        return Ok(sel);
+    }
+    // Where a position moves: along with the changes at the line starts before it, and at its own line's start
+    // (outdenting stops at the line start; indenting moves it along, unless it's where a selection starts, which
+    // stays before the new indentation).
+    let mut before = vec![0i64; deltas.len()];
+    for k in 1..deltas.len() {
+        before[k] = before[k - 1] + deltas[k - 1];
+    }
+    let map = |p: u64| -> u64 {
+        let k = starts.partition_point(|&s| s <= p).max(1) - 1;
+        let (s, d) = (starts[k] as i64, deltas[k]);
+        let p = p as i64;
+        let own = if d < 0 {
+            (p + d).max(s) - p
+        } else if p > s || sel.is_empty() || p != sel.start() as i64 {
+            d
+        } else {
+            0
+        };
+        (p + before[k] + own) as u64
+    };
+    let new = Sel::new(map(sel.anchor), map(sel.caret));
+    doc.begin(EditKind::Other, sel);
+    doc.delete(a, b);
+    doc.insert(a, &out);
+    doc.end(new);
+    Ok(new)
+}
+
+/// `indent_lines` one line at a time (for selections with lines too long to copy).
+fn indent_each(doc: &mut Document, sel: Sel, lines: &[u64], unit: &[u8], width: usize, outdent: bool) -> Sel {
     doc.begin(EditKind::Other, sel);
     let mut anchor = sel.anchor;
     let mut caret = sel.caret;
@@ -1358,7 +1662,7 @@ pub fn indent_lines(doc: &mut Document, sel: Sel, unit: &[u8], tab_size: u32, ou
     // Work from the last line up so earlier offsets stay valid.
     for &ls in lines.iter().rev() {
         if outdent {
-            let head = doc.read(ls, ls + tab_size as u64);
+            let head = doc.read(ls, ls + width as u64);
             let n = if head.first() == Some(&b'\t') {
                 1
             } else {
@@ -1387,26 +1691,29 @@ pub fn indent_lines(doc: &mut Document, sel: Sel, unit: &[u8], tab_size: u32, ou
     }
     let new = Sel::new(anchor, caret);
     doc.end(new);
-    Some(new)
+    new
 }
 
-/// The indentation to insert for Tab at `pos`: a tab, or spaces up to the next tab stop.
-pub fn tab_text(doc: &Document, pos: u64, tab_size: u32, use_spaces: bool) -> Vec<u8> {
-    if !use_spaces {
-        return b"\t".to_vec();
-    }
+/// The indentation to insert for Tab at `pos`: a tab, or spaces up to the next multiple of the indent width (tabs
+/// before `pos` count as `tab_size` columns).
+pub fn tab_text(doc: &Document, pos: u64, ind: Indent, tab_size: u32) -> Vec<u8> {
+    let Indent::Spaces(width) = ind else { return b"\t".to_vec() };
+    let (width, tab_size) = (width.max(1), tab_size.max(1));
     let ls = doc.line_start_of(pos);
     let head = doc.read(pos.saturating_sub(1024).max(ls), pos);
     let mut col = 0u32;
     for c in String::from_utf8_lossy(&head).chars() {
         col = if c == '\t' { (col / tab_size + 1) * tab_size } else { col + 1 };
     }
-    let n = tab_size - col % tab_size;
-    vec![b' '; n as usize]
+    vec![b' '; (width - col % width) as usize]
 }
 
 /// Duplicates the selection, or the current line when nothing is selected.
-pub fn duplicate(doc: &mut Document, sel: Sel) -> Sel {
+pub fn duplicate(doc: &mut Document, sel: Sel) -> Result<Sel, &'static str> {
+    let (a, b) = if sel.is_empty() { (doc.line_start_of(sel.caret), doc.line_end_of(sel.caret)) } else { (sel.start(), sel.end()) };
+    if b - a > COPY_MAX {
+        return Err(TOO_MUCH_TEXT);
+    }
     doc.begin(EditKind::Other, sel);
     let new = if sel.is_empty() {
         let ls = doc.line_start_of(sel.caret);
@@ -1422,7 +1729,7 @@ pub fn duplicate(doc: &mut Document, sel: Sel) -> Sel {
         Sel::new(sel.anchor + n, sel.caret + n)
     };
     doc.end(new);
-    new
+    Ok(new)
 }
 
 /// Deletes the lines touched by the selection.
@@ -1448,16 +1755,19 @@ pub fn delete_lines(doc: &mut Document, sel: Sel) -> Option<Sel> {
 }
 
 /// Moves the selected lines up or down by one.
-pub fn move_lines(doc: &mut Document, sel: Sel, down: bool) -> Option<Sel> {
-    let lines = selected_lines(doc, sel)?;
+pub fn move_lines(doc: &mut Document, sel: Sel, down: bool) -> Result<Sel, &'static str> {
+    let lines = selected_lines(doc, sel).ok_or(TOO_MANY_LINES)?;
     let a = lines[0];
     let last = *lines.last().unwrap();
     let block_end = doc.line_end_of(last);
     let e = eol(doc).to_vec();
     if down {
-        let Some(nl) = doc.next_newline(block_end) else { return Some(sel) };
+        let Some(nl) = doc.next_newline(block_end) else { return Ok(sel) };
         let next_start = nl + 1;
         let next_end = doc.line_end_of(next_start);
+        if next_end - a > COPY_MAX {
+            return Err(TOO_MUCH_TEXT);
+        }
         let block = doc.read(a, block_end);
         let next = doc.read(next_start, next_end);
         doc.begin(EditKind::Other, sel);
@@ -1469,13 +1779,16 @@ pub fn move_lines(doc: &mut Document, sel: Sel, down: bool) -> Option<Sel> {
         let shift = next.len() as u64 + e.len() as u64;
         let new = Sel::new(sel.anchor + shift, sel.caret + shift);
         doc.end(new);
-        Some(new)
+        Ok(new)
     } else {
         if a == 0 {
-            return Some(sel);
+            return Ok(sel);
         }
         let prev_start = doc.line_start_of(a - 1);
         let prev_end = doc.line_end_of(prev_start);
+        if block_end - prev_start > COPY_MAX {
+            return Err(TOO_MUCH_TEXT);
+        }
         let block = doc.read(a, block_end);
         let prev = doc.read(prev_start, prev_end);
         doc.begin(EditKind::Other, sel);
@@ -1487,7 +1800,7 @@ pub fn move_lines(doc: &mut Document, sel: Sel, down: bool) -> Option<Sel> {
         let shift = a - prev_start;
         let new = Sel::new(sel.anchor - shift, sel.caret - shift);
         doc.end(new);
-        Some(new)
+        Ok(new)
     }
 }
 
@@ -1584,15 +1897,127 @@ mod tests {
         delete_lines(&mut d, Sel::at(4)).unwrap();
         assert_eq!(d.read(0, d.len()), b"a\nb");
         let mut d = Document::from_text(b"x\ny");
-        let s = indent_lines(&mut d, Sel::new(0, 3), b"\t", 4, false).unwrap();
+        let s = indent_lines(&mut d, Sel::new(0, 3), Indent::Tabs, 4, false).unwrap();
         assert_eq!(d.read(0, d.len()), b"\tx\n\ty");
         assert_eq!(s, Sel::new(0, 5));
-        indent_lines(&mut d, s, b"\t", 4, true).unwrap();
+        indent_lines(&mut d, s, Indent::Tabs, 4, true).unwrap();
         assert_eq!(d.read(0, d.len()), b"x\ny");
         assert_eq!(normalize_eols(b"a\nb\r\nc\rd", b"\r\n"), b"a\r\nb\r\nc\r\nd");
         let mut d = Document::from_text(b"ab");
-        let s = duplicate(&mut d, Sel::at(1));
+        let s = duplicate(&mut d, Sel::at(1)).unwrap();
         assert_eq!(d.read(0, d.len()), b"ab\r\nab");
         assert_eq!(s, Sel::at(5));
+        // Enter on a line of nothing but indentation takes the indentation along instead of leaving it behind.
+        let mut d = Document::from_text(b"  x\n    \ny");
+        let s = newline(&mut d, Sel::at(8), b"  ");
+        assert_eq!(d.read(0, d.len()), b"  x\n\r\n    \ny");
+        assert_eq!(s, Sel::at(10));
+    }
+
+    #[test]
+    fn indenting_at_once_matches_line_by_line() {
+        let text = b"a\n  b\n\n\tc\r\n     d\r\n\r\ne  \n    \nf";
+        let len = text.len() as u64;
+        for ind in [Indent::Tabs, Indent::Spaces(2), Indent::Spaces(4)] {
+            for outdent in [false, true] {
+                for anchor in 0..=len {
+                    for caret in [0, 1, 3, 7, 12, 20, len - 1, len] {
+                        let sel = Sel::new(anchor, caret.min(len));
+                        let mut one = Document::from_text(text);
+                        let mut each = Document::from_text(text);
+                        let a = indent_lines(&mut one, sel, ind, 4, outdent).unwrap();
+                        let lines = selected_lines(&each, sel).unwrap();
+                        let width = match ind {
+                            Indent::Spaces(n) => n as usize,
+                            Indent::Tabs => 4,
+                        };
+                        let b = indent_each(&mut each, sel, &lines, &ind.unit(), width, outdent);
+                        assert_eq!(one.read(0, one.len()), each.read(0, each.len()), "{ind:?} {outdent} {sel:?}");
+                        assert_eq!(a, b, "{ind:?} {outdent} {sel:?}");
+                        // one undo step brings it all back
+                        if one.can_undo() {
+                            one.undo();
+                            assert_eq!(one.read(0, one.len()), text);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn commenting_at_once_matches_line_by_line() {
+        let text = b"a\n  b // x\n\n\t// c\r\n     d\r\n  \r\n//e  \n    \n// f";
+        let len = text.len() as u64;
+        for style in [CommentStyle::Line("// "), CommentStyle::Line("REM ")] {
+            for anchor in 0..=len {
+                for caret in [0, 1, 3, 7, 12, 20, len - 1, len] {
+                    let sel = Sel::new(anchor, caret.min(len));
+                    let mut one = Document::from_text(text);
+                    let mut each = Document::from_text(text);
+                    let a = toggle_comment_with(&mut one, sel, style, u64::MAX).unwrap();
+                    let b = toggle_comment_with(&mut each, sel, style, 0).unwrap();
+                    assert_eq!(one.read(0, one.len()), each.read(0, each.len()), "{sel:?}");
+                    assert_eq!(a, b, "{sel:?}");
+                    // and back
+                    let a2 = toggle_comment_with(&mut one, a, style, u64::MAX).unwrap();
+                    let b2 = toggle_comment_with(&mut each, b, style, 0).unwrap();
+                    assert_eq!(one.read(0, one.len()), each.read(0, each.len()), "{sel:?} again");
+                    assert_eq!(a2, b2, "{sel:?} again");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn closing_brackets_line_up_with_their_opening_line() {
+        let mut d = Document::from_text(b"  if (x) {\n      ");
+        let s = close_bracket(&mut d, Sel::at(17), b'}', 4).unwrap();
+        assert_eq!(d.read(0, d.len()), b"  if (x) {\n  }");
+        assert_eq!(s, Sel::at(14));
+        // no opening bracket around: one level less
+        let mut d = Document::from_text(b"a\n      ");
+        close_bracket(&mut d, Sel::at(8), b']', 4).unwrap();
+        assert_eq!(d.read(0, d.len()), b"a\n    ]");
+        let mut d = Document::from_text(b"a\n\t\t");
+        close_bracket(&mut d, Sel::at(4), b'}', 4).unwrap();
+        assert_eq!(d.read(0, d.len()), b"a\n\t}");
+        // nested: the line of the bracket it closes
+        let mut d = Document::from_text(b"[\n  [1,\n   2],\n  {\n    ");
+        let end = d.len();
+        close_bracket(&mut d, Sel::at(end), b'}', 2).unwrap();
+        assert!(d.read(0, d.len()).ends_with(b"  {\n  }"));
+        // text before the caret, or already in place: typed as usual
+        let mut d = Document::from_text(b"{\n  x ");
+        assert!(close_bracket(&mut d, Sel::at(6), b'}', 2).is_none());
+        let mut d = Document::from_text(b"{\n");
+        assert!(close_bracket(&mut d, Sel::at(2), b'}', 2).is_none());
+    }
+
+    #[test]
+    fn indentation_is_detected() {
+        assert_eq!(detect_indent(b"a\n\tb\n\t\tc\n\td\n"), Some(Indent::Tabs));
+        assert_eq!(detect_indent(b"a:\n  b:\n    c: 1\n  d: 2\n"), Some(Indent::Spaces(2)));
+        assert_eq!(detect_indent(b"def f():\n    if x:\n        y()\n    return 1\n"), Some(Indent::Spaces(4)));
+        // block comments in a tab-indented file
+        assert_eq!(detect_indent(b"/*\n * x\n * y\n */\nint f() {\n\treturn 1;\n\tx;\n\ty;\n}\n"), Some(Indent::Tabs));
+        assert_eq!(detect_indent(b"no\nindentation\nhere\n"), None);
+        assert_eq!(detect_indent(b""), None);
+        assert_eq!(detect_indent(b"    starts indented\nx\n"), Some(Indent::Spaces(4)));
+    }
+
+    #[test]
+    fn huge_lines_are_not_copied() {
+        let mut big = vec![b'a'; (COPY_MAX + 10) as usize];
+        big.extend_from_slice(b"\nb");
+        let mut d = Document::from_text(&big);
+        assert_eq!(duplicate(&mut d, Sel::at(5)), Err(TOO_MUCH_TEXT));
+        assert_eq!(move_lines(&mut d, Sel::at(5), true), Err(TOO_MUCH_TEXT));
+        let end = d.len();
+        assert_eq!(move_lines(&mut d, Sel::at(end), false), Err(TOO_MUCH_TEXT));
+        assert_eq!(d.len(), big.len() as u64);
+        let s = duplicate(&mut d, Sel::at(end)).unwrap();
+        assert!(d.read(0, d.len()).ends_with(b"\nb\r\nb"));
+        assert_eq!(s, Sel::at(d.len()));
     }
 }

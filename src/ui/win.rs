@@ -39,6 +39,23 @@ pub struct Scripted {
     /// The prompts that were "shown".
     pub asked: Vec<String>,
     pub clipboard: Option<Vec<u8>>,
+    /// Bumped whenever the private clipboard changes (like GetClipboardSequenceNumber).
+    pub clipboard_seq: u32,
+    /// The menus that would have opened (they never are in this mode, as they'd wait for the mouse).
+    pub menus: Vec<String>,
+}
+
+/// Test mode: notes that menu `name` would open now (and returns true: don't show it).
+pub fn scripted_menu(name: &str) -> bool {
+    scripted(|s| s.menus.push(name.to_string())).is_some()
+}
+
+/// Changes whenever anything is put on the clipboard (by any program).
+pub fn clipboard_sequence() -> u32 {
+    if let Some(n) = scripted(|s| s.clipboard_seq) {
+        return n;
+    }
+    unsafe { windows::Win32::System::DataExchange::GetClipboardSequenceNumber() }
 }
 
 thread_local! {
@@ -142,7 +159,12 @@ pub fn get_clipboard(hwnd: HWND) -> Option<Vec<u8>> {
 
 /// Puts UTF-8 text on the clipboard.
 pub fn set_clipboard(hwnd: HWND, text: &[u8]) -> bool {
-    if scripted(|s| s.clipboard = Some(text.to_vec())).is_some() {
+    if scripted(|s| {
+        s.clipboard = Some(text.to_vec());
+        s.clipboard_seq += 1;
+    })
+    .is_some()
+    {
         return true;
     }
     let wide: Vec<u16> = String::from_utf8_lossy(text).encode_utf16().chain(std::iter::once(0)).collect();
@@ -236,6 +258,11 @@ pub fn save_dialog(hwnd: HWND, name: &str, folder: Option<&Path>) -> Option<Path
         let opts = dlg.GetOptions().unwrap_or_default();
         let _ = dlg.SetOptions(opts | FOS_OVERWRITEPROMPT | FOS_PATHMUSTEXIST | FOS_FORCEFILESYSTEM);
         let _ = dlg.SetFileName(&HSTRING::from(name));
+        // A name typed without an extension gets the file's own ("Untitled.txt" for a new document: notes →
+        // notes.txt, like Notepad). A file named without one (Makefile) gets none.
+        if let Some(ext) = Path::new(name).extension() {
+            let _ = dlg.SetDefaultExtension(&HSTRING::from(ext));
+        }
         if let Some(dir) = folder {
             if let Ok(item) = SHCreateItemFromParsingName::<_, _, IShellItem>(&HSTRING::from(dir.as_os_str()), None) {
                 let _ = dlg.SetFolder(&item);

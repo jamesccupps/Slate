@@ -5,13 +5,23 @@
 //! With `SLATE_TEST_VISIBLE=1` the window is shown instead (on top, without taking the keyboard focus), it draws
 //! through the real swap chain, and `shot` captures what is actually on screen, native edit boxes included.
 //!
-//! Commands: `size:1200x800`, `theme:dark|light`, `open:<path>`, `type:<text>` (`\n` and `\t` allowed),
-//! `key:<combo>` (e.g. `ctrl+shift+k`, `enter`, `pagedown`), `cmd:<Name>` (a menu command, e.g. `JsonFormat`),
+//! Commands: `size:1200x800`, `theme:dark|light`, `open:<path>`, `type:<text>` (`\n`, `\r` and `\t` allowed),
+//! `key:<combo>` (e.g. `ctrl+shift+k`, `enter`, `pagedown`, `apps`), `cmd:<Name>` (a menu command, e.g. `JsonFormat`),
 //! `find:<text>`, `replace:<text>`, `goto:<line>`, `saveas:<path>`, `click:<x>,<y>`, `dblclick:<x>,<y>`,
 //! `wheel:<rows>`, `wait:<ms>`, `jobs` (wait for background work), `shot:<file.png>`, `print:<what>`
 //! (`text`, `sel`, `status`, `lines`, `title`, `top`, `find`, `tabs`, `dirty`, `asked`, `clipboard`, `window`,
 //! `saving`), `expect:<what>=<value>`, `answer:save,dont,cancel` (answers for the next prompts, which are never
 //! shown in this mode; `asked` lists the prompts so far), `set:restore_session=true`.
+//!
+//! Lower level: `down:<x>,<y>` / `move:<x>,<y>` / `up:<x>,<y>` (left button, for drags; also where drag scrolling
+//! sees the pointer), `wheelraw:<delta>` or `wheelraw:ctrl,<delta>` (one WM_MOUSEWHEEL; touchpads send small
+//! deltas), `char:<hex>[,<hex>…]` (WM_CHAR through the window procedure, e.g. `char:d83d,de00`), `altkey` (Alt
+//! pressed and released alone: WM_SYSCOMMAND SC_KEYMENU), `altgr:on|off` (pretend Ctrl+Alt+letter types a
+//! character, like AltGr on a Polish keyboard), `activate` / `deactivate` (WM_ACTIVATE), `cancelmode`
+//! (WM_CANCELMODE: something took the mouse capture), `timer:<id>` (run a timer's tick now; 3 = disk check, 4 = drag
+//! scrolling). More `print:` values: `focus` (main, find, replace, goto), `armed` (menu bar title with the
+//! keyboard), `opened` (menus that would have opened: native menus are never shown in this mode), `keys0`…`keys4`
+//! (each menu item's access key), `scrollx`, `zoom`, `topline`, `drag`, `wintitle`, `tabnames`, `indent`.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -90,6 +100,9 @@ fn vk_of(name: &str) -> Option<u16> {
         "insert" => VK_INSERT,
         "plus" => VK_OEM_PLUS,
         "minus" => VK_OEM_MINUS,
+        "space" => VK_SPACE,
+        "apps" => VK_APPS,
+        "alt" => VK_MENU,
         f if f.starts_with('f') && f.len() > 1 && f[1..].parse::<u16>().is_ok() => {
             return Some(VK_F1.0 + f[1..].parse::<u16>().unwrap() - 1);
         }
@@ -147,6 +160,10 @@ fn cmd_of(name: &str) -> Option<Cmd> {
         "NextTab" => Cmd::NextTab,
         "PrevTab" => Cmd::PrevTab,
         "Reload" => Cmd::Reload,
+        "IndentSpaces" => Cmd::IndentSpaces(true),
+        "IndentTabs" => Cmd::IndentSpaces(false),
+        "Shortcuts" => Cmd::Shortcuts,
+        "SaveAs" => Cmd::SaveAs,
         "ReplaceAll" => return None,
         _ => return None,
     })
@@ -336,6 +353,22 @@ fn describe(cell: &Cell, what: &str) -> String {
             let items = a.menu_items(m[4..].parse().unwrap_or(0));
             labels(&items)
         }
+        k if k.starts_with("keys") => {
+            // keys0 … keys4: each item's access key (the letter after '&'; '?' for none), submenus in brackets
+            fn keys(items: &[super::commands::Item]) -> String {
+                let key = |l: &str| l.split_once('&').and_then(|(_, r)| r.chars().next()).map(|c| c.to_ascii_uppercase()).unwrap_or('?');
+                items
+                    .iter()
+                    .filter_map(|it| match it {
+                        super::commands::Item::Cmd { label, .. } => Some(key(label).to_string()),
+                        super::commands::Item::Sub { label, items } => Some(format!("{}[{}]", key(label), keys(items))),
+                        _ => None,
+                    })
+                    .collect()
+            }
+            let items = a.menu_items(k[4..].parse().unwrap_or(0));
+            keys(&items)
+        }
         "asked" => super::win::SCRIPTED.with(|s| s.borrow().as_ref().map(|s| s.asked.join(" | ")).unwrap_or_default()),
         "clipboard" => super::win::SCRIPTED
             .with(|s| s.borrow().as_ref().and_then(|s| s.clipboard.clone()))
@@ -344,6 +377,30 @@ fn describe(cell: &Cell, what: &str) -> String {
         "window" => (unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindow(a.hwnd) }.as_bool()).to_string(),
         "saving" => a.tabs.iter().filter(|t| t.save.is_some()).count().to_string(),
         "notice" => a.tab().notice.as_ref().map(|n| n.text.clone()).unwrap_or_default(),
+        "focus" => {
+            let f = unsafe { GetFocus() };
+            let names = [(a.hwnd, "main"), (a.find.find_edit, "find"), (a.find.replace_edit, "replace"), (a.find.goto_edit, "goto")];
+            names.iter().find(|(h, _)| *h == f).map(|(_, n)| n.to_string()).unwrap_or_else(|| "none".into())
+        }
+        "armed" => a.menu_armed.map(|i| super::commands::MENU_TITLES[i].to_string()).unwrap_or_default(),
+        "opened" => super::win::SCRIPTED.with(|s| s.borrow().as_ref().map(|s| s.menus.join(" | ")).unwrap_or_default()),
+        "scrollx" => format!("{:.0}", a.tab().view.scroll_x),
+        "zoom" => format!("{:.0}%", a.settings.zoom * 100.0),
+        "topline" => {
+            let top = a.tab().view.top;
+            a.tab().doc.line_of(top).map(|l| (l + 1).to_string()).unwrap_or_default()
+        }
+        "drag" => format!("{:?}", a.tab().view.drag),
+        "wintitle" => {
+            let mut buf = [0u16; 1024];
+            let n = unsafe { windows::Win32::UI::WindowsAndMessaging::GetWindowTextW(a.hwnd, &mut buf) };
+            String::from_utf16_lossy(&buf[..n.max(0) as usize])
+        }
+        "tabnames" => (0..a.tabs.len()).map(|i| a.tab_label(i)).collect::<Vec<_>>().join(" | "),
+        "indent" => match a.indent_now() {
+            super::app::Indent::Tabs => "tabs".into(),
+            super::app::Indent::Spaces(n) => format!("spaces {n}"),
+        },
         "find" => {
             a.update_find_status();
             a.find.status.clone()
@@ -389,7 +446,7 @@ pub fn run(args: &[String]) -> i32 {
     let mut out = String::new();
     for line in lines.iter().map(|l| l.trim()).filter(|l| !l.is_empty() && !l.starts_with('#')) {
         let (op, arg) = line.split_once(':').unwrap_or((line, ""));
-        let unescape = |s: &str| s.replace("\\n", "\n").replace("\\t", "\t");
+        let unescape = |s: &str| s.replace("\\r", "\r").replace("\\n", "\n").replace("\\t", "\t");
         match op {
             "size" => {
                 if let Some((w, h)) = arg.split_once('x') {
@@ -596,6 +653,65 @@ pub fn run(args: &[String]) -> i32 {
                         super::restore(&mut a, &[]);
                     }
                 }
+            }
+            "down" | "move" | "up" => {
+                let (x, y) = arg.split_once(',').map(|(x, y)| (x.parse().unwrap_or(0.0), y.parse().unwrap_or(0.0))).unwrap_or((0.0, 0.0));
+                super::actions::TEST_POINTER.with(|p| p.set(Some((x, y))));
+                {
+                    let mut a = cell.borrow_mut();
+                    match op {
+                        "down" => {
+                            a.on_mouse_move(x, y);
+                            a.on_mouse_down(x, y, 0);
+                        }
+                        "move" => a.on_mouse_move(x, y),
+                        _ => a.on_mouse_up(x, y, 0),
+                    }
+                }
+                drain_pending(&cell);
+            }
+            "wheelraw" => {
+                let (ctrl, delta) = match arg.split_once(',') {
+                    Some((m, d)) => (m == "ctrl", d),
+                    None => (false, arg),
+                };
+                super::commands::FORCED_MODS.with(|m| m.set(Some((ctrl, false, false))));
+                {
+                    let mut a = cell.borrow_mut();
+                    let (x, y) = (a.r_edit.x + 100.0, a.r_edit.y + 100.0);
+                    a.on_wheel(delta.parse().unwrap_or(120), false, x, y);
+                    a.hover = Hit::None;
+                }
+                super::commands::FORCED_MODS.with(|m| m.set(None));
+            }
+            "char" => {
+                use windows::Win32::Foundation::{LPARAM, WPARAM};
+                use windows::Win32::UI::WindowsAndMessaging::{SendMessageW, WM_CHAR};
+                for c in arg.split(',') {
+                    let v = u16::from_str_radix(c.trim(), 16).unwrap_or(0);
+                    unsafe { SendMessageW(hwnd, WM_CHAR, WPARAM(v as usize), LPARAM(0)) };
+                }
+            }
+            "altkey" => {
+                use windows::Win32::Foundation::{LPARAM, WPARAM};
+                use windows::Win32::UI::WindowsAndMessaging::{SC_KEYMENU, SendMessageW, WM_SYSCOMMAND};
+                unsafe { SendMessageW(hwnd, WM_SYSCOMMAND, WPARAM(SC_KEYMENU as usize), LPARAM(0)) };
+            }
+            "altgr" => super::commands::FORCED_ALTGR.with(|f| f.set(arg == "on")),
+            "activate" | "deactivate" | "cancelmode" => {
+                use windows::Win32::Foundation::{LPARAM, WPARAM};
+                use windows::Win32::UI::WindowsAndMessaging::{SendMessageW, WA_ACTIVE, WA_INACTIVE, WM_ACTIVATE, WM_CANCELMODE};
+                let (m, w) = match op {
+                    "activate" => (WM_ACTIVATE, WA_ACTIVE as usize),
+                    "deactivate" => (WM_ACTIVATE, WA_INACTIVE as usize),
+                    _ => (WM_CANCELMODE, 0),
+                };
+                unsafe { SendMessageW(hwnd, m, WPARAM(w), LPARAM(0)) };
+            }
+            "timer" => {
+                let id: usize = arg.parse().unwrap_or(0);
+                cell.borrow_mut().on_timer(id);
+                drain_pending(&cell);
             }
             "scrollto" => {
                 // fraction of the scrollbar, 0..1

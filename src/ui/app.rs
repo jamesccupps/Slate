@@ -11,7 +11,8 @@ use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Direct2D::Common::D2D1_COLOR_F;
 use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_LINE_SPACING_METHOD_UNIFORM,
-    DWRITE_WORD_WRAPPING_NO_WRAP, DWRITE_WORD_WRAPPING_WRAP, IDWriteTextFormat,
+    DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_RANGE, DWRITE_WORD_WRAPPING_NO_WRAP, DWRITE_WORD_WRAPPING_WRAP,
+    IDWriteTextFormat,
 };
 use windows::Win32::Graphics::Gdi::InvalidateRect;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
@@ -25,8 +26,9 @@ use crate::core::search::Found;
 use crate::core::source::Source;
 use crate::core::text::{Encoding, Eol};
 
-use super::commands::{Cmd, MENU_TITLES};
+use super::commands::{Cmd, MENU_KEYS, MENU_TITLES};
 use super::update::Release;
+pub use super::editor::Indent;
 use super::editor::{Ctx, Geom, Style, View};
 use super::findbar::{self, FindBar};
 use super::gfx::{Align, Gfx, Rect, font_info, rgb};
@@ -150,6 +152,12 @@ pub struct Tab {
     pub discard: bool,
     /// JSON path bar and structure panel state.
     pub structure: super::structure::Structure,
+    /// How this document is indented (worked out from its text, or picked in the menu); None: the settings' default.
+    pub indent: Option<Indent>,
+    /// The user picked `indent` (so it isn't guessed again, and wins over the rules for TSV files and makefiles).
+    pub indent_picked: bool,
+    /// A name for a tab that isn't a file (the keyboard shortcuts).
+    pub title_override: Option<String>,
 }
 
 impl Tab {
@@ -174,10 +182,16 @@ impl Tab {
             seen_disk: None,
             discard: false,
             structure: Default::default(),
+            indent: None,
+            indent_picked: false,
+            title_override: None,
         }
     }
 
     pub fn title(&self) -> String {
+        if let Some(t) = &self.title_override {
+            return t.clone();
+        }
         match &self.doc.path {
             Some(p) => p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| p.display().to_string()),
             None if self.untitled > 1 => format!("Untitled {}", self.untitled),
@@ -308,6 +322,17 @@ pub struct App {
     pub mouse_tracking: bool,
     /// `g.generation` the cached layouts were made for.
     pub gfx_generation: u64,
+    /// Alt was pressed and released on its own: the menu bar has the keyboard, with this title highlighted.
+    pub menu_armed: Option<usize>,
+    /// Mouse wheel movement not scrolled yet (in rows; touchpads send small steps), and for Ctrl+wheel zoom (in
+    /// wheel units).
+    pub wheel_rows: f32,
+    pub wheel_zoom: i32,
+    /// Copy or Cut with nothing selected put a whole line on the clipboard: its clipboard sequence number, so a paste
+    /// of that line goes in as a line above the caret's.
+    pub line_clip: Option<u32>,
+    /// The flash message came from searching (cleared when the search changes).
+    pub flash_search: bool,
 }
 
 pub const ZOOM_STEPS: [f32; 15] = [0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0, 4.0, 5.0];
@@ -380,6 +405,11 @@ impl App {
             last_session_save: Instant::now(),
             mouse_tracking: false,
             gfx_generation: 0,
+            menu_armed: None,
+            wheel_rows: 0.0,
+            wheel_zoom: 0,
+            line_clip: None,
+            flash_search: false,
         };
         app.apply_theme();
         app
@@ -401,7 +431,18 @@ impl App {
 
     pub fn flash(&mut self, msg: impl Into<String>, bad: bool) {
         self.flash = Some((msg.into(), Instant::now(), bad));
+        self.flash_search = false;
+        // (The caret's blinking no longer repaints an unfocused window: take the message away on time.)
+        unsafe {
+            windows::Win32::UI::WindowsAndMessaging::SetTimer(self.hwnd, super::actions::TIMER_FLASH, 6100, None);
+        }
         self.invalidate();
+    }
+
+    /// A message about the search ("No results"...), which goes away once the search changes.
+    pub fn flash_search(&mut self, msg: impl Into<String>, bad: bool) {
+        self.flash(msg, bad);
+        self.flash_search = true;
     }
 
     pub fn new_tab_id(&mut self) -> u64 {
@@ -512,6 +553,12 @@ impl App {
         self.newtab_rect = Rect::new(nx, top + (h - 28.0) / 2.0, 28.0, 28.0);
     }
 
+    /// Where tabs stop being drawn (and clicked): just before the new-tab button, which follows the last tab or,
+    /// when the tabs don't all fit, stays at the end of the strip.
+    fn tabs_clip_right(&self) -> f32 {
+        self.newtab_rect.x - 4.0
+    }
+
     /// Scrolls the tab strip so the active tab is visible.
     pub fn reveal_active_tab(&mut self) {
         self.layout_tabs();
@@ -549,7 +596,7 @@ impl App {
     pub fn hit(&self, x: f32, y: f32) -> Hit {
         if self.r_tabs.contains(x, y) {
             for (i, (r, c)) in self.tab_rects.iter().enumerate() {
-                if r.contains(x, y) && x >= self.r_tabs.x && x < self.r_tabs.right() - 44.0 {
+                if r.contains(x, y) && x >= self.r_tabs.x && x < self.tabs_clip_right() {
                     if c.contains(x, y) {
                         return Hit::TabClose(i);
                     }
@@ -678,11 +725,63 @@ impl App {
         }
     }
 
+    /// What tab `i` is called on the tab strip: its title, plus as much of its folder as tells it apart from other
+    /// tabs with the same name ("config.json — server").
+    pub fn tab_label(&self, i: usize) -> String {
+        let tab = &self.tabs[i];
+        let title = tab.title();
+        let Some(path) = tab.doc.path.as_ref().filter(|_| tab.title_override.is_none()) else { return title };
+        // folder names from the file upwards
+        let dirs = |p: &std::path::Path| -> Vec<String> {
+            let parent = p.parent().map(|d| d.components().collect::<Vec<_>>()).unwrap_or_default();
+            parent
+                .iter()
+                .rev()
+                .filter_map(|c| match c {
+                    std::path::Component::Normal(s) => Some(s.to_string_lossy().to_lowercase()),
+                    _ => None,
+                })
+                .collect()
+        };
+        let name = |p: &std::path::Path| p.file_name().map(|n| n.to_string_lossy().to_lowercase());
+        let others: Vec<Vec<String>> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter(|(j, t)| *j != i && t.title_override.is_none())
+            .filter_map(|(_, t)| t.doc.path.as_deref())
+            .filter(|p| name(p) == name(path))
+            .map(dirs)
+            .collect();
+        if others.is_empty() {
+            return title;
+        }
+        let mine = dirs(path);
+        let shown: Vec<String> = path
+            .parent()
+            .map(|d| {
+                d.components()
+                    .rev()
+                    .filter_map(|c| match c {
+                        std::path::Component::Normal(s) => Some(s.to_string_lossy().into_owned()),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let k = (1..=mine.len()).find(|&k| others.iter().all(|o| o.get(..k) != mine.get(..k))).unwrap_or(mine.len());
+        if k == 0 {
+            return title;
+        }
+        let folder: Vec<&str> = shown[..k].iter().rev().map(String::as_str).collect();
+        format!("{title} — {}", folder.join("\\"))
+    }
+
     fn paint_tabs(&mut self) {
         let t = self.theme.clone();
         let g = &self.g;
         g.fill(self.r_tabs, t.frame);
-        let clip = Rect::new(self.r_tabs.x, self.r_tabs.y, self.r_tabs.w - 44.0, self.r_tabs.h);
+        let clip = Rect::new(self.r_tabs.x, self.r_tabs.y, self.tabs_clip_right() - self.r_tabs.x, self.r_tabs.h);
         g.push_clip(clip);
         for (i, (r, c)) in self.tab_rects.iter().enumerate() {
             if r.right() < clip.x || r.x > clip.right() {
@@ -701,11 +800,13 @@ impl App {
                 g.line(r.right() - 0.5, r.y + 10.0, r.right() - 0.5, r.bottom() - 10.0, t.border, 1.0);
             }
             let busy = tab.busy() || !tab.doc.is_ready();
-            let title = tab.title();
-            let text_r = Rect::new(r.x + 14.0, r.y, (c.x - r.x - 18.0).max(10.0), r.h - 2.0);
+            let title = self.tab_label(i);
+            let show_close = hovered || active;
+            // (Room for the unsaved-changes dot next to the close button on the active tab.)
+            let dot = active && tab.doc.is_dirty() && show_close && self.hover != Hit::TabClose(i);
+            let text_r = Rect::new(r.x + 14.0, r.y, (c.x - r.x - if dot { 30.0 } else { 18.0 }).max(10.0), r.h - 2.0);
             let color = if active { t.text } else { t.text_dim };
             g.text(&title, &self.fonts.ui, text_r, color, Align::Left);
-            let show_close = hovered || active;
             if show_close {
                 if self.hover == Hit::TabClose(i) {
                     g.fill_round(*c, 4.0, t.hover);
@@ -715,7 +816,7 @@ impl App {
                 let d = 8.0;
                 g.fill_round(Rect::new(c.x + (c.w - d) / 2.0, c.y + (c.h - d) / 2.0, d, d), d / 2.0, t.text_dim);
             }
-            if active && tab.doc.is_dirty() && show_close && self.hover != Hit::TabClose(i) {
+            if dot {
                 // dirty dot shown next to the close button on the active tab
                 let d = 6.0;
                 g.fill_round(Rect::new(c.x - 10.0, c.y + (c.h - d) / 2.0, d, d), d / 2.0, t.text_dim);
@@ -741,10 +842,20 @@ impl App {
         for (i, r) in self.menu_rects.iter().enumerate() {
             if self.menu_open == Some(i) {
                 g.fill_round(*r, 5.0, t.pressed);
-            } else if self.hover == Hit::Menu(i) {
+            } else if self.hover == Hit::Menu(i) || self.menu_armed == Some(i) {
                 g.fill_round(*r, 5.0, t.hover);
             }
-            g.text(MENU_TITLES[i], &self.fonts.ui, *r, t.text, Align::Center);
+            if self.menu_armed.is_some() {
+                // The keyboard is on the menu bar: underline the letter that opens each menu.
+                let l = g.layout(&super::gfx::wide(MENU_TITLES[i]), &self.fonts.ui, r.w, r.h);
+                unsafe {
+                    let _ = l.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                    let _ = l.SetUnderline(true, DWRITE_TEXT_RANGE { startPosition: MENU_KEYS[i], length: 1 });
+                }
+                g.draw_layout(&l, r.x, r.y, t.text);
+            } else {
+                g.text(MENU_TITLES[i], &self.fonts.ui, *r, t.text, Align::Center);
+            }
         }
         // Light/dark switch: a sun in dark mode, a moon in light mode.
         if self.hover == Hit::ThemeToggle {
@@ -978,7 +1089,7 @@ impl App {
         let tab = self.tab();
         if let Some(s) = &tab.save {
             let then = if s.close_after { " (closes when done)" } else { "" };
-            return Some((format!("Saving… {:.0}%{then}", s.job.fraction() * 100.0), false));
+            return Some((format!("Saving… {:.0}%{then}  (Esc to cancel)", s.job.fraction() * 100.0), false));
         }
         if let Some(task) = &tab.task {
             let what = match task.kind {
@@ -992,6 +1103,13 @@ impl App {
             };
             return Some((format!("{what}… {:.0}%  (Esc to cancel)", task.job.fraction() * 100.0), false));
         }
+        // A recent message comes before progress below: it often says why something didn't happen ("Still reading
+        // the file's lines…" while that runs).
+        if let Some((m, at, bad)) = &self.flash {
+            if at.elapsed().as_secs() < 6 {
+                return Some((m.clone(), *bad));
+            }
+        }
         if let Some(j) = &tab.index_job {
             return Some((format!("Reading lines… {:.0}%", j.fraction() * 100.0), false));
         }
@@ -1001,11 +1119,6 @@ impl App {
         if let Some(j) = &tab.search.job {
             if self.find.open {
                 return Some((format!("Searching… {:.0}%", j.fraction() * 100.0), false));
-            }
-        }
-        if let Some((m, at, bad)) = &self.flash {
-            if at.elapsed().as_secs() < 6 {
-                return Some((m.clone(), *bad));
             }
         }
         if tab.doc.read_errors() > 0 {

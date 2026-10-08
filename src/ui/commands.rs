@@ -95,6 +95,8 @@ pub struct Mods {
 thread_local! {
     /// Test mode: pretend these modifier keys (ctrl, shift, alt) are held.
     pub static FORCED_MODS: std::cell::Cell<Option<(bool, bool, bool)>> = const { std::cell::Cell::new(None) };
+    /// Test mode: pretend the keyboard layout types a character for every letter with AltGr (Ctrl+Alt), like Polish.
+    pub static FORCED_ALTGR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 pub fn mods() -> Mods {
@@ -110,8 +112,44 @@ pub fn mods() -> Mods {
     }
 }
 
+/// Whether `vk` types a character with these modifiers in the current keyboard layout. Windows reports AltGr as
+/// Ctrl+Alt, so on many layouts Ctrl+Alt+letter is a letter (Polish AltGr+S is "ś"), not a shortcut.
+pub fn makes_char(vk: u16, m: &Mods) -> bool {
+    if FORCED_ALTGR.with(|f| f.get()) {
+        return m.ctrl && m.alt && (VK_A.0..=VK_Z.0).contains(&vk);
+    }
+    unsafe {
+        let mut state = [0u8; 256];
+        let mut hold = |k: VIRTUAL_KEY| state[k.0 as usize] = 0x80;
+        if m.ctrl {
+            hold(VK_CONTROL);
+            hold(VK_LCONTROL);
+        }
+        if m.alt {
+            hold(VK_MENU);
+            hold(VK_RMENU);
+        }
+        if m.shift {
+            hold(VK_SHIFT);
+            hold(VK_LSHIFT);
+        }
+        state[VK_CAPITAL.0 as usize] = (GetKeyState(VK_CAPITAL.0 as i32) & 1) as u8;
+        let layout = GetKeyboardLayout(0);
+        let scan = MapVirtualKeyExW(vk as u32, MAPVK_VK_TO_VSC, layout);
+        let mut buf = [0u16; 8];
+        // Flag 4: leave the keyboard state alone, so a pending dead key still combines with the next key.
+        let n = ToUnicodeEx(vk as u32, scan, &state, &mut buf, 4, layout);
+        // A dead key (n < 0) types a character too; control characters (Ctrl+Enter...) don't count.
+        n < 0 || buf[..n.max(0) as usize].iter().any(|&c| c >= 0x20)
+    }
+}
+
 /// Shortcuts that work everywhere (also while typing in the find box).
 pub fn global_key(vk: u16, m: &Mods) -> Option<Cmd> {
+    if m.ctrl && m.alt && makes_char(vk, m) {
+        // AltGr+key types a character.
+        return None;
+    }
     let k = VIRTUAL_KEY(vk);
     let c = m.ctrl && !m.alt;
     Some(match (k, c, m.shift) {
@@ -245,6 +283,8 @@ pub fn build_menu(items: &[Item], ids: &mut Vec<Cmd>) -> HMENU {
 }
 
 pub const MENU_TITLES: [&str; 5] = ["File", "Edit", "View", "Format", "Help"];
+/// The letter of each title that opens it with Alt (F, E, V, O, H), underlined while the menu bar has the keyboard.
+pub const MENU_KEYS: [u32; 5] = [0, 0, 0, 1, 0];
 
 /// Menu bar shortcut letters (Alt+F etc.).
 pub fn menu_for_letter(vk: u16) -> Option<usize> {
@@ -259,36 +299,67 @@ pub fn menu_for_letter(vk: u16) -> Option<usize> {
 }
 
 pub const SHORTCUTS: &str = "\
+Keyboard shortcuts
+
 Files
-  Ctrl+N / Ctrl+T    New tab
-  Ctrl+O             Open
-  Ctrl+S             Save
-  Ctrl+Shift+S       Save as
-  Ctrl+Alt+S         Save all
-  Ctrl+W             Close tab
-  Ctrl+Tab           Next tab
-  Ctrl+1 … 9         Go to tab
+  Ctrl+N / Ctrl+T               New tab
+  Ctrl+O                        Open
+  Ctrl+S                        Save
+  Ctrl+Shift+S                  Save as
+  Ctrl+Alt+S                    Save all
+  Ctrl+W / Ctrl+F4              Close tab
+  Ctrl+Tab / Ctrl+PgDn          Next tab
+  Ctrl+Shift+Tab / Ctrl+PgUp    Previous tab
+  Ctrl+1 … Ctrl+8               Go to that tab
+  Ctrl+9                        Go to the last tab
+  Alt+F4                        Exit (unsaved work comes back next time)
 
 Editing
-  Ctrl+Z / Ctrl+Y    Undo / Redo
-  Ctrl+X / C / V     Cut / Copy / Paste (no selection: the whole line)
-  Ctrl+D             Duplicate line
-  Ctrl+Shift+K       Delete line
-  Alt+Up / Down      Move line up / down
-  Tab / Shift+Tab    Indent / outdent selected lines
-  Ctrl+/             Comment / uncomment lines
-  Ctrl+Shift+U       UPPERCASE (Ctrl+U: lowercase)
-  Ctrl+Backspace     Delete previous word
-  F5                 Insert time and date
+  Ctrl+Z / Ctrl+Y               Undo / Redo (Ctrl+Shift+Z redoes too)
+  Ctrl+X / Ctrl+C / Ctrl+V      Cut / Copy / Paste (nothing selected: the whole line)
+  Shift+Del / Shift+Ins         Cut / Paste
+  Ctrl+Ins                      Copy
+  Ctrl+A                        Select all
+  Ctrl+D                        Duplicate the line (or the selection)
+  Ctrl+Shift+K                  Delete the line
+  Alt+Up / Alt+Down             Move the line up / down
+  Tab / Shift+Tab               Indent / outdent the selected lines
+  Ctrl+/                        Comment / uncomment the lines
+  Ctrl+U / Ctrl+Shift+U         lowercase / UPPERCASE
+  Ctrl+Backspace / Ctrl+Del     Delete the word before / after the caret
+  F5                            Insert the time and date
+  Shift+Alt+F                   Format JSON or XML
 
-Find
-  Ctrl+F             Find
-  Ctrl+H             Replace
-  F3 / Shift+F3      Next / previous match
-  Ctrl+G             Go to line
+Moving around
+  Ctrl+Left / Ctrl+Right        Previous / next word (with Shift: select)
+  Home / End                    Start / end of the line (Home: first the text, then the edge)
+  Ctrl+Home / Ctrl+End          Start / end of the document
+  PgUp / PgDn                   Page up / down
+  Ctrl+Up / Ctrl+Down           Scroll without moving the caret
+  Ctrl+G                        Go to line (line:column works too)
+
+Find and replace
+  Ctrl+F / Ctrl+H               Find / Replace
+  F3 / Shift+F3                 Next / previous match
+  Enter / Shift+Enter           Next / previous match (in the find box)
+  Alt+C / Alt+W / Alt+R         Match case / Whole word / Regular expression
+  Enter                         Replace this match (in the replace box)
+  Ctrl+Alt+Enter                Replace all (in the replace box)
+  Tab                           Switch between the find and replace boxes
+  Esc                           Close the find bar
 
 View
-  Alt+Z              Word wrap
-  Ctrl+Plus / Minus  Zoom (or Ctrl+mouse wheel)
-  Ctrl+0             Reset zoom
-  Shift+Alt+F        Format JSON or XML";
+  Alt+Z                         Word wrap
+  Ctrl+Plus / Ctrl+Minus        Zoom in / out (or Ctrl+mouse wheel)
+  Ctrl+0                        Reset zoom
+  Ctrl+Shift+O                  JSON structure panel
+
+Menus
+  Alt, then a letter            Open a menu (or Alt+F, Alt+E, Alt+V, Alt+O, Alt+H)
+  F10                           File menu
+  Shift+F10 / Menu key          Context menu
+
+Mouse
+  Double-click / triple-click   Select a word / a line
+  Click a line number           Select the line (drag for more)
+  Shift+wheel                   Scroll sideways (when word wrap is off)";
