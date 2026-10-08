@@ -1,11 +1,14 @@
 //! Updates from GitHub. Slate asks GitHub for the latest published release of `REPO` (at most once a day, and from
 //! Help → Check for updates). A newer one shows up in the status bar. Updating downloads the release's Slate.exe,
 //! checks it against the release's Slate.exe.sha256, moves the running exe aside (Windows lets a running program be
-//! renamed but not overwritten; old copies are deleted on the next start), puts the new one in its place and
-//! restarts. The session brings the tabs and their unsaved text back.
+//! renamed but not overwritten), puts the new one in its place and restarts. The session brings the tabs and their
+//! unsaved text back. If the new version doesn't start (blocked by Windows, or it fails right away), the old one goes
+//! back in place and starts instead; old copies are deleted by the next normal start.
 //!
 //! Releases are made by the GitHub workflow in `.github/workflows/build.yml` when a `v*` tag is pushed (as drafts;
-//! a release only counts once it's published).
+//! a release only counts once it's published). What this needs from a release never changes, as every version
+//! already out there reads it: the tag `vX.Y.Z`, and the assets `Slate.exe` and `Slate.exe.sha256`
+//! ("<64 hex digits>  Slate.exe").
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -24,13 +27,17 @@ const MAX_EXE: usize = 64 << 20;
 pub struct Version(pub u32, pub u32, pub u32);
 
 impl Version {
-    /// `v1.2.3`, `1.2`, `1.2.3-beta` (the suffix is ignored).
+    /// `v1.2.3`, `1.2` (build metadata after `+` is ignored). A pre-release (`1.2.3-beta`) isn't a version that
+    /// gets offered: None.
     pub fn parse(s: &str) -> Option<Version> {
         let s = s.trim().trim_start_matches(['v', 'V']);
-        let mut parts = s.split(['-', '+']).next()?.split('.');
+        let s = s.split('+').next()?;
+        if s.is_empty() || s.contains('-') {
+            return None;
+        }
+        let mut parts = s.split('.');
         let mut num = || -> Option<u32> { parts.next().map_or(Some(0), |p| p.parse().ok()) };
-        let v = Version(num()?, num()?, num()?);
-        (!s.is_empty()).then_some(v)
+        Some(Version(num()?, num()?, num()?))
     }
 
     /// This Slate's version (tests can pretend to be an older one).
@@ -57,7 +64,7 @@ pub struct Release {
     pub exe_url: String,
     /// Bytes (for progress).
     pub exe_size: u64,
-    pub sha_url: Option<String>,
+    pub sha_url: String,
 }
 
 /// Reads the release from GitHub's answer to `releases/latest`.
@@ -73,7 +80,8 @@ pub fn parse_release(json: &[u8]) -> Result<Release, String> {
         page: v["html_url"].as_str().unwrap_or("").to_string(),
         exe_url: url("Slate.exe").ok_or("The latest release has no Slate.exe")?,
         exe_size: asset("Slate.exe").and_then(|a| a["size"].as_u64()).unwrap_or(0),
-        sha_url: url("Slate.exe.sha256"),
+        // (Without it the download can't be checked: such a release isn't offered.)
+        sha_url: url("Slate.exe.sha256").ok_or("The latest release has no checksum (Slate.exe.sha256)")?,
     })
 }
 
@@ -200,8 +208,7 @@ pub fn latest() -> Result<Release, String> {
 /// Downloads the release's Slate.exe next to the running one and checks it against the release's checksum.
 /// Returns the downloaded file.
 pub fn download(rel: &Release, ctx: &Ctx) -> Result<PathBuf, String> {
-    let sha_url = rel.sha_url.as_deref().ok_or("The release has no checksum (Slate.exe.sha256), so it can't be checked")?;
-    let want = parse_sha(&get_all(sha_url, "application/octet-stream", 4096, None)?).ok_or("The release's checksum can't be read")?;
+    let want = parse_sha(&get_all(&rel.sha_url, "application/octet-stream", 4096, None)?).ok_or("The release's checksum can't be read")?;
     let exe = get_all(&rel.exe_url, "application/octet-stream", MAX_EXE, Some(ctx))?;
     if !exe.starts_with(b"MZ") || sha256(&exe) != Some(want) {
         return Err("The download doesn't match the release's checksum, so it wasn't installed".into());
@@ -213,28 +220,100 @@ pub fn download(rel: &Release, ctx: &Ctx) -> Result<PathBuf, String> {
     Ok(tmp)
 }
 
-/// Puts the downloaded exe in place of the running one, which is renamed aside.
-pub fn install(new_exe: &Path) -> Result<(), String> {
+/// Whether Slate can replace itself where it is (not, say, in Program Files without administrator rights).
+pub fn can_replace() -> bool {
+    let Some(dir) = super::settings::exe_dir() else { return false };
+    let probe = dir.join(format!("Slate.update-{}.probe", std::process::id()));
+    let ok = fs::File::create(&probe).is_ok();
+    let _ = fs::remove_file(&probe);
+    ok
+}
+
+/// Windows, or a virus scanner looking at a new file, can hold a file for a moment: tries again for a few seconds.
+fn retry(mut f: impl FnMut() -> std::io::Result<()>) -> std::io::Result<()> {
+    let mut tries = 0;
+    loop {
+        match f() {
+            // access denied, sharing violation, lock violation
+            Err(e) if tries < 20 && matches!(e.raw_os_error(), Some(5 | 32 | 33)) => {
+                tries += 1;
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+            r => return r,
+        }
+    }
+}
+
+/// The running version's exe after `install` moved it aside, and the version installed in its place.
+static REPLACED: std::sync::Mutex<Option<(PathBuf, Version)>> = std::sync::Mutex::new(None);
+
+/// Puts the downloaded exe (`version`) in place of the running one, which is renamed aside.
+pub fn install(new_exe: &Path, version: Version) -> Result<(), String> {
     let me = std::env::current_exe().map_err(|e| e.to_string())?;
     let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
     let old = me.with_file_name(format!("Slate.old-{stamp}.exe"));
-    if let Err(e) = fs::rename(&me, &old) {
+    if let Err(e) = retry(|| fs::rename(&me, &old)) {
         let _ = fs::remove_file(new_exe);
         return Err(format!("Couldn't move the running version aside ({e})"));
     }
-    if let Err(e) = fs::rename(new_exe, &me) {
-        let _ = fs::rename(&old, &me);
+    if let Err(e) = retry(|| fs::rename(new_exe, &me)) {
+        // This version back in place; if even that fails, a copy of it (a running exe can be read).
+        if retry(|| fs::rename(&old, &me)).is_err() && fs::copy(&old, &me).is_err() {
+            return Err(format!("Couldn't put the new version in place ({e}); the downloaded one is {}", new_exe.display()));
+        }
         let _ = fs::remove_file(new_exe);
         return Err(format!("Couldn't put the new version in place ({e})"));
     }
+    *REPLACED.lock().unwrap() = Some((old, version));
     Ok(())
 }
 
-/// Starts the (new) Slate; it waits for this one to finish closing.
+/// Starts the new Slate (after this one has closed its window and written the session). If it doesn't start (Windows
+/// blocks it, or it ends with an error within a few seconds), this version goes back in place and starts instead.
 pub fn restart() {
-    if let Ok(me) = std::env::current_exe() {
-        let _ = std::process::Command::new(me).arg("--wait-for").arg(std::process::id().to_string()).spawn();
+    let Ok(me) = std::env::current_exe() else { return };
+    let replaced = REPLACED.lock().unwrap().take();
+    // The new one is the running Slate right away; this one only watches.
+    super::release_instance_lock();
+    let failed = match std::process::Command::new(&me).arg("--updated").spawn() {
+        Ok(mut child) => {
+            let start = std::time::Instant::now();
+            loop {
+                match child.try_wait() {
+                    Ok(None) if start.elapsed() < std::time::Duration::from_secs(15) => {
+                        std::thread::sleep(std::time::Duration::from_millis(100))
+                    }
+                    Ok(Some(status)) => break !status.success(),
+                    // Still running after a while: it started.
+                    _ => break false,
+                }
+            }
+        }
+        Err(_) => true,
+    };
+    if let (true, Some((old, version))) = (failed, replaced) {
+        roll_back(&me, &old, version);
     }
+}
+
+/// Puts this version (moved aside to `old`) back in place of the new one (`version`) and starts it.
+fn roll_back(me: &Path, old: &Path, version: Version) {
+    if swap_back(me, old) {
+        let _ = std::process::Command::new(me).arg("--update-failed").arg(version.to_string()).spawn();
+    }
+}
+
+/// `old` back in place of `me` (which is kept as Slate.update-failed-*.exe until the next start cleans up).
+fn swap_back(me: &Path, old: &Path) -> bool {
+    let failed = me.with_file_name(format!("Slate.update-failed-{}.exe", std::process::id()));
+    if retry(|| fs::rename(me, &failed)).is_err() {
+        return false;
+    }
+    if retry(|| fs::rename(old, me)).is_err() {
+        let _ = fs::rename(&failed, me);
+        return false;
+    }
+    true
 }
 
 /// Started by `restart`: waits (a few seconds at most) for the old Slate to exit.
@@ -273,7 +352,8 @@ mod tests {
     fn versions() {
         assert_eq!(Version::parse("v1.2.3"), Some(Version(1, 2, 3)));
         assert_eq!(Version::parse("0.2"), Some(Version(0, 2, 0)));
-        assert_eq!(Version::parse("2.0.0-beta.1"), Some(Version(2, 0, 0)));
+        assert_eq!(Version::parse("2.0.0-beta.1"), None);
+        assert_eq!(Version::parse("2.0.1+ci.7"), Some(Version(2, 0, 1)));
         assert_eq!(Version::parse("vx"), None);
         assert_eq!(Version::parse(""), None);
         assert!(Version(0, 10, 0) > Version(0, 9, 9));
@@ -288,9 +368,28 @@ mod tests {
         let r = parse_release(json).unwrap();
         assert_eq!(r.version, Version(0, 3, 1));
         assert_eq!(r.exe_url, "https://github.com/x/Slate.exe");
-        assert_eq!(r.sha_url.as_deref(), Some("https://github.com/x/Slate.exe.sha256"));
+        assert_eq!(r.sha_url, "https://github.com/x/Slate.exe.sha256");
         assert!(parse_release(br#"{"tag_name": "v1.0.0", "assets": []}"#).is_err());
+        // no checksum: not offered
+        assert!(parse_release(br#"{"tag_name": "v1.0.0", "assets": [{"name": "Slate.exe", "browser_download_url": "https://x/Slate.exe"}]}"#).is_err());
         assert!(parse_release(b"<html>").is_err());
+    }
+
+    #[test]
+    fn going_back_to_the_old_version() {
+        let dir = std::env::temp_dir().join(format!("slate-swap-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let (me, old) = (dir.join("Slate.exe"), dir.join("Slate.old-1.exe"));
+        fs::write(&me, "new").unwrap();
+        fs::write(&old, "old").unwrap();
+        assert!(swap_back(&me, &old));
+        assert_eq!(fs::read_to_string(&me).unwrap(), "old");
+        assert!(!old.exists());
+        // nothing to go back to: the new one stays
+        assert!(!swap_back(&me, &old));
+        assert_eq!(fs::read_to_string(&me).unwrap(), "old");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

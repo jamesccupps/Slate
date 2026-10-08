@@ -323,3 +323,10 @@ pub fn set_window_icons(hwnd: HWND, big: isize, small: isize) {
         SendMessageW(hwnd, WM_SETICON, WPARAM(0), LPARAM(small));
     }
 }
+
+/// Whether this Slate runs as administrator. An elevated Slate keeps its own window and session, apart from a
+/// normal one (Windows doesn't let the two exchange messages anyway).
+pub fn elevated() -> bool {
+    static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *E.get_or_init(|| unsafe { windows::Win32::UI::Shell::IsUserAnAdmin() }.as_bool())
+}

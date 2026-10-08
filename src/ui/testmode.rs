@@ -70,6 +70,7 @@ fn busy(cell: &Cell) -> bool {
             || t.find_job.is_some()
             || t.structure.busy()
     }) || matches!(a.update, super::app::UpdateState::Checking { .. } | super::app::UpdateState::Downloading { .. })
+        || a.session_job.is_some()
 }
 
 fn vk_of(name: &str) -> Option<u16> {
@@ -389,7 +390,7 @@ pub fn run(args: &[String]) -> i32 {
     let mut out = String::new();
     for line in lines.iter().map(|l| l.trim()).filter(|l| !l.is_empty() && !l.starts_with('#')) {
         let (op, arg) = line.split_once(':').unwrap_or((line, ""));
-        let unescape = |s: &str| s.replace("\\n", "\n").replace("\\t", "\t");
+        let unescape = |s: &str| s.replace("\\r", "\r").replace("\\n", "\n").replace("\\t", "\t");
         match op {
             "size" => {
                 if let Some((w, h)) = arg.split_once('x') {
@@ -581,13 +582,25 @@ pub fn run(args: &[String]) -> i32 {
                 mark = now;
             }
             "temp" => crate::core::source::set_temp_dir(PathBuf::from(arg)),
-            "persist" => super::settings::NO_PERSIST.store(false, std::sync::atomic::Ordering::Relaxed),
+            "persist" => {
+                // Only into a data folder of the test's own: never the real settings and session.
+                if std::env::var_os("SLATE_DATA_DIR").is_some() {
+                    super::settings::NO_PERSIST.store(false, std::sync::atomic::Ordering::Relaxed);
+                } else {
+                    out.push_str("persist needs SLATE_DATA_DIR\n");
+                    failures += 1;
+                }
+            }
             "session" => {
                 let mut a = cell.borrow_mut();
                 match arg {
                     "save" => {
                         a.settings.restore_session = true;
                         a.save_session();
+                    }
+                    "soon" => {
+                        a.settings.restore_session = true;
+                        a.save_session_soon();
                     }
                     _ => {
                         a.settings.restore_session = true;

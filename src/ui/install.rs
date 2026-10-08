@@ -91,12 +91,26 @@ fn install_exe() -> std::io::Result<PathBuf> {
     if dest.exists() && crate::core::io::same_file(&me, &dest) {
         return Ok(dest);
     }
+    // Copied under another name first: if that fails, the installed Slate is still as it was.
+    let tmp = dir.join(format!("Slate.update-{}.exe", std::process::id()));
+    if let Err(e) = std::fs::copy(&me, &tmp) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
     if dest.exists() {
         // Windows lets a running exe be renamed but not overwritten.
         let old = dir.join(format!("Slate.old-{}.exe", std::process::id()));
-        std::fs::rename(&dest, &old)?;
+        if let Err(e) = std::fs::rename(&dest, &old) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+        if let Err(e) = std::fs::rename(&tmp, &dest) {
+            let _ = std::fs::rename(&old, &dest);
+            return Err(e);
+        }
+    } else {
+        std::fs::rename(&tmp, &dest)?;
     }
-    std::fs::copy(&me, &dest)?;
     Ok(dest)
 }
 

@@ -86,6 +86,12 @@ pub enum TaskResult {
     Cancelled,
 }
 
+impl crate::core::job::Failure for TaskResult {
+    fn failure(msg: &str) -> Self {
+        TaskResult::Failed(msg.to_string())
+    }
+}
+
 pub struct Task {
     pub kind: TaskKind,
     pub job: Job<TaskResult>,
@@ -222,7 +228,7 @@ pub enum UpdateState {
     /// Asking GitHub; `manual`: from the Help menu (so say what came out of it).
     Checking { manual: bool, job: Job<Result<Release, String>> },
     Available(Release),
-    Downloading { release: Release, job: Job<Result<std::path::PathBuf, String>> },
+    Downloading { release: Release, job: Job<Result<(), String>> },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -305,6 +311,8 @@ pub struct App {
     pub untitled_counter: u32,
     pub session_dirty: bool,
     pub last_session_save: Instant,
+    /// The session being written on another thread (while editing).
+    pub session_job: Option<Job<super::session::Outcome>>,
     pub mouse_tracking: bool,
     /// `g.generation` the cached layouts were made for.
     pub gfx_generation: u64,
@@ -378,6 +386,7 @@ impl App {
             untitled_counter: 0,
             session_dirty: false,
             last_session_save: Instant::now(),
+            session_job: None,
             mouse_tracking: false,
             gfx_generation: 0,
         };

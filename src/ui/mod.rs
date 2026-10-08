@@ -46,6 +46,12 @@ use app::{App, Cell, Deferred, Hit};
 use commands::Cmd;
 
 pub const CLASS: PCWSTR = w!("SlateMainWindow");
+
+/// The main window's class. A Slate running as administrator uses its own, so a normal Slate never finds (and tries
+/// to hand files to) a window Windows won't let it talk to.
+pub fn class() -> PCWSTR {
+    if win::elevated() { w!("SlateMainWindow.Admin") } else { CLASS }
+}
 const COPYDATA_OPEN: usize = 0x51A7E;
 
 thread_local! {
@@ -84,14 +90,54 @@ fn log_crash(what: &str) {
 
 /// Runs queued actions (menus, dialogs, commands) once the App isn't borrowed.
 pub fn drain_pending(cell: &Cell) {
+    thread_local! {
+        static DRAINING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    // Not again from inside a dialog or menu that one of these shows (its message loop comes through here too):
+    // the rest waits until it's closed. An Exit run then would destroy the window under the dialog.
+    if DRAINING.with(|d| d.replace(true)) {
+        return;
+    }
+    struct Done;
+    impl Drop for Done {
+        fn drop(&mut self) {
+            DRAINING.with(|d| d.set(false));
+        }
+    }
+    let _done = Done;
     loop {
         let next = match cell.try_borrow_mut() {
             Ok(mut a) if !a.pending.is_empty() => Some(a.pending.remove(0)),
+            Ok(mut a) => {
+                let late = LATE_FILES.with(|l| std::mem::take(&mut *l.borrow_mut()));
+                if !late.is_empty() {
+                    a.open_paths(&late);
+                }
+                None
+            }
             _ => None,
         };
         match next {
             Some(d) => actions::run(cell, d),
             None => break,
+        }
+    }
+}
+
+thread_local! {
+    /// Files dropped on the window or sent by another Slate while the app was busy; opened right after.
+    static LATE_FILES: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Opens `paths` now, or as soon as the app isn't busy.
+fn open_soon(cell: &Cell, hwnd: HWND, paths: Vec<PathBuf>) {
+    match cell.try_borrow_mut() {
+        Ok(mut a) => a.open_paths(&paths),
+        Err(_) => {
+            LATE_FILES.with(|l| l.borrow_mut().extend(paths));
+            unsafe {
+                let _ = PostMessageW(hwnd, WM_APP_JOB, WPARAM(0), LPARAM(0));
+            }
         }
     }
 }
@@ -351,9 +397,7 @@ fn handle(cell: &Cell, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<L
                 paths.push(PathBuf::from(String::from_utf16_lossy(&buf[..len])));
             }
             unsafe { DragFinish(drop) };
-            if let Ok(mut a) = cell.try_borrow_mut() {
-                a.open_paths(&paths);
-            }
+            open_soon(cell, hwnd, paths);
             Some(LRESULT(0))
         }
         WM_COPYDATA => {
@@ -364,10 +408,8 @@ fn handle(cell: &Cell, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<L
             let units = unsafe { std::slice::from_raw_parts(cds.lpData as *const u16, cds.cbData as usize / 2) };
             let text = String::from_utf16_lossy(units);
             let paths: Vec<PathBuf> = text.split('\n').filter(|s| !s.is_empty()).map(PathBuf::from).collect();
-            if let Ok(mut a) = cell.try_borrow_mut() {
-                if !paths.is_empty() {
-                    a.open_paths(&paths);
-                }
+            if !paths.is_empty() {
+                open_soon(cell, hwnd, paths);
             }
             unsafe {
                 if IsIconic(hwnd).as_bool() {
@@ -477,17 +519,34 @@ fn handle(cell: &Cell, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<L
     }
 }
 
-/// If Slate is already running, hands it the files and returns true.
+/// The single-instance lock, held from start until `release_instance_lock`.
+static INSTANCE_LOCK: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+
+/// Lets a Slate starting now be the running one (the update restart: this one is closing).
+pub fn release_instance_lock() {
+    let h = INSTANCE_LOCK.swap(0, std::sync::atomic::Ordering::Relaxed);
+    if h != 0 {
+        unsafe {
+            let _ = windows::Win32::Foundation::CloseHandle(windows::Win32::Foundation::HANDLE(h as *mut _));
+        }
+    }
+}
+
+/// If Slate is already running, hands it the files and returns true. A Slate running as administrator is a separate
+/// one, with its own lock, window class and session.
 fn forward_to_running(paths: &[PathBuf]) -> bool {
     unsafe {
-        let m = CreateMutexW(None, false, w!("Local\\Slate.SingleInstance"));
-        if GetLastError() != ERROR_ALREADY_EXISTS {
-            // We're first; keep the mutex for the life of the process.
-            std::mem::forget(m);
-            return false;
+        let name = if win::elevated() { w!("Local\\Slate.SingleInstance.Admin") } else { w!("Local\\Slate.SingleInstance") };
+        if let Ok(h) = CreateMutexW(None, false, name) {
+            if GetLastError() != ERROR_ALREADY_EXISTS {
+                // We're first; keep the lock while we run.
+                INSTANCE_LOCK.store(h.0 as isize, std::sync::atomic::Ordering::Relaxed);
+                return false;
+            }
         }
+        // Running already (or the lock can't be opened at all: then look for the window anyway).
         for _ in 0..50 {
-            if let Ok(h) = FindWindowW(CLASS, None) {
+            if let Ok(h) = FindWindowW(class(), None) {
                 if !h.is_invalid() {
                     let text: Vec<u16> =
                         paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join("\n").encode_utf16().collect();
@@ -499,8 +558,18 @@ fn forward_to_running(paths: &[PathBuf]) -> bool {
                     let mut pid = 0u32;
                     GetWindowThreadProcessId(h, Some(&mut pid));
                     let _ = AllowSetForegroundWindow(pid);
-                    SendMessageW(h, WM_COPYDATA, WPARAM(0), LPARAM(&cds as *const _ as isize));
-                    return true;
+                    // A Slate that hangs doesn't hold this one up: then this one starts on its own.
+                    let mut res = 0usize;
+                    let sent = SendMessageTimeoutW(
+                        h,
+                        WM_COPYDATA,
+                        WPARAM(0),
+                        LPARAM(&cds as *const _ as isize),
+                        SMTO_ABORTIFHUNG | SMTO_BLOCK,
+                        10_000,
+                        Some(&mut res),
+                    );
+                    return sent.0 != 0;
                 }
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
@@ -522,7 +591,7 @@ pub fn register_class() -> HINSTANCE {
             hInstance: hinst,
             hIcon: icon,
             hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
-            lpszClassName: CLASS,
+            lpszClassName: class(),
             ..Default::default()
         };
         RegisterClassExW(&wc);
@@ -542,7 +611,7 @@ pub fn create_window(hinst: HINSTANCE, s: &settings::Settings) -> HWND {
     unsafe {
         CreateWindowExW(
             WS_EX_ACCEPTFILES,
-            CLASS,
+            class(),
             w!("Slate"),
             WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
             x,
@@ -572,13 +641,20 @@ pub fn make_app(hwnd: HWND) -> Cell {
 pub fn restore(app: &mut App, paths: &[PathBuf]) {
     let mut active_id = None;
     if app.settings.restore_session {
-        if let Some(s) = session::load() {
-            for (k, st) in s.tabs.iter().enumerate() {
-                let before = app.tabs.len();
-                restore_tab(app, st);
-                if k == s.active && app.tabs.len() > before {
-                    active_id = Some(app.tabs[app.tabs.len() - 1].id);
-                }
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| restore_session(app))) {
+            Ok(id) => active_id = id,
+            Err(_) => {
+                // It would fail the same way at every start: put it all aside and start without it.
+                app.tabs.clear();
+                app.active = 0;
+                let kept = session::put_aside();
+                app.flash(
+                    format!(
+                        "Slate couldn't reopen last time's tabs (details in crash.log). Their unsaved text is kept in {}.",
+                        kept.display()
+                    ),
+                    true,
+                );
             }
         }
     }
@@ -594,37 +670,111 @@ pub fn restore(app: &mut App, paths: &[PathBuf]) {
     }
 }
 
-fn restore_tab(app: &mut App, st: &session::SessionTab) {
+/// The session's tabs, then unsaved text no tab refers to (see session.rs) as new tabs. Returns the tab to show.
+fn restore_session(app: &mut App) -> Option<u64> {
+    use crate::core::document::Document;
+    let mut active_id = None;
+    let (mut missing, mut unreachable) = (Vec::new(), Vec::new());
+    if let Some(s) = session::load() {
+        for (k, st) in s.tabs.iter().enumerate() {
+            let before = app.tabs.len();
+            let name = || st.path.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned());
+            match restore_tab(app, st) {
+                Restored::Yes => {}
+                Restored::Missing => missing.extend(name()),
+                Restored::Unreachable => unreachable.extend(name()),
+            }
+            if k == s.active && app.tabs.len() > before {
+                active_id = Some(app.tabs[app.tabs.len() - 1].id);
+            }
+        }
+    }
+    let claimed: Vec<String> = app.tabs.iter().filter_map(|t| t.backup_name.clone()).collect();
+    let found = session::orphans(&claimed);
+    for (name, bytes) in &found {
+        let mut doc = Document::from_text(bytes);
+        doc.eol = crate::core::text::detect_eol(&bytes[..bytes.len().min(64 << 10)]);
+        doc.mark_dirty();
+        let k = app.add_tab(doc);
+        app.tabs[k].backup_name = Some(name.clone());
+        app.tabs[k].backup_version = app.tabs[k].doc.version;
+    }
+    let mut msg = Vec::new();
+    match found.len() {
+        0 => {}
+        1 => msg.push("Unsaved text from last time is back in a new tab.".to_string()),
+        n => msg.push(format!("Unsaved text from last time is back in {n} new tabs.")),
+    }
+    if !missing.is_empty() {
+        msg.push(format!("Not found any more: {}.", missing.join(", ")));
+    }
+    if !unreachable.is_empty() {
+        msg.push(format!("Couldn't be reached (network?): {}.", unreachable.join(", ")));
+    }
+    if !msg.is_empty() {
+        app.flash(msg.join(" "), !missing.is_empty() || !unreachable.is_empty());
+    }
+    active_id
+}
+
+enum Restored {
+    Yes,
+    /// Its file isn't there any more (and it had no unsaved text).
+    Missing,
+    /// Its file (on a network share) didn't answer in time.
+    Unreachable,
+}
+
+/// Whether `p` exists; None if that takes too long (a network share that's gone: Windows can take half a minute to
+/// give up, and this runs before the window shows).
+fn exists_soon(p: &std::path::Path) -> Option<bool> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let p = p.to_path_buf();
+    std::thread::spawn(move || {
+        let _ = tx.send(p.exists());
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(2)).ok()
+}
+
+fn restore_tab(app: &mut App, st: &session::SessionTab) -> Restored {
     use crate::core::document::{Document, Sel};
     let mut i = None;
     if let Some(name) = &st.backup {
         if let Some(bytes) = session::read_backup(name) {
-            let mut doc = Document::from_text(&bytes);
-            doc.path = st.path.clone();
-            doc.encoding = st.encoding;
-            doc.bom = st.bom;
-            doc.eol = st.eol;
-            doc.disk = session::disk_from(st);
-            doc.mark_dirty();
-            let k = app.add_tab(doc);
-            // This tab's text is exactly what that backup file holds.
-            app.tabs[k].backup_name = Some(name.clone());
-            app.tabs[k].backup_version = app.tabs[k].doc.version;
-            i = Some(k);
+            if session::is_damaged(&bytes) {
+                // Written just before a power cut: the file on disk, if any, is the better copy.
+                session::set_aside(name);
+            } else {
+                let mut doc = Document::from_text(&bytes);
+                doc.path = st.path.clone();
+                doc.encoding = st.encoding;
+                doc.bom = st.bom;
+                doc.eol = st.eol;
+                doc.disk = session::disk_from(st);
+                doc.mark_dirty();
+                let k = app.add_tab(doc);
+                // This tab's text is exactly what that backup file holds.
+                app.tabs[k].backup_name = Some(name.clone());
+                app.tabs[k].backup_version = app.tabs[k].doc.version;
+                i = Some(k);
+            }
         }
     }
     if i.is_none() {
         if let Some(p) = &st.path {
-            if p.exists() {
-                let before = app.tabs.len();
-                app.open_paths(std::slice::from_ref(p));
-                if app.tabs.len() > before {
-                    i = Some(app.tabs.len() - 1);
-                }
+            match exists_soon(p) {
+                Some(true) => {}
+                Some(false) => return Restored::Missing,
+                None => return Restored::Unreachable,
+            }
+            let before = app.tabs.len();
+            app.open_paths(std::slice::from_ref(p));
+            if app.tabs.len() > before {
+                i = Some(app.tabs.len() - 1);
             }
         }
     }
-    let Some(i) = i else { return };
+    let Some(i) = i else { return Restored::Yes };
     let tab = &mut app.tabs[i];
     if st.untitled > 0 && tab.doc.path.is_none() {
         tab.untitled = st.untitled;
@@ -636,9 +786,31 @@ fn restore_tab(app: &mut App, st: &session::SessionTab) {
         tab.lang = st.lang;
         tab.lang_picked = true;
     }
-    let len = tab.doc.len();
-    tab.view.sel = Sel::new(st.anchor.min(len), st.caret.min(len));
-    tab.view.top = st.top.min(len);
+    // The text may not be what the session describes (a backup written after it): keep positions on characters.
+    let doc = &tab.doc;
+    let mut top = char_start(doc, st.top);
+    if top != st.top.min(doc.len()) {
+        let ls = doc.line_start_of(top);
+        if top - ls <= 64 << 10 {
+            top = ls;
+        }
+    }
+    tab.view.sel = Sel::new(char_start(doc, st.anchor), char_start(doc, st.caret));
+    tab.view.top = top;
+    Restored::Yes
+}
+
+/// `pos`, moved back to the start of the character it falls in (and to the `\r` of a `\r\n`).
+fn char_start(doc: &crate::core::document::Document, pos: u64) -> u64 {
+    let pos = pos.min(doc.len());
+    let mut p = pos;
+    while p > 0 && pos - p < 3 && doc.byte_at(p).is_some_and(|b| b & 0xC0 == 0x80) {
+        p -= 1;
+    }
+    if p > 0 && doc.byte_at(p) == Some(b'\n') && doc.byte_at(p - 1) == Some(b'\r') {
+        p -= 1;
+    }
+    p
 }
 
 pub fn run(args: Vec<String>) -> i32 {
@@ -653,12 +825,25 @@ pub fn run(args: Vec<String>) -> i32 {
     if args.first().map(String::as_str) == Some("--test") {
         return testmode::run(&args[1..]);
     }
-    // Started by an update: let the old version finish closing first.
+    // Started by an update: `--updated` (the version before watches this one start, ready to go back to itself),
+    // or by 0.2.0's updater `--wait-for <pid>` (it ends first). `--update-failed <version>`: that version didn't
+    // start, and this one is back.
     let mut args = args;
+    let mut updated = false;
     if let Some(i) = args.iter().position(|a| a == "--wait-for") {
         if let Some(pid) = args.get(i + 1).and_then(|p| p.parse().ok()) {
             update::wait_for(pid);
         }
+        args.drain(i..(i + 2).min(args.len()));
+        updated = true;
+    }
+    if let Some(i) = args.iter().position(|a| a == "--updated") {
+        args.remove(i);
+        updated = true;
+    }
+    let mut update_failed = None;
+    if let Some(i) = args.iter().position(|a| a == "--update-failed") {
+        update_failed = Some(args.get(i + 1).cloned().unwrap_or_default());
         args.drain(i..(i + 2).min(args.len()));
     }
     let paths: Vec<PathBuf> =
@@ -666,7 +851,10 @@ pub fn run(args: Vec<String>) -> i32 {
     if forward_to_running(&paths) {
         return 0;
     }
-    install::clean_old_copies();
+    if !updated && update_failed.is_none() {
+        // (Right after an update the copy before it stays: it goes back in place if the new one fails to start.)
+        install::clean_old_copies();
+    }
     crate::core::source::set_temp_dir(settings::temp_dir());
     let hinst = register_class();
     let s = settings::Settings::load();
@@ -675,6 +863,14 @@ pub fn run(args: Vec<String>) -> i32 {
     {
         let mut a = cell.borrow_mut();
         restore(&mut a, &paths);
+        if updated {
+            a.flash(format!("Slate is updated to {}.", update::Version::current()), false);
+        }
+        if let Some(v) = update_failed {
+            a.flash(format!("Slate {v} didn't start on this PC, so this version is back (with your tabs)."), true);
+            a.settings.failed_update = v;
+            a.settings.save();
+        }
         a.layout();
         a.update_title();
         a.timer(TIMER_DISK, 2000);

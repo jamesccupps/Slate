@@ -504,6 +504,7 @@ impl App {
             }
         }
         any |= self.poll_update();
+        any |= self.poll_session();
         if !any {
             self.kill_timer(TIMER_JOBS);
         }
@@ -548,8 +549,16 @@ impl App {
     }
 
     pub fn start_update(&mut self, release: Release) {
+        if !update::can_replace() {
+            let dir = super::settings::exe_dir().map(|d| d.display().to_string()).unwrap_or_default();
+            update::show_page(&release);
+            self.flash(format!("Slate can't replace itself in {dir}; the release page is open to download it from."), true);
+            return;
+        }
         let r = release.clone();
-        let job = Job::spawn(release.exe_size, self.notify.clone(), move |ctx| update::download(&r, ctx));
+        let job = Job::spawn(release.exe_size, self.notify.clone(), move |ctx| {
+            update::download(&r, ctx).and_then(|file| update::install(&file, r.version))
+        });
         self.update = UpdateState::Downloading { release, job };
         self.timer(TIMER_JOBS, 100);
         self.invalidate();
@@ -566,7 +575,8 @@ impl App {
                 Some(Ok(rel)) => {
                     self.settings.last_update_check = unix_now();
                     self.settings.save();
-                    if rel.version > Version::current() {
+                    // (One that didn't start on this PC before is only offered when asked for.)
+                    if rel.version > Version::current() && (manual || rel.version.to_string() != self.settings.failed_update) {
                         self.update = UpdateState::Available(rel);
                         if manual {
                             self.pending.push(Deferred::UpdatePrompt);
@@ -586,18 +596,12 @@ impl App {
                     self.update = UpdateState::Downloading { release, job };
                     return true;
                 }
-                Some(Ok(file)) => match update::install(&file) {
-                    Ok(()) => {
-                        // Close (keeping the tabs in the session) and start the new version.
-                        self.flash(format!("Restarting with Slate {}…", release.version), false);
-                        self.restart_on_exit = true;
-                        self.pending.push(Deferred::Cmd(Cmd::Exit));
-                    }
-                    Err(e) => {
-                        self.flash(format!("Couldn't update: {e}"), true);
-                        self.update = UpdateState::Available(release);
-                    }
-                },
+                Some(Ok(())) => {
+                    // Close (keeping the tabs in the session) and start the new version.
+                    self.flash(format!("Restarting with Slate {}…", release.version), false);
+                    self.restart_on_exit = true;
+                    self.pending.push(Deferred::Cmd(Cmd::Exit));
+                }
                 Some(Err(e)) => {
                     if e != "Cancelled" {
                         self.flash(format!("Couldn't update: {e}"), true);
@@ -2068,12 +2072,13 @@ impl App {
             TIMER_DISK => {
                 self.check_disk();
                 if self.session_dirty && self.settings.restore_session && self.last_session_save.elapsed() > Duration::from_secs(20) {
-                    self.save_session();
+                    self.save_session_soon();
                 }
             }
             TIMER_SEARCH => self.start_count(),
             TIMER_UPDATE => {
-                self.kill_timer(TIMER_UPDATE);
+                // Again in an hour: Slate can stay open for days.
+                self.timer(TIMER_UPDATE, 3_600_000);
                 if self.settings.check_updates && unix_now().saturating_sub(self.settings.last_update_check) >= 20 * 3600 {
                     self.check_for_update(false);
                 }
@@ -2105,11 +2110,42 @@ impl App {
         }
     }
 
-    /// Writes the session (when that's on). Returns false if unsaved work couldn't be written to it.
+    /// Writes the session now (when that's on). Returns false if unsaved work couldn't be written to it.
     pub fn save_session(&mut self) -> bool {
+        // One being written on another thread finishes first (the backups it writes are newer than those on disk).
+        if let Some(mut job) = self.session_job.take() {
+            if let Some(out) = job.wait() {
+                session::finish(&mut self.tabs, out);
+            }
+        }
         self.last_session_save = Instant::now();
         self.session_dirty = false;
         !self.settings.restore_session || session::save(&mut self.tabs, self.active)
+    }
+
+    /// Writes the session on another thread (while editing: backups of big documents take a moment).
+    pub fn save_session_soon(&mut self) {
+        if self.session_job.is_some() {
+            return;
+        }
+        self.last_session_save = Instant::now();
+        self.session_dirty = false;
+        self.session_job = session::start(&mut self.tabs, self.active, self.notify.clone());
+        if self.session_job.is_some() {
+            self.timer(TIMER_JOBS, 100);
+        }
+    }
+
+    /// Picks up the session write when it's done; returns whether it's still going.
+    fn poll_session(&mut self) -> bool {
+        let Some(job) = self.session_job.as_mut() else { return false };
+        let Some(out) = job.take() else { return true };
+        self.session_job = None;
+        if !session::finish(&mut self.tabs, out) {
+            // Try again with the next round.
+            self.session_dirty = true;
+        }
+        false
     }
 
     fn notice_action(&mut self, i: usize) {

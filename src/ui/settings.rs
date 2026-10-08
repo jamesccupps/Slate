@@ -1,4 +1,5 @@
-//! User settings, stored as JSON in %LOCALAPPDATA%\Slate\settings.json.
+//! User settings, stored as JSON in settings.json in the data folder (`data_dir`: %LOCALAPPDATA%\Slate, or the
+//! `data` folder next to a portable Slate.exe).
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -45,6 +46,11 @@ pub struct Settings {
     /// Look for a new version on GitHub (at most once a day), and when that last happened (Unix seconds).
     pub check_updates: bool,
     pub last_update_check: u64,
+    /// A version whose update didn't start on this PC (and was undone): not offered again by the daily check.
+    pub failed_update: String,
+    /// Settings this version doesn't know (written by a newer one), kept for it.
+    #[serde(flatten)]
+    pub other: serde_json::Map<String, serde_json::Value>,
 }
 
 impl Default for Settings {
@@ -67,6 +73,8 @@ impl Default for Settings {
             window: None,
             check_updates: true,
             last_update_check: 0,
+            failed_update: String::new(),
+            other: serde_json::Map::new(),
         }
     }
 }
@@ -118,30 +126,43 @@ impl Settings {
     }
 
     pub fn load() -> Settings {
-        std::fs::read(Self::path())
-            .ok()
-            .and_then(|b| serde_json::from_slice::<Settings>(&b).ok())
-            .map(|mut s| {
-                s.zoom = s.zoom.clamp(0.5, 5.0);
-                s.font_size = s.font_size.clamp(6.0, 72.0);
-                s.tab_size = s.tab_size.clamp(1, 16);
-                s.json_indent = s.json_indent.clamp(1, 8);
-                s
-            })
-            .unwrap_or_default()
+        let mut s = std::fs::read(Self::path()).map(|b| Self::from_json(&b)).unwrap_or_default();
+        s.zoom = s.zoom.clamp(0.5, 5.0);
+        s.font_size = s.font_size.clamp(6.0, 72.0);
+        s.tab_size = s.tab_size.clamp(1, 16);
+        s.json_indent = s.json_indent.clamp(1, 8);
+        s
+    }
+
+    /// One setting that can't be used (damaged, or a value from a newer version) keeps its default instead of
+    /// resetting all of them.
+    pub fn from_json(bytes: &[u8]) -> Settings {
+        use serde_json::Value;
+        let Ok(Value::Object(file)) = serde_json::from_slice::<Value>(bytes) else { return Settings::default() };
+        let Ok(Value::Object(mut merged)) = serde_json::to_value(Settings::default()) else { return Settings::default() };
+        for (k, v) in file {
+            let mut trial = merged.clone();
+            trial.insert(k.clone(), v.clone());
+            if serde_json::from_value::<Settings>(Value::Object(trial)).is_ok() {
+                merged.insert(k, v);
+            }
+        }
+        serde_json::from_value(Value::Object(merged)).unwrap_or_default()
     }
 
     pub fn save(&self) {
+        use std::io::Write;
         if !persist() {
             return;
         }
         let dir = data_dir();
         let _ = std::fs::create_dir_all(&dir);
-        if let Ok(json) = serde_json::to_vec_pretty(self) {
-            let tmp = dir.join("settings.json.tmp");
-            if std::fs::write(&tmp, json).is_ok() {
-                let _ = std::fs::rename(&tmp, Self::path());
-            }
+        let Ok(json) = serde_json::to_vec_pretty(self) else { return };
+        let tmp = dir.join("settings.json.tmp");
+        // On the disk before it takes the name (after a power cut a renamed file can otherwise come back empty).
+        let written = std::fs::File::create(&tmp).and_then(|mut f| f.write_all(&json).and_then(|_| f.sync_all()));
+        if written.is_ok() {
+            let _ = std::fs::rename(&tmp, Self::path());
         }
     }
 
@@ -153,5 +174,23 @@ impl Settings {
 
     pub fn indent_unit(&self) -> Vec<u8> {
         if self.use_spaces { vec![b' '; self.tab_size as usize] } else { b"\t".to_vec() }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_bad_or_newer_value_keeps_the_other_settings() {
+        let s = Settings::from_json(br#"{"font_size": 14.0, "theme": "Sepia", "wrap": false, "new_thing": {"a": 1}}"#);
+        assert_eq!(s.font_size, 14.0);
+        assert_eq!(s.theme, ThemeMode::System);
+        assert!(!s.wrap);
+        // kept for the version that knows it
+        let back = serde_json::to_value(&s).unwrap();
+        assert_eq!(back["new_thing"]["a"], 1);
+        // damaged: defaults
+        assert_eq!(Settings::from_json(b"{\"font_si").font_size, 11.0);
     }
 }
