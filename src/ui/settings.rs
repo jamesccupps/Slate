@@ -83,7 +83,16 @@ impl Default for Settings {
 pub static NO_PERSIST: AtomicBool = AtomicBool::new(false);
 
 pub fn persist() -> bool {
-    !NO_PERSIST.load(Ordering::Relaxed)
+    !NO_PERSIST.load(Ordering::Relaxed) && !guest()
+}
+
+/// Set when this Slate started while another one was running but didn't answer (busy or hung), so it couldn't take
+/// the files: this one opens them in a window of its own that leaves that Slate's settings and session alone (it
+/// keeps nothing for next time, so closing asks about unsaved changes).
+pub static GUEST: AtomicBool = AtomicBool::new(false);
+
+pub fn guest() -> bool {
+    GUEST.load(Ordering::Relaxed)
 }
 
 /// The folder Slate.exe runs from.

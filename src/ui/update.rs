@@ -216,7 +216,16 @@ pub fn download(rel: &Release, ctx: &Ctx) -> Result<PathBuf, String> {
     let me = std::env::current_exe().map_err(|e| e.to_string())?;
     let dir = me.parent().ok_or("Can't tell where Slate is")?;
     let tmp = dir.join(format!("Slate.update-{}.exe", std::process::id()));
-    fs::write(&tmp, &exe).map_err(|e| format!("Can't write to {} ({e})", dir.display()))?;
+    // On the disk before it takes Slate.exe's place (after a power cut a renamed file can come back empty).
+    let written = fs::File::create(&tmp).and_then(|mut f| {
+        use std::io::Write;
+        f.write_all(&exe)?;
+        f.sync_all()
+    });
+    if let Err(e) = written {
+        let _ = fs::remove_file(&tmp);
+        return Err(format!("Can't write to {} ({e})", dir.display()));
+    }
     Ok(tmp)
 }
 
@@ -247,24 +256,51 @@ fn retry(mut f: impl FnMut() -> std::io::Result<()>) -> std::io::Result<()> {
 /// The running version's exe after `install` moved it aside, and the version installed in its place.
 static REPLACED: std::sync::Mutex<Option<(PathBuf, Version)>> = std::sync::Mutex::new(None);
 
+/// Set while `install` swaps the exe (for that moment there's no Slate.exe): closing waits for it (`wait_for_swap`).
+static SWAPPING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Called before Slate ends: lets an exe swap in progress finish.
+pub fn wait_for_swap() {
+    let start = std::time::Instant::now();
+    while SWAPPING.load(std::sync::atomic::Ordering::SeqCst) && start.elapsed() < std::time::Duration::from_secs(10) {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
 /// Puts the downloaded exe (`version`) in place of the running one, which is renamed aside.
 pub fn install(new_exe: &Path, version: Version) -> Result<(), String> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::sync::atomic::Ordering;
     let me = std::env::current_exe().map_err(|e| e.to_string())?;
     let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
     let old = me.with_file_name(format!("Slate.old-{stamp}.exe"));
-    if let Err(e) = retry(|| fs::rename(&me, &old)) {
+    // A virus scanner looks at a new exe for a moment: wait until nothing else has it open, so the two renames below
+    // follow each other at once.
+    if let Err(e) = retry(|| fs::OpenOptions::new().read(true).share_mode(0).open(new_exe).map(drop)) {
+        let _ = fs::remove_file(new_exe);
+        return Err(format!("Another program holds the downloaded version ({e})"));
+    }
+    SWAPPING.store(true, Ordering::SeqCst);
+    let r = swap_in(&me, new_exe, &old);
+    SWAPPING.store(false, Ordering::SeqCst);
+    r?;
+    *REPLACED.lock().unwrap() = Some((old, version));
+    Ok(())
+}
+
+fn swap_in(me: &Path, new_exe: &Path, old: &Path) -> Result<(), String> {
+    if let Err(e) = retry(|| fs::rename(me, old)) {
         let _ = fs::remove_file(new_exe);
         return Err(format!("Couldn't move the running version aside ({e})"));
     }
-    if let Err(e) = retry(|| fs::rename(new_exe, &me)) {
+    if let Err(e) = retry(|| fs::rename(new_exe, me)) {
         // This version back in place; if even that fails, a copy of it (a running exe can be read).
-        if retry(|| fs::rename(&old, &me)).is_err() && fs::copy(&old, &me).is_err() {
+        if retry(|| fs::rename(old, me)).is_err() && fs::copy(old, me).is_err() {
             return Err(format!("Couldn't put the new version in place ({e}); the downloaded one is {}", new_exe.display()));
         }
         let _ = fs::remove_file(new_exe);
         return Err(format!("Couldn't put the new version in place ({e})"));
     }
-    *REPLACED.lock().unwrap() = Some((old, version));
     Ok(())
 }
 
@@ -303,14 +339,21 @@ fn roll_back(me: &Path, old: &Path, version: Version) {
     }
 }
 
-/// `old` back in place of `me` (which is kept as Slate.update-failed-*.exe until the next start cleans up).
+/// `old` back in place of `me` (which is kept as Slate.update-failed-*.exe until the next start cleans up). The new
+/// one may be gone already: a virus scanner can remove an exe it doesn't trust.
 fn swap_back(me: &Path, old: &Path) -> bool {
+    if !old.exists() {
+        return false;
+    }
     let failed = me.with_file_name(format!("Slate.update-failed-{}.exe", std::process::id()));
-    if retry(|| fs::rename(me, &failed)).is_err() {
+    let moved = me.exists();
+    if moved && retry(|| fs::rename(me, &failed)).is_err() {
         return false;
     }
     if retry(|| fs::rename(old, me)).is_err() {
-        let _ = fs::rename(&failed, me);
+        if moved {
+            let _ = fs::rename(&failed, me);
+        }
         return false;
     }
     true
@@ -388,6 +431,10 @@ mod tests {
         assert!(!old.exists());
         // nothing to go back to: the new one stays
         assert!(!swap_back(&me, &old));
+        assert_eq!(fs::read_to_string(&me).unwrap(), "old");
+        // the new one is gone (a virus scanner took it): the old one still comes back
+        fs::rename(&me, &old).unwrap();
+        assert!(swap_back(&me, &old));
         assert_eq!(fs::read_to_string(&me).unwrap(), "old");
         let _ = fs::remove_dir_all(&dir);
     }

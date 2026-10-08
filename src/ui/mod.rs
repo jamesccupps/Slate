@@ -135,12 +135,18 @@ thread_local! {
 fn open_soon(cell: &Cell, hwnd: HWND, paths: Vec<PathBuf>) {
     match cell.try_borrow_mut() {
         Ok(mut a) => a.open_paths(&paths),
-        Err(_) => {
-            LATE_FILES.with(|l| l.borrow_mut().extend(paths));
-            unsafe {
-                let _ = PostMessageW(hwnd, WM_APP_JOB, WPARAM(0), LPARAM(0));
-            }
-        }
+        Err(_) => open_later(hwnd, paths),
+    }
+}
+
+/// Opens `paths` with the next message.
+fn open_later(hwnd: HWND, paths: Vec<PathBuf>) {
+    if paths.is_empty() {
+        return;
+    }
+    LATE_FILES.with(|l| l.borrow_mut().extend(paths));
+    unsafe {
+        let _ = PostMessageW(hwnd, WM_APP_JOB, WPARAM(0), LPARAM(0));
     }
 }
 
@@ -170,7 +176,10 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
     };
     let r = guarded(&cell, || format!("handling message {msg:#x}"), || {
         let r = handle(&cell, hwnd, msg, wp, lp);
-        drain_pending(&cell);
+        // (Not for files another Slate sent: it waits for the answer, so they're opened just after.)
+        if msg != WM_COPYDATA {
+            drain_pending(&cell);
+        }
         r
     });
     match r {
@@ -453,9 +462,8 @@ fn handle(cell: &Cell, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<L
             let units = unsafe { std::slice::from_raw_parts(cds.lpData as *const u16, cds.cbData as usize / 2) };
             let text = String::from_utf16_lossy(units);
             let paths: Vec<PathBuf> = text.split('\n').filter(|s| !s.is_empty()).map(PathBuf::from).collect();
-            if !paths.is_empty() {
-                open_soon(cell, hwnd, paths);
-            }
+            // Answered at once; opening them (which can take a while on a slow share) comes right after.
+            open_later(hwnd, paths);
             unsafe {
                 if IsIconic(hwnd).as_bool() {
                     let _ = ShowWindow(hwnd, SW_RESTORE);
@@ -567,6 +575,8 @@ fn handle(cell: &Cell, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<L
                     a.save_session();
                     a.settings.save();
                 }
+                // Windows may end the process once this returns.
+                update::wait_for_swap();
             } else {
                 // The shutdown was called off.
                 unsafe {
@@ -596,20 +606,30 @@ pub fn release_instance_lock() {
     }
 }
 
-/// If Slate is already running, hands it the files and returns true. A Slate running as administrator is a separate
-/// one, with its own lock, window class and session.
-fn forward_to_running(paths: &[PathBuf]) -> bool {
+/// Whether another Slate runs, and took the files.
+enum Running {
+    /// No: this one is the Slate.
+    No,
+    /// Yes, and it opened the files.
+    Took,
+    /// Yes, but it didn't answer (busy or hung).
+    Busy,
+}
+
+/// If Slate is already running, hands it the files. A Slate running as administrator is a separate one, with its
+/// own lock, window class and session.
+fn forward_to_running(paths: &[PathBuf]) -> Running {
     unsafe {
         let name = if win::elevated() { w!("Local\\Slate.SingleInstance.Admin") } else { w!("Local\\Slate.SingleInstance") };
         if let Ok(h) = CreateMutexW(None, false, name) {
             if GetLastError() != ERROR_ALREADY_EXISTS {
                 // We're first; keep the lock while we run.
                 INSTANCE_LOCK.store(h.0 as isize, std::sync::atomic::Ordering::Relaxed);
-                return false;
+                return Running::No;
             }
         }
-        // Running already (or the lock can't be opened at all: then look for the window anyway).
-        for _ in 0..50 {
+        // Running already (or the lock can't be opened at all: then look for the window anyway). It may be starting.
+        for _ in 0..100 {
             if let Ok(h) = FindWindowW(class(), None) {
                 if !h.is_invalid() {
                     let text: Vec<u16> =
@@ -622,7 +642,7 @@ fn forward_to_running(paths: &[PathBuf]) -> bool {
                     let mut pid = 0u32;
                     GetWindowThreadProcessId(h, Some(&mut pid));
                     let _ = AllowSetForegroundWindow(pid);
-                    // A Slate that hangs doesn't hold this one up: then this one starts on its own.
+                    // A Slate that hangs doesn't hold this one up.
                     let mut res = 0usize;
                     let sent = SendMessageTimeoutW(
                         h,
@@ -633,12 +653,12 @@ fn forward_to_running(paths: &[PathBuf]) -> bool {
                         10_000,
                         Some(&mut res),
                     );
-                    return sent.0 != 0;
+                    return if sent.0 != 0 { Running::Took } else { Running::Busy };
                 }
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
-        false
+        Running::Busy
     }
 }
 
@@ -732,7 +752,7 @@ pub fn make_app(hwnd: HWND) -> Cell {
 /// Puts back the tabs from last time, then opens `paths`.
 pub fn restore(app: &mut App, paths: &[PathBuf]) {
     let mut active_id = None;
-    if app.settings.restore_session {
+    if app.settings.restore_session && !settings::guest() {
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| restore_session(app))) {
             Ok(id) => active_id = id,
             Err(_) => {
@@ -768,13 +788,17 @@ fn restore_session(app: &mut App) -> Option<u64> {
     let mut active_id = None;
     let (mut missing, mut unreachable) = (Vec::new(), Vec::new());
     if let Some(s) = session::load() {
+        let there = exist_all(&s.tabs);
         for (k, st) in s.tabs.iter().enumerate() {
             let before = app.tabs.len();
             let name = || st.path.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned());
-            match restore_tab(app, st) {
+            match restore_tab(app, st, there[k]) {
                 Restored::Yes => {}
                 Restored::Missing => missing.extend(name()),
-                Restored::Unreachable => unreachable.extend(name()),
+                Restored::Unreachable => {
+                    session::carry(st);
+                    unreachable.extend(name());
+                }
             }
             if k == s.active && app.tabs.len() > before {
                 active_id = Some(app.tabs[app.tabs.len() - 1].id);
@@ -801,7 +825,7 @@ fn restore_session(app: &mut App) -> Option<u64> {
         msg.push(format!("Not found any more: {}.", missing.join(", ")));
     }
     if !unreachable.is_empty() {
-        msg.push(format!("Couldn't be reached (network?): {}.", unreachable.join(", ")));
+        msg.push(format!("Couldn't be reached (network?), tried again next time: {}.", unreachable.join(", ")));
     }
     if !msg.is_empty() {
         app.flash(msg.join(" "), !missing.is_empty() || !unreachable.is_empty());
@@ -817,18 +841,31 @@ enum Restored {
     Unreachable,
 }
 
-/// Whether `p` exists; None if that takes too long (a network share that's gone: Windows can take half a minute to
-/// give up, and this runs before the window shows).
-fn exists_soon(p: &std::path::Path) -> Option<bool> {
+/// Whether each tab's file exists, all looked at together; None for one that doesn't answer within 2 s (a network
+/// share that's gone: Windows can take half a minute to give up, and this runs before the window shows).
+fn exist_all(tabs: &[session::SessionTab]) -> Vec<Option<bool>> {
     let (tx, rx) = std::sync::mpsc::channel();
-    let p = p.to_path_buf();
-    std::thread::spawn(move || {
-        let _ = tx.send(p.exists());
-    });
-    rx.recv_timeout(std::time::Duration::from_secs(2)).ok()
+    let mut out = vec![None; tabs.len()];
+    let mut asked = 0;
+    for (i, t) in tabs.iter().enumerate() {
+        if let Some(p) = t.path.clone() {
+            let tx = tx.clone();
+            asked += 1;
+            std::thread::spawn(move || {
+                let _ = tx.send((i, p.exists()));
+            });
+        }
+    }
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while asked > 0 {
+        let Ok((i, there)) = rx.recv_timeout(until.saturating_duration_since(std::time::Instant::now())) else { break };
+        out[i] = Some(there);
+        asked -= 1;
+    }
+    out
 }
 
-fn restore_tab(app: &mut App, st: &session::SessionTab) -> Restored {
+fn restore_tab(app: &mut App, st: &session::SessionTab, there: Option<bool>) -> Restored {
     use crate::core::document::{Document, Sel};
     let mut i = None;
     if let Some(name) = &st.backup {
@@ -854,7 +891,7 @@ fn restore_tab(app: &mut App, st: &session::SessionTab) -> Restored {
     }
     if i.is_none() {
         if let Some(p) = &st.path {
-            match exists_soon(p) {
+            match there {
                 Some(true) => {}
                 Some(false) => return Restored::Missing,
                 None => return Restored::Unreachable,
@@ -940,8 +977,10 @@ pub fn run(args: Vec<String>) -> i32 {
     }
     let paths: Vec<PathBuf> =
         args.iter().filter(|a| !a.starts_with("--")).map(|a| std::path::absolute(a).unwrap_or_else(|_| PathBuf::from(a))).collect();
-    if forward_to_running(&paths) {
-        return 0;
+    match forward_to_running(&paths) {
+        Running::Took => return 0,
+        Running::No => {}
+        Running::Busy => settings::GUEST.store(true, std::sync::atomic::Ordering::Relaxed),
     }
     if !updated && update_failed.is_none() {
         // (Right after an update the copy before it stays: it goes back in place if the new one fails to start.)
@@ -955,13 +994,25 @@ pub fn run(args: Vec<String>) -> i32 {
     {
         let mut a = cell.borrow_mut();
         restore(&mut a, &paths);
+        // (Ahead of what restoring had to say, which stays.)
+        let said = a.flash.take();
+        let mut first = None;
         if updated {
-            a.flash(format!("Slate is updated to {}.", update::Version::current()), false);
+            first = Some((format!("Slate is updated to {}.", update::Version::current()), false));
         }
         if let Some(v) = update_failed {
-            a.flash(format!("Slate {v} didn't start on this PC, so this version is back (with your tabs)."), true);
+            first = Some((format!("Slate {v} didn't start on this PC, so this version is back (with your tabs)."), true));
             a.settings.failed_update = v;
             a.settings.save();
+        }
+        if settings::guest() {
+            first = Some(("Another Slate is busy, so this window opened on its own: it doesn't keep its tabs for next time.".into(), false));
+        }
+        match (first, said) {
+            (Some((m, bad)), Some((s, _, sbad))) => a.flash(format!("{m} {s}"), bad || sbad),
+            (Some((m, bad)), None) => a.flash(m, bad),
+            (None, Some((s, _, sbad))) => a.flash(s, sbad),
+            (None, None) => {}
         }
         a.layout();
         a.update_title();
@@ -985,6 +1036,7 @@ pub fn run(args: Vec<String>) -> i32 {
         }
     }
     let code = message_loop(&cell, hwnd);
+    update::wait_for_swap();
     let restart = cell.borrow().restart_on_exit;
     drop(cell);
     release_app();

@@ -45,6 +45,7 @@ jobs:
 
       - name: Smoke test (the built Slate.exe, in its test mode)
         shell: pwsh
+        timeout-minutes: 5
         run: |
           # Starts the exe users get, types, formats, saves and renders offscreen (tests\smoke.txt).
           $dir = Join-Path $env:RUNNER_TEMP smoke

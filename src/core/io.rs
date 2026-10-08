@@ -376,7 +376,9 @@ fn move_file(from: &Path, to: &Path) -> bool {
 /// thing tried; if it stops half way (the old file moved aside, the new one not in), the old one is moved back.
 /// After it worked the backup (the old file, which open handles still read) is deleted. ReplaceFile also gives
 /// the new file the old one's security settings, alternate streams and attributes.
-fn replace_file(temp: &Path, target: &Path, dir: &Path) -> bool {
+/// Ok(false): not replaced, the original is as it was. Err(backup): ReplaceFile stopped halfway and the original,
+/// which it had moved to `backup`, couldn't be put back.
+fn replace_file(temp: &Path, target: &Path, dir: &Path) -> Result<bool, PathBuf> {
     let n = SAVE_COUNTER.fetch_add(1, Ordering::Relaxed);
     let backup = dir.join(format!(".slate-bak-{}-{n}.tmp", std::process::id()));
     let (t, r, b) = (wide(&verbatim(target)), wide(&verbatim(temp)), wide(&verbatim(&backup)));
@@ -390,11 +392,13 @@ fn replace_file(temp: &Path, target: &Path, dir: &Path) -> bool {
         }
         let _ = fs::remove_file(&backup);
     } else if !target.exists() && backup.exists() {
-        unsafe {
-            let _ = MoveFileExW(PCWSTR(b.as_ptr()), PCWSTR(t.as_ptr()), MOVEFILE_WRITE_THROUGH);
+        let back = unsafe { MoveFileExW(PCWSTR(b.as_ptr()), PCWSTR(t.as_ptr()), MOVEFILE_WRITE_THROUGH) }.is_ok();
+        if !back {
+            // (Not hidden, so `clean_stale_temps` never takes it for a leftover.)
+            return Err(backup);
         }
     }
-    ok
+    Ok(ok)
 }
 
 /// Gives the new file the old one's creation time and attributes (and clears our temp "hidden" flag).
@@ -517,6 +521,11 @@ fn clean_stale_temps(dir: &Path) {
         if pid == me {
             continue;
         }
+        // A .slate-bak is a leftover only when it's hidden (ReplaceFile worked and the share still held the old
+        // file). One that isn't is an original that couldn't be put back: never deleted.
+        if name.starts_with(".slate-bak-") && e.metadata().map_or(true, |m| m.file_attributes() & FILE_ATTRIBUTE_HIDDEN == 0) {
+            continue;
+        }
         // Only if that Slate is gone and the file is a few minutes old.
         let running = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }
             .map(|h| unsafe { windows::Win32::Foundation::CloseHandle(h) })
@@ -621,12 +630,24 @@ pub fn save(
     // a plain rename, and if that can't replace the file because Slate still has it open, ReplaceFile.
     let posix = posix_rename(&file, &verbatim(&target)).is_ok();
     drop(file);
-    let renamed = posix || move_file(&temp_path, &target) || (old.is_some() && replace_file(&temp_path, &target, dir));
+    let mut set_aside = None;
+    let renamed = posix
+        || move_file(&temp_path, &target)
+        || (old.is_some()
+            && replace_file(&temp_path, &target, dir).unwrap_or_else(|backup| {
+                set_aside = Some(backup);
+                false
+            }));
     if !renamed {
         let _ = fs::remove_file(&temp_path);
-        return Err(SaveError::Io(
-            "Windows didn't let Slate replace the file (it may be in use). Try again, or use Save As.".into(),
-        ));
+        return Err(SaveError::Io(match set_aside {
+            Some(b) => format!(
+                "Windows stopped Slate halfway through replacing the file: the original is now {}. Use Save As to \
+                 keep your text.",
+                b.display()
+            ),
+            None => "Windows didn't let Slate replace the file (it may be in use). Try again, or use Save As.".into(),
+        }));
     }
 
     clean_stale_temps(dir);
@@ -811,6 +832,27 @@ mod tests {
         v
     }
 
+    #[test]
+    fn an_original_replace_file_left_aside_is_never_cleaned_up() {
+        let dir = test_dir("setaside");
+        let yesterday = std::time::SystemTime::now() - std::time::Duration::from_secs(86_400);
+        // Left by a Slate that's gone (no such process): the original, which couldn't be put back, and a hidden
+        // leftover of a ReplaceFile that worked.
+        for (name, hidden) in [(".slate-bak-4294967280-0.tmp", false), (".slate-bak-4294967280-1.tmp", true)] {
+            let f = File::create(dir.join(name)).unwrap();
+            f.set_modified(yesterday).unwrap();
+            drop(f);
+            if hidden {
+                let w = wide(&dir.join(name));
+                unsafe { SetFileAttributesW(PCWSTR(w.as_ptr()), HIDDEN) }.unwrap();
+            }
+        }
+        let mut doc = Document::from_text(b"another file");
+        save(&doc.snapshot(), &dir.join("other.txt"), Encoding::Utf8, false, false, &ctx()).unwrap();
+        assert_eq!(names(&dir), [".slate-bak-4294967280-0.tmp", "other.txt"]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// A document over a file read from disk (as for big files), with "EDIT\n" typed at the start.
     fn edited(path: &Path) -> (Document, Arc<Source>) {
         let src = Arc::new(Source::open_file(path).unwrap());
@@ -898,7 +940,7 @@ mod tests {
         let src = Source::open_file(&target).unwrap();
         let temp = dir.join("new.tmp");
         fs::write(&temp, b"NEW content").unwrap();
-        assert!(replace_file(&temp, &target, &dir));
+        assert_eq!(replace_file(&temp, &target, &dir), Ok(true));
         assert_eq!(fs::read(&target).unwrap(), b"NEW content");
         let mut old = Vec::new();
         src.read_into(0, 23, &mut old);
@@ -908,7 +950,7 @@ mod tests {
         // Another program has it open without delete sharing: nothing can replace it, and nothing changes.
         let other = OpenOptions::new().read(true).share_mode(0x1).open(&target).unwrap();
         fs::write(&temp, b"newer").unwrap();
-        assert!(!replace_file(&temp, &target, &dir));
+        assert_eq!(replace_file(&temp, &target, &dir), Ok(false));
         fs::remove_file(&temp).unwrap();
         let mut doc = Document::from_text(b"newer");
         assert!(save(&doc.snapshot(), &target, Encoding::Utf8, false, false, &ctx()).is_err());

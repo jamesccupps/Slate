@@ -3786,7 +3786,9 @@ pub fn close_window(cell: &Cell) {
             (a.tabs[i].title(), a.hwnd)
         };
         cell.borrow_mut().activate(i);
-        let detail = if !restore {
+        let detail = if super::settings::guest() {
+            "This window opened while another Slate was busy, so it doesn't keep unsaved changes for next time."
+        } else if !restore {
             ""
         } else if !session_ok {
             "Slate couldn't keep unsaved changes for next time (the settings folder can't be written)."

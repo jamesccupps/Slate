@@ -351,9 +351,31 @@ pub fn set_window_icons(hwnd: HWND, big: isize, small: isize) {
     }
 }
 
-/// Whether this Slate runs as administrator. An elevated Slate keeps its own window and session, apart from a
-/// normal one (Windows doesn't let the two exchange messages anyway).
+/// Whether this Slate was started "as administrator" next to the user's normal rights (UAC gave it the full token of
+/// a split one). Such a Slate keeps its own window and session, apart from a normal one (Windows doesn't let the two
+/// exchange messages). With UAC off, or as the built-in Administrator, every Slate has the same rights and there's
+/// no normal one to keep apart from: false.
 pub fn elevated() -> bool {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::Security::{GetTokenInformation, TOKEN_ELEVATION_TYPE, TOKEN_QUERY, TokenElevationType, TokenElevationTypeFull};
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
     static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *E.get_or_init(|| unsafe { windows::Win32::UI::Shell::IsUserAnAdmin() }.as_bool())
+    *E.get_or_init(|| unsafe {
+        let mut token = HANDLE::default();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).is_err() {
+            return false;
+        }
+        let mut kind = TOKEN_ELEVATION_TYPE(0);
+        let mut len = 0u32;
+        let ok = GetTokenInformation(
+            token,
+            TokenElevationType,
+            Some(&mut kind as *mut _ as *mut _),
+            std::mem::size_of::<TOKEN_ELEVATION_TYPE>() as u32,
+            &mut len,
+        )
+        .is_ok();
+        let _ = CloseHandle(token);
+        ok && kind == TokenElevationTypeFull
+    })
 }

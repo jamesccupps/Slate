@@ -213,7 +213,16 @@ fn plan(tabs: &mut [Tab], active: usize) -> Plan {
             disk_modified_ms: doc.disk.map(|x| ms(x.modified)),
         });
     }
+    // Tabs whose files didn't answer this time (a network share): tried again next time.
+    list.extend(CARRIED.lock().unwrap().iter().cloned());
     Plan { dir: d, session: Session { tabs: list, active: active_idx }, backups, keep }
+}
+
+/// Tabs of the session whose files couldn't be reached this time; kept in the session to be tried again.
+static CARRIED: Mutex<Vec<SessionTab>> = Mutex::new(Vec::new());
+
+pub fn carry(t: &SessionTab) {
+    CARRIED.lock().unwrap().push(SessionTab { backup: None, ..t.clone() });
 }
 
 /// Writes the backups, then the session.json that refers to them, then deletes the backups no longer needed.
@@ -249,6 +258,9 @@ fn apply(tabs: &mut [Tab], out: &Outcome) {
 
 /// Writes the session now (closing, shutting down). Returns false if something couldn't be written.
 pub fn save(tabs: &mut [Tab], active: usize) -> bool {
+    if super::settings::guest() {
+        return false;
+    }
     if !super::settings::persist() {
         return true;
     }
@@ -415,12 +427,21 @@ pub fn put_aside() -> PathBuf {
     to
 }
 
-/// Forgets the session (setting turned off).
+/// Forgets the session (setting turned off): session.json and this Slate's backups. What it didn't write (another
+/// Slate's backups, a session set aside after a crash, damaged backups) stays.
 pub fn clear() {
     if !super::settings::persist() {
         return;
     }
-    let _ = fs::remove_dir_all(dir());
+    let d = dir();
+    for name in ["session.json", "session.json.bak", "session.json.tmp"] {
+        let _ = fs::remove_file(d.join(name));
+    }
+    let mut owned = OWNED.lock().unwrap();
+    for name in std::mem::take(&mut *owned) {
+        let _ = fs::remove_file(d.join(&name));
+    }
+    CARRIED.lock().unwrap().clear();
 }
 
 #[cfg(test)]

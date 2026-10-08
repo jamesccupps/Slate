@@ -93,7 +93,8 @@ fn install_exe() -> std::io::Result<PathBuf> {
     }
     // Copied under another name first: if that fails, the installed Slate is still as it was.
     let tmp = dir.join(format!("Slate.update-{}.exe", std::process::id()));
-    if let Err(e) = std::fs::copy(&me, &tmp) {
+    // (On the disk before it takes the name: after a power cut a renamed file can come back empty.)
+    if let Err(e) = std::fs::copy(&me, &tmp).and_then(|_| std::fs::OpenOptions::new().write(true).open(&tmp)?.sync_all()) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
