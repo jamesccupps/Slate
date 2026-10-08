@@ -78,6 +78,10 @@ pub struct Structure {
     revealed: Vec<NodeKey>,
     pub rows: Vec<Row>,
     rows_dirty: bool,
+    /// The document versions `rows` and `path` were worked out for: after a change they show the old text's places
+    /// until the new ones are ready, and clicking them mustn't select those places in the new text.
+    rows_version: u64,
+    path_version: u64,
     pub scroll: f32,
     pub selected: Option<NodeKey>,
     /// Where each path segment was drawn (for clicks).
@@ -112,6 +116,16 @@ impl Structure {
 
     pub fn busy(&self) -> bool {
         self.scanning.is_some()
+    }
+
+    /// Whether the tree rows are for the text as it is now (see `rows_version`).
+    pub fn rows_current(&self, doc: &Document) -> bool {
+        self.rows_version == doc.version
+    }
+
+    /// Whether the path bar is for the text as it is now.
+    pub fn path_current(&self, doc: &Document) -> bool {
+        self.path_version == doc.version
     }
 
     pub fn progress(&self) -> Option<f32> {
@@ -181,6 +195,7 @@ impl Structure {
                     let changed = self.path.as_ref() != Some(&p);
                     self.path = Some(p);
                     self.path_for = Some((caret, doc.version));
+                    self.path_version = doc.version;
                     if changed && self.follow {
                         self.reveal_path();
                     }
@@ -301,6 +316,7 @@ impl Structure {
         let mut out = Vec::new();
         self.add(doc, notify, open, TOP, &list, 0, n, 0, &mut out);
         self.rows = out;
+        self.rows_version = doc.version;
     }
 
     /// Adds the rows of children `a..b` of the container at `open` (whose node id is `id`).

@@ -284,6 +284,11 @@ impl<'w> Formatter<'w> {
     /// after its start tag, which keeps the whitespace between them).
     fn markup(&mut self, depth: usize, glue: bool) {
         if !self.text {
+            // A space on one line after an end or empty tag belongs to the text around it, before an end tag, a
+            // comment or a PI too (`<span><b>big</b> </span>world`): the element it's in has text from here on.
+            if self.closed && !self.stack.is_empty() && !self.ws.is_empty() && !self.ws.iter().any(|&c| c == b'\n' || c == b'\r') {
+                self.mixed = self.mixed.min(self.stack.len());
+            }
             if self.stack.len() >= self.mixed || glue {
                 // Inside text, the whitespace between tags belongs to it (`<b>big</b> <i>world</i>`), and an element
                 // that holds only whitespace keeps it (`<w:t xml:space="preserve"> </w:t>`).
@@ -892,7 +897,12 @@ mod tests {
         assert_eq!(pretty("<a>x <!--c--> y<?pi?>&lt;</a>"), "<a>x <!--c--> y<?pi?>&lt;</a>\n");
         assert_eq!(pretty("<a>\n <![CDATA[ ]]>\n</a>"), "<a>\n <![CDATA[ ]]>\n</a>\n");
         assert_eq!(pretty("<a  x = '1'\n/>"), "<a x='1'/>\n");
-        assert_eq!(fmt(Mode::Minify, "<a> <b> x </b> </a>\n").unwrap(), "<a><b> x </b></a>");
+        assert_eq!(fmt(Mode::Minify, "<a> <b> x </b> </a>\n").unwrap(), "<a><b> x </b> </a>");
+        // a space on one line after an inline element, before an end tag, comment or PI, is text
+        assert_eq!(fmt(Mode::Minify, "<p><span><b>big</b> </span>world</p>").unwrap(), "<p><span><b>big</b> </span>world</p>");
+        assert_eq!(fmt(Mode::Minify, "<p><b>x</b> <!--c--> <i>y</i></p>").unwrap(), "<p><b>x</b> <!--c--> <i>y</i></p>");
+        assert_eq!(fmt(Mode::Minify, "<p><a><img/> </a>Next</p>").unwrap(), "<p><a><img/> </a>Next</p>");
+        assert_eq!(fmt(Mode::Minify, "<r>\n  <a/>\n  <b/>\n</r>").unwrap(), "<r><a/><b/></r>");
         // whitespace too long to hold back is kept as text (outside the root element it is still dropped)
         let ws = " ".repeat(MAX_WS + 1);
         assert_eq!(fmt(Mode::Pretty, &format!("{ws}<a>{ws}</a>{ws}")).unwrap(), format!("<a>{ws}</a>\n"));

@@ -398,6 +398,8 @@ fn md_line(l: &[u8], col0: bool, mut st: State, o: &mut Out) -> State {
 
 /// How far ahead the end of `code`, a link's (url) or a <tag> is looked for.
 const MD_LOOK: usize = 2048;
+/// How far an inline code span's closing backticks are looked for (unmatched ones on a long line add up).
+const MD_CODE_LOOK: usize = 512;
 /// The same for *emphasis* and a [link's text], which are rarely longer than a sentence (a line of `*a *b *c…`
 /// looked 2 KB ahead for each star).
 const SHORT_LOOK: usize = 256;
@@ -435,7 +437,7 @@ fn md_inline(l: &[u8], mut i: usize, o: &mut Out, st: &mut State) {
             b'`' => {
                 // `code`, ``co`de``
                 let run = l[i..].iter().take_while(|&&b| b == b'`').count();
-                let look = n.min(i + run + MD_LOOK);
+                let look = n.min(i + run + MD_CODE_LOOK);
                 let mut p = i + run;
                 let mut found = None;
                 while let Some(q) = memchr::memchr(b'`', &l[p.min(look)..look]) {
@@ -470,7 +472,11 @@ fn md_inline(l: &[u8], mut i: usize, o: &mut Out, st: &mut State) {
                     }
                     continue;
                 }
-                // <tag> or <https://autolink>
+                // <tag> or <https://autolink> (only these start with a letter, digit or `/`: `<<<` isn't looked into)
+                if !l.get(i + 1).is_some_and(|&b| b.is_ascii_alphanumeric() || b == b'/') {
+                    i += 1;
+                    continue;
+                }
                 match memchr::memchr(b'>', &l[i..n.min(i + MD_LOOK)]) {
                     Some(p) if p > 1 => {
                         let inner = &l[i + 1..i + p];
@@ -712,8 +718,9 @@ fn yaml_value(l: &[u8], mut i: usize, ind: usize, o: &mut Out, st: &mut State) {
                     }
                     b' ' | b'\t' => i += 1,
                     _ => {
-                        let e = i + l[i..].iter().take_while(|&&b| !matches!(b, b',' | b']' | b'}' | b'[' | b'{')).count();
-                        let e = l[i..e].iter().position(|&b| b == b':').map_or(e, |p| i + p).max(i + 1);
+                        // (`:` ends it too: looking for it afterwards made `[a:a:a…` quadratic)
+                        let e = i + l[i..].iter().take_while(|&&b| !matches!(b, b',' | b']' | b'}' | b'[' | b'{' | b':')).count();
+                        let e = e.max(i + 1);
                         let v = l[i..e].trim_ascii_end();
                         o.put(i, i + v.len(), yaml_scalar_tok(v));
                         i = e;

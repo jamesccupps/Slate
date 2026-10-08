@@ -112,8 +112,8 @@ pub fn drain_pending(cell: &Cell) {
             Ok(mut a) if !a.pending.is_empty() => Some(a.pending.remove(0)),
             Ok(mut a) => {
                 let late = LATE_FILES.with(|l| std::mem::take(&mut *l.borrow_mut()));
-                if !late.is_empty() {
-                    a.open_paths(&late);
+                for (paths, args) in late {
+                    if args { a.open_command_line(&paths) } else { a.open_paths(&paths) }
                 }
                 None
             }
@@ -128,23 +128,24 @@ pub fn drain_pending(cell: &Cell) {
 
 thread_local! {
     /// Files dropped on the window or sent by another Slate while the app was busy; opened right after.
-    static LATE_FILES: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
+    /// (and whether they're from a command line: another Slate's)
+    static LATE_FILES: RefCell<Vec<(Vec<PathBuf>, bool)>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Opens `paths` now, or as soon as the app isn't busy.
 fn open_soon(cell: &Cell, hwnd: HWND, paths: Vec<PathBuf>) {
     match cell.try_borrow_mut() {
         Ok(mut a) => a.open_paths(&paths),
-        Err(_) => open_later(hwnd, paths),
+        Err(_) => open_later(hwnd, paths, false),
     }
 }
 
 /// Opens `paths` with the next message.
-fn open_later(hwnd: HWND, paths: Vec<PathBuf>) {
+fn open_later(hwnd: HWND, paths: Vec<PathBuf>, args: bool) {
     if paths.is_empty() {
         return;
     }
-    LATE_FILES.with(|l| l.borrow_mut().extend(paths));
+    LATE_FILES.with(|l| l.borrow_mut().push((paths, args)));
     unsafe {
         let _ = PostMessageW(hwnd, WM_APP_JOB, WPARAM(0), LPARAM(0));
     }
@@ -382,6 +383,17 @@ fn handle(cell: &Cell, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<L
             }
             Some(LRESULT(0))
         }
+        WM_PARENTNOTIFY | WM_NCLBUTTONDOWN | WM_NCRBUTTONDOWN => {
+            // A click in the find box (its edit boxes tell the window) or on the title bar ends the menu bar's
+            // keyboard mode, as a click in the text does; otherwise the next letters would open menus.
+            let button = matches!((wp.0 & 0xFFFF) as u32, WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN);
+            if msg != WM_PARENTNOTIFY || button {
+                if let Ok(mut a) = cell.try_borrow_mut() {
+                    a.disarm_menu_bar();
+                }
+            }
+            None
+        }
         WM_CAPTURECHANGED | WM_CANCELMODE => {
             // The mouse capture went elsewhere (Alt+Tab, a menu, a dialog) before the button came up: end any drag,
             // or moving the mouse would go on selecting (and scrolling) with no button held.
@@ -463,7 +475,7 @@ fn handle(cell: &Cell, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<L
             let text = String::from_utf16_lossy(units);
             let paths: Vec<PathBuf> = text.split('\n').filter(|s| !s.is_empty()).map(PathBuf::from).collect();
             // Answered at once; opening them (which can take a while on a slow share) comes right after.
-            open_later(hwnd, paths);
+            open_later(hwnd, paths, true);
             unsafe {
                 if IsIconic(hwnd).as_bool() {
                     let _ = ShowWindow(hwnd, SW_RESTORE);
@@ -771,7 +783,7 @@ pub fn restore(app: &mut App, paths: &[PathBuf]) {
         }
     }
     if !paths.is_empty() {
-        app.open_paths(paths);
+        app.open_command_line(paths);
     } else if let Some(id) = active_id {
         if let Some(i) = app.tabs.iter().position(|t| t.id == id) {
             app.activate(i);

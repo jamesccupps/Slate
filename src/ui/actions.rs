@@ -399,6 +399,13 @@ impl App {
 
     // ---- files ----
 
+    /// Opens files named on a command line (Slate's own, or another Slate's that handed them over).
+    pub fn open_command_line(&mut self, paths: &[PathBuf]) {
+        self.create_missing = true;
+        self.open_paths(paths);
+        self.create_missing = false;
+    }
+
     pub fn open_paths(&mut self, paths: &[PathBuf]) {
         for p in paths {
             let p = std::path::absolute(p).unwrap_or_else(|_| p.clone());
@@ -443,7 +450,7 @@ impl App {
                 }
                 Err(e) => {
                     let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                    if e.kind() == io::ErrorKind::NotFound && p.parent().is_some_and(Path::is_dir) {
+                    if self.create_missing && e.kind() == io::ErrorKind::NotFound && p.parent().is_some_and(Path::is_dir) {
                         // A file that isn't there yet in a folder that is (`Slate todo.txt`): an empty tab that
                         // becomes that file when it's saved (Notepad offers to create it).
                         let mut doc = Document::new();
@@ -1324,15 +1331,13 @@ impl App {
         if s.is_empty() || !self.editable() {
             return;
         }
-        let width = match self.indent_now() {
-            Indent::Spaces(n) => n,
-            Indent::Tabs => self.settings.tab_size,
-        };
         let tab = &mut self.tabs[self.active];
         let sel = tab.view.sel;
-        if s == "}" || s == "]" {
-            // Closing a block that Enter indented: the bracket lines up with the line that opened it.
-            if let Some(new) = editor::close_bracket(&mut tab.doc, sel, s.as_bytes()[0], width) {
+        // Closing a block that Enter indented: the bracket lines up with the line that opened it (in code and JSON;
+        // in text, data and makefiles a bracket is just typed).
+        let code = !matches!(tab.lang, Lang::Plain | Lang::Log | Lang::Markdown | Lang::Csv | Lang::CsvSemi | Lang::Tsv) && !needs_tabs(tab);
+        if (s == "}" || s == "]") && code {
+            if let Some(new) = editor::close_bracket(&mut tab.doc, sel, s.as_bytes()[0]) {
                 tab.view.sel = new;
                 self.after_edit();
                 return;
@@ -2949,7 +2954,17 @@ impl App {
     fn jump_to_value(&mut self, start: u64, end: u64, container: bool) {
         let tab = self.tab_mut();
         let len = tab.doc.len();
-        let (start, end) = (start.min(len), end.min(len));
+        // (On character boundaries whatever happens: a selection ending inside a character would let typing split it.)
+        let doc = &tab.doc;
+        let on_char = |mut p: u64| {
+            p = p.min(len);
+            let from = p;
+            while p > 0 && from - p < 3 && doc.byte_at(p).is_some_and(|b| b & 0xC0 == 0x80) {
+                p -= 1;
+            }
+            p
+        };
+        let (start, end) = (on_char(start), on_char(end));
         tab.view.sel = if !container && end > start && end - start <= 64 * 1024 { Sel::new(start, end) } else { Sel::at(start) };
         tab.view.upstream = false;
         tab.view.want_x = None;
@@ -2963,6 +2978,10 @@ impl App {
     }
 
     fn jump_path(&mut self, i: usize) {
+        if !self.tab().structure.path_current(&self.tab().doc) {
+            self.flash("The path is being worked out again after your change; try again in a moment", false);
+            return;
+        }
         let step = self.tab().structure.path.as_ref().and_then(|p| p.get(i)).cloned();
         if let Some(st) = step {
             let first = self.tab().doc.byte_at(st.start).unwrap_or(0);
@@ -2976,6 +2995,12 @@ impl App {
             self.tab_mut().structure.toggle(row.key);
         }
         if !chevron && row.end > row.start {
+            // Rows from before a change point into the old text.
+            if !self.tab().structure.rows_current(&self.tab().doc) {
+                self.flash("The structure is being updated after your change; try again in a moment", false);
+                self.invalidate();
+                return;
+            }
             self.tab_mut().structure.selected = Some(row.key);
             let container = row.kind.is_none_or(|k| k.is_container());
             self.jump_to_value(row.start, row.end, container);

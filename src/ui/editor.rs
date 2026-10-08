@@ -1305,7 +1305,7 @@ pub fn newline(doc: &mut Document, sel: Sel, indent_unit: &[u8]) -> Sel {
 /// Typing `}` or `]` with only indentation before it on the line (where Enter after `{` put one level more): the
 /// line gets the indentation of the line with the matching `{` or `[`, or one level less when that isn't found
 /// nearby. Done with the bracket as one step; None when there's nothing to change.
-pub fn close_bracket(doc: &mut Document, sel: Sel, close: u8, width: u32) -> Option<Sel> {
+pub fn close_bracket(doc: &mut Document, sel: Sel, close: u8) -> Option<Sel> {
     let pos = sel.caret;
     let ls = doc.line_start_of(pos);
     if !sel.is_empty() || pos == ls || pos - ls > 4096 {
@@ -1316,24 +1316,10 @@ pub fn close_bracket(doc: &mut Document, sel: Sel, close: u8, width: u32) -> Opt
         return None;
     }
     let open = if close == b'}' { b'{' } else { b'[' };
-    let indent: Vec<u8> = match matching_open(doc, ls, open, close) {
-        Some(o) => {
-            let ols = doc.line_start_of(o);
-            doc.read(ols, o.min(ols + 4096)).into_iter().take_while(|&b| b == b' ' || b == b'\t').collect()
-        }
-        None => {
-            // one level less: a tab, or the spaces back to the previous multiple of the width
-            let mut h = head.clone();
-            if h.last() == Some(&b'\t') {
-                h.pop();
-            } else {
-                let spaces = h.iter().rev().take_while(|&&b| b == b' ').count();
-                let n = ((h.len() - 1) % width.max(1) as usize + 1).min(spaces);
-                h.truncate(h.len() - n);
-            }
-            h
-        }
-    };
+    // (Without the bracket it closes, nothing tells what the indentation should be: typed as usual.)
+    let o = matching_open(doc, ls, open, close)?;
+    let ols = doc.line_start_of(o);
+    let indent: Vec<u8> = doc.read(ols, o.min(ols + 4096)).into_iter().take_while(|&b| b == b' ' || b == b'\t').collect();
     if indent == head {
         return None;
     }
@@ -2008,26 +1994,24 @@ mod tests {
     #[test]
     fn closing_brackets_line_up_with_their_opening_line() {
         let mut d = Document::from_text(b"  if (x) {\n      ");
-        let s = close_bracket(&mut d, Sel::at(17), b'}', 4).unwrap();
+        let s = close_bracket(&mut d, Sel::at(17), b'}').unwrap();
         assert_eq!(d.read(0, d.len()), b"  if (x) {\n  }");
         assert_eq!(s, Sel::at(14));
-        // no opening bracket around: one level less
+        // no opening bracket around: typed as usual (a `}` in a TSV row or a makefile recipe keeps its tab)
         let mut d = Document::from_text(b"a\n      ");
-        close_bracket(&mut d, Sel::at(8), b']', 4).unwrap();
-        assert_eq!(d.read(0, d.len()), b"a\n    ]");
+        assert!(close_bracket(&mut d, Sel::at(8), b']').is_none());
         let mut d = Document::from_text(b"a\n\t\t");
-        close_bracket(&mut d, Sel::at(4), b'}', 4).unwrap();
-        assert_eq!(d.read(0, d.len()), b"a\n\t}");
+        assert!(close_bracket(&mut d, Sel::at(4), b'}').is_none());
         // nested: the line of the bracket it closes
         let mut d = Document::from_text(b"[\n  [1,\n   2],\n  {\n    ");
         let end = d.len();
-        close_bracket(&mut d, Sel::at(end), b'}', 2).unwrap();
+        close_bracket(&mut d, Sel::at(end), b'}').unwrap();
         assert!(d.read(0, d.len()).ends_with(b"  {\n  }"));
         // text before the caret, or already in place: typed as usual
         let mut d = Document::from_text(b"{\n  x ");
-        assert!(close_bracket(&mut d, Sel::at(6), b'}', 2).is_none());
+        assert!(close_bracket(&mut d, Sel::at(6), b'}').is_none());
         let mut d = Document::from_text(b"{\n");
-        assert!(close_bracket(&mut d, Sel::at(2), b'}', 2).is_none());
+        assert!(close_bracket(&mut d, Sel::at(2), b'}').is_none());
     }
 
     #[test]

@@ -1063,6 +1063,8 @@ fn extras(sx: &Syntax, t: &[u8], i: usize, st: State, o: &mut Out) -> Option<Ste
                 let mut depth = 0;
                 for (k, &b) in t[i..n.min(i + 120)].iter().enumerate() {
                     match b {
+                        // (generic types nest a little; `[a [a [a …` mustn't be looked through again and again)
+                        b'[' if depth >= 3 => break,
                         b'[' => depth += 1,
                         b']' => {
                             depth -= 1;

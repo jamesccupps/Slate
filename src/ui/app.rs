@@ -351,6 +351,9 @@ pub struct App {
     pub gfx_generation: u64,
     /// Alt was pressed and released on its own: the menu bar has the keyboard, with this title highlighted.
     pub menu_armed: Option<usize>,
+    /// Set while opening files named on a command line (`open_command_line`): one that isn't there yet becomes an
+    /// empty tab that saving creates. Elsewhere (Open recent, a drop) a missing file is an error.
+    pub create_missing: bool,
     /// Mouse wheel movement not scrolled yet (in rows; touchpads send small steps), and for Ctrl+wheel zoom (in
     /// wheel units).
     pub wheel_rows: f32,
@@ -436,6 +439,7 @@ impl App {
             mouse_tracking: false,
             gfx_generation: 0,
             menu_armed: None,
+            create_missing: false,
             wheel_rows: 0.0,
             wheel_zoom: 0,
             line_clip: None,

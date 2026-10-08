@@ -24,7 +24,8 @@
 //! keyboard), `opened` (menus that would have opened: native menus are never shown in this mode), `keys0`…`keys4`
 //! (each menu item's access key), `scrollx`, `zoom`, `topline`, `drag`, `wintitle`, `tabnames`, `indent`.
 //!
-//! Also: `lang:<name>` (pick the language), `hit:<x>,<y>` / `hover:<x>,<y>` (what's at a point / move the mouse
+//! Also: `args:<path>` (open it as if named on the command line: a missing file becomes a new one), `lang:<name>`
+//! (pick the language), `hit:<x>,<y>` / `hover:<x>,<y>` (what's at a point / move the mouse
 //! there), `scrollto:<0..1>`, `endsession` (what a Windows shutdown asks), `t:<label>` (a timing mark), `temp:<dir>`,
 //! `persist` (write settings and the session; only with `SLATE_DATA_DIR` set, never into the real data folder),
 //! `session:save|soon|restore` (write the session now / on another thread as the timer does / restore it), `guest`
@@ -483,6 +484,8 @@ pub fn run(args: &[String]) -> i32 {
                 a.rebuild_style();
             }
             "open" => cell.borrow_mut().open_paths(&[PathBuf::from(arg)]),
+            // as if named on Slate's command line (a file that isn't there yet becomes a new one)
+            "args" => cell.borrow_mut().open_command_line(&[PathBuf::from(arg)]),
             "lang" => match super::highlight::Lang::ALL.iter().find(|l| l.label().eq_ignore_ascii_case(arg)) {
                 Some(&l) => cell.borrow_mut().exec(Cmd::SetLang(l)),
                 None => {
