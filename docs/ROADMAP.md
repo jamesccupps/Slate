@@ -54,7 +54,13 @@ their language; an XML path bar and structure panel; crash reports without telem
 2. **Release basics (S–M).** Code signing (SignPath Foundation is free for open source; Azure Artifact Signing is
    about $10 a month) so Windows stops warning, then the updater also checks the signature; winget and Scoop
    manifests. (Licensed MIT since October 2026.)
-3. **Big unsaved files, the rest (S–M).** Compact a big document's `.data` while it stays unsaved (it only grows
+3. **PPCL (S–M).** Siemens' Powers Process Control Language (APOGEE and Desigo field panels): 5-digit line numbers,
+   `C` comment lines, dotted operators (`.EQ.`, `.GT.`, `.AND.`, `.OR.`), statements and commands (`IF`/`THEN`/
+   `ELSE`, `GOTO`, `ON`, `OFF`, `SET`, `LOOP`, `TABLE`, `SAMPLE`, `WAIT`, `ONPWRT`, `DEFINE`, `ACT`, `ALARM`, `EMON`…),
+   point names in quotes, `$LOC`/`$ARG` variables, `@` priorities (`@EMER`, `@OPER`, `@NONE`), times and resident
+   points. Detected by its line-numbered content, and by extension (`.ppcl`; `.pcl` only with that content, as `.pcl`
+   is also HP's printer language). Built against real program exports, to get the dialects right.
+4. **Big unsaved files, the rest (S–M).** Compact a big document's `.data` while it stays unsaved (it only grows
    now), keep its newline index in the session so putting it back doesn't count the lines again, and keep big
    documents that Format or Replace All rewrote (today closing still asks about those).
 
