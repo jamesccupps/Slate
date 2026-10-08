@@ -91,6 +91,8 @@ their language; an XML path bar and structure panel; crash reports without telem
 - More code pages: Shift-JIS, GBK, Windows-125x, ISO-8859-x (M).
 - Save as administrator through an elevated helper (M). An ARM64 build next to the x64 one (M; `Slate.exe` stays
   x64, since every installed Slate downloads that name).
+- Drawing: a long line packed with colors (minified XML, ~2,700 tags per 8 KiB) costs 70–130 ms per caret move, against
+  ~17 ms as plain text: lay out, color and hit-test only the part of a segment that's in view (M).
 - Engine: a piece tree with O(log n) lookups for documents with hundreds of thousands of edits (M); regex matches
   longer than 64 KiB that cross a search window (M); UTF-16 files with unpaired surrogates kept byte-exact (S);
   saving where Slate can't create files, and keeping hard links (S–M); trimming what undo history keeps alive (S);
