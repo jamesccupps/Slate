@@ -8,7 +8,8 @@
 //! Commands: `size:1200x800`, `theme:dark|light`, `open:<path>`, `type:<text>` (`\n` and `\t` allowed),
 //! `key:<combo>` (e.g. `ctrl+shift+k`, `enter`, `pagedown`), `cmd:<Name>` (a menu command, e.g. `JsonFormat`),
 //! `find:<text>`, `replace:<text>`, `goto:<line>`, `saveas:<path>`, `click:<x>,<y>`, `dblclick:<x>,<y>`,
-//! `wheel:<rows>`, `wait:<ms>`, `jobs` (wait for background work), `shot:<file.png>`, `print:<what>`
+//! `wheel:<rows>`, `wait:<ms>`, `jobs` (wait for background work), `checkdisk` (look for files changed on disk,
+//! as the window does every 2 s; then `jobs`), `shot:<file.png>`, `print:<what>`
 //! (`text`, `sel`, `status`, `lines`, `title`, `top`, `find`, `tabs`, `dirty`, `asked`, `clipboard`, `window`,
 //! `saving`), `expect:<what>=<value>`, `answer:save,dont,cancel` (answers for the next prompts, which are never
 //! shown in this mode; `asked` lists the prompts so far), `set:restore_session=true`.
@@ -69,7 +70,8 @@ fn busy(cell: &Cell) -> bool {
             || t.search.job.is_some()
             || t.find_job.is_some()
             || t.structure.busy()
-    }) || matches!(a.update, super::app::UpdateState::Checking { .. } | super::app::UpdateState::Downloading { .. })
+    }) || a.disk_job.is_some()
+        || matches!(a.update, super::app::UpdateState::Checking { .. } | super::app::UpdateState::Downloading { .. })
 }
 
 fn vk_of(name: &str) -> Option<u16> {
@@ -522,6 +524,8 @@ pub fn run(args: &[String]) -> i32 {
                 a.hover = Hit::None;
             }
             "wait" => pump(&cell, arg.parse().unwrap_or(100)),
+            // What the timer does every 2 s in the real window (follow with `jobs`).
+            "checkdisk" => cell.borrow_mut().check_disk(),
             "endsession" => {
                 // What a shutdown asks: may the session end? Then "it isn't ending after all".
                 use windows::Win32::Foundation::{LPARAM, WPARAM};

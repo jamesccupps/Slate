@@ -173,16 +173,39 @@ fn convert_eol(snap: &crate::core::buffer::Snapshot, to_crlf: bool, w: &mut dyn 
 }
 
 /// Runs a background transform; if part of the text couldn't be read meanwhile (the file shrank or went away),
-/// the result is thrown away instead of producing text with zeros in it.
+/// the result is thrown away instead of producing text with zeros in it. The same if another program wrote into
+/// the file the text is read from: the result would mix its version with the user's.
 fn guarded(snap: &crate::core::buffer::Snapshot, f: impl FnOnce() -> TaskResult) -> TaskResult {
     let before = snap.read_errors();
     let r = f();
-    if snap.read_errors() != before && !matches!(r, TaskResult::Cancelled) {
+    if matches!(r, TaskResult::Cancelled) {
+        return r;
+    }
+    if snap.read_errors() != before {
         return TaskResult::Failed(
             "Part of the file couldn't be read (was it changed or removed?), so nothing was changed.".into(),
         );
     }
+    if snap.changed_in_place() {
+        return TaskResult::Failed(
+            "Another program changed this file while it was open, so nothing was changed. Reload it first.".into(),
+        );
+    }
     r
+}
+
+/// Whether tab `t` has the file `p` (whose canonical form is `canon`) open. Its own path is canonicalized once
+/// and kept, so opening a file doesn't ask the file system about every open tab (slow, or stuck, on a network
+/// drive that went away).
+fn has_file(t: &mut Tab, p: &Path, canon: Option<&Path>) -> bool {
+    let Some(path) = &t.doc.path else { return false };
+    if t.canon.as_ref().is_none_or(|c| &c.0 != path) {
+        t.canon = Some((path.clone(), std::fs::canonicalize(path).ok()));
+    }
+    match (t.canon.as_ref().and_then(|c| c.1.as_deref()), canon) {
+        (Some(a), Some(b)) => a == b,
+        _ => path == p,
+    }
 }
 
 fn now_text() -> String {
@@ -315,7 +338,8 @@ impl App {
     pub fn open_paths(&mut self, paths: &[PathBuf]) {
         for p in paths {
             let p = std::path::absolute(p).unwrap_or_else(|_| p.clone());
-            if let Some(i) = self.tabs.iter().position(|t| t.doc.path.as_ref().is_some_and(|q| fileio::same_file(q, &p))) {
+            let canon = std::fs::canonicalize(&p).ok();
+            if let Some(i) = self.tabs.iter_mut().position(|t| has_file(t, &p, canon.as_deref())) {
                 self.activate(i);
                 continue;
             }
@@ -421,6 +445,19 @@ impl App {
 
     /// Starts saving tab `i`. Returns false if it can't be saved now.
     pub fn start_save(&mut self, i: usize, path: PathBuf, encoding: Encoding, close_after: bool) -> bool {
+        self.start_save_lossy(i, path, encoding, close_after, false)
+    }
+
+    /// `start_save`; `lossy_ok`: the user agreed that characters ANSI can't hold become "?" (otherwise such a save
+    /// stops before writing anything and asks, see `Deferred::AskLossy`).
+    pub fn start_save_lossy(
+        &mut self,
+        i: usize,
+        path: PathBuf,
+        encoding: Encoding,
+        close_after: bool,
+        lossy_ok: bool,
+    ) -> bool {
         let notify = self.notify.clone();
         let tab = &mut self.tabs[i];
         if let Some(st) = tab.save.as_mut() {
@@ -442,7 +479,7 @@ impl App {
         let version = tab.doc.version;
         let p = path.clone();
         let bom = tab.doc.bom;
-        let job = Job::spawn(snap.len(), notify, move |ctx| fileio::save(&snap, &p, encoding, bom, ctx));
+        let job = Job::spawn(snap.len(), notify, move |ctx| fileio::save(&snap, &p, encoding, bom, lossy_ok, ctx));
         tab.save = Some(SaveTask { job, state, version, path, encoding, close_after, again: false });
         tab.doc.seal();
         self.timer(TIMER_JOBS, 100);
@@ -450,46 +487,107 @@ impl App {
         true
     }
 
-    /// Looks for files changed on disk by other programs.
+    /// Looks for files changed on disk by other programs. The file system is asked on a background thread (a
+    /// network drive that went away can take half a minute to answer, which mustn't freeze the window);
+    /// `poll_disk` acts on what it finds.
     pub fn check_disk(&mut self) {
-        for i in 0..self.tabs.len() {
-            let tab = &self.tabs[i];
+        if self.disk_job.is_some() {
+            return; // the last look hasn't finished (a slow drive): the next one waits for it
+        }
+        let mut asks = Vec::new();
+        for tab in &self.tabs {
             if tab.save.is_some() || tab.load_job.is_some() || tab.task.is_some() {
                 continue;
             }
             let (Some(path), Some(old)) = (tab.doc.path.clone(), tab.doc.disk) else { continue };
-            let now = fileio::disk_info(&path);
-            if now == Some(old) {
+            // Unsaved changes to text read from a file (a big one): did another program write into that file?
+            let sources = if tab.doc.is_dirty() { tab.doc.file_sources() } else { Vec::new() };
+            asks.push((tab.id, path, old, sources));
+        }
+        if asks.is_empty() {
+            return;
+        }
+        self.disk_job = Some(Job::spawn(0, self.notify.clone(), move |_| {
+            asks.into_iter()
+                .map(|(id, path, old, sources)| DiskCheck {
+                    id,
+                    old,
+                    now: fileio::disk_info(&path),
+                    in_place: sources.iter().any(|s| s.changed_in_place()),
+                })
+                .collect()
+        }));
+    }
+
+    /// Acts on a finished `check_disk`; returns whether one is still running.
+    fn poll_disk(&mut self) -> bool {
+        let Some(job) = self.disk_job.as_mut() else { return false };
+        let Some(found) = job.take() else { return true };
+        self.disk_job = None;
+        for c in found {
+            let Some(i) = self.tabs.iter().position(|t| t.id == c.id) else { continue };
+            let tab = &self.tabs[i];
+            // Saved, reloaded or busy since the look started: the next look is what counts.
+            if tab.doc.disk != Some(c.old) || tab.save.is_some() || tab.load_job.is_some() || tab.task.is_some() {
                 continue;
             }
-            if tab.seen_disk == Some(now) {
+            if (c.now == Some(c.old) && !c.in_place) || tab.seen_disk == Some(c.now) {
                 continue;
             }
-            if now.is_some() && !tab.doc.is_dirty() && tab.index_job.is_none() {
-                self.reload(i, None);
-                continue;
-            }
-            let tab = &mut self.tabs[i];
-            tab.seen_disk = Some(now);
-            tab.notice = Some(if now.is_none() {
-                Notice {
-                    kind: NoticeKind::Warn,
-                    text: "This file was deleted or moved. Save it to keep your copy.".into(),
-                    actions: vec![("Save as…".into(), NoticeAction::SaveAs), ("Dismiss".into(), NoticeAction::Dismiss)],
+            let dirty = tab.doc.is_dirty();
+            if c.now.is_some() && !dirty {
+                if tab.index_job.is_some() {
+                    // Still reading its lines: reloading now would start that over; it reloads once they're read.
+                    self.tabs[i].notice = Some(Notice {
+                        kind: NoticeKind::Info,
+                        text: "This file changed on disk. Slate reloads it as soon as it has read all its lines."
+                            .into(),
+                        actions: vec![("Reload now".into(), NoticeAction::Reload)],
+                    });
+                } else {
+                    self.reload(i, None);
+                    continue;
                 }
             } else {
-                Notice {
-                    kind: NoticeKind::Warn,
-                    text: "Another program changed this file. Your unsaved changes are still here.".into(),
-                    actions: vec![
-                        ("Reload (lose my changes)".into(), NoticeAction::Reload),
-                        ("Keep mine".into(), NoticeAction::KeepMine),
-                    ],
-                }
-            });
+                let tab = &mut self.tabs[i];
+                tab.seen_disk = Some(c.now);
+                tab.notice = Some(if c.in_place {
+                    // Big files are read from disk as needed: what the user didn't edit is now the other program's.
+                    Notice {
+                        kind: NoticeKind::Warn,
+                        text: "Another program changed this file while it was open. Slate reads big files from disk, \
+                               so the parts you didn't edit now show its version, and your changes can't be saved \
+                               without mixing the two."
+                            .into(),
+                        actions: vec![
+                            ("Reload (lose my changes)".into(), NoticeAction::Reload),
+                            ("Dismiss".into(), NoticeAction::Dismiss),
+                        ],
+                    }
+                } else if c.now.is_none() {
+                    Notice {
+                        kind: NoticeKind::Warn,
+                        text: "This file was deleted or moved. Save it to keep your copy.".into(),
+                        actions: vec![
+                            ("Save as…".into(), NoticeAction::SaveAs),
+                            ("Dismiss".into(), NoticeAction::Dismiss),
+                        ],
+                    }
+                } else {
+                    Notice {
+                        kind: NoticeKind::Warn,
+                        text: "Another program changed this file. Your unsaved changes are still here.".into(),
+                        actions: vec![
+                            ("Reload (lose my changes)".into(), NoticeAction::Reload),
+                            ("Keep mine".into(), NoticeAction::KeepMine),
+                        ],
+                    }
+                });
+            }
             self.layout();
             self.invalidate();
         }
+        false
     }
 
     // ---- background jobs ----
@@ -504,6 +602,7 @@ impl App {
             }
         }
         any |= self.poll_update();
+        any |= self.poll_disk();
         if !any {
             self.kill_timer(TIMER_JOBS);
         }
@@ -675,6 +774,23 @@ impl App {
                 self.tabs[i].index_job = None;
                 self.tabs[i].doc.poll_index();
                 self.tabs[i].view.clear_cache();
+                if let Some(why) = self.tabs[i].doc.index_error() {
+                    // It stays as it is (readable, not editable): line counts can't be guessed.
+                    self.tabs[i].notice = Some(Notice {
+                        kind: NoticeKind::Error,
+                        text: format!(
+                            "Slate couldn't read all of this file ({why}), so line numbers and editing are off. \
+                             Reload to try again."
+                        ),
+                        actions: vec![
+                            ("Reload".into(), NoticeAction::Reload),
+                            ("Dismiss".into(), NoticeAction::Dismiss),
+                        ],
+                    });
+                    self.layout();
+                }
+                // It may have changed on disk meanwhile (a clean document reloads only once its lines are read).
+                self.check_disk();
             } else {
                 running = true;
             }
@@ -777,6 +893,14 @@ impl App {
                 }
                 self.settings.add_recent(&st.path);
                 self.session_dirty = true;
+                if saved.lossy {
+                    // (only when the user said so) The tab keeps the real characters: never close it now, nor the
+                    // window it was being saved for.
+                    self.cancel_close();
+                    self.layout();
+                    self.update_title();
+                    return false;
+                }
                 let dirty = self.tabs[i].doc.is_dirty();
                 if st.close_after && (!dirty || self.tabs[i].discard) {
                     self.remove_tab(i);
@@ -795,10 +919,30 @@ impl App {
                 false
             }
             Err(e) => {
+                let closing = self.closing;
                 self.cancel_close();
                 let msg = match &e {
                     SaveError::Cancelled => {
                         self.flash("Saving was cancelled.", false);
+                        return false;
+                    }
+                    SaveError::Lossy => {
+                        // Nothing was written: ask what to do (outside this borrow, it shows a dialog).
+                        let tab = &mut self.tabs[i];
+                        tab.ask_lossy = Some((st.path.clone(), st.close_after, closing));
+                        self.pending.push(Deferred::AskLossy(tab.id));
+                        return false;
+                    }
+                    SaveError::Changed => {
+                        self.tabs[i].notice = Some(Notice {
+                            kind: NoticeKind::Error,
+                            text: format!("Couldn't save: {e}"),
+                            actions: vec![
+                                ("Reload (lose my changes)".into(), NoticeAction::Reload),
+                                ("Dismiss".into(), NoticeAction::Dismiss),
+                            ],
+                        });
+                        self.layout();
                         return false;
                     }
                     SaveError::ReadOnly => "This file is read-only, so it couldn't be saved.".to_string(),
@@ -1044,6 +1188,8 @@ impl App {
         let tab = self.tab();
         let why = if tab.load_job.is_some() {
             Some("Still opening the file…")
+        } else if !tab.doc.is_ready() && tab.doc.index_error().is_some() {
+            Some("Part of this file couldn't be read, so it can't be edited. Reload it to try again.")
         } else if !tab.doc.is_ready() {
             Some("Still reading the file's lines — editing works in a moment.")
         } else if tab.task.is_some() {
@@ -1487,7 +1633,7 @@ impl App {
         let len = tab.doc.len();
         let mut from = if forward { sel.end() } else { sel.start() };
         // Don't find the same empty match again.
-        if sel.is_empty() && forward && m.is_match_exactly(b"") && from < len {
+        if sel.is_empty() && forward && from < len && m.is_match_at(&tab.doc, from, from) {
             from = tab.doc.next_char(from);
         }
         self.find.origin = Some(if forward { sel.end() } else { sel.start() });
@@ -1573,8 +1719,8 @@ impl App {
         let tab = self.tab_mut();
         let sel = tab.view.sel;
         if !sel.is_empty() && sel.end() - sel.start() < (16 << 20) {
-            let text = tab.doc.read(sel.start(), sel.end());
-            if m.is_match_exactly(&text) {
+            // (a match where it is: "foo" as a whole word isn't one inside "foobar")
+            if m.is_match_at(&tab.doc, sel.start(), sel.end()) {
                 let hs = sel.start().saturating_sub(64);
                 let hay = tab.doc.read(hs, (sel.end() + 64).min(tab.doc.len()));
                 let mut out = Vec::new();
@@ -2991,6 +3137,7 @@ pub fn run(cell: &Cell, d: Deferred) {
                 }
             }
         }
+        Deferred::AskLossy(id) => ask_lossy(cell, id),
         Deferred::UpdatePrompt => {
             let (rel, hwnd) = {
                 let a = cell.borrow();
@@ -3154,6 +3301,45 @@ pub fn run_cmd(cell: &Cell, cmd: Cmd) {
 
 fn tab_index(cell: &Cell, id: u64) -> Option<usize> {
     cell.borrow().tabs.iter().position(|t| t.id == id)
+}
+
+/// A save of tab `id` stopped before writing because ANSI can't hold some characters (like Notepad, ask first):
+/// save it as UTF-8 instead (carrying on with closing, if that's what it was for), save as ANSI anyway (the
+/// characters become "?"; the tab then stays open, with the text still in it), or don't save.
+fn ask_lossy(cell: &Cell, id: u64) {
+    let (hwnd, title, (path, close_after, closing)) = {
+        let mut a = cell.borrow_mut();
+        let hwnd = a.hwnd;
+        let Some(t) = a.tabs.iter_mut().find(|t| t.id == id) else { return };
+        let Some(ask) = t.ask_lossy.take() else { return };
+        (hwnd, t.title(), ask)
+    };
+    let q = format!("Some characters in {title} can't be saved as ANSI");
+    let detail = format!(
+        "In {} they would become \"?\". UTF-8 keeps every character, and nearly every program reads it.",
+        Encoding::Ansi.label()
+    );
+    let choice = win::ask(hwnd, "Slate", &q, &detail, &["Save as UTF-8", "Save as ANSI anyway", "Cancel"]);
+    // The dialog let other things happen (tabs can close or move meanwhile): find the tab again.
+    let Some(i) = tab_index(cell, id) else { return };
+    match choice {
+        Some(0) => {
+            let started = {
+                let mut a = cell.borrow_mut();
+                let t = &mut a.tabs[i];
+                t.doc.encoding = Encoding::Utf8;
+                t.doc.bom = false;
+                a.start_save(i, path, Encoding::Utf8, close_after)
+            };
+            if started && closing {
+                run_cmd(cell, Cmd::Exit);
+            }
+        }
+        Some(1) => {
+            cell.borrow_mut().start_save_lossy(i, path, Encoding::Ansi, false, true);
+        }
+        _ => {}
+    }
 }
 
 /// Saves tab `i` (asking for a name when needed). Returns false if the user cancelled or it can't be saved now.

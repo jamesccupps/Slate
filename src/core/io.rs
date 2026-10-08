@@ -5,9 +5,15 @@
 //! the background. Files in UTF-16 or the ANSI code page are converted to UTF-8 when opened (big ones into a
 //! self-deleting temp file) and converted back when saved.
 //!
+//! A file is only taken as ANSI if its text converts back to exactly its bytes; otherwise it stays UTF-8, where
+//! every byte is kept as it is.
+//!
 //! Saving writes a hidden temp file next to the target and then swaps it into place with a POSIX-semantics
 //! rename, which works even while Slate still reads the old file (big files, undo history): open handles keep
-//! seeing the old content. A failed or cancelled save leaves the original untouched.
+//! seeing the old content. Where that rename isn't supported (network shares, FAT drives) a plain rename is
+//! tried, and for a file Slate still has open, ReplaceFile. A failed or cancelled save leaves the original
+//! untouched. Saving refuses to write text that ANSI can't hold (unless asked to) and text read from a file
+//! another program has written into meanwhile (see `Source::changed_in_place`).
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Write};
@@ -20,8 +26,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Storage::FileSystem::{
-    FILE_BASIC_INFO, FILE_RENAME_INFO, FileBasicInfo, FileRenameInfoEx, MOVEFILE_REPLACE_EXISTING,
-    MOVEFILE_WRITE_THROUGH, MoveFileExW, SetFileInformationByHandle,
+    FILE_ATTRIBUTE_HIDDEN as HIDDEN, FILE_BASIC_INFO, FILE_RENAME_INFO, FileBasicInfo, FileRenameInfoEx,
+    MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW, REPLACEFILE_IGNORE_ACL_ERRORS,
+    REPLACEFILE_IGNORE_MERGE_ERRORS, ReplaceFileW, SetFileAttributesW, SetFileInformationByHandle,
 };
 use windows::core::PCWSTR;
 
@@ -30,7 +37,7 @@ use super::document::{DiskInfo, Document};
 use super::job::{Ctx, Job, Notify};
 use super::source::{IndexBuilder, Source, create_temp_file};
 use super::text::{
-    AnsiDecoder, AnsiEncoder, Encoding, Utf16Decoder, Utf16Encoder, detect_encoding, detect_eol,
+    self, AnsiCheck, AnsiDecoder, AnsiEncoder, Encoding, Utf16Decoder, Utf16Encoder, detect_encoding, detect_eol,
 };
 
 /// Files up to this size are read into memory.
@@ -91,9 +98,13 @@ pub fn open_with(path: &Path, notify: Notify, prev: Option<Arc<Source>>, force: 
     let src = Arc::new(src);
     let mut sample = Vec::new();
     src.read_into(0, SAMPLE, &mut sample);
+    let truncated = src.len() > SAMPLE;
     let (encoding, bom) = match force {
         Some(e) => (e, if sample.starts_with(e.bom()) { e.bom().len() } else { 0 }),
-        None => detect_encoding(&sample, src.len() > SAMPLE),
+        None => match detect_encoding(&sample, truncated) {
+            (Encoding::Ansi, _) if !text::ansi_fits(&sample, truncated) => (Encoding::Utf8, 0),
+            d => d,
+        },
     };
     if encoding.is_native() {
         let mut doc = Document::new_pending(src.clone(), bom as u64);
@@ -109,7 +120,20 @@ pub fn open_with(path: &Path, notify: Notify, prev: Option<Arc<Source>>, force: 
     let path = path.to_path_buf();
     let total = src.len();
     Ok(Loading::Converting(Job::spawn(total, notify, move |ctx| {
-        let mut doc = convert_to_temp(&src, encoding, bom as u64, ctx)?;
+        let mut doc = match convert_to_temp(&src, encoding, bom as u64, force.is_none(), ctx) {
+            // Detected as ANSI, but further on it doesn't convert to text and back exactly: keep its bytes as they
+            // are instead (UTF-8, read straight from the file like any big file).
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => {
+                if !src.build_index(&ctx.cancel, &ctx.progress) {
+                    let why = src.index_error().unwrap_or_else(|| "cancelled".into());
+                    return Err(io::Error::other(why));
+                }
+                let mut doc = Document::new_pending(src.clone(), 0);
+                doc.eol = detect_eol(&sample);
+                doc
+            }
+            r => r?,
+        };
         doc.path = Some(path);
         doc.disk = disk;
         Ok(doc)
@@ -123,7 +147,7 @@ pub fn document_from_bytes(data: Vec<u8>) -> Document {
 
 /// Like `document_from_bytes`, optionally forcing the encoding.
 pub fn document_from_bytes_as(mut data: Vec<u8>, force: Option<Encoding>) -> Document {
-    let (encoding, bom) = match force {
+    let (mut encoding, bom) = match force {
         Some(e) => (e, if data.starts_with(e.bom()) && !e.bom().is_empty() { e.bom().len() } else { 0 }),
         None => detect_encoding(&data, false),
     };
@@ -144,7 +168,13 @@ pub fn document_from_bytes_as(mut data: Vec<u8>, force: Option<Encoding>) -> Doc
             let mut d = AnsiDecoder::new();
             d.push(&data, &mut out);
             d.finish(&mut out);
-            out
+            if force.is_none() && !text::ansi_round_trips(&out, &data) {
+                // Detected, but saving the text in ANSI wouldn't give these bytes back: keep them as they are.
+                encoding = Encoding::Utf8;
+                data
+            } else {
+                out
+            }
         }
     };
     let eol = detect_eol(&content[..content.len().min(SAMPLE as usize)]);
@@ -156,7 +186,11 @@ pub fn document_from_bytes_as(mut data: Vec<u8>, force: Option<Encoding>) -> Doc
     doc
 }
 
-fn convert_to_temp(src: &Source, encoding: Encoding, bom: u64, ctx: &Ctx) -> io::Result<Document> {
+/// Converts a big file to UTF-8 in a temp file. `verify` (ANSI that was detected, not chosen): stop with
+/// `InvalidData` as soon as the text doesn't convert back to exactly the file's bytes.
+fn convert_to_temp(src: &Source, encoding: Encoding, bom: u64, verify: bool, ctx: &Ctx) -> io::Result<Document> {
+    let mut check = (verify && encoding == Encoding::Ansi).then(AnsiCheck::new);
+    let not_ansi = || io::Error::new(io::ErrorKind::InvalidData, "not text in the ANSI code page");
     let (file, temp_path) = create_temp_file()?;
     let mut idx = IndexBuilder::new();
     let mut out_len = 0u64;
@@ -188,6 +222,12 @@ fn convert_to_temp(src: &Source, encoding: Encoding, bom: u64, ctx: &Ctx) -> io:
                 Encoding::Ansi => ansi.push(&input, &mut out),
                 _ => u16d.push(&input, &mut out),
             }
+            if let Some(c) = check.as_mut() {
+                c.push(&input, &out);
+                if !c.ok() {
+                    return Err(not_ansi());
+                }
+            }
             emit(&out)?;
             ctx.set(pos);
         }
@@ -195,6 +235,9 @@ fn convert_to_temp(src: &Source, encoding: Encoding, bom: u64, ctx: &Ctx) -> io:
         match encoding {
             Encoding::Ansi => ansi.finish(&mut out),
             _ => u16d.finish(&mut out),
+        }
+        if check.take().is_some_and(|c| !c.finish(&out)) {
+            return Err(not_ansi());
         }
         emit(&out)?;
         drop(emit);
@@ -219,6 +262,10 @@ fn convert_to_temp(src: &Source, encoding: Encoding, bom: u64, ctx: &Ctx) -> io:
 pub enum SaveError {
     Cancelled,
     ReadOnly,
+    /// Some characters can't be stored in the ANSI code page (they would become `?`); nothing was written.
+    Lossy,
+    /// Another program wrote into a file the text is read from (see `Source::changed_in_place`).
+    Changed,
     Io(String),
 }
 
@@ -227,6 +274,12 @@ impl std::fmt::Display for SaveError {
         match self {
             SaveError::Cancelled => write!(f, "Saving was cancelled."),
             SaveError::ReadOnly => write!(f, "The file is read-only."),
+            SaveError::Lossy => write!(f, "Some characters can't be saved in ANSI."),
+            SaveError::Changed => write!(
+                f,
+                "Another program changed this file while it was open. Slate reads big files from disk, so the parts \
+                 you didn't edit aren't your version any more, and saving would mix the two. Nothing was saved."
+            ),
             SaveError::Io(s) => write!(f, "{s}"),
         }
     }
@@ -310,6 +363,40 @@ fn posix_rename(file: &File, target: &Path) -> io::Result<()> {
     .map_err(|e| io::Error::from_raw_os_error(e.code().0 & 0xFFFF))
 }
 
+/// Renames the closed file `from` to `to`, replacing it (fails if `to` is open, even with delete sharing).
+fn move_file(from: &Path, to: &Path) -> bool {
+    let (f, t) = (wide(&verbatim(from)), wide(&verbatim(to)));
+    unsafe { MoveFileExW(PCWSTR(f.as_ptr()), PCWSTR(t.as_ptr()), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) }
+        .is_ok()
+}
+
+/// Puts the closed file `temp` in place of the existing `target` with ReplaceFile, which works where a rename
+/// over a file that is still open doesn't (Slate reading a big file from a network share or a FAT drive): it
+/// moves the old file aside under a backup name, then moves `temp` in. That isn't atomic, so it is only the last
+/// thing tried; if it stops half way (the old file moved aside, the new one not in), the old one is moved back.
+/// After it worked the backup (the old file, which open handles still read) is deleted. ReplaceFile also gives
+/// the new file the old one's security settings, alternate streams and attributes.
+fn replace_file(temp: &Path, target: &Path, dir: &Path) -> bool {
+    let n = SAVE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let backup = dir.join(format!(".slate-bak-{}-{n}.tmp", std::process::id()));
+    let (t, r, b) = (wide(&verbatim(target)), wide(&verbatim(temp)), wide(&verbatim(&backup)));
+    let flags = REPLACEFILE_IGNORE_MERGE_ERRORS | REPLACEFILE_IGNORE_ACL_ERRORS;
+    let ok = unsafe { ReplaceFileW(PCWSTR(t.as_ptr()), PCWSTR(r.as_ptr()), PCWSTR(b.as_ptr()), flags, None, None) }
+        .is_ok();
+    if ok {
+        // (it may stay in the folder until Slate lets go of it, on a network share: hidden)
+        unsafe {
+            let _ = SetFileAttributesW(PCWSTR(b.as_ptr()), HIDDEN);
+        }
+        let _ = fs::remove_file(&backup);
+    } else if !target.exists() && backup.exists() {
+        unsafe {
+            let _ = MoveFileExW(PCWSTR(b.as_ptr()), PCWSTR(t.as_ptr()), MOVEFILE_WRITE_THROUGH);
+        }
+    }
+    ok
+}
+
 /// Gives the new file the old one's creation time and attributes (and clears our temp "hidden" flag).
 fn copy_identity(file: &File, old: Option<&fs::Metadata>) {
     let mut info = FILE_BASIC_INFO::default();
@@ -338,10 +425,12 @@ pub fn bom_bytes(encoding: Encoding, bom: bool) -> &'static [u8] {
 }
 
 /// Writes the content (with BOM and encoding) to `w`; returns (index of the written bytes for UTF-8, lossy).
+/// Stops with `Lossy` at the first character ANSI can't hold, unless `lossy_ok`.
 fn write_content(
     snap: &Snapshot,
     encoding: Encoding,
     bom: bool,
+    lossy_ok: bool,
     w: &mut dyn Write,
     ctx: &Ctx,
 ) -> Result<(Option<IndexBuilder>, bool), SaveError> {
@@ -377,6 +466,10 @@ fn write_content(
                 Encoding::Ansi => {
                     out.clear();
                     ansi.push(c, &mut out);
+                    if ansi.lossy && !lossy_ok {
+                        err = Some(SaveError::Lossy);
+                        return false;
+                    }
                     w.write_all(&out)
                 }
             };
@@ -398,18 +491,28 @@ fn write_content(
         Encoding::Ansi => ansi.finish(&mut out),
         _ => {}
     }
+    if ansi.lossy && !lossy_ok {
+        return Err(SaveError::Lossy);
+    }
     w.write_all(&out)?;
     Ok((idx, ansi.lossy))
 }
 
-/// Removes hidden temp files of saves that never finished (Slate was killed or crashed mid-save) in `dir`.
+/// Removes hidden temp files of saves that never finished (Slate was killed or crashed mid-save) in `dir`, and
+/// old versions a `replace_file` couldn't delete.
 fn clean_stale_temps(dir: &Path) {
     use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
     let Ok(rd) = fs::read_dir(dir) else { return };
     let me = std::process::id();
     for e in rd.flatten() {
         let name = e.file_name().to_string_lossy().into_owned();
-        let Some(rest) = name.strip_prefix(".slate-save-").and_then(|r| r.strip_suffix(".tmp")) else { continue };
+        let Some(rest) = name
+            .strip_prefix(".slate-save-")
+            .or_else(|| name.strip_prefix(".slate-bak-"))
+            .and_then(|r| r.strip_suffix(".tmp"))
+        else {
+            continue;
+        };
         let Some(pid) = rest.split('-').next().and_then(|p| p.parse::<u32>().ok()) else { continue };
         if pid == me {
             continue;
@@ -430,8 +533,19 @@ fn clean_stale_temps(dir: &Path) {
     }
 }
 
-/// Saves `snap` to `path` in `encoding` (with a byte order mark if `bom`). Run on a background thread.
-pub fn save(snap: &Snapshot, path: &Path, encoding: Encoding, bom: bool, ctx: &Ctx) -> Result<Saved, SaveError> {
+/// Saves `snap` to `path` in `encoding` (with a byte order mark if `bom`). Run on a background thread. Text that
+/// ANSI can't hold fails with `Lossy` (writing nothing) unless `lossy_ok`.
+pub fn save(
+    snap: &Snapshot,
+    path: &Path,
+    encoding: Encoding,
+    bom: bool,
+    lossy_ok: bool,
+    ctx: &Ctx,
+) -> Result<Saved, SaveError> {
+    if snap.changed_in_place() {
+        return Err(SaveError::Changed);
+    }
     // Save through a symbolic link to the file it points at.
     let target: PathBuf = match fs::symlink_metadata(path) {
         Ok(m) if m.file_type().is_symlink() => fs::canonicalize(path)?,
@@ -476,7 +590,7 @@ pub fn save(snap: &Snapshot, path: &Path, encoding: Encoding, bom: bool, ctx: &C
 
     let result = (|| -> Result<(Option<IndexBuilder>, bool), SaveError> {
         let mut w = BufWriter::with_capacity(1 << 20, &file);
-        let r = write_content(snap, encoding, bom, &mut w, ctx)?;
+        let r = write_content(snap, encoding, bom, lossy_ok, &mut w, ctx)?;
         w.flush()?;
         drop(w);
         if snap.read_errors() != errors_before {
@@ -484,6 +598,10 @@ pub fn save(snap: &Snapshot, path: &Path, encoding: Encoding, bom: bool, ctx: &C
                 "Part of the original file couldn't be read (was it changed or removed?), so nothing was saved."
                     .into(),
             ));
+        }
+        // (again: another program may have written to it while this one read it)
+        if snap.changed_in_place() {
+            return Err(SaveError::Changed);
         }
         file.sync_all()?;
         copy_identity(&file, old.as_ref());
@@ -498,21 +616,12 @@ pub fn save(snap: &Snapshot, path: &Path, encoding: Encoding, bom: bool, ctx: &C
         }
     };
 
-    // Swap the new file into place.
+    // Swap the new file into place: a POSIX rename (atomic, and it replaces a file still open with delete
+    // sharing, as Slate keeps big files); where the file system doesn't have those (network shares, FAT drives)
+    // a plain rename, and if that can't replace the file because Slate still has it open, ReplaceFile.
     let posix = posix_rename(&file, &verbatim(&target)).is_ok();
     drop(file);
-    let renamed = posix || {
-        let from = wide(&verbatim(&temp_path));
-        let to = wide(&verbatim(&target));
-        unsafe {
-            MoveFileExW(
-                PCWSTR(from.as_ptr()),
-                PCWSTR(to.as_ptr()),
-                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-            )
-        }
-        .is_ok()
-    };
+    let renamed = posix || move_file(&temp_path, &target) || (old.is_some() && replace_file(&temp_path, &target, dir));
     if !renamed {
         let _ = fs::remove_file(&temp_path);
         return Err(SaveError::Io(
@@ -576,14 +685,15 @@ mod tests {
         doc.insert(0, b"edited\n");
         doc.end(Default::default());
         let snap = doc.snapshot();
-        let saved = save(&snap, &path, Encoding::Utf8, false, &ctx()).unwrap();
+        let saved = save(&snap, &path, Encoding::Utf8, false, false, &ctx()).unwrap();
         let on_disk = fs::read(&path).unwrap();
         assert_eq!(&on_disk[..7], b"edited\n");
         assert_eq!(&on_disk[7..], &original[..]);
-        // The old source still reads the old content.
+        // The old source still reads the old content (and that file wasn't written into: replaced).
         let mut old = Vec::new();
         src.read_into(0, 12, &mut old);
         assert_eq!(&old, b"line 0\nline ");
+        assert!(!src.changed_in_place());
         assert_eq!(saved.disk.unwrap().len, on_disk.len() as u64);
         // No temp files left behind.
         let left: Vec<_> = fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
@@ -601,7 +711,7 @@ mod tests {
             let mut doc = Document::from_text("Grüße, café\r\nline two\r\n".as_bytes());
             doc.encoding = enc;
             let snap = doc.snapshot();
-            save(&snap, &path, enc, true, &ctx()).unwrap();
+            save(&snap, &path, enc, true, false, &ctx()).unwrap();
             let bytes = fs::read(&path).unwrap();
             let back = document_from_bytes(bytes);
             assert_eq!(back.encoding, enc, "{enc:?}");
@@ -620,7 +730,7 @@ mod tests {
         fs::set_permissions(&path, p.clone()).unwrap();
         let mut doc = Document::from_text(b"y");
         let snap = doc.snapshot();
-        assert!(matches!(save(&snap, &path, Encoding::Utf8, false, &ctx()), Err(SaveError::ReadOnly)));
+        assert!(matches!(save(&snap, &path, Encoding::Utf8, false, false, &ctx()), Err(SaveError::ReadOnly)));
         #[allow(clippy::permissions_set_readonly_false)]
         p.set_readonly(false);
         fs::set_permissions(&path, p).unwrap();
@@ -648,8 +758,9 @@ mod tests {
         assert!(tail.iter().all(|&b| b == 0));
         let snap = doc.snapshot();
         let other = dir.join("copy.txt");
-        let r = save(&snap, &other, Encoding::Utf8, false, &ctx());
-        assert!(matches!(r, Err(SaveError::Io(_))), "{:?}", r.as_ref().map(|_| ()));
+        let r = save(&snap, &other, Encoding::Utf8, false, false, &ctx());
+        // (the file it reads from got shorter: changed in place, which is found before reading it)
+        assert!(matches!(r, Err(SaveError::Changed)), "{:?}", r.as_ref().map(|_| ()));
         assert!(!other.exists());
         drop(doc);
         drop(src);
@@ -666,7 +777,7 @@ mod tests {
         assert_eq!(doc.encoding, Encoding::Utf16Le);
         assert!(!doc.bom);
         let snap = doc.snapshot();
-        save(&snap, &path, doc.encoding, doc.bom, &ctx()).unwrap();
+        save(&snap, &path, doc.encoding, doc.bom, false, &ctx()).unwrap();
         assert_eq!(fs::read(&path).unwrap(), bytes);
         let _ = fs::remove_dir_all(&dir);
     }
@@ -681,15 +792,152 @@ mod tests {
         }
         let mut doc = Document::from_text(b"changed");
         let snap = doc.snapshot();
-        save(&snap, &path, Encoding::Utf8, false, &ctx()).unwrap();
+        save(&snap, &path, Encoding::Utf8, false, false, &ctx()).unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"changed");
         // a cancelled save leaves the file alone
         let c = ctx();
         c.cancel.store(true, Ordering::Relaxed);
         let mut doc = Document::from_text(&vec![b'x'; 10 << 20]);
         let snap = doc.snapshot();
-        assert!(save(&snap, &path, Encoding::Utf8, false, &c).is_err());
+        assert!(save(&snap, &path, Encoding::Utf8, false, false, &c).is_err());
         assert_eq!(fs::read(&path).unwrap(), b"changed");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn names(dir: &Path) -> Vec<String> {
+        let mut v: Vec<String> =
+            fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        v.sort();
+        v
+    }
+
+    /// A document over a file read from disk (as for big files), with "EDIT\n" typed at the start.
+    fn edited(path: &Path) -> (Document, Arc<Source>) {
+        let src = Arc::new(Source::open_file(path).unwrap());
+        assert!(src.build_index(&AtomicBool::new(false), &AtomicU64::new(0)));
+        let mut doc = Document::new_pending(src.clone(), 0);
+        doc.begin(super::super::document::EditKind::Other, Default::default());
+        doc.insert(0, b"EDIT\n");
+        doc.end(Default::default());
+        (doc, src)
+    }
+
+    #[test]
+    fn text_from_a_file_rewritten_in_place_is_never_saved() {
+        let dir = test_dir("io-inplace");
+        let path = dir.join("big.log");
+        let lines = |tag: &str| -> Vec<u8> {
+            (0..60_000u32).flat_map(|i| format!("{tag} line {i:06}\n").into_bytes()).collect()
+        };
+        let original = lines("old");
+        fs::write(&path, &original).unwrap();
+        let (mut doc, src) = edited(&path);
+        // A log being written: fine, the text is what it was (saving it drops what came after).
+        let mut f = OpenOptions::new().append(true).share_mode(0x7).open(&path).unwrap();
+        f.write_all(b"one more line\n").unwrap();
+        drop(f);
+        let copy = dir.join("copy.log");
+        save(&doc.snapshot(), &copy, Encoding::Utf8, false, false, &ctx()).unwrap();
+        assert_eq!(fs::read(&copy).unwrap(), [b"EDIT\n".as_slice(), &original].concat());
+        // Rewritten by another program (same length): the text would mix both versions, so nothing is written.
+        let rewritten = lines("new");
+        fs::write(&path, &rewritten).unwrap();
+        let snap = doc.snapshot();
+        assert!(matches!(save(&snap, &path, Encoding::Utf8, false, false, &ctx()), Err(SaveError::Changed)));
+        assert!(matches!(save(&snap, &copy, Encoding::Utf8, false, false, &ctx()), Err(SaveError::Changed)));
+        assert_eq!(fs::read(&path).unwrap(), rewritten);
+        assert_eq!(names(&dir), ["big.log", "copy.log"]);
+        drop((doc, snap, src));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ansi_saves_that_would_lose_characters_stop_first() {
+        if text::ansi_codepage() != 1252 {
+            return; // (the characters below are about Windows-1252)
+        }
+        let dir = test_dir("lossy");
+        let path = dir.join("ansi.txt");
+        fs::write(&path, b"caf\xE9\r\n").unwrap();
+        let mut doc = document_from_bytes(fs::read(&path).unwrap());
+        assert_eq!(doc.encoding, Encoding::Ansi);
+        doc.begin(super::super::document::EditKind::Other, Default::default());
+        doc.insert(0, "→ ✓ ".as_bytes());
+        doc.end(Default::default());
+        let snap = doc.snapshot();
+        assert!(matches!(save(&snap, &path, Encoding::Ansi, false, false, &ctx()), Err(SaveError::Lossy)));
+        assert_eq!(fs::read(&path).unwrap(), b"caf\xE9\r\n");
+        assert_eq!(names(&dir), ["ansi.txt"]);
+        // When the user says so.
+        let saved = save(&snap, &path, Encoding::Ansi, false, true, &ctx()).unwrap();
+        assert!(saved.lossy);
+        assert_eq!(fs::read(&path).unwrap(), b"? ? caf\xE9\r\n");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mostly_utf8_files_stay_utf8_byte_for_byte() {
+        let dir = test_dir("mostly");
+        let path = dir.join("t.txt");
+        let mut bytes = "Grüße – naïve café ✓ 日本語\r\n".repeat(20).into_bytes();
+        bytes.extend_from_slice(b"one stray byte: \xFF\r\n");
+        fs::write(&path, &bytes).unwrap();
+        let mut doc = document_from_bytes(fs::read(&path).unwrap());
+        assert_eq!(doc.encoding, Encoding::Utf8);
+        save(&doc.snapshot(), &path, doc.encoding, doc.bom, false, &ctx()).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn replace_file_puts_a_file_in_place_of_one_still_open() {
+        let dir = test_dir("replacefile");
+        let target = dir.join("t.txt");
+        fs::write(&target, b"old content of the file").unwrap();
+        // Slate reading it (a big file): open with delete sharing.
+        let src = Source::open_file(&target).unwrap();
+        let temp = dir.join("new.tmp");
+        fs::write(&temp, b"NEW content").unwrap();
+        assert!(replace_file(&temp, &target, &dir));
+        assert_eq!(fs::read(&target).unwrap(), b"NEW content");
+        let mut old = Vec::new();
+        src.read_into(0, 23, &mut old);
+        assert_eq!(old, b"old content of the file");
+        drop(src);
+        assert_eq!(names(&dir), ["t.txt"]);
+        // Another program has it open without delete sharing: nothing can replace it, and nothing changes.
+        let other = OpenOptions::new().read(true).share_mode(0x1).open(&target).unwrap();
+        fs::write(&temp, b"newer").unwrap();
+        assert!(!replace_file(&temp, &target, &dir));
+        fs::remove_file(&temp).unwrap();
+        let mut doc = Document::from_text(b"newer");
+        assert!(save(&doc.snapshot(), &target, Encoding::Utf8, false, false, &ctx()).is_err());
+        drop(other);
+        assert_eq!(fs::read(&target).unwrap(), b"NEW content");
+        assert_eq!(names(&dir), ["t.txt"]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A file Slate reads from disk, saved on a network share (where the POSIX rename isn't supported and a plain
+    /// one can't replace a file still open). Needs `SLATE_TEST_SHARE`: a folder on a share (e.g. reached through
+    /// `\\localhost\C$\...`); skipped without it.
+    #[test]
+    fn files_read_from_a_share_save_over_it() {
+        let Some(share) = std::env::var_os("SLATE_TEST_SHARE") else { return };
+        let dir = PathBuf::from(share).join(format!("slate-test-{}-share", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("big.log");
+        let original: Vec<u8> = (0..200_000u32).flat_map(|i| format!("line {i}\n").into_bytes()).collect();
+        fs::write(&path, &original).unwrap();
+        let (mut doc, src) = edited(&path);
+        save(&doc.snapshot(), &path, Encoding::Utf8, false, false, &ctx()).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), [b"EDIT\n".as_slice(), &original].concat());
+        let mut old = Vec::new();
+        src.read_into(0, 12, &mut old);
+        assert_eq!(&old, b"line 0\nline ");
+        drop((doc, src));
+        assert_eq!(names(&dir), ["big.log"]);
         let _ = fs::remove_dir_all(&dir);
     }
 }

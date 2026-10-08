@@ -3,7 +3,7 @@
 //! memory). Pieces are grouped in leaves of at most `LEAF_MAX` with cached byte and newline totals, so lookups by
 //! offset or by line stay fast even after millions of edits, and nothing ever copies the original file.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use super::source::Source;
 
@@ -50,6 +50,10 @@ pub struct Buffer {
     leaves: Vec<Leaf>,
     len: u64,
     nl: u64,
+    /// Goes up whenever the pieces change; `used` holds the ids of the sources they use (sorted) and the
+    /// generation that list is for.
+    generation: u64,
+    used: Mutex<(u64, Vec<u32>)>,
 }
 
 /// An immutable view of a buffer for background work (search, save, formatting).
@@ -73,6 +77,8 @@ impl Buffer {
             leaves: vec![Leaf::default()],
             len: 0,
             nl: 0,
+            generation: 0,
+            used: Mutex::new((u64::MAX, Vec::new())),
         }
     }
 
@@ -132,9 +138,24 @@ impl Buffer {
         self.retotal();
     }
 
+    /// (Every change to the pieces ends here, except typing that extends the piece before it.)
     fn retotal(&mut self) {
         self.len = self.leaves.iter().map(|l| l.len).sum();
         self.nl = self.leaves.iter().map(|l| l.nl).sum();
+        self.generation += 1;
+    }
+
+    /// Calls `f` with the ids of the sources the pieces use (sorted); worked out again only after the pieces
+    /// changed, so this is cheap enough for every paint.
+    fn with_used<R>(&self, f: impl FnOnce(&[u32]) -> R) -> R {
+        let mut c = self.used.lock().unwrap();
+        if c.0 != self.generation {
+            let mut v: Vec<u32> = self.pieces().map(|p| p.src).collect();
+            v.sort_unstable();
+            v.dedup();
+            *c = (self.generation, v);
+        }
+        f(&c.1)
     }
 
     pub fn pieces(&self) -> impl Iterator<Item = &Piece> {
@@ -572,10 +593,19 @@ impl Buffer {
 
     /// Total read errors of the sources the current content uses (see `Source::read_errors`).
     pub fn read_errors(&self) -> u64 {
-        let mut used: Vec<u32> = self.pieces().map(|p| p.src).collect();
-        used.sort_unstable();
-        used.dedup();
-        used.iter().filter(|&&s| s != self.add_id).map(|&s| self.sources[s as usize].read_errors()).sum()
+        self.with_used(|used| {
+            used.iter().filter(|&&s| s != self.add_id).map(|&s| self.sources[s as usize].read_errors()).sum()
+        })
+    }
+
+    /// The files (not memory) the current content is read from.
+    pub fn file_sources(&self) -> Vec<Arc<Source>> {
+        self.with_used(|used| {
+            used.iter()
+                .filter(|&&s| s != self.add_id && self.sources[s as usize].is_file())
+                .map(|&s| self.sources[s as usize].clone())
+                .collect()
+        })
     }
 }
 
@@ -644,12 +674,22 @@ impl Snapshot {
         scratch
     }
 
-    /// Total read errors of the sources this snapshot uses.
-    pub fn read_errors(&self) -> u64 {
+    fn used(&self) -> Vec<u32> {
         let mut used: Vec<u32> = self.pieces.iter().map(|(_, p)| p.src).collect();
         used.sort_unstable();
         used.dedup();
-        used.iter().map(|&s| self.sources[s as usize].read_errors()).sum()
+        used
+    }
+
+    /// Total read errors of the sources this snapshot uses.
+    pub fn read_errors(&self) -> u64 {
+        self.used().iter().map(|&s| self.sources[s as usize].read_errors()).sum()
+    }
+
+    /// Whether another program wrote into a file this snapshot reads (see `Source::changed_in_place`): then the
+    /// parts read from it aren't what the user had, and writing them out would mix the two versions.
+    pub fn changed_in_place(&self) -> bool {
+        self.used().iter().any(|&s| self.sources[s as usize].changed_in_place())
     }
 
     /// The pieces with their document offsets.
@@ -767,6 +807,27 @@ mod tests {
         b.delete(10, model.len() as u64 - 10);
         model.drain(10..model.len() - 10);
         check(&b, &model);
+    }
+
+    #[test]
+    fn read_errors_follow_the_pieces() {
+        use std::io::Write;
+        // a file source that says it is longer than its file: reading its end fails
+        let (mut f, path) = crate::core::source::create_temp_file().unwrap();
+        f.write_all(&vec![b'x'; 300_000]).unwrap();
+        let mut b = Buffer::from_source(Arc::new(Source::from_file(f, 400_000, path, true, None)), 0);
+        b.read(350_000, 350_010);
+        assert!(b.read_errors() > 0);
+        assert_eq!(b.file_sources().len(), 1);
+        // (asked again and again, as painting does, without the pieces changing)
+        assert!(b.read_errors() > 0);
+        let removed = b.delete(0, b.len());
+        assert_eq!(b.read_errors(), 0);
+        assert!(b.file_sources().is_empty());
+        b.insert(0, b"typed");
+        b.insert_pieces(5, &removed);
+        assert!(b.read_errors() > 0);
+        assert_eq!(b.file_sources().len(), 1);
     }
 
     #[test]
