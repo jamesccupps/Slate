@@ -821,7 +821,10 @@ fn restore_session(app: &mut App) -> Option<u64> {
     // Files of the session's tabs being read: waited for once, together.
     let mut reading = Vec::new();
     session::prune_damaged();
-    if let Some(s) = session::load() {
+    let mut loaded = session::load();
+    // (big documents written anew when Slate stopped: the list that has all the newest text)
+    session::finish_rewrites(loaded.as_mut().map_or(&mut [][..], |s| &mut s.tabs[..]));
+    if let Some(s) = loaded {
         let there = exist_all(&s.tabs);
         for (k, st) in s.tabs.iter().enumerate() {
             let before = app.tabs.len();

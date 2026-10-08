@@ -63,6 +63,9 @@ pub struct DiskCheck {
     pub now: Option<crate::core::document::DiskInfo>,
     /// Another program wrote into a file the (unsaved) text is read from: the text isn't the user's any more.
     pub in_place: bool,
+    /// A file the (unsaved) text is read from was found not at its path any more (`Source::look_at_path`): the
+    /// session has to be written again.
+    pub gone: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

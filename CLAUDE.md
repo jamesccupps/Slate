@@ -174,10 +174,11 @@ Commits use the GitHub no-reply address (repo-local git config); GitHub refuses 
   it can't keep are asked about (saying why): big ones that would have to copy over 64 MiB from files (Format,
   Replace all or a conversion of a file over 64 MiB; a file replaced while the text still reads the old one), or all
   if the session can't be written; with the session turned off, also big tabs from last time that aren't back yet.
-  Reload is refused while the tab is being saved. A tab closed while it is saving closes
-  once the save is done — unless the text changed meanwhile. On shutdown, unsaved work that can't be kept blocks it
-  with a reason (`ShutdownBlockReasonCreate`), so Windows asks the user. Saving in ANSI never turns characters into
-  "?" without asking first (Save as UTF-8 / ANSI anyway / Cancel), and a tab or window never closes after such a save.
+  Reload is refused while the tab is being saved (in a box, before anything else). A tab closed while it is saving
+  closes once the save is done — unless the text changed meanwhile. On shutdown, unsaved work that can't be kept
+  blocks it with a reason (`ShutdownBlockReasonCreate`), so Windows asks the user. Saving in ANSI never turns
+  characters into "?" without asking first (Save as UTF-8 / ANSI anyway / Cancel), and a tab or window never closes
+  after such a save.
 - Files changed by other programs are looked for every 2 s and when the window is activated, on a background thread
   (`check_disk`, then `poll_disk`; a network drive that went away mustn't freeze the window). A clean document
   reloads (one whose lines are still being read, once they are); with unsaved changes the user is told, and for a
@@ -192,12 +193,16 @@ Commits use the GitHub no-reply address (repo-local git config); GitHub refuses 
   caught and the session set aside. While editing it's written on another thread; closing writes it in place.
   Documents up to 64 MiB are backed up as a copy. Bigger ones as their pieces: `<name>.pieces` (the piece list, with
   the `Identity` of each file of the user's it reads: stamp, file id, sample hashes; rewritten when the text
-  changed, small) and `<name>.data` (what a later run couldn't read otherwise: typed and pasted text, each source
+  changed, or when a file it names is `gone` or not read any more: after a save, or another file found in its place)
+  and `<name>.data` (what a later run couldn't read otherwise: typed and pasted text, each source
   once, and the parts used of a self-deleting temp file or a `gone` file, up to 64 MiB; appended with a hash per
   write, flushed before the list that refers to it replaces the old one; written anew under another name with only
-  what's used once most of it isn't). After saving a big file the text reads the saved file, also if it changed
-  during the save (`Buffer::move_onto`). A write that fails waits longer each time; a disk without room for it isn't
-  written to. Putting one back runs on another thread behind a tab that
+  what's used once most of it isn't, as `<name>.data.tmp` until the list naming it is there: at the start,
+  `finish_rewrites` keeps whichever has the newest text whole when a crash cut that short). After saving a big file
+  the text reads the saved file, also if it changed during the save (`Buffer::move_onto`). A write that fails waits
+  longer each time, and the session counts as not all written until it's done, so the timer tries again; a disk
+  without room for it (and an eighth more, at least 1 MiB) isn't written to. Putting one back runs on another thread
+  behind a tab that
   waits (`session::Restoring`): only if each file is the same one, not shorter, and unchanged or only grown (a log),
   with the same sample hashes; otherwise the added text comes back on its own in a new tab, read from `<name>.data`
   where it is (and the files go into `damaged\`, kept 30 days), never laid over something else. A tab whose file

@@ -1117,9 +1117,11 @@ impl App {
             asks.into_iter()
                 .filter_map(|(id, path, old, sources)| {
                     // (another file put in its place, or moved away: the session can't read it in a later run)
+                    let was = sources.iter().filter(|s| s.is_gone()).count();
                     sources.iter().for_each(|s| s.look_at_path());
+                    let gone = sources.iter().filter(|s| s.is_gone()).count() > was;
                     let now = fileio::disk_answer(&path)?;
-                    Some(DiskCheck { id, old, now, in_place: sources.iter().any(|s| s.changed_in_place()) })
+                    Some(DiskCheck { id, old, now, in_place: sources.iter().any(|s| s.changed_in_place()), gone })
                 })
                 .collect()
         }));
@@ -1131,6 +1133,8 @@ impl App {
         let Some(found) = job.take() else { return true };
         self.disk_job = None;
         for c in found {
+            // (the session copies what's used of a file that isn't at its path any more: written again)
+            self.session_dirty |= c.gone;
             let Some(i) = self.tabs.iter().position(|t| t.id == c.id) else { continue };
             let tab = &self.tabs[i];
             // Saved, reloaded or busy since the look started: the next look is what counts.
@@ -3085,7 +3089,12 @@ impl App {
         match a {
             NoticeAction::Reload => {
                 let i = self.active;
-                self.reload(i, None);
+                if self.tabs[i].save.is_some() {
+                    // (refused, said where it shows: see `Cmd::Reload`)
+                    self.pending.push(Deferred::Cmd(Cmd::Reload));
+                } else {
+                    self.reload(i, None);
+                }
             }
             NoticeAction::KeepMine => {
                 let tab = self.tab_mut();
@@ -4343,10 +4352,16 @@ pub fn run_cmd(cell: &Cell, cmd: Cmd) {
             cell.borrow_mut().exec(cmd);
         }
         Cmd::ReopenEncoding(_) | Cmd::Reload => {
-            let (dirty, hwnd, title) = {
+            let (dirty, saving, hwnd, title) = {
                 let a = cell.borrow();
-                (a.tab().doc.is_dirty(), a.hwnd, a.tab().title())
+                (a.tab().doc.is_dirty(), a.tab().save.is_some(), a.hwnd, a.tab().title())
             };
+            if saving {
+                // (said in a box: the status bar shows the save going on)
+                let q = format!("{title} is being saved.");
+                win::ask(hwnd, "Slate", &q, "Reload it once that's done.", &["OK"]);
+                return;
+            }
             if dirty {
                 let q = format!("Reload {title} and lose your changes?");
                 if win::ask(hwnd, "Slate", &q, "", &["&Reload", "Cancel"]) != Some(0) {

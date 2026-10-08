@@ -163,11 +163,15 @@ pub struct Plan {
     big: Vec<BigWrite>,
     /// Every backup the session refers to.
     keep: Vec<String>,
+    /// A big document waits to be written (after a write that failed): the session isn't all written yet.
+    pending: bool,
 }
 
 pub struct Outcome {
     /// Everything was written.
     pub ok: bool,
+    /// Something waits to be written later (see `Plan::pending`).
+    pending: bool,
     /// (tab id, file name, document version) of each backup written.
     written: Vec<(u64, String, u64)>,
     /// Each big document's write.
@@ -187,19 +191,23 @@ struct BigDone {
 
 impl Failure for Outcome {
     fn failure(_: &str) -> Self {
-        Outcome { ok: false, written: Vec::new(), big: Vec::new() }
+        Outcome { ok: false, pending: false, written: Vec::new(), big: Vec::new() }
     }
 }
 
 /// Works out what to write. Backups are rewritten only for tabs that changed since the last write. `closing`: the
 /// last write (big documents waiting after a failed write try once more).
 fn plan(tabs: &mut [Tab], active: usize, closing: bool) -> Plan {
-    let d = dir();
+    plan_in(dir(), tabs, active, closing)
+}
+
+fn plan_in(d: PathBuf, tabs: &mut [Tab], active: usize, closing: bool) -> Plan {
     let mut backups = Vec::new();
     let mut big = Vec::new();
     let mut keep: Vec<String> = Vec::new();
     let mut list = Vec::new();
     let mut active_idx = 0;
+    let mut pending = false;
     for (i, tab) in tabs.iter_mut().enumerate() {
         if tab.load_job.is_some() && tab.doc.path.is_none() {
             continue;
@@ -227,15 +235,25 @@ fn plan(tabs: &mut [Tab], active: usize, closing: bool) -> Plan {
                 }
                 keep.push(name.clone());
                 backup = Some(name);
-            } else if big_keepable(&tab.doc) && (closing || tab.big.as_ref().is_none_or(|b| !b.waiting())) {
-                pieces = Some(tab.big.get_or_insert_with(BigBackup::new).name.clone());
-            } else if let Some(b) = tab.big.as_ref().filter(|b| b.listed) {
-                // The list written last still holds the edits as they were then (after a crash, that's better than
-                // nothing); closing asks about what can't be kept. Or it waits after a write that failed.
-                pieces = Some(b.name.clone());
-                stale = true;
             } else {
-                tab.big = None;
+                let keepable = big_keepable(&tab.doc);
+                if keepable && (closing || tab.big.as_ref().is_none_or(|b| !b.waiting())) {
+                    pieces = Some(tab.big.get_or_insert_with(BigBackup::new).name.clone());
+                } else {
+                    // It waits after a write that failed (tried again then: the session isn't all written), or it
+                    // can't be kept any more (closing asks). The list written last, if any, still holds the edits
+                    // as they were then: after a crash, that's better than nothing.
+                    pending |= keepable;
+                    match tab.big.as_ref() {
+                        Some(b) if b.listed => {
+                            pieces = Some(b.name.clone());
+                            stale = true;
+                        }
+                        // (waiting, nothing written yet: kept, with its tries, for the next one)
+                        Some(_) if keepable => {}
+                        _ => tab.big = None,
+                    }
+                }
             }
         } else {
             tab.big = None;
@@ -263,7 +281,10 @@ fn plan(tabs: &mut [Tab], active: usize, closing: bool) -> Plan {
         };
         if let Some(name) = &pieces {
             let b = tab.big.as_ref().unwrap();
-            let due = !stale && (b.version != tab.doc.version || !d.join(pieces_file(name)).exists());
+            // (also when a file the list names isn't there any more as it was: the text moved onto a saved file,
+            // or another file took its place)
+            let due =
+                !stale && (b.version != tab.doc.version || b.outdated() || !d.join(pieces_file(name)).exists());
             match due.then(|| plan_big(b, &mut tab.doc, tab.id, &st)).flatten() {
                 Some(w) => {
                     own(&pieces_file(&w.name));
@@ -289,7 +310,7 @@ fn plan(tabs: &mut [Tab], active: usize, closing: bool) -> Plan {
         }
         list.push(st);
     }
-    Plan { dir: d, session: Session { tabs: list, active: active_idx }, backups, big, keep }
+    Plan { dir: d, session: Session { tabs: list, active: active_idx }, backups, big, keep, pending }
 }
 
 /// The session's files of a tab.
@@ -305,7 +326,7 @@ fn files_of(st: &SessionTab) -> Vec<String> {
 /// Writes the backups, then the session.json that refers to them, then deletes the backups no longer needed.
 fn write(mut p: Plan) -> Outcome {
     if fs::create_dir_all(&p.dir).is_err() {
-        return Outcome { ok: false, written: Vec::new(), big: Vec::new() };
+        return Outcome { ok: false, pending: p.pending, written: Vec::new(), big: Vec::new() };
     }
     let mut ok = true;
     let mut written = Vec::new();
@@ -322,8 +343,9 @@ fn write(mut p: Plan) -> Outcome {
         if r.is_err() {
             ok = false;
             // A list that was never written (or whose added text is gone) can't be put back: the session refers to
-            // the one before (it was being written anew), or to none for this tab (and the next write tries again).
-            if r == Err(BigErr::Lost) || !p.dir.join(pieces_file(&w.name)).exists() {
+            // the one before (it was being written anew: also if the new list got written, as it may not have all
+            // its text), or to none for this tab (and the next write tries again).
+            if w.replaces.is_some() || r == Err(BigErr::Lost) || !p.dir.join(pieces_file(&w.name)).exists() {
                 let before = w.replaces.clone().filter(|n| p.dir.join(pieces_file(n)).exists());
                 for t in p.session.tabs.iter_mut().filter(|t| t.pieces.as_deref() == Some(w.name.as_str())) {
                     t.pieces = before.clone();
@@ -338,7 +360,7 @@ fn write(mut p: Plan) -> Outcome {
     if ok {
         prune(&p.dir, &p.keep);
     }
-    Outcome { ok, written, big }
+    Outcome { ok, pending: p.pending, written, big }
 }
 
 /// Notes which backups are on disk now.
@@ -396,7 +418,8 @@ pub fn start(tabs: &mut [Tab], active: usize, notify: Notify) -> Option<Job<Outc
 /// Takes the outcome of `start`'s write. Returns whether everything was written.
 pub fn finish(tabs: &mut [Tab], out: Outcome) -> bool {
     apply(tabs, &out);
-    out.ok
+    // (a big document waiting to be written: not all of it, so it's tried again)
+    out.ok && !out.pending
 }
 
 fn write_backup(snap: &Snapshot, path: &Path) -> bool {
@@ -487,7 +510,10 @@ pub fn is_damaged(bytes: &[u8]) -> bool {
 
 /// Moves a damaged backup into `damaged\`, so it's neither restored nor deleted.
 pub fn set_aside(name: &str) {
-    let d = dir();
+    set_aside_in(&dir(), name);
+}
+
+fn set_aside_in(d: &Path, name: &str) {
     let to = d.join("damaged").join(name);
     let _ = fs::create_dir_all(d.join("damaged"));
     if fs::rename(d.join(name), &to).is_ok() {
@@ -622,12 +648,13 @@ pub struct BigBackup {
 type Sums = Vec<(u64, u64, u64)>;
 
 /// What `<name>.data` holds: its length in use, the parts of sources in it (source, from, to, where in the file),
-/// and hashes of what was added at each write, checked when it's read back.
+/// and hashes of what was added at each write, checked when it's read back. And the files `<name>.pieces` names.
 #[derive(Clone, Default)]
 struct Stored {
     len: u64,
     parts: Vec<(Weak<Source>, u64, u64, u64)>,
     sums: Sums,
+    named: Vec<Weak<Source>>,
 }
 
 /// Bytes of parts copied from files (`Keep::Parts`) a big document can have; beyond that, closing asks.
@@ -641,14 +668,21 @@ impl BigBackup {
         BigBackup { name, stored: Stored::default(), version: u64::MAX, listed: false, retry: None }
     }
 
-    /// The backup a document (`doc`) was just put back from: `data` over `<name>.data` (None if empty), as `list`
-    /// says. Written anew soon if most of `<name>.data` isn't used.
-    fn restored(name: &str, data: Option<&Arc<Source>>, list: &BigList, doc: &Document) -> BigBackup {
+    /// The backup a document (`doc`) was just put back from: `data` over `<name>.data` (None if empty), and the
+    /// `files` it read, as `list` says. Written anew soon if most of `<name>.data` isn't used.
+    fn restored(
+        name: &str,
+        data: Option<&Arc<Source>>,
+        files: &[Arc<Source>],
+        list: &BigList,
+        doc: &Document,
+    ) -> BigBackup {
         let h = &list.header;
         let parts = data.iter().map(|d| (Arc::downgrade(d), 0, h.data_len, 0)).collect();
         let used: u64 = list.pieces.iter().filter(|p| p.0 == 0).map(|p| p.2).sum();
         let version = if h.data_len > used + used.max(SLACK) { u64::MAX } else { doc.version };
-        let stored = Stored { len: h.data_len, parts, sums: h.sums.clone() };
+        let named = files.iter().map(Arc::downgrade).collect();
+        let stored = Stored { len: h.data_len, parts, sums: h.sums.clone(), named };
         BigBackup { name: name.to_string(), stored, version, listed: true, retry: None }
     }
 
@@ -657,12 +691,20 @@ impl BigBackup {
         self.retry.is_some_and(|(at, _)| Instant::now() < at)
     }
 
+    /// `<name>.pieces` names a file that isn't there any more as it was (`Source::is_gone`: a save put a new one in
+    /// its place, or another program did) or that the text doesn't read any more (it moved onto a saved file): it
+    /// has to be written again, also if the text didn't change.
+    fn outdated(&self) -> bool {
+        self.stored.named.iter().any(|w| w.upgrade().is_none_or(|s| s.is_gone()))
+    }
+
     /// A write finished: what was added to `<name>.data` (`s`), for document `version`.
     fn took(&mut self, s: &Stored, version: u64) {
         self.stored.len = s.len;
         self.stored.parts.retain(|p| p.0.strong_count() > 0);
         self.stored.parts.extend(s.parts.iter().cloned());
         self.stored.sums = s.sums.clone();
+        self.stored.named = s.named.clone();
         self.version = version;
         self.listed = true;
         self.retry = None;
@@ -762,9 +804,11 @@ struct BigWrite {
     add: Vec<(Arc<Source>, u64, u64)>,
     /// The hashes of what `<name>.data` holds before.
     sums: Sums,
-    /// The new `<name>.pieces` (its `data_len` and `sums` are filled in once `<name>.data` is written).
+    /// The new `<name>.pieces` (its `data_len` and `sums` are filled in once `<name>.data` is written), and the
+    /// files it names.
     header: PiecesHeader,
     pieces: Pieces,
+    named: Vec<Weak<Source>>,
 }
 
 impl BigWrite {
@@ -776,7 +820,7 @@ impl BigWrite {
             parts.push((Arc::downgrade(s), *a, *b, at));
             at += b - a;
         }
-        Stored { len, parts, sums }
+        Stored { len, parts, sums, named: self.named.clone() }
     }
 }
 
@@ -805,6 +849,17 @@ pub struct PiecesHeader {
     /// Hashes of the parts of `<name>.data` (see `Stored`; none from lists of 0.4.0).
     #[serde(default)]
     pub sums: Sums,
+    /// This list was written anew (with only what the text used) in place of that one: until session.json names this
+    /// one instead, one of the two isn't needed (see `finish_rewrites`).
+    #[serde(default)]
+    pub replaces: Option<String>,
+}
+
+impl PiecesHeader {
+    /// The head of a list with nothing in it yet.
+    fn empty() -> PiecesHeader {
+        PiecesHeader { tab: None, len: 0, data_len: 0, files: Vec::new(), sums: Vec::new(), replaces: None }
+    }
 }
 
 const PIECES_MAGIC: &[u8] = b"SLATE-PIECES 1\n";
@@ -939,17 +994,17 @@ fn plan_big(b: &BigBackup, doc: &mut Document, tab: u64, st: &SessionTab) -> Opt
     }
     // The list.
     let mut files: Vec<Identity> = Vec::new();
-    let mut file_ids: Vec<*const Source> = Vec::new();
+    let mut named: Vec<Weak<Source>> = Vec::new();
     let mut pieces = Vec::with_capacity(snap.pieces().len());
     for (_, p) in snap.pieces() {
         let src = &snap.sources()[p.src as usize];
         match kind(src) {
             Keep::File(id) => {
-                let k = match file_ids.iter().position(|&f| f == Arc::as_ptr(src)) {
+                let k = match named.iter().position(|w| w.as_ptr() == Arc::as_ptr(src)) {
                     Some(k) => k,
                     None => {
                         files.push(id.clone());
-                        file_ids.push(Arc::as_ptr(src));
+                        named.push(Arc::downgrade(src));
                         files.len() - 1
                     }
                 };
@@ -962,41 +1017,70 @@ fn plan_big(b: &BigBackup, doc: &mut Document, tab: u64, st: &SessionTab) -> Opt
             }
         }
     }
-    let header = PiecesHeader { tab: Some(st.clone()), len: snap.len(), data_len: end, files, sums: Vec::new() };
+    let replaces = anew.then(|| b.name.clone());
+    let header = PiecesHeader {
+        tab: Some(st.clone()),
+        len: snap.len(),
+        data_len: end,
+        files,
+        replaces: replaces.clone(),
+        ..PiecesHeader::empty()
+    };
     Some(BigWrite {
         tab,
         name,
-        replaces: anew.then(|| b.name.clone()),
+        replaces,
         version: doc.version,
         data_from,
         add,
         sums: if anew { Vec::new() } else { b.stored.sums.clone() },
         header,
         pieces,
+        named,
     })
 }
 
 /// Writes a big document's part: adds to `<name>.data` and flushes it, then puts the new list of pieces in place
 /// (flushed first too). Ok: the length of `<name>.data` in use now, and its hashes.
 fn write_big(dir: &Path, w: &BigWrite) -> Result<(u64, Sums), BigErr> {
-    let failed = |e: &std::io::Error| BigErr::Failed { full: matches!(e.raw_os_error(), Some(39 | 112)) };
+    // A disk without room for it (and a little more) isn't even tried: nothing is created, nor written again and
+    // again.
+    let need: u64 = w.add.iter().map(|(_, a, e)| e - a).sum();
+    if need > 0 && crate::core::io::free_space(dir).is_some_and(|free| free < need + (need / 8).max(1 << 20)) {
+        return Err(BigErr::Failed { full: true });
+    }
     let path = dir.join(data_file(&w.name));
+    if w.replaces.is_none() {
+        return append_big(dir, w, &path);
+    }
+    // Written anew: under a temporary name until the list that names it is there (a crash on the way leaves nothing
+    // that looks like text of its own; see `finish_rewrites`).
+    let tmp = dir.join(format!("{}.tmp", data_file(&w.name)));
+    let r = append_big(dir, w, &tmp).and_then(|done| match fs::rename(&tmp, &path) {
+        Ok(()) => Ok(done),
+        Err(_) => Err(BigErr::Failed { full: false }),
+    });
+    if r.is_err() {
+        let _ = fs::remove_file(dir.join(pieces_file(&w.name)));
+        let _ = fs::remove_file(&tmp);
+    }
+    r
+}
+
+/// `write_big`'s work: adds to `<name>.data` (at `path`), then writes the list.
+fn append_big(dir: &Path, w: &BigWrite, path: &Path) -> Result<(u64, Sums), BigErr> {
+    let failed = |e: &std::io::Error| BigErr::Failed { full: matches!(e.raw_os_error(), Some(39 | 112)) };
     let mut f = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false) // (only ever added to, below)
         .share_mode(0x7)
-        .open(&path)
+        .open(path)
         .map_err(|e| failed(&e))?;
     let have = f.metadata().map_err(|e| failed(&e))?.len();
     if have < w.data_from {
         return Err(BigErr::Lost);
-    }
-    // A disk that's too full isn't even tried: nothing is written again and again.
-    let need: u64 = w.add.iter().map(|(_, a, e)| e - a).sum();
-    if need > 0 && crate::core::io::free_space(dir).is_some_and(|free| free < need + (64 << 20)) {
-        return Err(BigErr::Failed { full: true });
     }
     let mut end = w.data_from;
     let mut sums = w.sums.clone();
@@ -1176,6 +1260,7 @@ fn restore_big_in(dir: &Path, name: &str, list: &BigList, ctx: &Ctx) -> Restored
         done += id.len;
         sources.push(Arc::new(src));
     }
+    let files = sources[1..].to_vec();
     let Some(buf) = Buffer::from_pieces(sources, &list.pieces) else {
         return Restored::Damaged("its list of pieces doesn't fit the files".into());
     };
@@ -1183,7 +1268,7 @@ fn restore_big_in(dir: &Path, name: &str, list: &BigList, ctx: &Ctx) -> Restored
         return Restored::Damaged("its list of pieces doesn't fit the files".into());
     }
     let doc = Document::from_buffer(buf);
-    let kept = BigBackup::restored(name, data.as_ref(), list, &doc);
+    let kept = BigBackup::restored(name, data.as_ref(), &files, list, &doc);
     let canon = own_path.and_then(|p| fs::canonicalize(p).ok());
     Restored::Ready { doc, kept, canon }
 }
@@ -1318,11 +1403,63 @@ pub fn set_aside_big(name: &str) -> PathBuf {
     dir().join("damaged")
 }
 
+/// Finishes what a crash cut short of lists written anew (`PiecesHeader::replaces`), before the session is put back:
+/// a new list whose text is all there takes the place of the one it replaces (in `tabs`, session.json's, too), else
+/// it goes; the other one goes. And a `<name>.data.tmp` that no list names goes (a write anew that didn't get that
+/// far). So none of them comes back as a tab of its own, and the newest text is the one put back.
+pub fn finish_rewrites(tabs: &mut [SessionTab]) {
+    finish_rewrites_in(&dir(), tabs);
+}
+
+fn finish_rewrites_in(d: &Path, tabs: &mut [SessionTab]) {
+    let names = |suffix: &str| -> Vec<String> {
+        let Ok(rd) = fs::read_dir(d) else { return Vec::new() };
+        let mut v: Vec<String> = rd
+            .flatten()
+            .filter_map(|e| e.file_name().to_string_lossy().strip_suffix(suffix).map(str::to_string))
+            .filter(|n| n.starts_with("tab-"))
+            .collect();
+        v.sort();
+        v
+    };
+    let forget = |name: &str| {
+        for f in [pieces_file(name), data_file(name), format!("{}.tmp", data_file(name))] {
+            let _ = fs::remove_file(d.join(f));
+        }
+    };
+    // (again while that changed something: written anew twice)
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for x in names(".pieces") {
+            let Some((h, _)) = fs::read(d.join(pieces_file(&x))).ok().and_then(|b| decode_pieces(&b)) else { continue };
+            let Some(w) = h.replaces.filter(|w| *w != x && d.join(pieces_file(w)).exists()) else { continue };
+            // (its text is written before the list, under a temporary name until after it)
+            let (data, tmp) = (d.join(data_file(&x)), d.join(format!("{}.tmp", data_file(&x))));
+            let whole = h.data_len == 0 || data.exists() || (tmp.exists() && fs::rename(&tmp, &data).is_ok());
+            let (keep, drop) = if whole { (x, w) } else { (w, x) };
+            for t in tabs.iter_mut().filter(|t| t.pieces.as_deref() == Some(drop.as_str())) {
+                t.pieces = Some(keep.clone());
+            }
+            forget(&drop);
+            changed |= !d.join(pieces_file(&drop)).exists();
+        }
+    }
+    for x in names(".data.tmp") {
+        if !d.join(pieces_file(&x)).exists() {
+            let _ = fs::remove_file(d.join(format!("{}.tmp", data_file(&x))));
+        }
+    }
+}
+
 /// Big documents no restored tab refers to (`claimed`: their names): Slate stopped between writing a list of
 /// pieces and the session.json that refers to it. Their lists say what the tabs were.
 pub fn big_orphans(claimed: &[String]) -> Vec<SessionTab> {
-    let d = dir();
-    let Ok(rd) = fs::read_dir(&d) else { return Vec::new() };
+    big_orphans_in(&dir(), claimed)
+}
+
+fn big_orphans_in(d: &Path, claimed: &[String]) -> Vec<SessionTab> {
+    let Ok(rd) = fs::read_dir(d) else { return Vec::new() };
     let mut names: Vec<String> = rd
         .flatten()
         .filter_map(|e| e.file_name().to_string_lossy().strip_suffix(".pieces").map(str::to_string))
@@ -1331,7 +1468,7 @@ pub fn big_orphans(claimed: &[String]) -> Vec<SessionTab> {
     names.sort();
     let mut out = Vec::new();
     for name in names {
-        match read_big_in(&d, &name) {
+        match read_big_in(d, &name) {
             Ok(list) => {
                 let mut st = list.header.tab.unwrap_or_else(SessionTab::untitled);
                 st.backup = None;
@@ -1340,7 +1477,8 @@ pub fn big_orphans(claimed: &[String]) -> Vec<SessionTab> {
             }
             // (kept for a look, never deleted)
             Err(ListErr::Damaged(_)) => {
-                set_aside_big(&name);
+                set_aside_in(d, &pieces_file(&name));
+                set_aside_in(d, &data_file(&name));
             }
             // (next time)
             Err(ListErr::Busy(_)) => {}
@@ -1366,7 +1504,7 @@ fn data_orphans_in(d: &Path) -> Vec<(SessionTab, BigList)> {
             continue;
         }
         own(&file);
-        let header = PiecesHeader { tab: None, len, data_len: len, files: Vec::new(), sums: Vec::new() };
+        let header = PiecesHeader { len, data_len: len, ..PiecesHeader::empty() };
         let st = SessionTab { pieces: Some(name.to_string()), ..SessionTab::untitled() };
         out.push((st, BigList { header, pieces: vec![(0, 0, len)] }));
     }
@@ -1676,7 +1814,7 @@ mod tests {
         let huge = 1u64 << 52;
         let (f, path) = crate::core::source::create_temp_file().unwrap();
         let src = Arc::new(Source::session_file(f, huge, path, crate::core::source::IndexBuilder::new().finish()));
-        let header = PiecesHeader { tab: None, len: huge, data_len: huge, files: Vec::new(), sums: Vec::new() };
+        let header = PiecesHeader { len: huge, data_len: huge, ..PiecesHeader::empty() };
         let w = BigWrite {
             tab: 1,
             name: "tab-full".into(),
@@ -1687,10 +1825,11 @@ mod tests {
             sums: Vec::new(),
             header,
             pieces: vec![(0, 0, huge)],
+            named: Vec::new(),
         };
         assert_eq!(write_big(&dir, &w), Err(BigErr::Failed { full: true }));
-        assert_eq!(fs::metadata(dir.join("tab-full.data")).unwrap().len(), 0);
-        assert!(!dir.join("tab-full.pieces").exists());
+        // (not even created)
+        assert!(!dir.join("tab-full.data").exists() && !dir.join("tab-full.pieces").exists());
         let mut b = BigBackup::new();
         b.failed(true);
         let first = b.retry.unwrap().0;
@@ -1839,7 +1978,7 @@ mod tests {
         list.pieces.retain(|p| p.0 != 0);
         list.header.len = list.pieces.iter().map(|p| p.2).sum();
         let doc = Document::new();
-        assert_eq!(BigBackup::restored(&before, None, &list, &doc).version, u64::MAX);
+        assert_eq!(BigBackup::restored(&before, None, &[], &list, &doc).version, u64::MAX);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1907,13 +2046,153 @@ mod tests {
     #[test]
     fn lists_of_pieces_read_back_as_written() {
         let st = SessionTab { path: Some(PathBuf::from(r"C:\x\big.log")), ..SessionTab::untitled() };
-        let h = PiecesHeader { tab: Some(st), len: 30, data_len: 10, files: Vec::new(), sums: vec![(0, 10, u64::MAX)] };
+        let sums = vec![(0, 10, u64::MAX)];
+        let replaces = Some("tab-before".to_string());
+        let h = PiecesHeader { tab: Some(st), len: 30, data_len: 10, sums, replaces, ..PiecesHeader::empty() };
         let pieces = vec![(0, 0, 10), (1, 5, 20)];
         let bytes = encode_pieces(&h, &pieces).unwrap();
         let (back, p) = decode_pieces(&bytes).unwrap();
         assert_eq!(p, pieces);
         assert_eq!((back.len, back.data_len, back.sums), (30, 10, vec![(0, 10, u64::MAX)]));
+        assert_eq!(back.replaces.as_deref(), Some("tab-before"));
         assert_eq!(back.tab.unwrap().path, Some(PathBuf::from(r"C:\x\big.log")));
         assert!(decode_pieces(&bytes[..bytes.len() - 1]).is_none());
+    }
+
+    /// A tab with a big (over `BACKUP_LIMIT`) document over `dir/big.log` (zeros after a first line), indexed, with
+    /// "typed " added at its start.
+    fn big_tab(dir: &Path) -> Tab {
+        let path = dir.join("big.log");
+        let f = fs::File::create(&path).unwrap();
+        f.set_len(BACKUP_LIMIT + 4096).unwrap();
+        drop(f);
+        let f = OpenOptions::new().write(true).open(&path).unwrap();
+        std::os::windows::fs::FileExt::seek_write(&f, b"first line\n", 0).unwrap();
+        drop(f);
+        let src = Arc::new(Source::open_file(&path).unwrap());
+        assert!(src.build_index(&AtomicBool::new(false), &AtomicU64::new(0)));
+        let mut doc = Document::new_pending(src, 0);
+        doc.path = Some(path);
+        let mut t = Tab::new(1, doc);
+        edit(&mut t.doc, 0, b"typed ", 0);
+        t
+    }
+
+    /// One session write the way the timer does it (`closing`: the way closing does), into `dir`.
+    fn session_write(dir: &Path, tabs: &mut [Tab], closing: bool) -> Outcome {
+        let out = write(plan_in(dir.to_path_buf(), tabs, 0, closing));
+        apply(tabs, &out);
+        out
+    }
+
+    #[test]
+    fn a_list_naming_a_file_that_was_replaced_is_written_again() {
+        let dir = test_dir("big-due");
+        let mut tabs = vec![big_tab(&dir)];
+        let out = session_write(&dir, &mut tabs, false);
+        assert!(out.ok && out.big.len() == 1);
+        let name = name(&tabs[0].big);
+        // saved, with nothing typed since: the same version, but the list names the file before the save
+        let saved = tabs[0].doc.snapshot();
+        save_as_slate_does(&mut tabs[0].doc, &saved);
+        assert!(tabs[0].big.as_ref().unwrap().outdated());
+        let out = session_write(&dir, &mut tabs, false);
+        assert_eq!(out.big.len(), 1, "written again");
+        assert!(!tabs[0].big.as_ref().unwrap().outdated());
+        let mut want = b"typed first line\n".to_vec();
+        want.resize((BACKUP_LIMIT + 4096 + 6) as usize, 0);
+        assert_eq!(text_of(restore_in(&dir, &name)), want);
+        // nothing new: not written again
+        assert!(session_write(&dir, &mut tabs, false).big.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_found_in_place_of_another_makes_the_list_due() {
+        let dir = test_dir("big-due-other");
+        let path = dir.join("big.log");
+        let mut d = file_doc(&path, &lines(20_000, "orig"));
+        let mut big = None;
+        edit(&mut d, 0, b"x", 0);
+        write_once(&dir, &mut big, &mut d).unwrap();
+        assert!(!big.as_ref().unwrap().outdated());
+        fs::write(dir.join("other.log"), b"another file").unwrap();
+        fs::rename(dir.join("other.log"), &path).unwrap();
+        d.file_sources().iter().for_each(|s| s.look_at_path());
+        assert!(big.as_ref().unwrap().outdated());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_write_that_waits_is_tried_again() {
+        let dir = test_dir("big-wait");
+        let mut tabs = vec![big_tab(&dir)];
+        // the first write failed: it waits (nothing written yet), kept with its tries; the session isn't all written
+        let mut b = BigBackup::new();
+        b.failed(false);
+        tabs[0].big = Some(b);
+        let out = session_write(&dir, &mut tabs, false);
+        assert!(out.big.is_empty() && out.pending && !finish(&mut tabs, out));
+        assert_eq!(tabs[0].big.as_ref().map(|b| b.retry.unwrap().1), Some(1));
+        // closing: tried once more
+        let out = session_write(&dir, &mut tabs, true);
+        assert!(out.ok && !out.pending && out.big.len() == 1);
+        let name = name(&tabs[0].big);
+        // waiting with a list written: that list stays in the session meanwhile
+        edit(&mut tabs[0].doc, 0, b"more ", 0);
+        tabs[0].big.as_mut().unwrap().failed(true);
+        let p = plan_in(dir.clone(), &mut tabs, 0, false);
+        assert!(p.pending && p.big.is_empty());
+        assert_eq!(p.session.tabs[0].pieces.as_deref(), Some(name.as_str()));
+        assert!(p.keep.contains(&pieces_file(&name)));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Writes a list `name` (a `replaces` of another, `data_len` bytes of `<name>.data` that it reads).
+    fn put_list(dir: &Path, name: &str, replaces: Option<&str>, data: Option<&[u8]>) {
+        let len = data.map_or(4, |d| d.len() as u64);
+        let replaces = replaces.map(str::to_string);
+        let h = PiecesHeader { len, data_len: len, replaces, ..PiecesHeader::empty() };
+        fs::write(dir.join(pieces_file(name)), encode_pieces(&h, &[(0, 0, len)]).unwrap()).unwrap();
+        if let Some(d) = data {
+            fs::write(dir.join(data_file(name)), d).unwrap();
+        }
+    }
+
+    #[test]
+    fn lists_written_anew_when_slate_stopped_are_sorted_out() {
+        let dir = test_dir("rewrites");
+        let st = |n: &str| SessionTab { pieces: Some(n.to_string()), ..SessionTab::untitled() };
+        // whole: it takes the place of the one session.json names (the newest text), which goes
+        put_list(&dir, "tab-1", None, Some(b"old!"));
+        put_list(&dir, "tab-2", Some("tab-1"), Some(b"new!"));
+        // its text still under the temporary name (stopped before the rename): whole too
+        put_list(&dir, "tab-3", None, Some(b"old!"));
+        put_list(&dir, "tab-4", Some("tab-3"), None);
+        fs::write(dir.join("tab-4.data.tmp"), b"new!").unwrap();
+        // no text at all: it goes, the one it would replace stays
+        put_list(&dir, "tab-5", None, Some(b"old!"));
+        put_list(&dir, "tab-6", Some("tab-5"), None);
+        // session.json named the new one already (the old one wasn't deleted yet): the old one goes
+        put_list(&dir, "tab-7", None, Some(b"old!"));
+        put_list(&dir, "tab-8", Some("tab-7"), Some(b"new!"));
+        // written anew twice
+        put_list(&dir, "tab-a1", None, Some(b"old!"));
+        put_list(&dir, "tab-a2", Some("tab-a1"), Some(b"mid!"));
+        put_list(&dir, "tab-a3", Some("tab-a2"), Some(b"new!"));
+        // a write anew that didn't get to its list
+        fs::write(dir.join("tab-9.data.tmp"), b"partial").unwrap();
+        let mut tabs = vec![st("tab-1"), st("tab-3"), st("tab-5"), st("tab-8"), st("tab-a1")];
+        finish_rewrites_in(&dir, &mut tabs);
+        let named: Vec<&str> = tabs.iter().map(|t| t.pieces.as_deref().unwrap()).collect();
+        assert_eq!(named, ["tab-2", "tab-4", "tab-5", "tab-8", "tab-a3"]);
+        let left = |n: &str| dir.join(pieces_file(n)).exists() || dir.join(data_file(n)).exists();
+        for gone in ["tab-1", "tab-3", "tab-6", "tab-7", "tab-a1", "tab-a2"] {
+            assert!(!left(gone), "{gone} is left");
+        }
+        assert_eq!(fs::read(dir.join("tab-4.data")).unwrap(), b"new!");
+        assert!(!dir.join("tab-9.data.tmp").exists());
+        assert!(big_orphans_in(&dir, &named.iter().map(|n| n.to_string()).collect::<Vec<_>>()).is_empty());
+        let _ = fs::remove_dir_all(&dir);
     }
 }
