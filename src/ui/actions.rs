@@ -1345,9 +1345,9 @@ impl App {
                 } else if m.ctrl {
                     if right { tab.doc.word_right(sel.caret) } else { tab.doc.word_left(sel.caret) }
                 } else if right {
-                    tab.doc.next_char(sel.caret)
+                    editor::next_cluster(&tab.doc, sel.caret)
                 } else {
-                    tab.doc.prev_char(sel.caret)
+                    editor::prev_cluster(&tab.doc, sel.caret)
                 };
                 tab.view.set_caret(pos, ext);
                 tab.view.want_x = None;

@@ -1200,6 +1200,38 @@ pub fn normalize_eols(text: &[u8], eol: &[u8]) -> Vec<u8> {
     out
 }
 
+/// The position after the character people see at `pos`: a letter with its accents, an emoji sequence, a flag
+/// (Left/Right and Delete step over it whole). `\r\n` counts as one.
+pub fn next_cluster(doc: &Document, pos: u64) -> u64 {
+    let len = doc.len();
+    if pos >= len {
+        return len;
+    }
+    let b = doc.read(pos, (pos + 256).min(len));
+    if matches!(b.first(), Some(b'\r' | b'\n')) {
+        return doc.next_char(pos);
+    }
+    pos + text::cluster_len_at(&b).max(1) as u64
+}
+
+/// The text from shortly before `pos` (from its line's start when that's near) up to `pos`.
+fn before(doc: &Document, pos: u64) -> Vec<u8> {
+    let b = doc.read(pos.saturating_sub(256), pos);
+    match memchr::memrchr(b'\n', &b) {
+        Some(i) => b[i + 1..].to_vec(),
+        None => b,
+    }
+}
+
+/// The position before the character people see that ends at `pos`.
+pub fn prev_cluster(doc: &Document, pos: u64) -> u64 {
+    let b = before(doc, pos);
+    if b.is_empty() || b.ends_with(b"\r") {
+        return doc.prev_char(pos);
+    }
+    pos - text::cluster_len_before(&b).max(1) as u64
+}
+
 pub fn backspace(doc: &mut Document, sel: Sel, word: bool) -> Sel {
     if !sel.is_empty() {
         return replace_selection(doc, sel, b"", EditKind::Other);
@@ -1207,7 +1239,12 @@ pub fn backspace(doc: &mut Document, sel: Sel, word: bool) -> Sel {
     if sel.caret == 0 {
         return sel;
     }
-    let a = if word { doc.word_left(sel.caret) } else { doc.prev_char(sel.caret) };
+    // (an emoji or a flag goes as a whole; an accented letter loses its last accent)
+    let back = || {
+        let b = before(doc, sel.caret);
+        if b.is_empty() || b.ends_with(b"\r") { doc.prev_char(sel.caret) } else { sel.caret - text::backspace_len(&b).max(1) as u64 }
+    };
+    let a = if word { doc.word_left(sel.caret) } else { back() };
     doc.begin(if word { EditKind::Other } else { EditKind::Backspace }, sel);
     doc.delete(a, sel.caret);
     let new = Sel::at(a);
@@ -1222,7 +1259,7 @@ pub fn delete_forward(doc: &mut Document, sel: Sel, word: bool) -> Sel {
     if sel.caret >= doc.len() {
         return sel;
     }
-    let b = if word { doc.word_right(sel.caret) } else { doc.next_char(sel.caret) };
+    let b = if word { doc.word_right(sel.caret) } else { next_cluster(doc, sel.caret) };
     doc.begin(if word { EditKind::Other } else { EditKind::DeleteForward }, sel);
     doc.delete(sel.caret, b);
     doc.end(sel);
