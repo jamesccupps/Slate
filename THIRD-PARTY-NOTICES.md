@@ -20,6 +20,24 @@ It also contains startup and runtime support code that comes with Rust's GNU too
 MinGW-w64 project (https://www.mingw-w64.org/, whose runtime is in the public domain or under the Zope Public License
 2.1) and GCC's libgcc (under the GCC Runtime Library Exception).
 
+The Linux version (`slate`) contains the same crates except the `windows` ones, and these (each under the MIT license,
+or MIT or Apache-2.0):
+
+| Component | Version | Copyright | Source |
+|---|---|---|---|
+| gtk4, gdk4, gsk4 (and their -sys crates) | 0.11.5 | The gtk-rs Project Developers | https://github.com/gtk-rs/gtk4-rs |
+| glib, gio, pango, pangocairo, cairo-rs, gdk-pixbuf, graphene-rs (and their -sys crates), gobject-sys | 0.22 | The gtk-rs Project Developers | https://github.com/gtk-rs/gtk-rs-core |
+| libc | 0.2.190 | The Rust Project Developers | https://github.com/rust-lang/libc |
+| bitflags | 2.13.2 | The Rust Project Developers | https://github.com/bitflags/bitflags |
+| futures-channel, futures-core, futures-executor, futures-io, futures-task, futures-util | 0.3.34 | The futures-rs authors | https://github.com/rust-lang/futures-rs |
+| pin-project-lite | 0.2.17 | Taiki Endo | https://github.com/taiki-e/pin-project-lite |
+| slab | 0.4.12 | Carl Lerche | https://github.com/tokio-rs/slab |
+| smallvec | 1.16.2 | The Servo Project Developers | https://github.com/servo/rust-smallvec |
+| field-offset, memoffset | 0.3.6, 0.9.1 | Diggory Blake; Gilad Naaman | https://github.com/Diggsey/rust-field-offset |
+
+GTK, GLib, Pango, cairo and the libraries under them aren't part of it: it uses the system's (under their own
+licenses, mostly the LGPL).
+
 ## MIT License
 
 Copyright (c) the authors and copyright holders listed above

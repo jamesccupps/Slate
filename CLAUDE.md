@@ -1,7 +1,9 @@
 # Slate
 
 A fast, simple Notepad replacement for Windows that opens huge files (800 MB+ JSON) instantly. Native Win32 +
-Direct2D/DirectWrite, written in Rust. Single portable `Slate.exe`, nothing to install at runtime.
+Direct2D/DirectWrite, written in Rust. Single portable `Slate.exe`, nothing to install at runtime. Since 0.8.0 also on
+Linux (x86-64 and ARM64, the user's Raspberry Pi 5): the same engine, colors and editing in a GTK 4 window
+(`src/gtk`), packaged as a `.deb`.
 
 It is a general text editor first ("a better Notepad"); the JSON and XML extras (format/minify/check, the path bar and
 the structure panel) only show for those files. It should be quick, easy to use, with only the features
@@ -30,14 +32,25 @@ cargo test --lib
 - Never start Slate (or anything long-running) from a Claude session expecting it to persist: Claude is an MSIX app,
   so children run in its container (private HKCU/AppData, killed when Claude restarts). Tests render offscreen.
 
+Linux: GTK 4.8 or newer (`gtk4` crate 0.11 with `v4_8`, as Debian 12 and Raspberry Pi OS 12 have it) and `libc`;
+`cargo build --release` gives `target/release/Slate` (installed as `slate`). On the Windows development PC it's built
+and tested in Docker (Docker Desktop): an image from `rust:1-bookworm` with `libgtk-4-dev xvfb xauth
+fonts-dejavu-core fonts-noto-color-emoji dbus-x11`, the source mounted, `CARGO_TARGET_DIR` in a volume, and the
+program run under `xvfb-run` with `GTK_A11Y=none GSK_RENDERER=cairo`. `cargo check --lib --target
+x86_64-unknown-linux-gnu` on Windows checks the shared code without GTK. `packaging/linux/package.sh <binary>
+<version> <amd64|arm64> <out>` makes the `.deb` (`/usr/bin/slate`, the desktop file `io.github.jamesccupps.Slate`,
+icons) and a tarball, each with a `.sha256`.
+
 ## Releasing
 
 1. Bump `version` in `Cargo.toml` (the updater compares it with the release tag; CI refuses a tag that doesn't
    match). Write the notes in `docs/release-notes-<version>.md`; CI puts them in the draft.
 2. Commit and push to `main`; then `git tag vX.Y.Z` and `git push origin vX.Y.Z`.
-3. The Build workflow (`.github/workflows/build.yml`) tests, builds, runs the exe through `tests/smoke.txt` and
-   drafts the release with `Slate.exe` and `Slate.exe.sha256`. The user publishes it — Slate's updater
-   (`src/ui/update.rs`) only sees published releases.
+3. The Build workflow (`.github/workflows/build.yml`) tests, builds, runs the exe through `tests/smoke.txt`; the
+   Linux jobs (x86-64 and ARM64, in a `debian:12` container so the result runs on Debian 12 / Raspberry Pi OS 12
+   and newer) test, build, run `tests/smoke-linux.txt` under Xvfb and package; then a release job (the only one
+   with write access) drafts the release with `Slate.exe`, `Slate.exe.sha256` and the `.deb`s and tarballs (with
+   their `.sha256`). The user publishes it — Slate's updater (`src/ui/update.rs`) only sees published releases.
 
 What the updater reads from a release can never change, as every version out there reads it: the tag `vX.Y.Z` (no
 pre-release suffix), assets named exactly `Slate.exe` and `Slate.exe.sha256` (`<64 hex digits>  Slate.exe`), this
@@ -50,7 +63,17 @@ Commits use the GitHub no-reply address (repo-local git config); GitHub refuses 
 
 ## Layout
 
-- `src/core/` — the engine, no UI. Unit-tested (`cargo test --lib`).
+Shared by both platforms: `src/core` (the engine), `src/highlight*` (colors), `src/edit.rs` (editing operations,
+display segments, coloring checkpoints, the transform sink), `src/theme.rs` (palettes; Windows' high contrast and
+accent stay Windows-only), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate`, `$XDG_DATA_HOME/slate` or
+`~/.local/share/slate` on Linux, or the portable `data` folder). Windows: `src/ui`. Linux: `src/gtk`.
+
+- `src/core/` — the engine, no UI. Unit-tested (`cargo test --lib`). What it asks the OS for goes through `os.rs`
+  (Windows and Unix sides: shared opens, reads at an offset, a second handle, stamps and file IDs — on Unix dev/inode
+  and times in 100 ns units like Windows', as the session keeps them —, self-deleting temp files, free space,
+  whether a process runs, which errors pass by themselves). Saving on Linux is a rename (atomic; open files keep the
+  old one), the directory synced, the old file's permissions and owner kept; ANSI there is Windows-1252 from a
+  built-in table (checked against Windows' own by a test on Windows). New documents get `Eol::NATIVE`.
   - `source.rs` — immutable byte sources: memory, or a file read on demand via a 64 KiB block cache (opened with
     full sharing, never locked). Newline index = cumulative count per 64 KiB block, built in the background; a file
     that only grew (a log) reuses the old index if sampled blocks (and the old last, incomplete block) still match.
@@ -113,9 +136,23 @@ Commits use the GitHub no-reply address (repo-local git config); GitHub refuses 
     their other half and an odd last byte read as U+FFFD and are counted in `Document::bad_units`; ANSI = the system
     code page, Windows-1252 under the UTF-8 code page option; single-byte code pages through tables made once from
     Windows' own conversions), display decoding (control chars → symbols), char classes.
-  - `job.rs` — background jobs with progress/cancel, notify the UI by posting a window message.
+  - `job.rs` — background jobs with progress/cancel, notify the UI by posting a window message (on Linux: an idle
+    callback on GLib's main loop).
+- `src/gtk/` — the Linux app (GTK 4): `mod.rs` the window (menu bar from a `gio::Menu`, actions with accelerators,
+    the find bar's GtkEntry boxes, a notice line, native scrollbars mapping bytes, dialogs: `FileChooserNative` and
+    `MessageDialog` as GTK 4.8 has them, the session written every 5 s when it changed and on closing; one Slate per
+    session through GApplication/D-Bus, `HANDLES_OPEN`), `app.rs` the state and commands (`App`, `Tab`, `Cmd`; what
+    needs a dialog is queued in `asks`), `view.rs` the text view on Pango and cairo (segments laid out plain and cached,
+    rows of one height, colors drawn with the glyphs by `draw_row`: only those in view, each in its byte's color —
+    color attributes made Pango shape minified JSON in thousands of pieces; wrapped rows hang under the indentation
+    with a negative Pango indent), `chrome.rs` the tab strip and status bar (drawn like Windows'), `session.rs`
+    (`session.json` and a copy per unsaved tab up to 64 MiB; bigger ones are asked about), `testmode.rs`
+    (`slate --test script` under Xvfb: commands at the top of the file; shots through `WidgetPaintable`). Not on Linux
+    yet: the structure panel and path bar, updates, show whitespace, bracket matching, overtype, high contrast.
+    `SLATE_TIMING=1` prints how long painting and keys take.
 - `src/ui/` — the Win32 app (see the module docs at the top of each file).
-  - `highlight.rs` (+ `highlight/code.rs`, `highlight/markup.rs`, `highlight/config.rs`) — syntax coloring for 52
+  - `src/highlight.rs` (+ `highlight/code.rs`, `highlight/markup.rs`, `highlight/config.rs`; shared, `ui` reaches it
+    as `super::highlight`) — syntax coloring for 52
     languages: hand-written lexers that color one segment and return the `State` they end in (inside a block
     comment, a multi-line string, an XML tag, a Markdown code block...). `code.rs` is one configurable lexer for
     programming/scripting languages (keyword tables + per-language extras: Rust and C++ raw strings, PowerShell

@@ -56,6 +56,14 @@ about twice as fast, ANSI and UTF-16 files open several times faster. Search fin
 exactly, and runs regexes in the background. Crisp lines at 125% and 150%, tooltips, pressed states, a scrollbar in
 the structure panel, a hanging indent with word wrap. Details in the [0.7.0 release notes](release-notes-0.7.0.md).
 
+## 0.8.0: Linux
+
+Slate on Linux, Raspberry Pi included: the same engine, colors and editing operations (now shared: `src/core`,
+`src/highlight`, `src/edit.rs`, `src/theme.rs`, `src/settings.rs`, with the engine's few system calls behind
+`core::os`) in a GTK 4 window (`src/gtk`), built for x86-64 and ARM64 on Debian 12 and packaged as a `.deb`. Huge files
+open as fast as on Windows; colors are drawn with the glyphs, only what's in view. Details in the
+[0.8.0 release notes](release-notes-0.8.0.md).
+
 ## Next
 
 1. **Accessibility: UI Automation (L).** The high-contrast theme (Windows' colors, read again when they change) and a
@@ -100,12 +108,12 @@ the structure panel, a hanging indent with word wrap. Details in the [0.7.0 rele
 
 ## Later
 
-- **A Linux version, Raspberry Pi included (L).** The engine (`src/core`: text storage, search, JSON/XML, line
-  tools) is plain Rust except for a few file-handling and ANSI code-page calls, which go behind a small platform
-  layer. The window and drawing get a second front end on a cross-platform toolkit (GTK 4, or winit with a 2D GPU
-  renderer and a text-shaping crate; to be decided by what keeps huge files instant). Builds for x86-64 and ARM64
-  (the Pi) in CI, packaged as an AppImage or .deb; release files get their own names, so the Windows updater's
-  `Slate.exe` / `Slate.exe.sha256` stay exactly as they are.
+- **Linux, the rest (M each unless said):** the JSON/XML structure panel and path bar; updates (an apt repository,
+  or the release's `.deb` offered in the status bar like on Windows); keeping big unsaved documents in the session
+  (`.pieces`/`.data`, as on Windows); show whitespace, bracket matching, overtype, word counts and the tab list (S
+  each); the status bar's encoding and indentation menus, Open recent in the menu (S); following GNOME's dark/light
+  switch while running (S); Flatpak or AppImage for distributions without GTK 4.8 (S–M); an accessibility pass with
+  Orca (M).
 - **Maybe: a Markdown preview** (a rendered view next to the text, off by default) (M). Only if people ask for
   it: Slate is meant to stay quick and open anything, so it must cost nothing while it isn't used.
 - Several windows; drag a tab out into its own window (L).
@@ -156,7 +164,7 @@ the structure panel, a hanging indent with word wrap. Details in the [0.7.0 rele
 ## Infrastructure
 
 - Reproducible builds: a pinned toolchain, a build cache, no home paths or timestamps in the exe (S).
-- CI: write permission only for the release step (S); automated updater tests against a local stand-in for GitHub,
+- CI: automated updater tests against a local stand-in for GitHub,
   and test-mode commands for the timers (S). (The smoke test writes a session and puts it back.)
 - Test on what the development PC doesn't have: a FAT/exFAT drive, a Chinese/Japanese/Korean system locale, the
   "Use UTF-8 worldwide" option, a high-DPI second monitor and a taskbar on the side (S each).

@@ -1,5 +1,6 @@
-# Builds and tests Slate on every push. For a version tag (v1.2.3) it also drafts a GitHub release with Slate.exe
-# and Slate.exe.sha256 attached; publishing the draft is what makes Slate's built-in updater offer it.
+# Builds and tests Slate on every push: the Windows exe, and the Linux packages for x86-64 and ARM64 (Raspberry Pi).
+# For a version tag (v1.2.3) it also drafts a GitHub release with all of them attached; publishing the draft is what
+# makes Slate's built-in updater on Windows offer it (it reads only Slate.exe and Slate.exe.sha256).
 name: Build
 
 on:
@@ -9,11 +10,13 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Write access only where the release is drafted.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
+    name: Windows
     runs-on: windows-latest
     env:
       # link with the toolchain's own MinGW files (rust-mingw), whatever else the runner has on its PATH
@@ -70,20 +73,89 @@ jobs:
           name: Slate
           path: out/
 
+  linux:
+    name: Linux ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    # Built on Debian 12 (GTK 4.8, glibc 2.36): it then runs there, on Raspberry Pi OS 12 and on newer systems.
+    container: debian:12
+    steps:
+      - name: Tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates curl git build-essential pkg-config libgtk-4-dev \
+            xvfb xauth dbus-x11 fonts-dejavu-core
+
+      - uses: actions/checkout@v6
+
+      - name: Rust
+        run: |
+          curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Test
+        run: cargo test --lib --locked
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Smoke test (the built program, in its test mode, under Xvfb)
+        timeout-minutes: 5
+        run: |
+          dir="$RUNNER_TEMP/smoke"
+          mkdir -p "$dir"
+          cd "$dir"
+          export SLATE_DATA_DIR="$dir/data" SLATE_TEST_LOG="$dir/log.txt" GTK_A11Y=none GSK_RENDERER=cairo
+          status=0
+          xvfb-run -a "$GITHUB_WORKSPACE/target/release/Slate" --test "$GITHUB_WORKSPACE/tests/smoke-linux.txt" || status=$?
+          cat log.txt || true
+          if [ "$status" -ne 0 ]; then echo "The smoke test failed (exit code $status)"; exit 1; fi
+
+      - name: Package
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          sh packaging/linux/package.sh target/release/Slate "$version" ${{ matrix.arch }} out
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: slate-linux-${{ matrix.arch }}
+          path: out/
+
+  release:
+    name: Draft the release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build, linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/download-artifact@v6
+        with:
+          path: out
+          merge-multiple: true
+
       - name: Draft the release
-        if: startsWith(github.ref, 'refs/tags/v')
-        shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $tag = "${{ github.ref_name }}"
+          tag="${GITHUB_REF_NAME}"
+          ls -la out
           # The notes come from docs/release-notes-<version>.md when there is one.
-          $notes = "docs/release-notes-$($tag.TrimStart('v')).md"
-          $opts = if (Test-Path $notes) { @('--notes-file', $notes) } else { @('--generate-notes') }
-          gh release view $tag *> $null
-          if ($LASTEXITCODE -eq 0) {
+          notes="docs/release-notes-${tag#v}.md"
+          if [ -f "$notes" ]; then set -- --notes-file "$notes"; else set -- --generate-notes; fi
+          if gh release view "$tag" > /dev/null 2>&1; then
             # Run again (the release is there already): replace its files.
-            gh release upload $tag out\Slate.exe out\Slate.exe.sha256 --clobber
-          } else {
-            gh release create $tag out\Slate.exe out\Slate.exe.sha256 --draft --title "Slate $tag" @opts
-          }
+            gh release upload "$tag" out/* --clobber
+          else
+            gh release create "$tag" out/* --draft --title "Slate $tag" "$@"
+          fi

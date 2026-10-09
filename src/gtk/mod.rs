@@ -422,6 +422,7 @@ fn connect(ui: &Rc<Ui>, prev: &gtk4::Button, next: &gtk4::Button, close_find: &g
     drag.connect_drag_end(|_, _, _| {
         if let Some(ui) = get_ui() {
             ui.with(|a| a.tab_mut().view.drag = None);
+            ui.set_primary();
         }
     });
     ui.text.add_controller(drag);
@@ -908,6 +909,25 @@ impl Ui {
         let g = self.geom();
         let gw = self.app.try_borrow().map(|a| self.gutter_width(&a)).unwrap_or(0.0);
         let x = x - gw - PAD;
+        if button == 2 {
+            // Linux: the middle button pastes what was selected last (anywhere), where it's clicked
+            let pos = self.with(|a| a.with_view(&g, |v, cx| v.pos_at(cx, x, y))).unwrap_or(0);
+            let primary = gdk::Display::default().map(|d| d.primary_clipboard());
+            if let (Some(cb), None) = (primary, &self.test) {
+                glib::spawn_future_local(async move {
+                    if let Ok(Some(t)) = cb.read_text_future().await {
+                        if let Some(ui) = get_ui() {
+                            let t = t.to_string();
+                            ui.with(|a| {
+                                a.tab_mut().view.sel = Sel::at(pos);
+                                a.paste_text(&t);
+                            });
+                        }
+                    }
+                });
+            }
+            return;
+        }
         if button != 1 {
             if button == 3 {
                 self.context_menu(x + gw + PAD, y);
@@ -939,6 +959,22 @@ impl Ui {
             });
             a.dirty_view = true;
         });
+    }
+
+    /// What's selected becomes the primary selection (what a middle click pastes, in any program).
+    fn set_primary(&self) {
+        if self.test.is_some() {
+            return;
+        }
+        let text = self.app.try_borrow().ok().and_then(|a| {
+            let tab = a.tab();
+            let sel = tab.view.sel;
+            (!sel.is_empty() && sel.end() - sel.start() <= 4 << 20)
+                .then(|| String::from_utf8_lossy(&tab.doc.read(sel.start(), sel.end())).into_owned())
+        });
+        if let (Some(t), Some(d)) = (text, gdk::Display::default()) {
+            d.primary_clipboard().set_text(&t);
+        }
     }
 
     fn text_dragged(&self, x: f64, y: f64) {

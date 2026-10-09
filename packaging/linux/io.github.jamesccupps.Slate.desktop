@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Slate
+GenericName=Text Editor
+Comment=A fast, simple text editor that opens files of any size
+Exec=slate %F
+Icon=io.github.jamesccupps.Slate
+Terminal=false
+StartupNotify=true
+Categories=Utility;TextEditor;Development;
+Keywords=text;editor;notepad;json;xml;log;csv;code;large;huge;
+MimeType=text/plain;text/markdown;text/csv;text/tab-separated-values;text/xml;application/xml;application/json;application/x-yaml;text/x-log;text/x-csrc;text/x-chdr;text/x-c++src;text/x-c++hdr;text/x-python;text/x-shellscript;application/x-shellscript;text/x-rust;text/x-java;text/javascript;application/javascript;text/x-sql;application/x-ini;text/x-diff;text/x-patch;

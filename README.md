@@ -1,7 +1,7 @@
 # Slate
 
-A fast, simple text editor for Windows that opens files of any size: an 800 MB JSON file opens instantly, scrolls
-smoothly, and can be searched, edited, formatted and saved.
+A fast, simple text editor for Windows and Linux (Raspberry Pi included) that opens files of any size: an 800 MB
+JSON file opens instantly, scrolls smoothly, and can be searched, edited, formatted and saved.
 
 - Opens huge files instantly: nothing is loaded up front, only what's on screen is read and drawn. Files open in the
   background, so a slow network drive never freezes the window.
@@ -69,6 +69,22 @@ Slate isn't code-signed yet, so the first time you run it Windows may show "Wind
 *More info* → *Run anyway*. Each release lists the SHA-256 of `Slate.exe` (in `Slate.exe.sha256`) if you want to
 check the download.
 
+### Linux and Raspberry Pi
+
+The [latest release](https://github.com/jamesccupps/Slate/releases/latest) has a `.deb` for 64-bit PCs
+(`slate_<version>_amd64.deb`) and for 64-bit ARM, Raspberry Pi 4 and 5 (`slate_<version>_arm64.deb`). It needs GTK
+4.8 or newer: Debian 12, Raspberry Pi OS 12 (Bookworm), Ubuntu 23.04 and newer, or similar. Install it with
+
+```
+sudo apt install ./slate_<version>_arm64.deb
+```
+
+Slate is then in the menu (Accessories), opens files from the file manager, and `slate notes.txt` opens a file from
+a terminal. The `.tar.gz` next to it is the same program to run without installing. The Linux version has the same
+engine, colors and editing as on Windows, in a GTK window; it doesn't update itself yet (install a newer `.deb`),
+and doesn't have the JSON/XML structure panel and path bar yet. Its settings and session are in
+`~/.local/share/slate`.
+
 ## Where Slate keeps things
 
 - Settings, the session (open tabs and unsaved text) and `crash.log` are in `%LOCALAPPDATA%\Slate`
@@ -99,8 +115,11 @@ MIT: see [LICENSE](LICENSE). The libraries built into `Slate.exe` are listed, wi
 
 ## Building
 
-Needs Rust (the GNU toolchain is enough; no Visual Studio). Run `build.cmd`, which produces `dist\Slate.exe`.
+Windows: needs Rust (the GNU toolchain is enough; no Visual Studio). Run `build.cmd`, which produces
+`dist\Slate.exe`. Linux: Rust and GTK 4's development files (`sudo apt install build-essential libgtk-4-dev`), then
+`cargo build --release` (`target/release/Slate`); `packaging/linux/package.sh` makes the `.deb`.
 `cargo test --lib` runs the unit tests, and `Slate.exe --test tests\smoke.txt` drives the real app in a hidden
 window (set `SLATE_DATA_DIR` to an empty folder first: the smoke test writes a session there and reads it back).
-GitHub Actions builds and tests every push; a version tag (`v1.2.3`) drafts a release with `Slate.exe` and
-`Slate.exe.sha256` attached. What's planned is in [docs/ROADMAP.md](docs/ROADMAP.md).
+GitHub Actions builds and tests every push, for Windows and for Linux on x86-64 and ARM64 (on Debian 12, under Xvfb:
+`tests/smoke-linux.txt`); a version tag (`v1.2.3`) drafts a release with `Slate.exe`, `Slate.exe.sha256` and the
+Linux packages attached. What's planned is in [docs/ROADMAP.md](docs/ROADMAP.md).

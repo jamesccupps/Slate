@@ -1,0 +1,51 @@
+size:1000x600
+theme:light
+type:{"name": "Slate", "list": [1, 2, 3]}
+lang:JSON
+cmd:json-format
+jobs
+expect:text={\n  "name": "Slate",\n  "list": [\n    1,\n    2,\n    3\n  ]\n}\n
+cmd:undo
+expect:text={"name": "Slate", "list": [1, 2, 3]}
+cmd:redo
+answer:smoke.json
+cmd:save-as
+jobs
+expect:dirty=false
+expect:tabnames=smoke.json
+find:Slate
+jobs
+expect:find=Some(1)
+key:esc
+key:ctrl+end
+type:\n
+expect:dirty=true
+cmd:save
+jobs
+expect:dirty=false
+shot:smoke-json.png
+cmd:new-tab
+type:<a><b>x</b></a>
+lang:XML
+cmd:xml-format
+jobs
+print:text
+cmd:new-tab
+type:fn main() {\n    println!("hi"); // done\n}
+lang:Rust
+cmd:select-all
+cmd:toggle-comment
+print:text
+shot:smoke-rust.png
+expect:tabs=3
+# What closing keeps comes back: the session, written into the data folder SLATE_DATA_DIR names (empty to begin with).
+persist
+session:save
+session:restore
+jobs
+expect:tabs=3
+expect:dirty=true
+expect:lang=Rust
+cmd:next-tab
+expect:tabnames=smoke.json, Untitled, Untitled
+expect:dirty=false
