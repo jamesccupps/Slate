@@ -607,7 +607,8 @@ impl View {
                             let _ = layout.SetDrawingEffect(&cx.g.brush(c), range);
                         }
                         match tok {
-                            Tok::Bold | Tok::Heading => {
+                            // (an error bold too: it mustn't pass for a string, PPCL's values, in any theme)
+                            Tok::Bold | Tok::Heading | Tok::Error => {
                                 let _ = layout.SetFontWeight(DWRITE_FONT_WEIGHT_BOLD, range);
                             }
                             Tok::Italic => {

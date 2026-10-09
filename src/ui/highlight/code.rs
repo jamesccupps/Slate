@@ -138,6 +138,8 @@ pub(super) struct Syntax {
     digit_sep: bool,
     /// Names may hold dots (R's `is.na`, NSIS's `un.onInit`).
     dots: bool,
+    /// A name in backticks is a name, whatever it holds: Kotlin's `` fun `adds two numbers`() ``, Scala's `` `type` ``.
+    ticks: bool,
 }
 
 const BASE: Syntax = Syntax {
@@ -167,6 +169,7 @@ const BASE: Syntax = Syntax {
     regex: false,
     digit_sep: false,
     dots: false,
+    ticks: false,
 };
 
 static PLAIN: Syntax = BASE;
@@ -272,6 +275,7 @@ static KOTLIN: Syntax = Syntax {
     nested: true,
     decorators: true,
     cap_types: true,
+    ticks: true,
     ..BASE
 };
 
@@ -293,6 +297,7 @@ static SWIFT: Syntax = Syntax {
     nested: true,
     decorators: true,
     cap_types: true,
+    ticks: true,
     ..BASE
 };
 
@@ -456,9 +461,10 @@ static SQL: Syntax = Syntax {
     ],
     ctl: &["begin", "case", "commit", "else", "end", "if", "loop", "return", "rollback", "then", "transaction", "when", "while"],
     types: &[
-        "bigint", "binary", "bit", "blob", "boolean", "char", "clob", "date", "datetime", "datetime2", "datetimeoffset",
-        "decimal", "double", "float", "int", "integer", "json", "money", "nchar", "ntext", "numeric", "nvarchar",
-        "real", "serial", "smallint", "text", "time", "timestamp", "tinyint", "uniqueidentifier", "uuid", "varbinary",
+        "bigint", "bigserial", "binary", "bit", "blob", "boolean", "bytea", "char", "clob", "date", "datetime",
+        "datetime2", "datetimeoffset", "decimal", "double", "float", "int", "integer", "interval", "json", "jsonb",
+        "longtext", "mediumtext", "money", "nchar", "ntext", "numeric", "nvarchar", "real", "serial", "smallint",
+        "smallserial", "text", "time", "timestamp", "tinyint", "tinytext", "uniqueidentifier", "uuid", "varbinary",
         "varchar", "xml",
     ],
     lits: &["false", "null", "true"],
@@ -712,11 +718,12 @@ static SCALA: Syntax = Syntax {
         "yield",
     ],
     lits: &["false", "null", "true"],
-    // `'c'` (`"…"` strings are read in `extras`)
+    // `'c'` (`"…"` strings and `'symbols` are read in `extras`)
     quotes: b"'",
     nested: true,
     decorators: true,
     cap_types: true,
+    ticks: true,
     ..BASE
 };
 
@@ -1034,6 +1041,14 @@ fn guarded_rest(t: &[u8], s: usize, mut i: usize, mark: u8, q: u8, esc: u8, b: u
     let n = t.len();
     let (mut pending, mut blank, mut lines) = (b & 1 != 0, b & 2 != 0, b >> 2);
     while i < n {
+        if !pending && !blank {
+            // (only the quote, the escape character and a line break matter)
+            let next = if esc != 0 { memchr::memchr3(q, esc, b'\n', &t[i..]) } else { memchr::memchr2(q, b'\n', &t[i..]) };
+            match next {
+                Some(p) => i += p,
+                None => break,
+            }
+        }
         let c = t[i];
         if c == b'\n' {
             pending = false;
@@ -1640,6 +1655,11 @@ fn resume(sx: &Syntax, t: &[u8], st: State, o: &mut Out) -> Step {
         }
         BLOCK_COMMENT if sx.flavor == Flavor::Pascal && st.b == 1 => paren_comment_rest(t, 0, 0, st, o),
         BLOCK_COMMENT => block_rest(sx, t, 0, 0, st.a.max(1), st, o),
+        // (the rest of a `name`)
+        STR if sx.ticks && st.a == b'`' => match scan_str(t, 0, b'`', 0, false, true) {
+            (e, true, _) => Ok(e),
+            _ => Err(st),
+        },
         STR => string_rest(sx, t, 0, 0, st.a, st.b, st, o),
         TRIPLE => triple_rest(t, 0, 0, st.a, triple_esc(sx), st.b == 1, st, o),
         RAW => raw_rest(t, 0, 0, st.a, st, o),
@@ -2134,6 +2154,12 @@ fn more_extras(sx: &Syntax, t: &[u8], i: usize, st: State, o: &mut Out) -> Optio
         }
         // "plain" and """multi-line""" (s"…" is read with the name before it)
         Flavor::Scala if c == b'"' => return Some(istr_open(sx, t, i, i, false, false, st, o)),
+        // Scala 2's symbols ('done), not a string to the line's end ('c' is one, read with the other quotes)
+        Flavor::Scala if c == b'\'' && ident_start(sx, at(t, i + 1)) && at(t, ident_end(sx, t, i + 1)) != b'\'' => {
+            let e = ident_end(sx, t, i + 1);
+            o.put(i, e, Tok::Lit);
+            return Some(Ok(e));
+        }
         Flavor::Pascal => {
             if c == b'(' && at(t, i + 1) == b'*' {
                 return Some(paren_comment_rest(t, i, i + 2, st, o));
@@ -2254,6 +2280,36 @@ fn nsis_extras(t: &[u8], i: usize, line_start: bool, st: State, o: &mut Out) -> 
     }
 }
 
+/// Whether a letter at the start of a token can start something else than a name (`R"(…)"`, `r#"…"#`, `E'…'`,
+/// Perl's `q(…)`, a Batch command, an AutoHotkey label at a line's start…): if not, the checks for those are skipped.
+fn letter_starts_more(flavor: Flavor, c: u8, line_start: bool) -> bool {
+    match flavor {
+        Flavor::Cpp | Flavor::ObjCpp => matches!(c, b'R' | b'u' | b'U' | b'L'),
+        Flavor::Rust => matches!(c, b'r' | b'b'),
+        Flavor::Sql => matches!(c, b'E' | b'e'),
+        Flavor::Dart => c == b'r',
+        Flavor::Perl => matches!(c, b'q' | b'm' | b's' | b't' | b'y' | b'_'),
+        Flavor::Ahk => line_start,
+        Flavor::Batch => true,
+        _ => false,
+    }
+}
+
+/// Whether punctuation `c` starts nothing in the language, so the checks for what does are skipped: in the C family,
+/// Java, Python, JavaScript, Rust… all but comments, strings, chars, attributes, decorators, `@` words, `$` names and
+/// a number's `.`; in SQL all but those, `--`, `[names]` and `@variables`. (An extra for these languages that starts
+/// with punctuation needs it left out here; `plain_punctuation_starts_nothing` checks each syntax's own.)
+fn plain_punct(flavor: Flavor, c: u8) -> bool {
+    c.is_ascii_punctuation()
+        && match flavor {
+            Flavor::Plain | Flavor::Cpp | Flavor::ObjC | Flavor::ObjCpp | Flavor::CSharp | Flavor::Rust => {
+                !matches!(c, b'/' | b'#' | b'@' | b'$' | b'"' | b'\'' | b'`' | b'.' | b'_')
+            }
+            Flavor::Sql => !matches!(c, b'-' | b'/' | b'#' | b'@' | b'"' | b'\'' | b'`' | b'[' | b'.' | b'_'),
+            _ => false,
+        }
+}
+
 /// After these words a `/` starts a regex rather than dividing (JavaScript; Perl).
 const REGEX_AFTER: [&[u8]; 14] =
     [b"await", b"case", b"delete", b"do", b"else", b"in", b"instanceof", b"new", b"of", b"return", b"throw", b"typeof", b"void", b"yield"];
@@ -2334,7 +2390,7 @@ fn code_run(sx: &Syntax, t: &[u8], st: State, o: &mut Out, close: &mut Option<us
                 continue;
             }
             b' ' | b'\t' | b'\r' => {
-                i += 1;
+                i += 1 + t[i + 1..].iter().take_while(|&&b| matches!(b, b' ' | b'\t' | b'\r')).count();
                 continue;
             }
             _ => {}
@@ -2343,160 +2399,186 @@ fn code_run(sx: &Syntax, t: &[u8], st: State, o: &mut Out, close: &mut Option<us
         let stmt_start = stmt;
         bol = false;
         stmt = false;
-        if sx.flavor == Flavor::Php && t[i..].starts_with(b"?>") {
-            // the end of the PHP code (the page around it is HTML)
-            o.put(i, i + 2, Tok::Control);
-            *close = Some(i + 2);
-            return mid;
-        }
-        if (sx.flavor == Flavor::Shell && c == b'\\') || (matches!(sx.flavor, Flavor::PowerShell | Flavor::Ahk) && c == b'`') {
-            // an escaped character outside quotes (`It\'s`), or a line continuation
-            i += if matches!(at(t, i + 1), b'\n' | 0) { 1 } else { 2 };
-            continue;
-        }
-        if sx.flavor == Flavor::Vb && c == b':' {
-            // a new statement (where `Rem` starts a comment)
-            stmt = true;
+        if plain_punct(sx.flavor, c) {
+            regex_ok = !matches!(c, b')' | b']' | b'<');
+            expect = 0;
             i += 1;
             continue;
         }
-        if sx.flavor == Flavor::Batch {
-            if let Some(e) = batch_var(t, i) {
-                o.put(i, e, Tok::Var);
-                i = e;
+        // A name: none of the checks for what starts with something else can apply.
+        let name = (c.is_ascii_alphabetic() || c == b'_') && !letter_starts_more(sx.flavor, c, line_start);
+        if !name {
+            if sx.flavor == Flavor::Php && t[i..].starts_with(b"?>") {
+                // the end of the PHP code (the page around it is HTML)
+                o.put(i, i + 2, Tok::Control);
+                *close = Some(i + 2);
+                return mid;
+            }
+            if (sx.flavor == Flavor::Shell && c == b'\\') || (matches!(sx.flavor, Flavor::PowerShell | Flavor::Ahk) && c == b'`') {
+                // an escaped character outside quotes (`It\'s`), or a line continuation
+                i += if matches!(at(t, i + 1), b'\n' | 0) { 1 } else { 2 };
                 continue;
             }
-            if matches!(c, b'&' | b'|' | b'(') {
-                (stmt, echo) = (true, false);
+            if sx.flavor == Flavor::Vb && c == b':' {
+                // a new statement (where `Rem` starts a comment)
+                stmt = true;
                 i += 1;
                 continue;
             }
-            if echo {
-                i += 1;
-                continue;
-            }
-            if line_start && c == b'@' {
-                o.put(i, i + 1, Tok::Dim);
-                (bol, stmt) = (true, true);
-                i += 1;
-                continue;
-            }
-            if line_start && c == b':' {
-                // ::comment or :label
-                let e = line_end(t, i);
-                o.put(i, e, if at(t, i + 1) == b':' { Tok::Comment } else { Tok::Section });
-                i = e;
-                continue;
-            }
-        }
-        if matches!(sx.flavor, Flavor::Shell | Flavor::Ruby | Flavor::Perl | Flavor::Hcl) && c == b'<' {
-            if let Some((e, word, indent)) = heredoc_open(sx, t, i) {
-                o.put(i, e, Tok::Str);
-                let (a, b) = word_hash(word);
-                heredoc = Some((a | indent as u8, b));
-                // (once per line: `<<A <<B <<C …` mustn't look for the line's end each time)
-                if e > heredoc_line_end {
-                    heredoc_line_end = line_end(t, e);
+            if sx.flavor == Flavor::Batch {
+                if let Some(e) = batch_var(t, i) {
+                    o.put(i, e, Tok::Var);
+                    i = e;
+                    continue;
                 }
-                i = e;
-                continue;
-            }
-        }
-        if sx.flavor == Flavor::Sql && mid.mode & MYSQL == 0 && (c == b'`' || t[i..].starts_with(b"/*!")) {
-            mid.mode |= MYSQL;
-        }
-        if let Some(r) = extras(sx, t, i, line_start, &mut regex_ok, mid, o) {
-            step!(r);
-        }
-        // MySQL's # comments (and `# note` at a line's start in any SQL; `#temp` is a T-SQL table)
-        let sql_hash = sx.flavor == Flavor::Sql
-            && c == b'#'
-            && (mid.mode & MYSQL != 0 || (line_start && matches!(at(t, i + 1), b' ' | b'\t' | b'\r' | b'\n' | 0)));
-        if sql_hash || line_comment(sx, t, i) {
-            let e = comment_end(sx, t, i);
-            o.put(i, e, Tok::Comment);
-            if sx.flavor == Flavor::Sql && (contains_ci(&t[i..e], b"mysql") || contains_ci(&t[i..e], b"mariadb")) {
-                mid.mode |= MYSQL;
-            }
-            regex_ok = true;
-            if e == n {
-                return State { kind: LINE_COMMENT, ..mid };
-            }
-            i = e;
-            continue;
-        }
-        if let Some((open, _)) = sx.block {
-            // (AutoHotkey's `/*` only at the start of a line; NSIS's not inside a word: `File dir/*.txt`)
-            if t[i..].starts_with(open) && (sx.flavor != Flavor::Ahk || line_start) && !(sx.flavor == Flavor::Nsis && nsis_glued(t, i)) {
-                regex_ok = true;
-                step!(block_rest(sx, t, i, i + open.len(), 1, mid, o));
-            }
-        }
-        if sx.regex && c == b'/' && regex_ok {
-            // (judged only from what came before, so it's the same wherever a long line is cut)
-            regex_ok = false;
-            step!(regex_rest(t, i, i + 1, false, false, mid, o));
-        }
-        if sx.preproc && c == b'#' && line_start {
-            // #include <x.h>, #define, #region
-            let w = i + 1 + t[i + 1..].iter().take_while(|&&b| b == b' ' || b == b'\t').count();
-            let e = w + t[w..].iter().take_while(|b| b.is_ascii_alphabetic()).count();
-            if matches!(sx.flavor, Flavor::Cpp | Flavor::ObjCpp) && w > i + 1 && at(t, e) == b'"' {
-                // `# R"(…` is a raw string after a stray `#`, as when the text is cut after the space
-                o.put(i, i + 1, Tok::Control);
-                i += 1;
-                continue;
-            }
-            o.put(i, e, Tok::Control);
-            if sx.flavor == Flavor::Ahk && t[w..e].eq_ignore_ascii_case(b"requires") && contains_ci(&t[e..line_end(t, e)], b"v2") {
-                mid.mode |= AHK_V2;
-            }
-            if matches!(&t[w..e], b"include" | b"import") {
-                let s = e + t[e..].iter().take_while(|&&b| b == b' ' || b == b'\t').count();
-                if at(t, s) == b'<' {
-                    let le = line_end(t, s);
-                    let close = t[s..le].iter().position(|&b| b == b'>').map_or(le, |p| s + p + 1);
-                    o.put(s, close, Tok::Str);
-                    i = close;
+                if matches!(c, b'&' | b'|' | b'(') {
+                    (stmt, echo) = (true, false);
+                    i += 1;
+                    continue;
+                }
+                if echo {
+                    i += 1;
+                    continue;
+                }
+                if line_start && c == b'@' {
+                    o.put(i, i + 1, Tok::Dim);
+                    (bol, stmt) = (true, true);
+                    i += 1;
+                    continue;
+                }
+                if line_start && c == b':' {
+                    // ::comment or :label
+                    let e = line_end(t, i);
+                    o.put(i, e, if at(t, i + 1) == b':' { Tok::Comment } else { Tok::Section });
+                    i = e;
                     continue;
                 }
             }
-            i = e;
-            continue;
-        }
-        if sx.decorators && c == b'@' && ident_start(sx, at(t, i + 1)) {
-            let mut e = ident_end(sx, t, i + 1);
-            while at(t, e) == b'.' && ident_start(sx, at(t, e + 1)) {
-                e = ident_end(sx, t, e + 1);
+            if matches!(sx.flavor, Flavor::Shell | Flavor::Ruby | Flavor::Perl | Flavor::Hcl) && c == b'<' {
+                if let Some((e, word, indent)) = heredoc_open(sx, t, i) {
+                    o.put(i, e, Tok::Str);
+                    let (a, b) = word_hash(word);
+                    heredoc = Some((a | indent as u8, b));
+                    // (once per line: `<<A <<B <<C …` mustn't look for the line's end each time)
+                    if e > heredoc_line_end {
+                        heredoc_line_end = line_end(t, e);
+                    }
+                    i = e;
+                    continue;
+                }
             }
-            o.put(i, e, Tok::Func);
-            regex_ok = false;
-            i = e;
-            continue;
-        }
-        if sx.sigils.contains(&c) {
-            if let Some(e) = sigil_var(sx, t, i) {
-                o.put(i, e, Tok::Var);
+            if sx.flavor == Flavor::Sql && mid.mode & MYSQL == 0 && (c == b'`' || t[i..].starts_with(b"/*!")) {
+                mid.mode |= MYSQL;
+            }
+            if let Some(r) = extras(sx, t, i, line_start, &mut regex_ok, mid, o) {
+                step!(r);
+            }
+            // MySQL's # comments (and `# note` at a line's start in any SQL; `#temp` is a T-SQL table)
+            let sql_hash = sx.flavor == Flavor::Sql
+                && c == b'#'
+                && (mid.mode & MYSQL != 0 || (line_start && matches!(at(t, i + 1), b' ' | b'\t' | b'\r' | b'\n' | 0)));
+            if sql_hash || line_comment(sx, t, i) {
+                let e = comment_end(sx, t, i);
+                o.put(i, e, Tok::Comment);
+                if sx.flavor == Flavor::Sql && (contains_ci(&t[i..e], b"mysql") || contains_ci(&t[i..e], b"mariadb")) {
+                    mid.mode |= MYSQL;
+                }
+                regex_ok = true;
+                if e == n {
+                    return State { kind: LINE_COMMENT, ..mid };
+                }
+                i = e;
+                continue;
+            }
+            if let Some((open, _)) = sx.block {
+                // (AutoHotkey's `/*` only at the start of a line; NSIS's not inside a word: `File dir/*.txt`)
+                if t[i..].starts_with(open) && (sx.flavor != Flavor::Ahk || line_start) && !(sx.flavor == Flavor::Nsis && nsis_glued(t, i)) {
+                    regex_ok = true;
+                    step!(block_rest(sx, t, i, i + open.len(), 1, mid, o));
+                }
+            }
+            if sx.regex && c == b'/' && regex_ok {
+                // (judged only from what came before, so it's the same wherever a long line is cut)
+                regex_ok = false;
+                step!(regex_rest(t, i, i + 1, false, false, mid, o));
+            }
+            if sx.preproc && c == b'#' && line_start {
+                // #include <x.h>, #define, #region
+                let w = i + 1 + t[i + 1..].iter().take_while(|&&b| b == b' ' || b == b'\t').count();
+                let e = w + t[w..].iter().take_while(|b| b.is_ascii_alphabetic()).count();
+                if matches!(sx.flavor, Flavor::Cpp | Flavor::ObjCpp) && w > i + 1 && at(t, e) == b'"' {
+                    // `# R"(…` is a raw string after a stray `#`, as when the text is cut after the space
+                    o.put(i, i + 1, Tok::Control);
+                    i += 1;
+                    continue;
+                }
+                o.put(i, e, Tok::Control);
+                if sx.flavor == Flavor::Ahk && t[w..e].eq_ignore_ascii_case(b"requires") && contains_ci(&t[e..line_end(t, e)], b"v2") {
+                    mid.mode |= AHK_V2;
+                }
+                if matches!(&t[w..e], b"include" | b"import") {
+                    let s = e + t[e..].iter().take_while(|&&b| b == b' ' || b == b'\t').count();
+                    if at(t, s) == b'<' {
+                        let le = line_end(t, s);
+                        let close = t[s..le].iter().position(|&b| b == b'>').map_or(le, |p| s + p + 1);
+                        o.put(s, close, Tok::Str);
+                        i = close;
+                        continue;
+                    }
+                }
+                i = e;
+                continue;
+            }
+            if sx.decorators && c == b'@' && ident_start(sx, at(t, i + 1)) {
+                let mut e = ident_end(sx, t, i + 1);
+                while at(t, e) == b'.' && ident_start(sx, at(t, e + 1)) {
+                    e = ident_end(sx, t, e + 1);
+                }
+                o.put(i, e, Tok::Func);
                 regex_ok = false;
                 i = e;
                 continue;
             }
-        }
-        if sx.triple.contains(&c) && at(t, i + 1) == c && at(t, i + 2) == c {
-            regex_ok = false;
-            step!(triple_rest(t, i, i + 3, c, triple_esc(sx), false, mid, o));
-        }
-        if sx.quotes.contains(&c) {
-            regex_ok = false;
-            step!(string_rest(sx, t, i, i + 1, c, 0, mid, o));
-        }
-        if c.is_ascii_digit() || (c == b'.' && at(t, i + 1).is_ascii_digit() && (i == 0 || !ident_char(sx, t[i - 1]))) {
-            let e = number_end(sx, t, i);
-            o.put(i, e, Tok::Num);
-            expect = 0;
-            regex_ok = false;
-            i = e;
-            continue;
+            if sx.sigils.contains(&c) {
+                if let Some(e) = sigil_var(sx, t, i) {
+                    o.put(i, e, Tok::Var);
+                    regex_ok = false;
+                    i = e;
+                    continue;
+                }
+            }
+            if sx.triple.contains(&c) && at(t, i + 1) == c && at(t, i + 2) == c {
+                regex_ok = false;
+                step!(triple_rest(t, i, i + 3, c, triple_esc(sx), false, mid, o));
+            }
+            if sx.quotes.contains(&c) {
+                regex_ok = false;
+                step!(string_rest(sx, t, i, i + 1, c, 0, mid, o));
+            }
+            if sx.ticks && c == b'`' {
+                // `type`, `adds two numbers`: a name (a function's after `fun`), whose words aren't keywords; it's over
+                // at the line's end (and goes on in the next text, as a string would)
+                let (e, closed, _) = scan_str(t, i + 1, b'`', 0, false, true);
+                let next = t[e..].iter().copied().find(|&b| b != b' ' && b != b'\t');
+                if expect == 1 || next == Some(b'(') {
+                    o.put(i, e, Tok::Func);
+                } else if expect == 2 {
+                    o.put(i, e, Tok::Type);
+                }
+                if !closed {
+                    return State { kind: STR, a: b'`', b: 0, ..mid };
+                }
+                (expect, regex_ok, i) = (0, false, e);
+                continue;
+            }
+            if c.is_ascii_digit() || (c == b'.' && at(t, i + 1).is_ascii_digit() && (i == 0 || !ident_char(sx, t[i - 1]))) {
+                let e = number_end(sx, t, i);
+                o.put(i, e, Tok::Num);
+                expect = 0;
+                regex_ok = false;
+                i = e;
+                continue;
+            }
         }
         if ident_start(sx, c) {
             let mut e = ident_end(sx, t, i);
@@ -2509,15 +2591,7 @@ fn code_run(sx: &Syntax, t: &[u8], st: State, o: &mut Out, close: &mut Option<us
             // after a '.', a keyword is a member name (`re.match`, `map.get`, `promise.catch`)
             let member = i > 0 && t[i - 1] == b'.' && !(i > 1 && t[i - 2] == b'.');
             let after: &[&[u8]] = if sx.flavor == Flavor::Perl { &PERL_REGEX_AFTER } else { &REGEX_AFTER };
-            regex_ok = !member && after.contains(&w);
-            if !o.on() && !matches!(sx.flavor, Flavor::Batch | Flavor::Vb) {
-                i = e;
-                continue;
-            }
-            let mut tok = if member { None } else { word_tok(sx, w) };
-            if sx.flavor == Flavor::Nsis {
-                (e, tok) = nsis_word(sx, t, e, stmt_start, tok);
-            }
+            regex_ok = sx.regex && !member && after.contains(&w);
             if matches!(sx.flavor, Flavor::Batch | Flavor::Vb) {
                 let ends = matches!(at(t, e), 0 | b' ' | b'\t' | b'\r' | b'\n');
                 if stmt_start && ends && w.eq_ignore_ascii_case(b"rem") {
@@ -2529,6 +2603,14 @@ fn code_run(sx: &Syntax, t: &[u8], st: State, o: &mut Out, close: &mut Option<us
                 if sx.flavor == Flavor::Batch && w.eq_ignore_ascii_case(b"echo") {
                     echo = true;
                 }
+            }
+            if !o.on() {
+                i = e;
+                continue;
+            }
+            let mut tok = if member { None } else { word_tok(sx, w) };
+            if sx.flavor == Flavor::Nsis {
+                (e, tok) = nsis_word(sx, t, e, stmt_start, tok);
             }
             if tok.is_none() {
                 let np = e + t[e..].iter().take_while(|&&b| b == b' ' || b == b'\t').count();
@@ -2564,7 +2646,8 @@ fn code_run(sx: &Syntax, t: &[u8], st: State, o: &mut Out, close: &mut Option<us
                         special
                     } else if sx.cap_types && w[0].is_ascii_uppercase() && w.iter().any(|b| b.is_ascii_lowercase()) {
                         Some(Tok::Type)
-                    } else if sx.calls && next == Some(b'(') {
+                    } else if sx.calls && next == Some(b'(') && (sx.flavor != Flavor::Sql || np == e) {
+                        // (in SQL only right before it: `CREATE TABLE t (…)` names a table)
                         Some(Tok::Func)
                     } else {
                         None
@@ -2629,6 +2712,14 @@ fn css_ident_end(t: &[u8], mut i: usize) -> usize {
         i += 1;
     }
     i
+}
+
+/// Whether a `{` comes before the next `;` or `}` on this line (looked for 256 bytes ahead), not counting SCSS's
+/// `#{…}`: what's at `i` inside a block is a selector's then (`@media print { nav ul { … } }`), not a value's.
+fn css_selector_ahead(t: &[u8], i: usize) -> bool {
+    let end = t.len().min(i + 256);
+    let end = memchr::memchr(b'\n', &t[i..end]).map_or(end, |p| i + p);
+    memchr::memchr3(b'{', b';', b'}', &t[i..end]).is_some_and(|q| t[i + q] == b'{' && (i + q == 0 || t[i + q - 1] != b'#'))
 }
 
 /// `b` holds the brace depth: 0 is where selectors are, deeper is inside rules (properties and values).
@@ -2714,11 +2805,15 @@ pub(super) fn css(t: &[u8], st: State, o: &mut Out) -> State {
             b'@' if css_ident_char(next) => {
                 let e = css_ident_end(t, i + 1);
                 o.put(i, e, Tok::Control);
+                // (LESS's `@color: #fff;` sets a value)
+                value |= at(t, e) == b':';
                 i = e;
             }
             b'$' if css_ident_char(next) => {
                 let e = css_ident_end(t, i + 1);
                 o.put(i, e, Tok::Var);
+                // (SCSS's `$color: #fff;`)
+                value |= at(t, e) == b':';
                 i = e;
             }
             b'-' if next == b'-' && css_ident_char(at(t, i + 2)) => {
@@ -2733,7 +2828,7 @@ pub(super) fn css(t: &[u8], st: State, o: &mut Out) -> State {
             b'#' if css_ident_char(next) => {
                 // a color inside rules, an id in selectors
                 let e = css_ident_end(t, i + 1);
-                o.put(i, e, if depth > 0 || value { Tok::Num } else { Tok::Func });
+                o.put(i, e, if (depth > 0 || value) && !(o.on() && css_selector_ahead(t, e)) { Tok::Num } else { Tok::Func });
                 i = e;
             }
             b'.' if !next.is_ascii_digit() && css_ident_char(next) && next != b'-' => {
@@ -2741,7 +2836,7 @@ pub(super) fn css(t: &[u8], st: State, o: &mut Out) -> State {
                 o.put(i, e, Tok::Func);
                 i = e;
             }
-            b':' if depth == 0 && (css_ident_char(next) || next == b':') => {
+            b':' if (css_ident_char(next) || next == b':') && (depth == 0 || css_selector_ahead(t, i)) => {
                 // :hover, ::before
                 let s = if next == b':' { i + 2 } else { i + 1 };
                 let e = css_ident_end(t, s);
@@ -2785,6 +2880,9 @@ pub(super) fn css(t: &[u8], st: State, o: &mut Out) -> State {
                     } else {
                         o.put(i, e, Tok::Tag);
                     }
+                } else if o.on() && css_selector_ahead(t, e) {
+                    // a selector inside a block (`@media`, nested SCSS)
+                    o.put(i, e, Tok::Tag);
                 } else {
                     let after = t[e..].iter().copied().find(|&b| b != b' ' && b != b'\t');
                     o.put(i, e, if after == Some(b':') && at(t, e + 1) != b':' { Tok::Attr } else { Tok::Str });
@@ -2813,6 +2911,28 @@ mod tests {
                 if sx.nocase {
                     assert!(list.iter().all(|k| k.bytes().all(|b| !b.is_ascii_uppercase())), "{lang:?} lowercase");
                 }
+            }
+        }
+    }
+
+    /// The punctuation `plain_punct` lets skip the checks starts nothing in those languages' syntax.
+    #[test]
+    fn plain_punctuation_starts_nothing() {
+        for lang in Lang::ALL {
+            let sx = super::syntax(lang);
+            for c in (0..=255u8).filter(|&c| super::plain_punct(sx.flavor, c)) {
+                let starts = sx.line.iter().any(|l| l[0] == c)
+                    || sx.block.is_some_and(|(open, _)| open[0] == c)
+                    || sx.quotes.contains(&c)
+                    || sx.triple.contains(&c)
+                    || sx.sigils.contains(&c)
+                    || (sx.regex && c == b'/')
+                    || (sx.preproc && c == b'#')
+                    || (sx.decorators && c == b'@')
+                    || (sx.ticks && c == b'`')
+                    || (sx.dollar_ident && c == b'$')
+                    || (sx.dots && c == b'.');
+                assert!(!starts, "{lang:?}: {:?}", c as char);
             }
         }
     }
@@ -2946,6 +3066,11 @@ mod tests {
         assert!(line_has(&v[1], "color", Tok::Attr) && line_has(&v[1], "red", Tok::Str));
         assert!(line_has(&v[2], ":hover", Tok::Control) && line_has(&v[3], "#fff", Tok::Num));
         has(Lang::Css, "@media (max-width: 600px) {", &[("max-width", Tok::Attr), ("600px", Tok::Num)]);
+        // selectors inside blocks (`@media`, SCSS's nesting) aren't values; SCSS's and LESS's variables hold values
+        let v = view(Lang::Css, "@media print {\n  nav ul, #main a:hover { color: #fff; }\n  &__title {\n  }\n}\n$primary: #0067c0;\n@accent: #ff0;\n");
+        assert!(line_has(&v[1], "nav", Tok::Tag) && line_has(&v[1], "ul", Tok::Tag) && line_has(&v[1], "#main", Tok::Func));
+        assert!(line_has(&v[1], ":hover", Tok::Control) && line_has(&v[1], "color", Tok::Attr) && line_has(&v[1], "#fff", Tok::Num));
+        assert!(line_has(&v[2], "__title", Tok::Tag) && line_has(&v[5], "#0067c0", Tok::Num) && line_has(&v[6], "#ff0", Tok::Num));
     }
 
     fn line_has(line: &[(String, Tok)], s: &str, tok: Tok) -> bool {
@@ -2993,6 +3118,9 @@ mod tests {
         assert_eq!(view(Lang::Sql, "# note, it's here\nSELECT 1;\n")[0], vec![("# note, it's here".into(), Tok::Comment)]);
         // PostgreSQL's E'…' strings have escapes
         assert!(line_has(&view(Lang::Sql, "SELECT E'it\\'s' -- c\n")[0], "-- c", Tok::Comment));
+        // a table's name before its columns isn't a function's
+        let t = toks(Lang::Sql, "CREATE TABLE orders (id BIGSERIAL, total NUMERIC(10, 2), at TIMESTAMP DEFAULT now())", State::START);
+        assert!(!t.iter().any(|t| t.0 == "orders") && t.contains(&("now".into(), Tok::Func)) && t.contains(&("BIGSERIAL".into(), Tok::Type)));
     }
 
     #[test]
@@ -3145,6 +3273,15 @@ mod tests {
         has(Lang::Scala, "final case class Greeter(name: String)", &[("class", Tok::Keyword), ("Greeter", Tok::Type)]);
         has(Lang::Scala, r#"println(raw"C:\dir\$name \" ok") // c"#, &[("$name", Tok::Var), (r#" \" ok""#, Tok::Str), ("// c", Tok::Comment)]);
         assert_eq!(end_state(Lang::Scala, src), State::START);
+        // Scala 2's 'symbols aren't strings to the line's end; a name in backticks has no keywords (Kotlin's neither)
+        has(Lang::Scala, "f('done, 'x', '\\n') // c", &[("'done", Tok::Lit), ("'x'", Tok::Str), ("'\\n'", Tok::Str), ("// c", Tok::Comment)]);
+        assert!(toks(Lang::Scala, "val `type` = x match { case `y` => 1 }", State::START).iter().all(|t| !t.0.contains('`')));
+        has(Lang::Kotlin, "@Test fun `returns null when it's empty`() { assertNull(f()) }", &[
+            ("fun", Tok::Keyword),
+            ("`returns null when it's empty`", Tok::Func),
+            ("assertNull", Tok::Func),
+        ]);
+        assert_eq!(toks(Lang::Swift, "let `default` = 1", State::START), vec![("let".into(), Tok::Keyword), ("1".into(), Tok::Num)]);
     }
 
     #[test]
