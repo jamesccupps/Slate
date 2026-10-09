@@ -105,6 +105,13 @@ impl Matcher {
         Ok(Matcher { re, regex_mode: q.regex, overlap })
     }
 
+    /// How long a text can be to search it on the UI thread: plain text is searched at several GB/s (32 MB in a few
+    /// ms), but some regexes go at a few dozen MB/s (`\b\w{30,}\b` over text that isn't all ASCII), which would
+    /// freeze the window for seconds.
+    pub fn sync_limit(&self) -> u64 {
+        if self.regex_mode { 256 << 10 } else { 32 << 20 }
+    }
+
     /// First match starting in `[from, to)`.
     pub fn find_fwd(&self, h: &dyn Haystack, from: u64, to: u64, ctx: Option<&Ctx>) -> Option<(u64, u64)> {
         let mut found = None;
