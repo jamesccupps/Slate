@@ -36,3 +36,14 @@ cmd:ToggleComment
 print:text
 shot:smoke-rust.png
 expect:tabs=3
+# What closing keeps comes back: the session, written into the data folder SLATE_DATA_DIR names
+persist
+session:save
+session:restore
+jobs
+expect:tabs=3
+expect:dirty=true
+expect:lang=Rust
+cmd:NextTab
+expect:title=smoke.json
+expect:dirty=false
