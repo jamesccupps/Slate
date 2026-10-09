@@ -1051,8 +1051,9 @@ impl App {
         self.start_save_lossy(i, path, encoding, close_after, false)
     }
 
-    /// `start_save`; `lossy_ok`: the user agreed that characters ANSI can't hold become "?" (otherwise such a save
-    /// stops before writing anything and asks, see `Deferred::AskLossy`).
+    /// `start_save`; `lossy_ok`: the user agreed that characters ANSI can't hold become "?", and that parts of a
+    /// damaged UTF-16 file stay U+FFFD (`Document::bad_units`); otherwise such a save stops before writing anything
+    /// and asks, see `Deferred::AskLossy`.
     pub fn start_save_lossy(
         &mut self,
         i: usize,
@@ -1083,7 +1084,13 @@ impl App {
         let p = path.clone();
         let bom = tab.doc.bom;
         let saving = snap.clone();
-        let job = Job::spawn(snap.len(), notify, move |ctx| fileio::save(&saving, &p, encoding, bom, lossy_ok, ctx));
+        let damaged = tab.doc.bad_units > 0 && !lossy_ok;
+        let job = Job::spawn(snap.len(), notify, move |ctx| {
+            if damaged {
+                return Err(SaveError::Lossy);
+            }
+            fileio::save(&saving, &p, encoding, bom, lossy_ok, ctx)
+        });
         let doc = tab.doc.id();
         tab.save = Some(SaveTask { job, state, version, snap, doc, path, encoding, close_after, again: false });
         tab.doc.seal();
@@ -1476,6 +1483,8 @@ impl App {
                 tab.doc.encoding = st.encoding;
                 tab.doc.disk = saved.disk;
                 tab.doc.mark_saved_at(st.state);
+                // (parts of a damaged file are saved as U+FFFD now, as the user agreed: the file has what the text has)
+                tab.doc.bad_units = 0;
                 tab.seen_disk = None;
                 // A big file: the text reads from the saved file from now on (what was typed meanwhile aside).
                 if let Some((src, start, nl)) = saved.rebase {
@@ -4552,13 +4561,30 @@ fn tab_index(cell: &Cell, id: u64) -> Option<usize> {
 /// save it as UTF-8 instead (carrying on with closing, if that's what it was for), save as ANSI anyway (the
 /// characters become "?"; the tab then stays open, with the text still in it), or don't save.
 fn ask_lossy(cell: &Cell, id: u64) {
-    let (hwnd, title, (path, close_after, closing)) = {
+    let (hwnd, title, (path, close_after, closing), damaged) = {
         let mut a = cell.borrow_mut();
         let hwnd = a.hwnd;
         let Some(t) = a.tabs.iter_mut().find(|t| t.id == id) else { return };
         let Some(ask) = t.ask_lossy.take() else { return };
-        (hwnd, t.title(), ask)
+        let damaged = (t.doc.bad_units > 0).then(|| (t.doc.bad_units, t.doc.encoding));
+        (hwnd, t.title(), ask, damaged)
     };
+    if let Some((n, enc)) = damaged {
+        // A file that wasn't all text in its encoding: what wasn't shows as U+FFFD, and can't be saved back.
+        let q = format!("Parts of {title} weren't {} text", enc.label());
+        let what = if n == 1 { "One place shows".to_string() } else { format!("{n} places show") };
+        let detail = format!("{what} \"\u{FFFD}\" where the file had something else, and would be saved that way.");
+        let choice = win::ask(hwnd, "Slate", &q, &detail, &["&Save anyway", "Cancel"]);
+        let Some(i) = tab_index(cell, id) else { return };
+        if choice == Some(0) {
+            let enc = cell.borrow().tabs[i].doc.encoding;
+            let started = cell.borrow_mut().start_save_lossy(i, path, enc, close_after, true);
+            if started && closing {
+                run_cmd(cell, Cmd::Exit);
+            }
+        }
+        return;
+    }
     let q = format!("Some characters in {title} can't be saved as ANSI");
     let detail = format!(
         "In {} they would become \"?\". UTF-8 keeps every character, and nearly every program reads it.",

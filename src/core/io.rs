@@ -55,15 +55,17 @@ pub enum Loading {
     Converting(Job<io::Result<Document>>),
 }
 
-/// Whether a file looks like a program, image or other binary rather than text: zero bytes near the start in
-/// something that isn't UTF-16.
+/// Whether a file looks like a program, image or other binary rather than text: zero bytes near the start, or in
+/// one opened as UTF-16 (which the same first 8 KiB decide), a character zero.
 pub fn looks_binary(path: &Path) -> bool {
     use std::io::Read;
     let mut head = vec![0u8; 8192];
     let n = File::open(path).and_then(|mut f| f.read(&mut head)).unwrap_or(0);
     let head = &head[..n];
-    let utf16 = matches!(detect_encoding(head, n == 8192).0, Encoding::Utf16Le | Encoding::Utf16Be);
-    !utf16 && memchr::memchr(0, head).is_some()
+    match detect_encoding(head, n == 8192) {
+        (Encoding::Utf16Le | Encoding::Utf16Be, bom) => head[bom..].chunks_exact(2).any(|u| u == [0, 0]),
+        _ => memchr::memchr(0, head).is_some(),
+    }
 }
 
 pub fn disk_info(path: &Path) -> Option<DiskInfo> {
@@ -219,8 +221,8 @@ pub fn open_with(
     let total = src.len();
     Ok(Loading::Converting(Job::spawn(total, notify, move |ctx| {
         let mut doc = match convert_to_temp(&src, encoding, bom as u64, force.is_none(), ctx) {
-            // Detected as ANSI (or UTF-16 without a BOM), but further on it doesn't convert to text and back
-            // exactly: keep its bytes as they are instead (UTF-8, read straight from the file like any big file).
+            // Detected as ANSI, but further on it doesn't convert to text and back exactly: keep its bytes as they
+            // are instead (UTF-8, read straight from the file like any big file).
             Err(e) if e.kind() == io::ErrorKind::InvalidData => {
                 if !src.build_index(&ctx.cancel, &ctx.progress) {
                     let why = src.index_error().unwrap_or_else(|| "cancelled".into());
@@ -276,6 +278,7 @@ pub fn document_from_bytes_as(mut data: Vec<u8>, force: Option<Encoding>) -> Doc
         Some(e) => (e, if data.starts_with(e.bom()) && !e.bom().is_empty() { e.bom().len() } else { 0 }),
         None => detect_encoding(&data, false),
     };
+    let mut bad = 0;
     let content = match encoding {
         Encoding::Utf8 | Encoding::Utf8Bom => {
             data.drain(..bom);
@@ -286,13 +289,8 @@ pub fn document_from_bytes_as(mut data: Vec<u8>, force: Option<Encoding>) -> Doc
             let mut d = Utf16Decoder::new(encoding == Encoding::Utf16Be);
             d.push(&data[bom..], &mut out);
             d.finish(&mut out);
-            if force.is_none() && bom == 0 && d.lossy {
-                // Taken for UTF-16 without a BOM, but not all of it is: keep its bytes as they are (like ANSI).
-                encoding = Encoding::Utf8;
-                data
-            } else {
-                out
-            }
+            bad = d.bad;
+            out
         }
         Encoding::Ansi => {
             let mut out = Vec::with_capacity(data.len() + data.len() / 8);
@@ -314,20 +312,20 @@ pub fn document_from_bytes_as(mut data: Vec<u8>, force: Option<Encoding>) -> Doc
     doc.encoding = encoding;
     doc.bom = bom > 0;
     doc.eol = eol;
+    doc.bad_units = bad;
     doc
 }
 
-/// Converts a big file to UTF-8 in a temp file. `verify` (an encoding that was detected, not chosen): stop with
-/// `InvalidData` as soon as the text doesn't convert back to exactly the file's bytes (ANSI, or UTF-16 without a
-/// BOM that isn't all UTF-16).
+/// Converts a big file to UTF-8 in a temp file. `verify` (ANSI that was detected, not chosen): stop with
+/// `InvalidData` as soon as the text doesn't convert back to exactly the file's bytes.
 fn convert_to_temp(src: &Source, encoding: Encoding, bom: u64, verify: bool, ctx: &Ctx) -> io::Result<Document> {
     let mut check = (verify && encoding == Encoding::Ansi).then(AnsiCheck::new);
-    let strict16 = verify && bom == 0 && encoding != Encoding::Ansi;
-    let not_ansi = || io::Error::new(io::ErrorKind::InvalidData, "not text in this encoding");
+    let not_ansi = || io::Error::new(io::ErrorKind::InvalidData, "not text in the ANSI code page");
     let (file, temp_path) = create_temp_file()?;
     let mut idx = IndexBuilder::new();
     let mut out_len = 0u64;
     let mut first: Vec<u8> = Vec::new();
+    let mut u16d = Utf16Decoder::new(encoding == Encoding::Utf16Be);
     {
         let mut w = BufWriter::with_capacity(1 << 20, &file);
         let mut emit = |out: &[u8]| -> io::Result<()> {
@@ -338,7 +336,6 @@ fn convert_to_temp(src: &Source, encoding: Encoding, bom: u64, verify: bool, ctx
             out_len += out.len() as u64;
             w.write_all(out)
         };
-        let mut u16d = Utf16Decoder::new(encoding == Encoding::Utf16Be);
         let mut ansi = AnsiDecoder::new();
         let mut out = Vec::with_capacity(CHUNK as usize * 2);
         let mut input = Vec::with_capacity(CHUNK as usize);
@@ -361,9 +358,6 @@ fn convert_to_temp(src: &Source, encoding: Encoding, bom: u64, verify: bool, ctx
                     return Err(not_ansi());
                 }
             }
-            if strict16 && u16d.lossy {
-                return Err(not_ansi());
-            }
             emit(&out)?;
             ctx.set(pos);
         }
@@ -372,7 +366,7 @@ fn convert_to_temp(src: &Source, encoding: Encoding, bom: u64, verify: bool, ctx
             Encoding::Ansi => ansi.finish(&mut out),
             _ => u16d.finish(&mut out),
         }
-        if check.take().is_some_and(|c| !c.finish(&out)) || (strict16 && u16d.lossy) {
+        if check.take().is_some_and(|c| !c.finish(&out)) {
             return Err(not_ansi());
         }
         emit(&out)?;
@@ -388,6 +382,7 @@ fn convert_to_temp(src: &Source, encoding: Encoding, bom: u64, verify: bool, ctx
     doc.encoding = encoding;
     doc.bom = bom > 0;
     doc.eol = detect_eol(&first);
+    doc.bad_units = u16d.bad;
     Ok(doc)
 }
 
@@ -1158,45 +1153,41 @@ mod tests {
     }
 
     #[test]
-    fn utf16_without_bom_is_only_taken_when_all_of_it_is() {
+    fn damaged_utf16_opens_as_utf16_and_counts_what_it_cant_keep() {
         let le = |s: &str| -> Vec<u8> { s.encode_utf16().flat_map(|u| u.to_le_bytes()).collect() };
-        // a lone surrogate (or an odd byte at the end) wouldn't come back when saved: the bytes stay as they are
-        let mut lone = le(&"plain text, no byte order mark\r\n".repeat(50));
+        let dir = test_dir("u16bad");
+        // a lone surrogate after the first 8 KiB, or an odd byte at the end: still UTF-16 text (saving asks first,
+        // see `Document::bad_units`), and not a binary file
+        let mut lone = le(&"plain text, no byte order mark\r\n".repeat(300));
         lone.extend_from_slice(&0xD800u16.to_le_bytes());
         lone.extend_from_slice(&le("more\r\n"));
-        let mut odd = le(&"text\r\n".repeat(50));
+        let mut odd = le(&"text\r\n".repeat(3000));
         odd.push(b'x');
-        for bytes in [&lone, &odd] {
-            let mut doc = document_from_bytes(bytes.clone());
-            assert!(!matches!(doc.encoding, Encoding::Utf16Le | Encoding::Utf16Be));
-            let dir = test_dir("u16strict");
-            let path = dir.join("t.txt");
-            save(&doc.snapshot(), &path, doc.encoding, doc.bom, false, &ctx()).unwrap();
-            assert_eq!(&fs::read(&path).unwrap(), bytes);
-            let _ = fs::remove_dir_all(&dir);
+        for (name, bytes) in [("lone.txt", &lone), ("odd.txt", &odd)] {
+            let doc = document_from_bytes(bytes.clone());
+            assert_eq!((doc.encoding, doc.bad_units), (Encoding::Utf16Le, 1), "{name}");
+            assert!(doc.read(0, 100).starts_with(b"plain text") || doc.read(0, 4) == b"text");
+            let path = dir.join(name);
+            fs::write(&path, bytes).unwrap();
+            assert!(!looks_binary(&path), "{name}");
         }
-        // the same in a big file, found while converting it (after the part that was looked at)
-        let dir = test_dir("u16strict-big");
+        // the same in a big file, found while converting it
         let path = dir.join("big.txt");
         let mut big = le(&"line of text\r\n".repeat(20_000));
         big.extend_from_slice(&0xDC00u16.to_le_bytes());
         fs::write(&path, &big).unwrap();
         let src = Source::open_file(&path).unwrap();
-        let r = convert_to_temp(&src, Encoding::Utf16Le, 0, true, &ctx());
-        assert!(matches!(r, Err(e) if e.kind() == io::ErrorKind::InvalidData));
-        // with a byte order mark (or chosen by the user) it's UTF-16, its stray halves shown as U+FFFD
-        let mut bom = vec![0xFF, 0xFE];
-        bom.extend_from_slice(&lone);
-        let doc = document_from_bytes(bom);
-        assert_eq!(doc.encoding, Encoding::Utf16Le);
-        assert!(convert_to_temp(&src, Encoding::Utf16Le, 0, false, &ctx()).is_ok());
-        // clean text without a BOM is still UTF-16, also with a pair cut off where a sample ends
-        let mut ok = le(&"text 😃\r\n".repeat(2000));
-        assert_eq!(document_from_bytes(ok.clone()).encoding, Encoding::Utf16Le);
-        ok.truncate(18 * 400 + 12);
-        assert_eq!(detect_encoding(&ok, true).0, Encoding::Utf16Le);
-        assert_ne!(detect_encoding(&ok, false).0, Encoding::Utf16Le);
-        drop(src);
+        let doc = convert_to_temp(&src, Encoding::Utf16Le, 0, true, &ctx()).unwrap();
+        assert_eq!((doc.encoding, doc.bad_units, doc.len()), (Encoding::Utf16Le, 1, 20_000 * 14 + 3));
+        drop((doc, src));
+        // clean text has none; mostly halves of characters isn't UTF-16
+        assert_eq!(document_from_bytes(le(&"text 😃\r\n".repeat(2000))).bad_units, 0);
+        let halves: Vec<u8> = (0..2000u16).flat_map(|i| if i % 8 == 0 { 0xD800u16 } else { 0x41 }.to_le_bytes()).collect();
+        assert_ne!(document_from_bytes(halves).encoding, Encoding::Utf16Le);
+        // numbers in 16 bits read like UTF-16, but have zeros in them: binary
+        let path = dir.join("numbers.bin");
+        fs::write(&path, (0..5000u16).flat_map(|i| (i % 200).to_le_bytes()).collect::<Vec<u8>>()).unwrap();
+        assert!(looks_binary(&path));
         let _ = fs::remove_dir_all(&dir);
     }
 

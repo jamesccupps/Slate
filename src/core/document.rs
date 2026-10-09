@@ -140,6 +140,9 @@ pub struct Document {
     pub bom: bool,
     pub eol: Eol,
     pub disk: Option<DiskInfo>,
+    /// Parts of the file that weren't text in its encoding (UTF-16 halves of characters without their other half,
+    /// an odd byte at the end): they read as U+FFFD and can't be saved back as they were, so saving asks first.
+    pub bad_units: u64,
 }
 
 impl Default for Document {
@@ -174,6 +177,7 @@ impl Document {
             bom: false,
             eol: Eol::Crlf,
             disk: None,
+            bad_units: 0,
         }
     }
 
