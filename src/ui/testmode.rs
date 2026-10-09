@@ -3,7 +3,9 @@
 //! Settings and the session are never written in this mode.
 //!
 //! With `SLATE_TEST_VISIBLE=1` the window is shown instead (on top, without taking the keyboard focus), it draws
-//! through the real swap chain, and `shot` captures what is actually on screen, native edit boxes included.
+//! through the real swap chain, and `shot` captures what is actually on screen, native edit boxes included. With
+//! `SLATE_TEST_GPU=1` the hidden window draws through its own swap chain on the GPU, as the real one does (for timings
+//! with `t:` marks; `shot` then goes offscreen for good).
 //!
 //! Commands: `size:1200x800`, `dpi:144` (as if the window moved to a monitor at that DPI: WM_DPICHANGED),
 //! `theme:dark|light`, `open:<path>`, `type:<text>` (`\n`, `\r` and `\t` allowed),
@@ -27,12 +29,13 @@
 //! (light, dark or high contrast), `syscaret` (whether the hidden system caret is where the caret is: `follows`),
 //! `statusbar` (all its texts), `closed` (tabs Reopen closed tab would bring back), `tablist` (the list of all
 //! tabs, or `hidden` while they all fit), `bracket` (the bracket pair at the caret), `overtype`, `tip` (the tooltip
-//! showing: `hover:` a part, then `timer:10`).
+//! showing: `hover:` a part, then `timer:10`), `caret` (blinked on or off; `timer:1` blinks it).
 //! `contrast:on|off|system` pretends Windows' high contrast is on or off (and tells the window it changed).
 //!
 //! Also: `args:<path>` (open it as if named on the command line: a missing file becomes a new one), `lang:<name>`
 //! (pick the language), `hit:<x>,<y>` / `hover:<x>,<y>` (what's at a point / move the mouse
-//! there), `scrollto:<0..1>`, `endsession` (what a Windows shutdown asks), `t:<label>` (a timing mark), `temp:<dir>`,
+//! there), `scrollto:<0..1>`, `dpi:<n>` (draw as on a screen at that DPI, 144 = 150%, in the same pixels),
+//! `endsession` (what a Windows shutdown asks), `t:<label>` (a timing mark), `temp:<dir>`,
 //! `persist` (write settings and the session; only with `SLATE_DATA_DIR` set, never into the real data folder),
 //! `session:save|soon|restore` (write the session now / on another thread as the timer does / restore it), `guest`
 //! (as if another Slate was running but didn't answer: nothing is kept for next time), `crash` (a native crash, to
@@ -504,6 +507,7 @@ fn describe(cell: &Cell, what: &str) -> String {
         }
         "overtype" => a.overtype.to_string(),
         "tip" => a.tip.text.clone().unwrap_or_default(),
+        "caret" => (if a.caret_on { "on" } else { "off" }).into(),
         k if k.starts_with("keys") => {
             // keys0 … keys4: each item's access key (the letter after '&'; '?' for none), submenus in brackets
             fn keys(items: &[super::commands::Item]) -> String {
@@ -651,6 +655,9 @@ pub fn run(args: &[String]) -> i32 {
         a.new_untitled();
     }
     let visible = std::env::var_os("SLATE_TEST_VISIBLE").is_some();
+    // (For timings: draw through the hidden window's own swap chain on the GPU, as the real window does; so does a
+    // script with `gfx:window`.)
+    let gpu = real || std::env::var_os("SLATE_TEST_GPU").is_some();
     let set_size = |hwnd: HWND, w: i32, h: i32| unsafe {
         use windows::Win32::UI::WindowsAndMessaging::{HWND_TOPMOST, SWP_NOACTIVATE, SWP_SHOWWINDOW};
         if visible {
@@ -660,7 +667,7 @@ pub fn run(args: &[String]) -> i32 {
         }
     };
     set_size(hwnd, 1200, 800);
-    if !visible && !real {
+    if !visible && !gpu {
         let _ = offscreen(&cell);
     }
     super::mark("ready");
@@ -675,7 +682,7 @@ pub fn run(args: &[String]) -> i32 {
             "size" => {
                 if let Some((w, h)) = arg.split_once('x') {
                     set_size(hwnd, w.parse().unwrap_or(1200), h.parse().unwrap_or(800));
-                    if !visible {
+                    if !visible && !gpu {
                         let _ = offscreen(&cell);
                     }
                 }
@@ -696,7 +703,7 @@ pub fn run(args: &[String]) -> i32 {
                 let r = RECT { right: r.left + scale(r.right - r.left), bottom: r.top + scale(r.bottom - r.top), ..r };
                 let (wp, lp) = (WPARAM((new | new << 16) as usize), LPARAM(&r as *const RECT as isize));
                 unsafe { SendMessageW(hwnd, WM_DPICHANGED, wp, lp) };
-                if !visible {
+                if !visible && !gpu {
                     let _ = offscreen(&cell);
                 }
             }
@@ -704,6 +711,14 @@ pub fn run(args: &[String]) -> i32 {
                 let mut a = cell.borrow_mut();
                 a.settings.theme = if arg == "dark" { ThemeMode::Dark } else { ThemeMode::Light };
                 a.apply_theme();
+            }
+            // as if the window were on a screen at that DPI (144: 150%), in the same number of pixels
+            "dpi" => {
+                cell.borrow_mut().dpi = arg.parse().unwrap_or(96);
+                if !visible && !gpu {
+                    let _ = offscreen(&cell);
+                }
+                cell.borrow_mut().layout();
             }
             "set" => {
                 let mut a = cell.borrow_mut();

@@ -544,6 +544,24 @@ impl Gfx {
         );
         unsafe { self.rt().DrawTextLayout(D2D_POINT_2F { x, y }, l, &self.brush(argb), opts) };
     }
+
+    /// `draw_layout`, but only the glyphs that reach into `view`: Direct2D draws every run of a layout, and a long row
+    /// of colored text has thousands, nearly all out of view (see `text_renderer`).
+    pub fn draw_layout_in(&self, l: &IDWriteTextLayout, x: f32, y: f32, argb: u32, view: Rect, glyphs: Ink) {
+        text_renderer::draw(self, l, x, y, argb, view, glyphs);
+    }
+}
+
+/// How `Gfx::draw_layout_in` colors a layout's text.
+#[derive(Clone, Copy, Default)]
+pub struct Ink<'a> {
+    /// The text may have color glyphs (emoji), which only Windows 11's Direct2D draws run by run (elsewhere the whole
+    /// layout is drawn).
+    pub color_glyphs: bool,
+    /// Where its colors start (UTF-16 positions, of a text `at` positions before the layout's), instead of colors set
+    /// on the layout (those cost a lot more when a segment is packed with them).
+    pub colors: &'a [(u32, u32)],
+    pub at: u32,
 }
 
 /// `v` (DIPs) moved to the nearest edge between device pixels at `dpi`.
@@ -632,4 +650,518 @@ pub fn offscreen_pixel_format() -> D2D1_PIXEL_FORMAT {
 
 pub fn pcwstr(v: &[u16]) -> PCWSTR {
     PCWSTR(v.as_ptr())
+}
+
+/// The text renderer behind `Gfx::draw_layout_in`, a COM object made by hand (a vtable and the data after it): only
+/// the glyphs in view, a row's runs in one font as one run per color (Direct2D's cost is per run), and colors given as
+/// a list rather than set on the layout (where each costs a lot when a segment is packed with them).
+mod text_renderer {
+    use std::cell::RefCell;
+    use std::ffi::c_void;
+
+    use windows::Win32::Foundation::{BOOL, E_NOINTERFACE, S_OK};
+    use windows::Win32::Graphics::Direct2D::Common::{D2D_POINT_2F, D2D_RECT_F};
+    use windows::Win32::Graphics::Direct2D::{
+        D2D1_COLOR_BITMAP_GLYPH_SNAP_OPTION_DEFAULT, ID2D1DeviceContext7, ID2D1RenderTarget, ID2D1SolidColorBrush,
+        ID2D1SvgGlyphStyle,
+    };
+    use windows::Win32::Graphics::DirectWrite::{
+        DWRITE_GLYPH_OFFSET, DWRITE_GLYPH_RUN, DWRITE_GLYPH_RUN_DESCRIPTION, DWRITE_MATRIX, DWRITE_MEASURING_MODE,
+        DWRITE_STRIKETHROUGH, DWRITE_UNDERLINE, IDWriteFontFace, IDWriteFontFace2, IDWritePixelSnapping,
+        IDWritePixelSnapping_Vtbl, IDWriteTextLayout, IDWriteTextRenderer, IDWriteTextRenderer_Vtbl,
+    };
+    use windows::core::{GUID, HRESULT, IUnknown, IUnknown_Vtbl, Interface};
+
+    use super::{Gfx, Ink, Rect};
+
+    type GlyphOffset = DWRITE_GLYPH_OFFSET;
+
+    /// See `Gfx::draw_layout_in`.
+    pub fn draw(g: &Gfx, l: &IDWriteTextLayout, x: f32, y: f32, argb: u32, view: Rect, glyphs: Ink) {
+        let Ink { color_glyphs, colors, at } = glyphs;
+        let rt = g.rt().clone();
+        let color = if color_glyphs {
+            match rt.cast::<ID2D1DeviceContext7>() {
+                Ok(dc) => Some(dc),
+                Err(_) => return g.draw_layout(l, x, y, argb),
+            }
+        } else {
+            None
+        };
+        let (mut dx, mut dy) = (96.0f32, 96.0f32);
+        unsafe { rt.GetDpi(&mut dx, &mut dy) };
+        let mut c = Culler {
+            vtbl: &CULLER_VTBL,
+            g,
+            rt,
+            argb,
+            view: view.d2d(),
+            ppd: dx / 96.0,
+            color,
+            colors,
+            at,
+            held: RefCell::new(Vec::new()),
+        };
+        unsafe {
+            // (The renderer lives on the stack for this call only: it counts no references.)
+            let r = std::mem::ManuallyDrop::new(IDWriteTextRenderer::from_raw(&mut c as *mut Culler as *mut c_void));
+            let _ = l.Draw(None, &*r, x, y);
+            c.flush();
+        }
+    }
+
+    #[repr(C)]
+    struct Culler<'a> {
+        vtbl: *const IDWriteTextRenderer_Vtbl,
+        g: &'a Gfx,
+        rt: ID2D1RenderTarget,
+        /// The color of text the layout gives none.
+        argb: u32,
+        view: D2D_RECT_F,
+        ppd: f32,
+        /// Draws color glyphs in color.
+        color: Option<ID2D1DeviceContext7>,
+        /// Where the text's colors start (UTF-16, of a text `at` positions before the layout's), if not on the layout.
+        colors: &'a [(u32, u32)],
+        at: u32,
+        /// Runs kept back to be drawn together (`flush`).
+        held: RefCell<Vec<Held>>,
+    }
+
+    /// The part in view of a glyph run, copied out of the layout until its row is done.
+    struct Held {
+        x: f32,
+        y: f32,
+        face: IDWriteFontFace,
+        em: f32,
+        mode: DWRITE_MEASURING_MODE,
+        bidi: u32,
+        glyphs: Vec<u16>,
+        advances: Vec<f32>,
+        offsets: Vec<DWRITE_GLYPH_OFFSET>,
+        /// Each glyph's color.
+        colors: Vec<u32>,
+    }
+
+    impl Culler<'_> {
+        /// Draws the runs held back: those next to each other on a row in one font (left to right) go as one run per
+        /// color, in which the other colors' glyphs are blanks. Direct2D's cost is mostly per run, and a row of code
+        /// has dozens of colors; this way it has as many runs as it has colors.
+        fn flush(&self) {
+            let held = self.held.take();
+            let width = |h: &Held| h.advances.iter().sum::<f32>();
+            let mut i = 0;
+            while i < held.len() {
+                let a = &held[i];
+                let mut end = a.x + width(a);
+                let mut j = i + 1;
+                while j < held.len() && a.bidi & 1 == 0 {
+                    let b = &held[j];
+                    let same = b.y == a.y && b.face.as_raw() == a.face.as_raw() && b.em == a.em && b.mode == a.mode;
+                    if !same || b.bidi != a.bidi || b.x < end - 0.01 {
+                        break;
+                    }
+                    end = b.x + width(b);
+                    j += 1;
+                }
+                let group = &held[i..j];
+                i = j;
+                // The group's glyphs, with a blank over any gap between runs (no color).
+                let (mut glyphs, mut advances, mut offsets, mut colors) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+                let mut x = a.x;
+                for h in group {
+                    if h.x > x + 0.01 {
+                        glyphs.push(0);
+                        advances.push(h.x - x);
+                        offsets.push(DWRITE_GLYPH_OFFSET::default());
+                        colors.push(None);
+                    }
+                    glyphs.extend_from_slice(&h.glyphs);
+                    advances.extend_from_slice(&h.advances);
+                    if h.offsets.is_empty() {
+                        offsets.extend(std::iter::repeat_n(DWRITE_GLYPH_OFFSET::default(), h.glyphs.len()));
+                    } else {
+                        offsets.extend_from_slice(&h.offsets);
+                    }
+                    colors.extend(h.colors.iter().map(|&c| Some(c)));
+                    x = h.x + width(h);
+                }
+                // (the font's space: a glyph with nothing to draw, in place of the other colors' glyphs)
+                let mut blank = 0u16;
+                let space = b' ' as u32;
+                if unsafe { a.face.GetGlyphIndices(&space, 1, &mut blank) }.is_err() || blank == 0 {
+                    // without one: each stretch of one color on its own
+                    let mut s = 0;
+                    while s < glyphs.len() {
+                        let mut e = s + 1;
+                        while e < glyphs.len() && colors[e] == colors[s] {
+                            e += 1;
+                        }
+                        if let Some(c) = colors[s] {
+                            self.draw_run(a, s, c, &glyphs[s..e], &advances, &offsets[s..e]);
+                        }
+                        s = e;
+                    }
+                    continue;
+                }
+                let mut done: Vec<u32> = Vec::new();
+                for &c in colors.iter().flatten() {
+                    if done.contains(&c) {
+                        continue;
+                    }
+                    done.push(c);
+                    let mine = |k: &Option<u32>| *k == Some(c);
+                    let (Some(first), Some(last)) = (colors.iter().position(mine), colors.iter().rposition(mine)) else {
+                        continue;
+                    };
+                    let ids: Vec<u16> =
+                        (first..=last).map(|g| if mine(&colors[g]) { glyphs[g] } else { blank }).collect();
+                    self.draw_run(a, first, c, &ids, &advances, &offsets[first..=last]);
+                }
+            }
+        }
+
+        /// Draws `glyphs` in the font and size of `h`, from the glyph `from` of the row's advances on, in `argb`.
+        fn draw_run(&self, h: &Held, from: usize, argb: u32, glyphs: &[u16], advances: &[f32], offsets: &[GlyphOffset]) {
+            let before: f32 = advances[..from].iter().sum();
+            let x = if h.bidi & 1 == 1 { h.x - before } else { h.x + before };
+            let run = DWRITE_GLYPH_RUN {
+                // (borrowed: no reference of its own)
+                fontFace: std::mem::ManuallyDrop::new(Some(unsafe { std::mem::transmute_copy(&h.face) })),
+                fontEmSize: h.em,
+                glyphCount: glyphs.len() as u32,
+                glyphIndices: glyphs.as_ptr(),
+                glyphAdvances: advances[from..from + glyphs.len()].as_ptr(),
+                glyphOffsets: if offsets.is_empty() { std::ptr::null() } else { offsets.as_ptr() },
+                isSideways: BOOL(0),
+                bidiLevel: h.bidi,
+            };
+            unsafe { self.rt.DrawGlyphRun(D2D_POINT_2F { x, y: h.y }, &run, &self.g.brush(argb), h.mode) };
+        }
+
+        /// Each glyph's color in glyphs `[a, b)` of a run: from the colors given (through the characters of each
+        /// glyph's cluster), else `default` (the run's own, or the text's).
+        unsafe fn glyph_colors(&self, desc: *const DWRITE_GLYPH_RUN_DESCRIPTION, n: usize, a: usize, b: usize, default: u32)
+        -> Vec<u32> {
+            let mut out = vec![default; b - a];
+            let colors = self.colors;
+            if colors.is_empty() || desc.is_null() {
+                return out;
+            }
+            let d = unsafe { &*desc };
+            if d.clusterMap.is_null() || d.stringLength == 0 {
+                return out;
+            }
+            let map = unsafe { std::slice::from_raw_parts(d.clusterMap, d.stringLength as usize) };
+            // the characters whose clusters reach into [a, b): from the one holding glyph `a` (its first character)
+            let mut i = map.partition_point(|&g| g as usize <= a).saturating_sub(1);
+            while i > 0 && map[i - 1] == map[i] {
+                i -= 1;
+            }
+            let base = self.at + d.textPosition;
+            let mut k = colors.partition_point(|e| e.0 <= base + i as u32).saturating_sub(1);
+            while i < map.len() && (map[i] as usize) < b {
+                let mut next = i + 1;
+                while next < map.len() && map[next] == map[i] {
+                    next += 1;
+                }
+                let g1 = if next < map.len() { map[next] as usize } else { n };
+                let pos = base + i as u32;
+                while k + 1 < colors.len() && colors[k + 1].0 <= pos {
+                    k += 1;
+                }
+                if colors[k].0 <= pos {
+                    for g in (map[i] as usize).max(a)..g1.min(b) {
+                        out[g - a] = colors[k].1;
+                    }
+                }
+                i = next;
+            }
+            out
+        }
+    }
+
+    static CULLER_VTBL: IDWriteTextRenderer_Vtbl = IDWriteTextRenderer_Vtbl {
+        base__: IDWritePixelSnapping_Vtbl {
+            base__: IUnknown_Vtbl { QueryInterface: query_interface, AddRef: no_count, Release: no_count },
+            IsPixelSnappingDisabled: no_snap,
+            GetCurrentTransform: transform,
+            GetPixelsPerDip: pixels_per_dip,
+        },
+        DrawGlyphRun: glyph_run,
+        DrawUnderline: underline,
+        DrawStrikethrough: strikethrough,
+        DrawInlineObject: inline_object,
+    };
+
+    unsafe extern "system" fn query_interface(this: *mut c_void, iid: *const GUID, out: *mut *mut c_void) -> HRESULT {
+        let iid = unsafe { *iid };
+        let ok = iid == IUnknown::IID || iid == IDWritePixelSnapping::IID || iid == IDWriteTextRenderer::IID;
+        unsafe { *out = if ok { this } else { std::ptr::null_mut() } };
+        if ok { S_OK } else { E_NOINTERFACE }
+    }
+
+    unsafe extern "system" fn no_count(_: *mut c_void) -> u32 {
+        1
+    }
+
+    unsafe extern "system" fn no_snap(_: *mut c_void, _: *const c_void, out: *mut BOOL) -> HRESULT {
+        unsafe { *out = BOOL(0) };
+        S_OK
+    }
+
+    unsafe extern "system" fn transform(this: *mut c_void, _: *const c_void, out: *mut DWRITE_MATRIX) -> HRESULT {
+        let c = unsafe { &*(this as *const Culler) };
+        let mut m = windows::Foundation::Numerics::Matrix3x2::default();
+        unsafe {
+            c.rt.GetTransform(&mut m);
+            *out = DWRITE_MATRIX { m11: m.M11, m12: m.M12, m21: m.M21, m22: m.M22, dx: m.M31, dy: m.M32 };
+        }
+        S_OK
+    }
+
+    unsafe extern "system" fn pixels_per_dip(this: *mut c_void, _: *const c_void, out: *mut f32) -> HRESULT {
+        unsafe { *out = (*(this as *const Culler)).ppd };
+        S_OK
+    }
+
+    /// The color a run was given on the layout (`SetDrawingEffect`), else the default one.
+    unsafe fn color_of(c: &Culler, effect: *mut c_void) -> u32 {
+        let brush = unsafe { IUnknown::from_raw_borrowed(&effect) }.and_then(|e| e.cast::<ID2D1SolidColorBrush>().ok());
+        let Some(brush) = brush else { return c.argb };
+        let k = unsafe { brush.GetColor() };
+        let to = |v: f32| (v * 255.0).round().clamp(0.0, 255.0) as u32;
+        to(k.a) << 24 | to(k.r) << 16 | to(k.g) << 8 | to(k.b)
+    }
+
+    unsafe extern "system" fn glyph_run(
+        this: *mut c_void,
+        _: *const c_void,
+        x: f32,
+        y: f32,
+        mode: DWRITE_MEASURING_MODE,
+        run: *const DWRITE_GLYPH_RUN,
+        desc: *const DWRITE_GLYPH_RUN_DESCRIPTION,
+        effect: *mut c_void,
+    ) -> HRESULT {
+        let c = unsafe { &*(this as *const Culler) };
+        let r = unsafe { &*run };
+        let em = r.fontEmSize;
+        let v = c.view;
+        // (with an em to spare for what glyphs reach beyond their advance: accents, italics, tall fallback fonts)
+        if y + em < v.top || y - 2.0 * em > v.bottom {
+            return S_OK;
+        }
+        let n = r.glyphCount as usize;
+        let advances = match r.glyphAdvances.is_null() || n == 0 {
+            true => &[],
+            false => unsafe { std::slice::from_raw_parts(r.glyphAdvances, n) },
+        };
+        let w: f32 = advances.iter().sum();
+        let rtl = r.bidiLevel & 1 == 1;
+        let (x0, x1) = if rtl { (x - w, x) } else { (x, x + w) };
+        if x1 + em < v.left || x0 - em > v.right {
+            return S_OK;
+        }
+        unsafe {
+            let color = color_of(c, effect);
+            // (only a color font's runs: drawn so, any run costs ten times as much)
+            let colored = |f: &IDWriteFontFace| f.cast::<IDWriteFontFace2>().is_ok_and(|f| f.IsColorFont().as_bool());
+            match (&c.color, r.fontFace.as_ref()) {
+                (Some(dc), Some(f)) if colored(f) => {
+                    let snap = D2D1_COLOR_BITMAP_GLYPH_SNAP_OPTION_DEFAULT;
+                    let brush = c.g.brush(color);
+                    let at = D2D_POINT_2F { x, y };
+                    let svg = None::<&ID2D1SvgGlyphStyle>;
+                    dc.DrawGlyphRunWithColorSupport(at, run, Some(desc), &brush, svg, 0, mode, snap);
+                }
+                // kept to be drawn with the rest of its row; left to right, only what's in view of it (a row of plain
+                // text without word wrap is one run of up to 8 KiB)
+                (_, Some(f)) if !r.isSideways.as_bool() && w > 0.0 => {
+                    let (mut a, mut ax, mut b) = (0, x, n);
+                    if !rtl {
+                        while a < n && ax + advances[a] + em < v.left {
+                            ax += advances[a];
+                            a += 1;
+                        }
+                        let mut bx = ax;
+                        b = a;
+                        while b < n && bx - em <= v.right {
+                            bx += advances[b];
+                            b += 1;
+                        }
+                    }
+                    if a == b {
+                        return S_OK;
+                    }
+                    let offsets = if r.glyphOffsets.is_null() { &[] } else { std::slice::from_raw_parts(r.glyphOffsets, n) };
+                    let colors = c.glyph_colors(desc, n, a, b, color);
+                    c.held.borrow_mut().push(Held {
+                        x: ax,
+                        y,
+                        face: f.clone(),
+                        em,
+                        mode,
+                        bidi: r.bidiLevel,
+                        glyphs: std::slice::from_raw_parts(r.glyphIndices, n)[a..b].to_vec(),
+                        advances: advances[a..b].to_vec(),
+                        offsets: offsets.get(a..b).unwrap_or_default().to_vec(),
+                        colors,
+                    });
+                }
+                _ => c.rt.DrawGlyphRun(D2D_POINT_2F { x, y }, run, &c.g.brush(color), mode),
+            }
+        }
+        S_OK
+    }
+
+    unsafe fn line(c: &Culler, x: f32, y: f32, width: f32, thickness: f32, offset: f32, effect: *mut c_void) {
+        let r = D2D_RECT_F { left: x, top: y + offset, right: x + width, bottom: y + offset + thickness };
+        unsafe { c.rt.FillRectangle(&r, &c.g.brush(color_of(c, effect))) };
+    }
+
+    unsafe extern "system" fn underline(
+        this: *mut c_void,
+        _: *const c_void,
+        x: f32,
+        y: f32,
+        u: *const DWRITE_UNDERLINE,
+        effect: *mut c_void,
+    ) -> HRESULT {
+        unsafe {
+            let u = &*u;
+            line(&*(this as *const Culler), x, y, u.width, u.thickness, u.offset, effect);
+        }
+        S_OK
+    }
+
+    unsafe extern "system" fn strikethrough(
+        this: *mut c_void,
+        _: *const c_void,
+        x: f32,
+        y: f32,
+        s: *const DWRITE_STRIKETHROUGH,
+        effect: *mut c_void,
+    ) -> HRESULT {
+        unsafe {
+            let s = &*s;
+            line(&*(this as *const Culler), x, y, s.width, s.thickness, s.offset, effect);
+        }
+        S_OK
+    }
+
+    unsafe extern "system" fn inline_object(
+        _: *mut c_void,
+        _: *const c_void,
+        _: f32,
+        _: f32,
+        _: *mut c_void,
+        _: BOOL,
+        _: BOOL,
+        _: *mut c_void,
+    ) -> HRESULT {
+        // (The text has no inline objects.)
+        S_OK
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use windows::Win32::Graphics::DirectWrite::DWRITE_TEXT_RANGE;
+    use windows::Win32::Graphics::Imaging::{
+        CLSID_WICImagingFactory, GUID_WICPixelFormat32bppPBGRA, IWICBitmap, IWICImagingFactory, WICBitmapCacheOnLoad,
+    };
+    use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx};
+
+    /// Gives `g` a render target: a bitmap of `w`×`h` pixels.
+    pub(crate) fn bitmap_target(g: &mut Gfx, w: u32, h: u32) -> IWICBitmap {
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+            let wic: IWICImagingFactory = CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER).unwrap();
+            let bmp = wic.CreateBitmap(w, h, &GUID_WICPixelFormat32bppPBGRA, WICBitmapCacheOnLoad).unwrap();
+            let props = D2D1_RENDER_TARGET_PROPERTIES {
+                r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
+                pixelFormat: offscreen_pixel_format(),
+                dpiX: 96.0,
+                dpiY: 96.0,
+                usage: D2D1_RENDER_TARGET_USAGE_NONE,
+                minLevel: D2D1_FEATURE_LEVEL_DEFAULT,
+            };
+            g.use_target(g.d2d.CreateWicBitmapRenderTarget(&bmp, &props).unwrap(), 96.0);
+            bmp
+        }
+    }
+
+    /// The pixels of what `f` draws into a fresh 300×120 bitmap (white).
+    fn render(g: &mut Gfx, f: impl Fn(&Gfx)) -> Vec<u8> {
+        let bmp = bitmap_target(g, 300, 120);
+        unsafe {
+            g.rt().BeginDraw();
+            g.rt().Clear(Some(&color(rgb(0xFFFFFF))));
+            f(g);
+            g.rt().EndDraw(None, None).unwrap();
+            let mut px = vec![0u8; 300 * 120 * 4];
+            bmp.CopyPixels(std::ptr::null(), 300 * 4, &mut px).unwrap();
+            px
+        }
+    }
+
+    #[test]
+    fn drawing_only_what_is_in_view_looks_the_same() {
+        // colored runs next to each other (drawn as one run per color), wrapped into rows; tabs, a fallback font for
+        // the kanji between runs in the main one, combining accents; emoji
+        let code = "let x = \"two\" + 3; // in colors\tand a tab, then \u{65E5}\u{672C} in between, e\u{301}, more words";
+        in_view_looks_the_same(code, false);
+        in_view_looks_the_same(&"a long run of plain text in one color, ".repeat(8), false);
+        in_view_looks_the_same("emoji \u{1F600}\u{2764}\u{FE0F} \u{65E5}\u{672C} x", true);
+    }
+
+    fn in_view_looks_the_same(s: &str, color_glyphs: bool) {
+        let mut g = Gfx::new().unwrap();
+        let fmt = g.format("Consolas", 14.0, DWRITE_FONT_WEIGHT_NORMAL);
+        let text = wide(s);
+        let draw = |view: Option<Rect>| {
+            let (text, fmt) = (&text, &fmt);
+            move |g: &Gfx| {
+                let l = g.layout(text, fmt, 260.0, 100.0);
+                let colors = [(0, 3, 0x0000FF), (8, 5, 0xA31515), (14, 1, 0x555555), (16, 1, 0x098658), (19, 12, 0x008000)];
+                // the colors on the layout, or (drawn in view) as a list of where each starts
+                let mut each = vec![rgb(0x1B1B1B); text.len()];
+                for (at, n, c) in colors {
+                    let len = each.len();
+                    each[(at as usize).min(len)..((at + n) as usize).min(len)].fill(rgb(c));
+                    if view.is_none() || color_glyphs {
+                        let range = DWRITE_TEXT_RANGE { startPosition: at, length: n };
+                        unsafe {
+                            let _ = l.SetDrawingEffect(&g.brush(rgb(c)), range);
+                        }
+                    }
+                }
+                let mut list: Vec<(u32, u32)> = Vec::new();
+                for (i, &c) in each.iter().enumerate() {
+                    if list.last().is_none_or(|&(_, k)| k != c) {
+                        list.push((i as u32, c));
+                    }
+                }
+                let ink = Ink { color_glyphs, colors: if color_glyphs { &[] } else { &list }, at: 0 };
+                match view {
+                    Some(v) => g.draw_layout_in(&l, 10.5, 10.25, rgb(0x1B1B1B), v, ink),
+                    None => g.draw_layout(&l, 10.5, 10.25, rgb(0x1B1B1B)),
+                }
+            }
+        };
+        let whole = render(&mut g, draw(None));
+        assert!(whole.iter().any(|&b| b < 0x80), "something is drawn");
+        assert!(render(&mut g, draw(Some(Rect::new(0.0, 0.0, 300.0, 120.0)))) == whole, "the same pixels: {s}");
+        // runs out of view aren't drawn
+        let below = render(&mut g, draw(Some(Rect::new(0.0, 200.0, 300.0, 20.0))));
+        assert!(below.iter().all(|&b| b == 0xFF));
+        let right = render(&mut g, draw(Some(Rect::new(400.0, 0.0, 100.0, 120.0))));
+        assert!(right.iter().all(|&b| b == 0xFF));
+        // in view, runs cut down to what's in view look the same
+        let part = render(&mut g, draw(Some(Rect::new(100.0, 0.0, 80.0, 120.0))));
+        let cols = |px: &[u8]| -> Vec<u8> { px.chunks(300 * 4).flat_map(|row| row[100 * 4..180 * 4].to_vec()).collect() };
+        assert!(cols(&part) == cols(&whole), "the same pixels in view: {s}");
+    }
 }

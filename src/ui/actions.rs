@@ -15,7 +15,7 @@ use windows::Win32::System::SystemInformation::GetLocalTime;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    DestroyMenu, DestroyWindow, GetCaretBlinkTime, GetSystemMetrics, KillTimer, SM_CXDOUBLECLK,
+    DestroyMenu, DestroyWindow, GetCaretBlinkTime, GetSystemMetrics, KillTimer, SM_CXDOUBLECLK, SPI_GETCARETTIMEOUT,
     SPI_GETWHEELSCROLLLINES, SW_SHOWNORMAL, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SetTimer, SystemParametersInfoW,
     TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_TOPALIGN, TrackPopupMenuEx,
 };
@@ -261,6 +261,7 @@ impl App {
 
     pub fn restart_caret(&mut self) {
         self.caret_on = true;
+        self.caret_since = Instant::now();
         unsafe {
             let blink = GetCaretBlinkTime();
             // Blinking turned off in Windows' settings (INFINITE), or the keyboard is elsewhere: a steady caret and no
@@ -3042,6 +3043,16 @@ impl App {
     pub fn on_timer(&mut self, id: usize) {
         match id {
             TIMER_CARET => {
+                // Like Windows' own caret, it stops blinking (shown) a while after the last key or click, so a window
+                // left alone doesn't keep repainting for it.
+                if self.caret_since.elapsed() >= caret_timeout() {
+                    self.kill_timer(TIMER_CARET);
+                    if !self.caret_on {
+                        self.caret_on = true;
+                        self.invalidate();
+                    }
+                    return;
+                }
                 self.caret_on = !self.caret_on;
                 self.invalidate();
             }
@@ -3227,6 +3238,10 @@ impl App {
                 let r = if cmd == Cmd::Undo { tab.doc.undo() } else { tab.doc.redo() };
                 if let Some(sel) = r {
                     tab.view.sel = sel;
+                    tab.view.upstream = false;
+                    // (An edit out of view comes back into the middle of it, not at its edge.)
+                    tab.view.sync(&mut tab.doc);
+                    self.reveal_caret(true);
                     self.after_edit();
                 }
             }
@@ -3960,6 +3975,20 @@ impl App {
 const LINES_MAX: u64 = 512 << 20;
 /// Selections up to this size can have their lines or letter case changed right away.
 const SELECTION_MAX: u64 = 16 << 20;
+
+/// How long the caret blinks after it last moved: Windows' setting (SPI_GETCARETTIMEOUT), 5 s unless changed.
+fn caret_timeout() -> Duration {
+    let mut ms = 0u32;
+    let got = unsafe {
+        SystemParametersInfoW(
+            SPI_GETCARETTIMEOUT,
+            0,
+            Some(&mut ms as *mut u32 as *mut _),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+    };
+    Duration::from_millis(if got.is_ok() && ms > 0 { ms as u64 } else { 5000 })
+}
 
 fn lines_done(op: LineOp, n: u64) -> String {
     match op {

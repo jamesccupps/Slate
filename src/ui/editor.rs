@@ -20,8 +20,8 @@ use windows::Win32::Graphics::DirectWrite::{
 use crate::core::document::{Document, EditKind, Sel};
 use crate::core::text::{self, is_continuation, utf8_len};
 
-use super::gfx::{Gfx, Rect};
-use super::highlight::{self, CommentStyle, Lang, State as HlState, Tok};
+use super::gfx::{Gfx, Ink, Rect};
+use super::highlight::{self, CommentStyle, Lang, Span, State as HlState, Tok};
 use super::theme::{Theme, metrics};
 
 pub const SEG: u64 = 8192;
@@ -30,7 +30,11 @@ const WINDOW_EXTRA: u64 = 64 * 1024;
 const PREFIX_MAX: u64 = 4096;
 /// How far before a grid point a long line may be cut at a space or comma instead.
 const CUT_BACK: u64 = 256;
+/// Layouts kept of segments shown recently: at most this many...
 const CACHE_MAX: usize = 4000;
+/// ...and this much of their text: a colored 8 KiB segment's layout takes half a MB, so the count alone let a long line
+/// scrolled through without word wrap fill gigabytes.
+const CACHE_BYTES: usize = 1 << 20;
 /// Documents up to this size get exact coloring of what spans lines (block comments, multi-line strings, tags...).
 const HL_EXACT_MAX: u64 = 32 << 20;
 /// How often lexer states are kept along the document.
@@ -125,13 +129,156 @@ impl Seg {
     }
 }
 
-pub struct SegLayout {
+/// A DirectWrite layout of a segment's text from UTF-16 position `at` on, whose first row is the segment's row
+/// `row0`, drawn `x` to the right of the text's left edge.
+pub struct Part {
     pub layout: IDWriteTextLayout,
+    pub at: u32,
+    pub x: f32,
+    pub row0: usize,
+}
+
+pub struct SegLayout {
+    /// The text in one layout; or, wrapped with the line indented, its first row and then the rows after it, laid out
+    /// narrower to hang under the line's indentation (as VS Code does).
+    pub parts: Vec<Part>,
     /// Byte offset (from the segment start) of each UTF-16 unit, plus one for the end.
     pub map: Vec<u32>,
     /// Rows as UTF-16 ranges `[start, end)`; a row's end is the next row's start.
     pub rows: Vec<(u32, u32)>,
     pub width: f32,
+    /// No character that may show as a color glyph (emoji), which only Windows 11 draws a run at a time
+    /// (`Gfx::draw_layout_in`).
+    pub plain: bool,
+    /// Where the colors start (UTF-16 position, color), when they're given at drawing time rather than set on the
+    /// layout (which costs a lot more when the text is packed with them; but a layout drawn whole needs them on it).
+    pub colors: Vec<(u32, u32)>,
+}
+
+/// A UTF-16 unit of a character that may show as a color glyph: emoji (all outside the BMP, the symbols and dingbats
+/// of U+2190…U+2BFF, the emoji variation selector) and the few others with an emoji form. (Not the stand-ins for
+/// control characters, U+2400…U+243F.)
+fn maybe_color(u: u16) -> bool {
+    matches!(u, 0xD800..=0xDFFF | 0x2190..=0x23FF | 0x2460..=0x2BFF | 0xFE0F | 0x00A9 | 0x00AE | 0x203C | 0x2049)
+        || matches!(u, 0x2122 | 0x2139 | 0x3030 | 0x303D | 0x3297 | 0x3299)
+}
+
+impl Part {
+    /// x of the start of the character at `u` (counted from the part's start), from the part's left edge.
+    fn layout_x(&self, u: u32) -> f32 {
+        let (mut x, mut y) = (0f32, 0f32);
+        let mut m = DWRITE_HIT_TEST_METRICS::default();
+        unsafe {
+            let _ = self.layout.HitTestTextPosition(u, BOOL(0), &mut x, &mut y, &mut m);
+        }
+        x
+    }
+}
+
+/// The rows of a layout of the segment's text from `at` to `end`, as UTF-16 ranges of the segment.
+fn layout_rows_of(layout: &IDWriteTextLayout, at: u32, end: u32) -> Vec<(u32, u32)> {
+    let mut count = 0u32;
+    unsafe {
+        let _ = layout.GetLineMetrics(None, &mut count);
+    }
+    let mut lm = vec![DWRITE_LINE_METRICS::default(); count.max(1) as usize];
+    unsafe {
+        let _ = layout.GetLineMetrics(Some(&mut lm), &mut count);
+    }
+    lm.truncate(count.max(1) as usize);
+    let mut rows = Vec::with_capacity(lm.len());
+    let mut pos = at;
+    for m in &lm {
+        let e = (pos + m.length).min(end);
+        rows.push((pos, e));
+        pos = e;
+    }
+    if let Some(last) = rows.last_mut() {
+        last.1 = end;
+    }
+    rows
+}
+
+fn tok_color(t: &Theme, tok: Tok) -> u32 {
+    match tok {
+        Tok::Key => t.syn_key,
+        Tok::Str => t.syn_string,
+        Tok::Num => t.syn_number,
+        Tok::Lit => t.syn_literal,
+        Tok::Punct => t.syn_punct,
+        Tok::Comment => t.syn_comment,
+        Tok::Section => t.syn_section,
+        Tok::Error => t.syn_error,
+        Tok::Warn => t.syn_warn,
+        Tok::Info => t.syn_info,
+        Tok::Dim => t.syn_dim,
+        Tok::Keyword => t.syn_keyword,
+        Tok::Control => t.syn_control,
+        Tok::Type => t.syn_type,
+        Tok::Func => t.syn_func,
+        Tok::Tag => t.syn_tag,
+        Tok::Attr => t.syn_attr,
+        Tok::Var => t.syn_var,
+        Tok::Heading => t.syn_heading,
+        Tok::Link => t.syn_link,
+        Tok::Added => t.syn_added,
+        Tok::Removed => t.syn_removed,
+        Tok::Col(k) => t.syn_cols[k as usize % 8],
+        Tok::Bold | Tok::Italic => t.text,
+    }
+}
+
+/// Colors a layout of the segment's text from UTF-16 position `at` to `end` with the spans (byte ranges of the
+/// segment) that fall in it: bold and italic, and (`colors`) the colors.
+fn color_layout(cx: &Ctx, layout: &IDWriteTextLayout, spans: &[Span], map: &[u32], at: u32, end: u32, colors: bool) {
+    let t = cx.theme;
+    for &(s, e, tok) in spans {
+        // (an error bold too: it mustn't pass for a string, PPCL's values, in any theme)
+        let bold = matches!(tok, Tok::Bold | Tok::Heading | Tok::Error);
+        let italic = matches!(tok, Tok::Italic);
+        if !colors && !bold && !italic {
+            continue;
+        }
+        let us = (map.partition_point(|&m| m < s) as u32).max(at);
+        let ue = (map.partition_point(|&m| m < e) as u32).min(end);
+        if ue <= us {
+            continue;
+        }
+        let range = DWRITE_TEXT_RANGE { startPosition: us - at, length: ue - us };
+        unsafe {
+            // (High contrast: all text in the one text color, which selected text is drawn over in its own.)
+            if colors && !t.hc {
+                let _ = layout.SetDrawingEffect(&cx.g.brush(tok_color(t, tok)), range);
+            }
+            if bold {
+                let _ = layout.SetFontWeight(DWRITE_FONT_WEIGHT_BOLD, range);
+            }
+            if italic {
+                let _ = layout.SetFontStyle(DWRITE_FONT_STYLE_ITALIC, range);
+            }
+        }
+    }
+}
+
+/// Where the colors of the spans start in a text of `total` UTF-16 units (a later span wins where they overlap, as on
+/// a layout); none for text without spans.
+fn colors_of(t: &Theme, spans: &[Span], map: &[u32], total: u32) -> Vec<(u32, u32)> {
+    if spans.is_empty() || t.hc {
+        return Vec::new();
+    }
+    let mut each = vec![t.text; total as usize];
+    for &(s, e, tok) in spans {
+        let us = map.partition_point(|&m| m < s).min(each.len());
+        let ue = map.partition_point(|&m| m < e).min(each.len());
+        each[us..ue.max(us)].fill(tok_color(t, tok));
+    }
+    let mut out: Vec<(u32, u32)> = Vec::new();
+    for (i, &c) in each.iter().enumerate() {
+        if out.last().is_none_or(|&(_, k)| k != c) {
+            out.push((i as u32, c));
+        }
+    }
+    out
 }
 
 impl SegLayout {
@@ -155,38 +302,67 @@ impl SegLayout {
         let (a, b) = self.rows[i];
         (self.rel_of(a), self.rel_of(b))
     }
+    /// The part with the text at UTF-16 position `u` (the last one for the end).
+    pub fn part_at(&self, u: u32) -> &Part {
+        &self.parts[self.parts.partition_point(|p| p.at <= u).max(1) - 1]
+    }
+    /// The part with row `i`.
+    pub fn part_of_row(&self, i: usize) -> &Part {
+        &self.parts[self.parts.partition_point(|p| p.row0 <= i).max(1) - 1]
+    }
     fn x_of(&self, u: u32, trailing: bool) -> f32 {
+        let p = self.part_at(u);
         let (mut x, mut y) = (0f32, 0f32);
         let mut m = DWRITE_HIT_TEST_METRICS::default();
         unsafe {
-            let _ = self.layout.HitTestTextPosition(u, BOOL(trailing as i32), &mut x, &mut y, &mut m);
+            let _ = p.layout.HitTestTextPosition(u - p.at, BOOL(trailing as i32), &mut x, &mut y, &mut m);
         }
-        x
+        p.x + x
     }
 
-    /// Each cluster's text position, x from the start of its row, and width: one call for the whole layout, where a
-    /// hit test per position gets dearer the further into a long line it is.
+    /// Where the text `[us, ue)` of row `i` is: (x, width), from the text's left edge.
+    fn range_x(&self, i: usize, us: u32, ue: u32) -> Vec<(f32, f32)> {
+        let p = self.part_of_row(i);
+        let hit = |m: &mut Vec<DWRITE_HIT_TEST_METRICS>, n: &mut u32| unsafe {
+            p.layout.HitTestTextRange(us - p.at, ue - us, 0.0, 0.0, Some(&mut m[..]), n).is_ok()
+        };
+        let (mut m, mut count) = (vec![DWRITE_HIT_TEST_METRICS::default(); 8], 0u32);
+        // (one rectangle for each run of one direction: more than 8 only with mixed right-to-left text)
+        let mut ok = hit(&mut m, &mut count);
+        if !ok && count as usize > m.len() {
+            m.resize(count as usize, DWRITE_HIT_TEST_METRICS::default());
+            ok = hit(&mut m, &mut count);
+        }
+        m.truncate(if ok { (count as usize).min(m.len()) } else { 0 });
+        m.iter().map(|m| (p.x + m.left, m.width)).collect()
+    }
+
+    /// Each cluster's text position, x from the text's left edge, and width: one call for each layout, where a hit
+    /// test per position gets dearer the further into a long line it is.
     fn clusters(&self) -> Vec<(u32, f32, f32)> {
-        let mut n = 0u32;
-        // (the first call says how many there are)
-        unsafe {
-            let _ = self.layout.GetClusterMetrics(None, &mut n);
-        }
-        let mut m = vec![DWRITE_CLUSTER_METRICS::default(); n as usize];
-        if n == 0 || unsafe { self.layout.GetClusterMetrics(Some(&mut m), &mut n) }.is_err() {
-            return Vec::new();
-        }
-        let mut out = Vec::with_capacity(m.len());
-        let (mut pos, mut x, mut row) = (0u32, 0f32, 0usize);
-        for c in &m[..(n as usize).min(m.len())] {
-            // (rows start at x 0: the text is left-aligned, and only left to right)
-            while row + 1 < self.rows.len() && pos >= self.rows[row + 1].0 {
-                row += 1;
-                x = 0.0;
+        let mut out = Vec::new();
+        for p in &self.parts {
+            let mut n = 0u32;
+            // (the first call says how many there are)
+            unsafe {
+                let _ = p.layout.GetClusterMetrics(None, &mut n);
             }
-            out.push((pos, x, c.width));
-            pos += c.length as u32;
-            x += c.width;
+            let mut m = vec![DWRITE_CLUSTER_METRICS::default(); n as usize];
+            if n == 0 || unsafe { p.layout.GetClusterMetrics(Some(&mut m), &mut n) }.is_err() {
+                continue;
+            }
+            out.reserve(m.len());
+            let (mut pos, mut x, mut row) = (p.at, p.x, p.row0);
+            for c in &m[..(n as usize).min(m.len())] {
+                // (rows start at the part's x: the text is left-aligned, and only left to right)
+                while row + 1 < self.rows.len() && pos >= self.rows[row + 1].0 {
+                    row += 1;
+                    x = p.x;
+                }
+                out.push((pos, x, c.width));
+                pos += c.length as u32;
+                x += c.width;
+            }
         }
         out
     }
@@ -382,7 +558,11 @@ pub struct View {
     pub content_w: f32,
     win: TextWindow,
     cache: HashMap<u64, CacheEntry>,
+    /// The text the cached layouts hold, in bytes.
+    cache_bytes: usize,
     tick: u64,
+    /// `tick` when the rows on screen were last laid out (what they use is never dropped from the cache).
+    frame_tick: u64,
     max_top: Option<((u64, u64, u32, usize), u64)>,
     spans: Vec<(u32, u32, Tok)>,
     hl: HlIndex,
@@ -418,7 +598,9 @@ impl View {
             content_w: 0.0,
             win: TextWindow::default(),
             cache: HashMap::new(),
+            cache_bytes: 0,
             tick: 0,
+            frame_tick: 0,
             max_top: None,
             spans: Vec::new(),
             hl: HlIndex::default(),
@@ -444,6 +626,7 @@ impl View {
     /// Forgets cached layouts (font, theme or wrap changed).
     pub fn clear_cache(&mut self) {
         self.cache.clear();
+        self.cache_bytes = 0;
         self.ws_clusters.clear();
         self.max_top = None;
     }
@@ -530,9 +713,11 @@ impl View {
         let st = self.hl_state(cx, seg);
         let bytes = self.window(cx.doc, seg.start, seg.end).to_vec();
         let width = if cx.style.wrap { (cx.geom.text_w * 2.0).round() as u64 } else { 0 };
+        // (Only a line that is one segment hangs its wrapped rows under its indentation.)
+        let whole_line = seg.line_start && seg.line_end;
         let mut h = std::collections::hash_map::DefaultHasher::new();
         bytes.hash(&mut h);
-        (width, cx.style.generation, cx.lang as u8, st).hash(&mut h);
+        (width, cx.style.generation, cx.lang as u8, st, whole_line).hash(&mut h);
         let key = h.finish();
         self.tick += 1;
         if let Some(e) = self.cache.get_mut(&key) {
@@ -541,22 +726,27 @@ impl View {
                 return e.layout.clone();
             }
         }
-        let lay = Rc::new(self.build_layout(cx, &bytes, st));
+        let lay = Rc::new(self.build_layout(cx, &bytes, st, whole_line));
         if !cx.g.has_target() {
             // No render target yet (colors need its brushes): use this layout once, don't keep it.
             return lay;
         }
-        if self.cache.len() >= CACHE_MAX {
+        if !self.cache.is_empty() && (self.cache.len() >= CACHE_MAX || self.cache_bytes > CACHE_BYTES) {
+            // the older half, but nothing the rows on screen use
             let mut ages: Vec<u64> = self.cache.values().map(|e| e.used).collect();
             ages.sort_unstable();
-            let cut = ages[ages.len() / 2];
+            let cut = ages[ages.len() / 2].min(self.frame_tick);
             self.cache.retain(|_, e| e.used > cut);
+            self.cache_bytes = self.cache.values().map(|e| e.bytes.len()).sum();
         }
-        self.cache.insert(key, CacheEntry { bytes: bytes.to_vec(), layout: lay.clone(), used: self.tick });
+        self.cache_bytes += bytes.len();
+        if let Some(old) = self.cache.insert(key, CacheEntry { bytes, layout: lay.clone(), used: self.tick }) {
+            self.cache_bytes -= old.bytes.len();
+        }
         lay
     }
 
-    fn build_layout(&mut self, cx: &Ctx, bytes: &[u8], st: HlState) -> SegLayout {
+    fn build_layout(&mut self, cx: &Ctx, bytes: &[u8], st: HlState, whole_line: bool) -> SegLayout {
         let mut u = Vec::with_capacity(bytes.len());
         let mut map = Vec::with_capacity(bytes.len() + 1);
         text::decode_display(bytes, &mut u, &mut map);
@@ -565,87 +755,48 @@ impl View {
         } else {
             (&cx.style.format_nowrap, 1.0e7)
         };
-        let layout = cx.g.layout(&u, fmt, max_w, 1.0e7);
+        let mut spans = std::mem::take(&mut self.spans);
+        spans.clear();
         if cx.lang != Lang::Plain && !bytes.is_empty() && cx.g.has_target() {
-            let mut spans = std::mem::take(&mut self.spans);
             highlight::lex(cx.lang, bytes, st, Some(&mut spans));
-            let t = cx.theme;
-            for &(s, e, tok) in &spans {
-                let c = match tok {
-                    Tok::Key => t.syn_key,
-                    Tok::Str => t.syn_string,
-                    Tok::Num => t.syn_number,
-                    Tok::Lit => t.syn_literal,
-                    Tok::Punct => t.syn_punct,
-                    Tok::Comment => t.syn_comment,
-                    Tok::Section => t.syn_section,
-                    Tok::Error => t.syn_error,
-                    Tok::Warn => t.syn_warn,
-                    Tok::Info => t.syn_info,
-                    Tok::Dim => t.syn_dim,
-                    Tok::Keyword => t.syn_keyword,
-                    Tok::Control => t.syn_control,
-                    Tok::Type => t.syn_type,
-                    Tok::Func => t.syn_func,
-                    Tok::Tag => t.syn_tag,
-                    Tok::Attr => t.syn_attr,
-                    Tok::Var => t.syn_var,
-                    Tok::Heading => t.syn_heading,
-                    Tok::Link => t.syn_link,
-                    Tok::Added => t.syn_added,
-                    Tok::Removed => t.syn_removed,
-                    Tok::Col(k) => t.syn_cols[k as usize % 8],
-                    Tok::Bold | Tok::Italic => t.text,
-                };
-                let us = map.partition_point(|&m| m < s);
-                let ue = map.partition_point(|&m| m < e);
-                if ue > us {
-                    let range = DWRITE_TEXT_RANGE { startPosition: us as u32, length: (ue - us) as u32 };
-                    unsafe {
-                        // (High contrast: all text in the one text color, which selected text is drawn over in its own.)
-                        if !t.hc {
-                            let _ = layout.SetDrawingEffect(&cx.g.brush(c), range);
-                        }
-                        match tok {
-                            // (an error bold too: it mustn't pass for a string, PPCL's values, in any theme)
-                            Tok::Bold | Tok::Heading | Tok::Error => {
-                                let _ = layout.SetFontWeight(DWRITE_FONT_WEIGHT_BOLD, range);
-                            }
-                            Tok::Italic => {
-                                let _ = layout.SetFontStyle(DWRITE_FONT_STYLE_ITALIC, range);
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            }
-            self.spans = spans;
         }
-        let mut count = 0u32;
-        unsafe {
-            let _ = layout.GetLineMetrics(None, &mut count);
-        }
-        let mut lm = vec![DWRITE_LINE_METRICS::default(); count.max(1) as usize];
-        unsafe {
-            let _ = layout.GetLineMetrics(Some(&mut lm), &mut count);
-        }
-        lm.truncate(count.max(1) as usize);
-        let mut rows = Vec::with_capacity(lm.len());
-        let mut pos = 0u32;
         let total = u.len() as u32;
-        for m in &lm {
-            let end = (pos + m.length).min(total);
-            rows.push((pos, end));
-            pos = end;
-        }
-        if let Some(last) = rows.last_mut() {
-            last.1 = total;
-        }
+        let layout = cx.g.layout(&u, fmt, max_w, 1.0e7);
+        // (Text that may have emoji can end up drawn whole, which needs its colors on the layout.)
+        let plain = !u.iter().any(|&c| maybe_color(c));
+        color_layout(cx, &layout, &spans, &map, 0, total, !plain);
+        let mut rows = layout_rows_of(&layout, 0, total);
         let mut tm = DWRITE_TEXT_METRICS::default();
         unsafe {
             let _ = layout.GetMetrics(&mut tm);
         }
-        SegLayout { layout, map, rows, width: tm.widthIncludingTrailingWhitespace }
+        let mut parts = vec![Part { layout, at: 0, x: 0.0, row0: 0 }];
+        // Word wrap: the rows after the first line up under the line's indentation (after a PPCL line number), unless
+        // that's more than half the width.
+        if cx.style.wrap && whole_line && rows.len() > 1 {
+            let numbered = matches!(cx.lang.comment(), Some(CommentStyle::AfterNumber(_)));
+            let k = map.partition_point(|&m| (m as usize) < text_start(bytes, numbered)) as u32;
+            let r1 = rows[0].1;
+            let ind = if k > 0 && k < r1 { parts[0].layout_x(k) } else { 0.0 };
+            if ind >= 1.0 && ind <= max_w / 2.0 {
+                let first = cx.g.layout(&u[..r1 as usize], fmt, max_w, 1.0e7);
+                let rest = cx.g.layout(&u[r1 as usize..], fmt, max_w - ind, 1.0e7);
+                let first_rows = layout_rows_of(&first, 0, r1);
+                if first_rows.len() == 1 {
+                    color_layout(cx, &first, &spans, &map, 0, r1, !plain);
+                    color_layout(cx, &rest, &spans, &map, r1, total, !plain);
+                    rows = first_rows;
+                    rows.extend(layout_rows_of(&rest, r1, total));
+                    parts = vec![
+                        Part { layout: first, at: 0, x: 0.0, row0: 0 },
+                        Part { layout: rest, at: r1, x: ind, row0: 1 },
+                    ];
+                }
+            }
+        }
+        let colors = if plain { colors_of(cx.theme, &spans, &map, total) } else { Vec::new() };
+        self.spans = spans;
+        SegLayout { parts, map, rows, width: tm.widthIncludingTrailingWhitespace, plain, colors }
     }
 
     // ---- rows ----
@@ -653,6 +804,7 @@ impl View {
     /// Lays out the rows that fill the view (into `self.rows`).
     pub fn layout_rows(&mut self, cx: &Ctx) {
         self.hl_guess = false;
+        self.frame_tick = self.tick;
         self.rows.clear();
         let len = cx.doc.len();
         let row_h = cx.style.row_h;
@@ -851,13 +1003,9 @@ impl View {
         if pos < seg.end && next <= seg.end {
             let lay = self.layout_of(cx, &seg);
             let (u0, u1) = (lay.u16_of(pos - seg.start), lay.u16_of(next - seg.start));
-            let mut count = 0u32;
-            let mut m = [DWRITE_HIT_TEST_METRICS::default(); 2];
-            unsafe {
-                let _ = lay.layout.HitTestTextRange(u0, u1.saturating_sub(u0), 0.0, 0.0, Some(&mut m), &mut count);
-            }
-            if count > 0 && m[0].width > 0.5 {
-                return m[0].width;
+            let w = lay.range_x(lay.row_of_u16(u0), u0, u1.max(u0)).first().map_or(0.0, |r| r.1);
+            if w > 0.5 {
+                return w;
             }
         }
         cx.style.char_w
@@ -900,14 +1048,15 @@ impl View {
         let lay = self.layout_of(cx, &seg);
         let ri = lay.row_of_rel(row_start - seg.start);
         let (ra, rb) = lay.rows[ri];
-        let ly = ri as f32 * cx.style.row_h + cx.style.row_h / 2.0;
+        let p = lay.part_of_row(ri);
+        let ly = (ri - p.row0) as f32 * cx.style.row_h + cx.style.row_h / 2.0;
         let mut trailing = BOOL(0);
         let mut inside = BOOL(0);
         let mut m = DWRITE_HIT_TEST_METRICS::default();
         unsafe {
-            let _ = lay.layout.HitTestPoint(lx.max(0.0), ly, &mut trailing, &mut inside, &mut m);
+            let _ = p.layout.HitTestPoint((lx - p.x).max(0.0), ly, &mut trailing, &mut inside, &mut m);
         }
-        let mut u = m.textPosition + if trailing.as_bool() { m.length } else { 0 };
+        let mut u = p.at + m.textPosition + if trailing.as_bool() { m.length } else { 0 };
         u = u.max(ra).min(rb.max(ra));
         let last_row = ri + 1 == lay.rows.len();
         // At the end of a wrapped row the position is the next row's start; keep the caret on this row.
@@ -1009,11 +1158,15 @@ impl View {
         let caret = self.sel.caret;
         let (seg, lay, row, _) = self.caret_place(cx, caret, self.upstream);
         let rs = seg.start + lay.row_bytes(row).0;
-        let ls = cx.doc.line_start_of(caret);
-        if rs > ls && caret != rs {
+        // (A row the line wrapped into starts after the line: no need to look for where that is, which in a huge line
+        // whose lines are still being counted means reading back to it.)
+        let first_row = row == 0 && seg.line_start;
+        if !first_row && caret != rs {
             self.set_caret(rs, extend);
         } else {
-            let head = cx.doc.read(ls, (ls + 4096).min(cx.doc.line_end_of(ls)));
+            let ls = if first_row { rs } else { cx.doc.line_start_of(caret) };
+            // (the indentation ends at the first other character, a line break too)
+            let head = cx.doc.read(ls, (ls + 4096).min(cx.doc.len()));
             let ind = head.iter().take_while(|&&b| b == b' ' || b == b'\t').count() as u64;
             let first = ls + ind;
             self.set_caret(if caret == first { ls } else { first }, extend);
@@ -1111,12 +1264,15 @@ impl View {
             }
         }
 
-        // Text: each segment layout once, positioned by its first visible row.
+        // Text: each segment's layouts once, positioned by its first visible row (and of a long one only what's in view).
         let mut i = 0;
         while i < self.rows.len() {
             let r = &self.rows[i];
             let y0 = r.y - r.row as f32 * row_h;
-            g.draw_layout(&r.lay.layout, ox, y0, t.text);
+            for p in &r.lay.parts {
+                let ink = Ink { color_glyphs: !r.lay.plain, colors: &r.lay.colors, at: p.at };
+                g.draw_layout_in(&p.layout, ox + p.x, y0 + p.row0 as f32 * row_h, t.text, clip, ink);
+            }
             let s = r.seg.start;
             while i < self.rows.len() && self.rows[i].seg.start == s {
                 i += 1;
@@ -1128,8 +1284,11 @@ impl View {
         if t.hc && !sel.is_empty() && (focused || sel_is_match) {
             for (rc, k) in self.range_rects(cx, sel.start(), sel.end(), ox, false) {
                 let r = &self.rows[k];
+                let p = r.lay.part_of_row(r.row);
+                let (x, y) = (ox + p.x, r.y - (r.row - p.row0) as f32 * row_h);
                 g.push_clip(rc);
-                g.draw_layout(&r.lay.layout, ox, r.y - r.row as f32 * row_h, t.selection_text);
+                let ink = Ink { color_glyphs: !r.lay.plain, ..Default::default() };
+                g.draw_layout_in(&p.layout, x, y, t.selection_text, rc, ink);
                 g.pop_clip();
             }
         }
@@ -1176,17 +1335,11 @@ impl View {
             }
             let s = a.max(r.start);
             let e = b.min(r.end);
-            let y0 = r.y - r.row as f32 * row_h;
             if s < e {
                 let us = r.lay.u16_of(s - r.seg.start);
                 let ue = r.lay.u16_of(e - r.seg.start);
-                let mut count = 0u32;
-                let mut buf = [DWRITE_HIT_TEST_METRICS::default(); 8];
-                unsafe {
-                    let _ = r.lay.layout.HitTestTextRange(us, ue - us, 0.0, 0.0, Some(&mut buf), &mut count);
-                }
-                for m in &buf[..(count as usize).min(8)] {
-                    out.push((Rect::new(ox + m.left, y0 + m.top, m.width.max(1.0), row_h), k));
+                for (x, w) in r.lay.range_x(r.row, us, ue) {
+                    out.push((Rect::new(ox + x, r.y, w.max(1.0), row_h), k));
                 }
             }
             // A line break in the range shows as a small block after the row.
@@ -2540,5 +2693,116 @@ mod tests {
         let s = duplicate(&mut d, Sel::at(end)).unwrap();
         assert!(d.read(0, d.len()).ends_with(b"\nb\r\nb"));
         assert_eq!(s, Sel::at(d.len()));
+    }
+
+    /// A view on `text` 300 DIPs wide (Consolas when the default font isn't there), with word wrap.
+    fn view_on(text: &[u8], lang: Lang, f: impl FnOnce(&mut View, &Ctx)) {
+        view_wrapped(text, lang, true, f)
+    }
+
+    fn view_wrapped(text: &[u8], lang: Lang, wrap: bool, f: impl FnOnce(&mut View, &Ctx)) {
+        let mut g = Gfx::new().unwrap();
+        // (layouts are kept only with a render target)
+        let _bitmap = crate::ui::gfx::tests::bitmap_target(&mut g, 8, 8);
+        let settings = crate::ui::settings::Settings { wrap, ..Default::default() };
+        let style = crate::ui::app::make_style(&g, &settings, 1);
+        let theme = Theme::light(0xFF0078D4);
+        let doc = Document::from_text(text);
+        let geom = View::geometry(&doc, &style, Rect::new(0.0, 0.0, 300.0, 400.0));
+        let cx = Ctx { doc: &doc, g: &g, style: &style, theme: &theme, lang, geom };
+        f(&mut View::new(), &cx);
+    }
+
+    #[test]
+    fn wrapped_rows_hang_under_the_indentation() {
+        let line = b"    let x = aaaa(bbbb, cccc, dddd, eeee, ffff, gggg, hhhh, iiii, jjjj, kkkk, llll, mmmm, nnnn);";
+        let mut text = line.to_vec();
+        text.extend_from_slice(b"\n\tx = 1\n00100     SET(1, \"A LONG POINT NAME\", \"ANOTHER POINT\", \"AND ANOTHER ONE\")\n");
+        view_on(&text, Lang::Plain, |v, cx| {
+            let seg = v.segment_at(cx.doc, 0);
+            let lay = v.layout_of(cx, &seg);
+            assert!(lay.rows.len() >= 3, "it wraps: {:?}", lay.rows);
+            assert_eq!(lay.parts.len(), 2);
+            // every row after the first starts where the text of the first does, after its 4 spaces
+            let ind = lay.x_of(4, false);
+            assert!(ind > 10.0);
+            for r in &lay.rows[1..] {
+                assert!((lay.x_of(r.0, false) - ind).abs() < 0.01, "row {r:?}");
+            }
+            // every position, from where it is on its row, hit-tests back to itself
+            for pos in 0..=line.len() as u64 {
+                for up in [false, true] {
+                    let (seg, lay, row, x) = v.caret_place(cx, pos, up);
+                    let rs = seg.start + lay.row_bytes(row).0;
+                    let (back, back_up) = v.pos_in_row(cx, rs, x + 0.25);
+                    assert_eq!(back, pos, "{pos} {up}");
+                    if back_up {
+                        assert_eq!(v.caret_place(cx, back, true).2, row);
+                    }
+                }
+            }
+            // a short line doesn't wrap: one layout
+            let seg = v.segment_at(cx.doc, line.len() as u64 + 1);
+            assert_eq!(v.layout_of(cx, &seg).parts.len(), 1);
+        });
+        // PPCL: under the statement, after the line number
+        view_on(&text, Lang::Ppcl, |v, cx| {
+            let at = text.windows(5).position(|w| w == b"00100").unwrap() as u64;
+            let seg = v.segment_at(cx.doc, at);
+            let lay = v.layout_of(cx, &seg);
+            assert!(lay.rows.len() >= 2);
+            let set = lay.x_of(10, false);
+            assert!((lay.x_of(lay.rows[1].0, false) - set).abs() < 0.01);
+        });
+    }
+
+    #[test]
+    fn every_caret_place_hit_tests_back_to_itself() {
+        // tabs, kanji (another font), emoji, a letter with its accent, and a line long enough to be cut in segments
+        let mut text = "\tab\tc 日本語の text 👍🏽 and e\u{301}x, \t \u{1F468}\u{200D}\u{1F469} end\n".repeat(3).into_bytes();
+        text.extend("word 日本 ".repeat(1200).as_bytes());
+        text.push(b'\n');
+        for wrap in [true, false] {
+            view_wrapped(&text, Lang::Plain, wrap, |v, cx| {
+                let mut pos = 0;
+                while pos < text.len() as u64 {
+                    for up in [false, true] {
+                        let (seg, lay, row, x) = v.caret_place(cx, pos, up);
+                        let rs = seg.start + lay.row_bytes(row).0;
+                        let (back, _) = v.pos_in_row(cx, rs, x + 0.25);
+                        assert_eq!(back, pos, "{pos} {up} {wrap}");
+                    }
+                    pos = next_cluster(cx.doc, pos);
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn home_goes_to_the_row_then_the_text_then_the_line() {
+        let line = b"    let x = aaaa(bbbb, cccc, dddd, eeee, ffff, gggg, hhhh, iiii, jjjj, kkkk, llll, mmmm, nnnn);";
+        let mut text = b"\n".to_vec();
+        text.extend_from_slice(line);
+        view_on(&text, Lang::Plain, |v, cx| {
+            let end = text.len() as u64;
+            let row = v.row_start(cx, end);
+            assert!(row > 10, "it wraps");
+            v.set_caret(end - 2, false);
+            let mut stops = Vec::new();
+            for _ in 0..4 {
+                v.home(cx, false);
+                stops.push(v.sel.caret);
+            }
+            assert_eq!(stops, [row, 5, 1, 5]);
+        });
+    }
+
+    #[test]
+    fn emoji_are_drawn_whole() {
+        let plain = |s: &str| !s.encode_utf16().any(maybe_color);
+        assert!(plain("let x = \"日本語\"; // naïve café ␍"));
+        assert!(!plain("ok 👍"));
+        assert!(!plain("❤️"));
+        assert!(!plain("☀"));
     }
 }
