@@ -1424,20 +1424,18 @@ impl App {
                 running = true;
             }
         }
-        // Find next / previous on a big document.
-        if let Some((job, version)) = self.tabs[i].find_job.as_mut() {
-            let version = *version;
-            if let Some(r) = job.take() {
-                self.tabs[i].find_job = None;
-                if i == self.active && self.tabs[i].doc.version == version {
+        // Find next / previous, or the search as you type, on another thread.
+        if let Some(f) = self.tabs[i].find_job.as_mut() {
+            if let Some(r) = f.job.take() {
+                let f = self.tabs[i].find_job.take().unwrap();
+                // (not if the text or the selection changed meanwhile: the user clicked elsewhere, or typed)
+                let tab = &self.tabs[i];
+                if i == self.active && tab.doc.version == f.version && tab.view.sel == f.sel {
+                    let r = r.map(|(s, e, wrapped)| ((s, e), wrapped));
                     match r {
-                        Some((s, e, wrapped)) => {
-                            self.select_match(s, e);
-                            if wrapped {
-                                self.flash_search("Search wrapped around", false);
-                            }
-                        }
-                        None => self.flash_search("No results", true),
+                        Some(((s, e), _)) if f.live => self.select_match(s, e),
+                        _ if f.live => {}
+                        r => self.found_next(r),
                     }
                 }
             } else {
@@ -2339,7 +2337,7 @@ impl App {
         let origin = self.find.origin.unwrap_or(self.tab().view.sel.start());
         let len = self.tab().doc.len();
         if len > m.sync_limit() {
-            self.find_async(m, origin, true);
+            self.find_async(m, origin, true, true);
             return;
         }
         let doc = &self.tab().doc;
@@ -2349,11 +2347,12 @@ impl App {
         }
     }
 
-    fn find_async(&mut self, m: Arc<Matcher>, from: u64, forward: bool) {
+    /// `live`: the search as you type (see `FindJob`).
+    fn find_async(&mut self, m: Arc<Matcher>, from: u64, forward: bool, live: bool) {
         let notify = self.notify.clone();
         let tab = self.tab_mut();
         let snap = tab.doc.snapshot();
-        let version = tab.doc.version;
+        let (version, sel) = (tab.doc.version, tab.view.sel);
         let job = Job::spawn(snap.len(), notify, move |ctx| {
             let len = snap.len();
             if forward {
@@ -2366,8 +2365,41 @@ impl App {
                 })
             }
         });
-        tab.find_job = Some((job, version));
+        tab.find_job = Some(FindJob { job, version, sel, live });
         self.timer(TIMER_JOBS, 100);
+    }
+
+    /// Shows what Find next / previous found (the match, and whether it wrapped around), or that it found nothing.
+    fn found_next(&mut self, r: Option<((u64, u64), bool)>) {
+        match r {
+            Some(((s, e), wrapped)) => {
+                self.select_match(s, e);
+                self.find.origin = Some(s);
+                if wrapped {
+                    self.flash_search("Search wrapped around", false);
+                }
+            }
+            None => self.flash_search("No results", true),
+        }
+    }
+
+    /// The match before `from` from a finished count of this search in this text (exact, and at once; for a
+    /// regex in a big document the search itself can only guess where a match before the caret starts). None if
+    /// there's no such count; Some(None) if it found no match there, nor wrapping around.
+    fn counted_previous(&self, from: u64) -> Option<Option<((u64, u64), bool)>> {
+        let tab = self.tab();
+        let q = &self.find.query;
+        let key = (q.text.clone(), q.match_case, q.whole_word, q.regex, tab.doc.version);
+        let f = tab.search.found.as_ref().filter(|f| f.complete && f.positions.len() as u64 == f.count)?;
+        if tab.search.key.as_ref() != Some(&key) {
+            return None;
+        }
+        // (the last that ends at or before `from`, else, wrapping around, the last one if it starts at or after it)
+        let k = f.positions.partition_point(|p| p.1 <= from);
+        Some(match k {
+            0 => f.positions.last().filter(|p| p.0 >= from).map(|&p| (p, true)),
+            k => Some((f.positions[k - 1], false)),
+        })
     }
 
     pub fn find_next(&mut self, forward: bool) {
@@ -2388,8 +2420,14 @@ impl App {
             from = tab.doc.next_char(from);
         }
         self.find.origin = Some(if forward { sel.end() } else { sel.start() });
+        if !forward {
+            if let Some(r) = self.counted_previous(from) {
+                self.found_next(r);
+                return;
+            }
+        }
         if len > m.sync_limit() {
-            self.find_async(m, from, forward);
+            self.find_async(m, from, forward, false);
             return;
         }
         let doc = &self.tab().doc;
@@ -2398,16 +2436,7 @@ impl App {
         } else {
             m.find_back(doc, 0, from, None).map(|x| (x, false)).or_else(|| m.find_back(doc, from, len, None).map(|x| (x, true)))
         };
-        match r {
-            Some(((s, e), wrapped)) => {
-                self.select_match(s, e);
-                self.find.origin = Some(s);
-                if wrapped {
-                    self.flash_search("Search wrapped around", false);
-                }
-            }
-            None => self.flash_search("No results", true),
-        }
+        self.found_next(r);
     }
 
     pub fn schedule_count(&mut self) {
