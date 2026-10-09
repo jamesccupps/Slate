@@ -102,7 +102,7 @@ jobs:
 
       - uses: azure/artifact-signing-action@v2
         with:
-          endpoint: ENDPOINT_TBD
+          endpoint: https://eus.codesigning.azure.net/
           signing-account-name: SlateAccount
           certificate-profile-name: Slate
           files: ${{ github.workspace }}\out\Slate.exe

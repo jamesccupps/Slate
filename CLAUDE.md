@@ -54,7 +54,8 @@ icons) and a tarball, each with a `.sha256`.
    Before the draft, the `sign` job signs `Slate.exe` in Azure Artifact Signing (account `SlateAccount`, certificate
    profile `Slate`), checks the signature, runs the smoke test on the signed exe and hashes it again.
    It signs in to Azure with GitHub's OIDC token (no password anywhere): the app registration "Slate signing"
-   trusts only `repo:jamesccupps/Slate:environment:release`, and the `release` environment only `v*` tags; the
+   trusts only `repo:jamesccupps@148652101/Slate@1409482725:environment:release` (GitHub's immutable subject:
+   owner and repository IDs, the repo's default), and the `release` environment only `v*` tags; the
    repository secrets `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID` say which app.
 4. Publishing the release runs `.github/workflows/apt.yml` (it starts itself again on `main`, as GitHub Pages only
    publishes from there): `packaging/linux/apt-repo.sh` makes the apt repository from the latest release's `.deb`s,
