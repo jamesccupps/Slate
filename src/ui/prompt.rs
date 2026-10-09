@@ -171,7 +171,8 @@ impl Prompt<'_> {
             }
             SendMessageW(hwnd, DM_SETDEFID, WPARAM(BUTTON as usize), LPARAM(0));
             Prompt::layout(p, hwnd, super::win::dpi_of(hwnd), None);
-            if let Ok(b) = GetDlgItem(hwnd, BUTTON) {
+            // (Not when a test draws it: that would activate it, and take the keyboard from the user's windows.)
+            if let (Ok(b), false) = (GetDlgItem(hwnd, BUTTON), super::win::testing()) {
                 SendMessageW(hwnd, WM_NEXTDLGCTL, WPARAM(b.0 as usize), LPARAM(1));
             }
         }

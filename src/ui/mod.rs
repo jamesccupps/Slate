@@ -549,11 +549,14 @@ fn handle(cell: &Cell, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<L
             let paths: Vec<PathBuf> = text.split('\n').filter(|s| !s.is_empty()).map(PathBuf::from).collect();
             // Answered at once; opening them (which can take a while on a slow share) comes right after.
             open_later(hwnd, paths, true);
-            unsafe {
-                if IsIconic(hwnd).as_bool() {
-                    let _ = ShowWindow(hwnd, SW_RESTORE);
+            // (A test's hidden window stays out of the user's way.)
+            if !win::testing() {
+                unsafe {
+                    if IsIconic(hwnd).as_bool() {
+                        let _ = ShowWindow(hwnd, SW_RESTORE);
+                    }
+                    let _ = SetForegroundWindow(hwnd);
                 }
-                let _ = SetForegroundWindow(hwnd);
             }
             Some(LRESULT(1))
         }
@@ -572,7 +575,7 @@ fn handle(cell: &Cell, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<L
         WM_ACTIVATE => {
             if loword(wp.0) as u32 == WA_INACTIVE {
                 // Remember where the keyboard was (the find box or the text) for when the window comes back.
-                let f = unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetFocus() };
+                let f = win::focus();
                 SAVED_FOCUS.with(|s| s.set(f.0 as isize));
                 if let Ok(mut a) = cell.try_borrow_mut() {
                     a.disarm_menu_bar();
@@ -595,9 +598,7 @@ fn handle(cell: &Cell, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<L
                 Ok(a) => a.find.open && a.find.is_edit(saved) && shown(saved),
                 Err(_) => false,
             };
-            unsafe {
-                let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(if back { saved } else { hwnd });
-            }
+            win::set_focus(if back { saved } else { hwnd });
             Some(LRESULT(0))
         }
         WM_IME_STARTCOMPOSITION => {

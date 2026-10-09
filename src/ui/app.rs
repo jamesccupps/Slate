@@ -970,7 +970,7 @@ impl App {
         }
         self.paint_tabs();
         self.paint_menu();
-        let f = unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetFocus() };
+        let f = win::focus();
         if !self.g.offscreen {
             // Asked here rather than tracked: focus moved while the app was busy never reaches WM_SETFOCUS.
             self.focused = f == self.hwnd;

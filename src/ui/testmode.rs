@@ -54,7 +54,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use windows::Win32::Foundation::HWND;
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::Graphics::Direct2D::{
     D2D1_FEATURE_LEVEL_DEFAULT, D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_DEFAULT,
     D2D1_RENDER_TARGET_USAGE_NONE,
@@ -63,10 +63,11 @@ use windows::Win32::Graphics::Imaging::{
     CLSID_WICImagingFactory, GUID_WICPixelFormat32bppPBGRA, IWICImagingFactory, WICBitmapCacheOnLoad,
 };
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
+use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::{
-    DestroyWindow, DispatchMessageW, MSG, PM_REMOVE, PeekMessageW, SWP_NOMOVE, SWP_NOZORDER, SetWindowPos,
-    TranslateMessage,
+    CallNextHookEx, DestroyWindow, DispatchMessageW, HCBT_ACTIVATE, MSG, PM_REMOVE, PeekMessageW, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOZORDER, SetWindowPos, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, WH_CBT,
 };
 
 use super::app::{Cell, Hit};
@@ -584,7 +585,7 @@ fn describe(cell: &Cell, what: &str) -> String {
         }
         "notice" => a.tab().notice.as_ref().map(|n| n.text.clone()).unwrap_or_default(),
         "focus" => {
-            let f = unsafe { GetFocus() };
+            let f = super::win::focus();
             let names = [(a.hwnd, "main"), (a.find.find_edit, "find"), (a.find.replace_edit, "replace"), (a.find.goto_edit, "goto")];
             names.iter().find(|(h, _)| *h == f).map(|(_, n)| n.to_string()).unwrap_or_else(|| "none".into())
         }
@@ -645,9 +646,19 @@ fn labels(items: &[super::commands::Item]) -> String {
         .join(" | ")
 }
 
+/// Keeps every window of the test's thread from being activated (CBT hook): one that was would take the keyboard from
+/// the user's own windows. (The focus is only noted: `win::set_focus`.)
+unsafe extern "system" fn never_activate(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    if code == HCBT_ACTIVATE as i32 {
+        return LRESULT(1);
+    }
+    unsafe { CallNextHookEx(None, code, wp, lp) }
+}
+
 pub fn run(args: &[String]) -> i32 {
     super::settings::NO_PERSIST.store(true, std::sync::atomic::Ordering::Relaxed);
     super::win::SCRIPTED.with(|s| *s.borrow_mut() = Some(Default::default()));
+    let hook = unsafe { SetWindowsHookExW(WH_CBT, Some(never_activate), None, GetCurrentThreadId()) };
     let lines: Vec<String> = if args.len() == 1 && Path::new(&args[0]).is_file() {
         std::fs::read_to_string(&args[0]).unwrap_or_default().lines().map(String::from).collect()
     } else {
@@ -661,6 +672,8 @@ pub fn run(args: &[String]) -> i32 {
     let hinst = register_class();
     let s = Settings { restore_session: false, ..Default::default() };
     let hwnd = create_window(hinst, &s);
+    // (as Slate takes it when it starts)
+    super::win::set_focus(hwnd);
     super::mark("window");
     let cell = make_app(hwnd);
     super::mark("app");
@@ -675,11 +688,11 @@ pub fn run(args: &[String]) -> i32 {
     // script with `gfx:window`.)
     let gpu = real || std::env::var_os("SLATE_TEST_GPU").is_some();
     let set_size = |hwnd: HWND, w: i32, h: i32| unsafe {
-        use windows::Win32::UI::WindowsAndMessaging::{HWND_TOPMOST, SWP_NOACTIVATE, SWP_SHOWWINDOW};
+        use windows::Win32::UI::WindowsAndMessaging::{HWND_TOPMOST, SWP_SHOWWINDOW};
         if visible {
             let _ = SetWindowPos(hwnd, HWND_TOPMOST, 40, 40, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
         } else {
-            let _ = SetWindowPos(hwnd, None, 0, 0, w, h, SWP_NOMOVE | SWP_NOZORDER);
+            let _ = SetWindowPos(hwnd, None, 0, 0, w, h, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
         }
     };
     set_size(hwnd, 1200, 800);
@@ -761,7 +774,7 @@ pub fn run(args: &[String]) -> i32 {
                 if let Some(vk) = parts.last().and_then(|k| vk_of(k)) {
                     super::commands::FORCED_MODS.with(|m| m.set(Some((ctrl, shift, alt))));
                     let bar_edit = {
-                        let f = unsafe { GetFocus() };
+                        let f = super::win::focus();
                         let a = cell.borrow();
                         if a.find.is_edit(f) { Some(f) } else { None }
                     };
@@ -1093,6 +1106,9 @@ pub fn run(args: &[String]) -> i32 {
     print!("{out}");
     unsafe {
         let _ = DestroyWindow(hwnd);
+        if let Ok(h) = hook {
+            let _ = UnhookWindowsHookEx(h);
+        }
     }
     drop(cell);
     super::release_app();

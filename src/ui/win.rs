@@ -44,6 +44,31 @@ pub struct Scripted {
     pub clipboard_seq: u32,
     /// The menus that would have opened (they never are in this mode, as they'd wait for the mouse).
     pub menus: Vec<String>,
+    /// The window with the keyboard focus, as far as Slate knows (`set_focus`): the real focus is never taken, as that
+    /// would activate the hidden window and take the keyboard from the user's own windows.
+    pub focus: isize,
+}
+
+/// Whether Slate runs a test script (`--test`).
+pub fn testing() -> bool {
+    SCRIPTED.with(|s| s.borrow().is_some())
+}
+
+/// Gives `h` the keyboard focus (SetFocus, which also activates its window); in test mode it's only noted.
+pub fn set_focus(h: HWND) {
+    if scripted(|s| s.focus = h.0 as isize).is_none() {
+        unsafe {
+            let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(h);
+        }
+    }
+}
+
+/// The window with the keyboard focus (GetFocus); in test mode the one `set_focus` gave it to.
+pub fn focus() -> HWND {
+    match scripted(|s| s.focus) {
+        Some(f) => HWND(f as *mut _),
+        None => unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetFocus() },
+    }
 }
 
 /// Test mode: notes that menu `name` would open now (and returns true: don't show it).

@@ -269,7 +269,7 @@ impl App {
             let blink = GetCaretBlinkTime();
             // Blinking turned off in Windows' settings (INFINITE), or the keyboard is elsewhere: a steady caret and no
             // timer repainting the window.
-            if blink == 0 || blink == u32::MAX || GetFocus() != self.hwnd {
+            if blink == 0 || blink == u32::MAX || win::focus() != self.hwnd {
                 let _ = KillTimer(self.hwnd, TIMER_CARET);
             } else {
                 SetTimer(self.hwnd, TIMER_CARET, blink.clamp(200, 2000), None);
@@ -2325,9 +2325,7 @@ impl App {
     pub fn close_find(&mut self) {
         self.find.open = false;
         self.layout();
-        unsafe {
-            let _ = SetFocus(self.hwnd);
-        }
+        win::set_focus(self.hwnd);
         self.restart_caret();
         self.invalidate();
     }
@@ -2562,7 +2560,7 @@ impl App {
             Part::Expand => {
                 let mode = if self.find.mode == BarMode::Replace { BarMode::Find } else { BarMode::Replace };
                 self.find.mode = mode;
-                if mode == BarMode::Find && unsafe { GetFocus() } == self.find.replace_edit {
+                if mode == BarMode::Find && win::focus() == self.find.replace_edit {
                     // The Replace box is about to be hidden: keep typing in the Find box.
                     FindBar::focus(self.find.find_edit);
                 }
@@ -2627,9 +2625,7 @@ impl App {
                     FindBar::focus(next);
                     FindBar::select_all(next);
                 } else {
-                    unsafe {
-                        let _ = SetFocus(self.hwnd);
-                    }
+                    win::set_focus(self.hwnd);
                 }
                 self.invalidate();
                 true
@@ -2685,9 +2681,7 @@ impl App {
             }
             (0, Hit::Menu(i)) => self.pending.push(Deferred::Menu(i)),
             (0, Hit::Text) | (0, Hit::Gutter) => {
-                unsafe {
-                    let _ = SetFocus(self.hwnd);
-                }
+                win::set_focus(self.hwnd);
                 let n = self.click_count(x, y);
                 self.editor_click(x, y, n, hit == Hit::Gutter);
                 capture(self.hwnd);
@@ -3730,9 +3724,7 @@ impl App {
         tab.doc.seal();
         self.with_view(|v, cx| v.reveal(cx, start, true));
         self.restart_caret();
-        unsafe {
-            let _ = SetFocus(self.hwnd);
-        }
+        win::set_focus(self.hwnd);
         self.invalidate();
     }
 

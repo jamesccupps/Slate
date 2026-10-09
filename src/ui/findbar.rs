@@ -8,7 +8,6 @@ use windows::Win32::Graphics::Gdi::{
     CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CreateFontW, CreateSolidBrush, DEFAULT_CHARSET, DeleteObject, FF_DONTCARE,
     FW_NORMAL, HBRUSH, HFONT, OUT_DEFAULT_PRECIS,
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, ES_AUTOHSCROLL, GetWindowTextLengthW, GetWindowTextW, HMENU, SW_HIDE, SW_SHOW, SWP_NOZORDER,
     SendMessageW, SetWindowPos, SetWindowTextW, ShowWindow, WINDOW_EX_STYLE, WINDOW_STYLE, WM_SETFONT, WS_CHILD,
@@ -160,9 +159,7 @@ impl FindBar {
     }
 
     pub fn focus(h: HWND) {
-        unsafe {
-            let _ = SetFocus(h);
-        }
+        super::win::set_focus(h);
     }
 
     /// Rebuilds the matcher from the current query.
