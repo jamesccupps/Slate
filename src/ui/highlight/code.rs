@@ -2702,6 +2702,9 @@ const CSS_COMMENT: u8 = 1;
 const CSS_STR: u8 = 2;
 /// A `//` comment (SCSS, LESS) cut off by the end of a text.
 const CSS_LINE_COMMENT: u8 = 3;
+/// In `b`, with the brace depth: inside an at-rule's condition or arguments, up to its `{` or `;` (`@media (min-width:
+/// 768px) and print {`, `@include mq($from: mobile) {`), where nothing is a selector.
+const CSS_AT: u16 = 0x8000;
 
 fn css_ident_char(c: u8) -> bool {
     c.is_ascii_alphanumeric() || c == b'-' || c == b'_' || c >= 0x80
@@ -2722,10 +2725,11 @@ fn css_selector_ahead(t: &[u8], i: usize) -> bool {
     memchr::memchr3(b'{', b';', b'}', &t[i..end]).is_some_and(|q| t[i + q] == b'{' && (i + q == 0 || t[i + q - 1] != b'#'))
 }
 
-/// `b` holds the brace depth: 0 is where selectors are, deeper is inside rules (properties and values).
+/// `b` holds the brace depth: 0 is where selectors are, deeper is inside rules (properties and values); and `CSS_AT`.
 pub(super) fn css(t: &[u8], st: State, o: &mut Out) -> State {
     let n = t.len();
-    let mut depth = st.b;
+    let (mut depth, mut at_rule) = (st.b & !CSS_AT, st.b & CSS_AT != 0);
+    let b = |depth: u16, at_rule: bool| depth | if at_rule { CSS_AT } else { 0 };
     let mut i = 0;
     match st.kind {
         CSS_COMMENT => match find(t, 0, b"*/") {
@@ -2768,7 +2772,7 @@ pub(super) fn css(t: &[u8], st: State, o: &mut Out) -> State {
                 }
                 None => {
                     o.put(i, n, Tok::Comment);
-                    return State { kind: CSS_COMMENT, a: 0, b: depth, ..st };
+                    return State { kind: CSS_COMMENT, a: 0, b: b(depth, at_rule), ..st };
                 }
             },
             // SCSS / LESS line comments (not the `//` of a URL)
@@ -2776,7 +2780,7 @@ pub(super) fn css(t: &[u8], st: State, o: &mut Out) -> State {
                 let e = line_end(t, i);
                 o.put(i, e, Tok::Comment);
                 if e == n {
-                    return State { kind: CSS_LINE_COMMENT, a: 0, b: depth, ..st };
+                    return State { kind: CSS_LINE_COMMENT, a: 0, b: b(depth, at_rule), ..st };
                 }
                 i = e;
             }
@@ -2784,22 +2788,23 @@ pub(super) fn css(t: &[u8], st: State, o: &mut Out) -> State {
                 let (e, closed, _) = scan_str(t, i + 1, c, b'\\', false, true);
                 o.put(i, e, Tok::Str);
                 if !closed {
-                    return State { kind: CSS_STR, a: c, b: depth, ..st };
+                    return State { kind: CSS_STR, a: c, b: b(depth, at_rule), ..st };
                 }
                 i = e;
             }
             b'{' => {
-                depth = depth.saturating_add(1);
-                value = false;
+                depth = (depth + 1).min(!CSS_AT);
+                (value, at_rule) = (false, false);
                 i += 1;
             }
             b'}' => {
                 depth = depth.saturating_sub(1);
-                value = false;
+                (value, at_rule) = (false, false);
                 i += 1;
             }
             b'\n' | b';' => {
                 value = false;
+                at_rule &= c == b'\n';
                 i += 1;
             }
             b'@' if css_ident_char(next) => {
@@ -2807,6 +2812,7 @@ pub(super) fn css(t: &[u8], st: State, o: &mut Out) -> State {
                 o.put(i, e, Tok::Control);
                 // (LESS's `@color: #fff;` sets a value)
                 value |= at(t, e) == b':';
+                at_rule = true;
                 i = e;
             }
             b'$' if css_ident_char(next) => {
@@ -2828,7 +2834,7 @@ pub(super) fn css(t: &[u8], st: State, o: &mut Out) -> State {
             b'#' if css_ident_char(next) => {
                 // a color inside rules, an id in selectors
                 let e = css_ident_end(t, i + 1);
-                o.put(i, e, if (depth > 0 || value) && !(o.on() && css_selector_ahead(t, e)) { Tok::Num } else { Tok::Func });
+                o.put(i, e, if (depth > 0 || value) && !(o.on() && !at_rule && css_selector_ahead(t, e)) { Tok::Num } else { Tok::Func });
                 i = e;
             }
             b'.' if !next.is_ascii_digit() && css_ident_char(next) && next != b'-' => {
@@ -2836,7 +2842,7 @@ pub(super) fn css(t: &[u8], st: State, o: &mut Out) -> State {
                 o.put(i, e, Tok::Func);
                 i = e;
             }
-            b':' if (css_ident_char(next) || next == b':') && (depth == 0 || css_selector_ahead(t, i)) => {
+            b':' if (css_ident_char(next) || next == b':') && !at_rule && (depth == 0 || css_selector_ahead(t, i)) => {
                 // :hover, ::before
                 let s = if next == b':' { i + 2 } else { i + 1 };
                 let e = css_ident_end(t, s);
@@ -2873,15 +2879,15 @@ pub(super) fn css(t: &[u8], st: State, o: &mut Out) -> State {
                     o.put(i, e, Tok::Func);
                 } else if depth == 0 && !value {
                     // a property outside braces is indented Sass's (`color: red`), or a media feature's
-                    // (`(max-width: 600px)`); otherwise it's a selector
-                    if at(t, e) == b':' && matches!(at(t, e + 1), b' ' | b'\t' | b'\r' | b'\n' | 0) {
+                    // (`(max-width: 600px)`, also `(max-width:600px)`); otherwise it's a selector
+                    if at(t, e) == b':' && (at_rule || matches!(at(t, e + 1), b' ' | b'\t' | b'\r' | b'\n' | 0)) {
                         o.put(i, e, Tok::Attr);
                         value = true;
                     } else {
                         o.put(i, e, Tok::Tag);
                     }
-                } else if o.on() && css_selector_ahead(t, e) {
-                    // a selector inside a block (`@media`, nested SCSS)
+                } else if o.on() && !at_rule && !(at(t, e) == b':' && matches!(at(t, e + 1), b' ' | b'\t')) && css_selector_ahead(t, e) {
+                    // a selector inside a block (`@media`, nested SCSS), not a property (`font: {` in SCSS)
                     o.put(i, e, Tok::Tag);
                 } else {
                     let after = t[e..].iter().copied().find(|&b| b != b' ' && b != b'\t');
@@ -2892,7 +2898,7 @@ pub(super) fn css(t: &[u8], st: State, o: &mut Out) -> State {
             _ => i += 1,
         }
     }
-    State { kind: 0, a: 0, b: depth, ..st }
+    State { kind: 0, a: 0, b: b(depth, at_rule), ..st }
 }
 
 #[cfg(test)]
@@ -3071,6 +3077,21 @@ mod tests {
         assert!(line_has(&v[1], "nav", Tok::Tag) && line_has(&v[1], "ul", Tok::Tag) && line_has(&v[1], "#main", Tok::Func));
         assert!(line_has(&v[1], ":hover", Tok::Control) && line_has(&v[1], "color", Tok::Attr) && line_has(&v[1], "#fff", Tok::Num));
         assert!(line_has(&v[2], "__title", Tok::Tag) && line_has(&v[5], "#0067c0", Tok::Num) && line_has(&v[6], "#ff0", Tok::Num));
+        // ... but an at-rule's condition holds no selectors, however many lines it takes
+        let t = toks(Lang::Css, "@media (min-width: 768px) and (max-width: 1023px) {", State::START);
+        assert!(t.contains(&("max-width".into(), Tok::Attr)) && !t.iter().any(|t| t.1 == Tok::Tag), "{t:?}");
+        let v = view(Lang::Css, ".a {\n  @media (min-width: 768px) {\n    width: 750px;\n  }\n}\n");
+        assert!(line_has(&v[1], "min-width", Tok::Attr) && line_has(&v[2], "width", Tok::Attr), "{v:?}");
+        for text in ["@supports (display: grid) {", "@media (prefers-color-scheme: dark) {", "@include mq($from: mobile) {"] {
+            for src in [text.to_string(), format!(".a {{\n  {text}\n  }}\n}}\n")] {
+                assert!(!view(Lang::Css, &src).iter().flatten().any(|t| t.1 == Tok::Tag), "{src:?}: {:?}", view(Lang::Css, &src));
+            }
+        }
+        let v = view(Lang::Css, ".a {\n  @media screen and (min-width:768px),\n    print and (orientation: landscape) {\n    b { c: 1 }\n  }\n}\n");
+        assert!(line_has(&v[1], "min-width", Tok::Attr) && line_has(&v[1], "768px", Tok::Num) && !v[2].iter().any(|t| t.1 == Tok::Tag));
+        assert!(line_has(&v[2], "orientation", Tok::Attr) && line_has(&v[3], "b", Tok::Tag) && line_has(&v[3], "c", Tok::Attr));
+        // a property in SCSS that holds a block (`font: { family: x; }`) is a property
+        assert!(line_has(&view(Lang::Css, ".a {\n  font: {\n    family: x;\n  }\n}\n")[1], "font", Tok::Attr));
     }
 
     fn line_has(line: &[(String, Tok)], s: &str, tok: Tok) -> bool {
