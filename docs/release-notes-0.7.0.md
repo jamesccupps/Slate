@@ -11,15 +11,16 @@ A speed and polish release. The whole app was audited again, in five parts: the 
 - ANSI files open up to 4 times faster and save twice as fast; UTF-16 files open twice as fast.
 - Replace all is up to twice as fast, sorting lines about a third faster, and JSON Format, Check and Minify 15–25% faster.
 - The window shows up a little sooner: the graphics driver loads while the rest of Slate starts.
-- The caret stops blinking a few seconds after the last key or click, as in other Windows apps, so an idle Slate doesn't redraw itself twice a second.
+- An idle Slate rests: the caret stops blinking a few seconds after the last key or click, as in other Windows apps, and the look for files changed on disk every 2 seconds no longer redraws the window when it finds nothing.
 
 ### Fixed
 - Find: a regular expression whose match ran over 64 KB (a long string in JSON, say) could be missed where the search crossed one of its 8 MB steps, and false matches reported after it; Replace all acted on those. Matches up to 1 MB are now always found as in a search of the whole text at once.
 - Regular-expression searches no longer freeze the window in files up to 32 MB: they run in the background, as in bigger files.
 - A file without a byte order mark that only looked like UTF-16 (often a binary file) is kept byte for byte, as ANSI files are, instead of having its odd bytes replaced when saved.
 - After saving a big file, a line another program added to it right after the save no longer becomes part of your text.
-- A Slate started while another one is closing waits for it, then opens with your tabs, instead of in a window that keeps nothing.
-- The session no longer fills a nearly full disk to the last byte.
+- After a restart, the note saying which unsaved changes couldn't be brought back (after a power cut, or a file that's gone or doesn't answer) stays on screen, also when Slate starts by opening a file; it used to vanish at once.
+- A file opened while Slate is closing (at its *Save changes?* prompt, say) opens in the next Slate instead of getting lost, and a Slate started while another one is closing waits for it, then opens with your tabs, instead of in a window that keeps nothing.
+- On a nearly full disk, the session no longer fills it to the last byte, and still keeps the unsaved changes that fit.
 - Colors: Markdown emphasis next to `code`, Scala symbols, names in backticks in Kotlin, Scala and Swift, CSS inside `@media` and nested SCSS, SQL's `CREATE TABLE`, web server logs, G-code's `;` at the end of a block, and C++ headers (`.h` files with classes or templates are C++, not C).
 
 ### Window
