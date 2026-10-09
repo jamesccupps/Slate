@@ -44,6 +44,8 @@ pub enum Ask {
     Quit,
     About,
     Shortcuts,
+    /// Make Slate the default app for the file types it opens?
+    MakeDefault,
 }
 
 /// A menu command or shortcut.
@@ -97,6 +99,7 @@ pub enum Cmd {
     InsertDateTime,
     About,
     Shortcuts,
+    MakeDefault,
 }
 
 pub struct SaveTask {
@@ -1149,6 +1152,7 @@ impl App {
             Cmd::InsertDateTime => self.insert_text(&now_text()),
             Cmd::About => self.asks.push(Ask::About),
             Cmd::Shortcuts => self.asks.push(Ask::Shortcuts),
+            Cmd::MakeDefault => self.asks.push(Ask::MakeDefault),
         }
         self.dirty_title = true;
     }

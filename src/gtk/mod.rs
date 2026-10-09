@@ -134,6 +134,27 @@ fn keep_until_answered(chooser: &gtk4::FileChooserNative) -> RefCell<Option<gtk4
     RefCell::new(Some(chooser.clone()))
 }
 
+/// Makes Slate the default app for the file types its desktop file lists (text/plain, application/json...): GIO
+/// writes them to the user's `~/.config/mimeapps.list`, which file managers read. Linux lets an app do this itself;
+/// on Windows the user has to pick Slate in Default apps.
+fn make_default() -> Result<usize, String> {
+    let id = format!("{APP_ID}.desktop");
+    let Some(info) = gio::AppInfo::all().into_iter().find(|i| i.id().is_some_and(|s| s == id)) else {
+        return Err("Slate isn't installed from its package (the .deb), so the system doesn't know it yet.".into());
+    };
+    let types = info.supported_types();
+    let mut done = 0;
+    for t in &types {
+        if info.set_as_default_for_type(t).is_ok() {
+            done += 1;
+        }
+    }
+    if done == 0 && !types.is_empty() {
+        return Err("The default apps couldn't be changed (~/.config/mimeapps.list).".into());
+    }
+    Ok(done)
+}
+
 /// Whether the desktop asks for dark: GNOME's color scheme, GTK's own setting, or a dark GTK theme (Raspberry Pi
 /// OS's PiXnoir).
 fn system_dark() -> bool {
@@ -700,6 +721,7 @@ fn commands() -> Vec<(&'static str, Cmd, &'static [&'static str])> {
         ("date-time", Cmd::InsertDateTime, &["F5"]),
         ("shortcuts", Cmd::Shortcuts, &["<Control>question"]),
         ("about", Cmd::About, &[]),
+        ("make-default", Cmd::MakeDefault, &[]),
     ]
 }
 
@@ -792,7 +814,7 @@ fn menu_model() -> gio::Menu {
     format.append_submenu(Some("Language"), &lang_menu());
     bar.append_submenu(Some("F_ormat"), &format);
     let help = gio::Menu::new();
-    help.append_section(None, &section(&[("Keyboard shortcuts", "shortcuts"), ("About Slate", "about")]));
+    help.append_section(None, &section(&[("Keyboard shortcuts", "shortcuts"), ("Open files with Slate…", "make-default"), ("About Slate", "about")]));
     bar.append_submenu(Some("_Help"), &help);
     bar
 }
@@ -1523,6 +1545,20 @@ impl Ui {
                     .build();
                 about.present();
             }
+            Ask::MakeDefault => {
+                self.dialog(
+                    "Open your text files with Slate?",
+                    "Slate becomes the app that opens text, Markdown, CSV, JSON, XML, YAML, log and code files when you \
+                     double-click them, for your account. Another app can be picked again any time (right-click a \
+                     file, Open With).",
+                    &[("Cancel", "cancel"), ("Set up", "setup")],
+                    |answer| {
+                        if let Some(ui) = get_ui() {
+                            ui.answer(Ask::MakeDefault, answer);
+                        }
+                    },
+                );
+            }
             Ask::Shortcuts => {
                 self.with(|a| {
                     let i = a.add_text_tab(SHORTCUTS.as_bytes(), None, Some(Lang::Plain));
@@ -1537,6 +1573,17 @@ impl Ui {
     /// What was answered (by the user, or by a test script).
     fn answer(&self, ask: Ask, answer: &str) {
         match ask {
+            Ask::MakeDefault => {
+                if answer != "setup" {
+                    return;
+                }
+                // (A test only says what it would do: it mustn't change the defaults of whoever runs it.)
+                let result = if self.test.is_some() { Ok(0) } else { make_default() };
+                self.with(|a| match result {
+                    Ok(n) => a.flash(format!("Slate now opens {n} kinds of files when they're double-clicked."), false),
+                    Err(e) => a.flash(e, true),
+                });
+            }
             Ask::Open => {
                 if !answer.is_empty() {
                     let p = PathBuf::from(answer);

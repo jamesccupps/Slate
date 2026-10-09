@@ -36,8 +36,10 @@ Linux: GTK 4.8 or newer (`gtk4` crate 0.11 with `v4_8`, as Debian 12 and Raspber
 `cargo build --release` gives `target/release/Slate` (installed as `slate`). On the Windows development PC it's built
 and tested in Docker (Docker Desktop): an image from `rust:1-bookworm` with `libgtk-4-dev xvfb xauth
 fonts-dejavu-core fonts-noto-color-emoji dbus-x11`, the source mounted, `CARGO_TARGET_DIR` in a volume, and the
-program run under `xvfb-run` with `GTK_A11Y=none GSK_RENDERER=cairo`. `cargo check --lib --target
-x86_64-unknown-linux-gnu` on Windows checks the shared code without GTK. `packaging/linux/package.sh <binary>
+program run under `xvfb-run` with `GTK_A11Y=none GSK_RENDERER=cairo` (`--test` scripts; for the real window's
+dialogs and menus, `Xvfb` + `dbus-run-session` + `xdotool` and ImageMagick's `import` for pictures, as test mode
+never shows a dialog). `cargo check --target x86_64-unknown-linux-gnu` on Windows doesn't work any more (GTK's
+crates need the Linux pkg-config). `packaging/linux/package.sh <binary>
 <version> <amd64|arm64> <out>` makes the `.deb` (`/usr/bin/slate`, the desktop file `io.github.jamesccupps.Slate`,
 icons) and a tarball, each with a `.sha256`.
 
@@ -166,7 +168,11 @@ accent stay Windows-only), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate
     with a negative Pango indent), `chrome.rs` the tab strip and status bar (drawn like Windows'), `session.rs`
     (`session.json` and a copy per unsaved tab up to 64 MiB; bigger ones are asked about), `testmode.rs`
     (`slate --test script` under Xvfb: commands at the top of the file; shots through `WidgetPaintable`). Not on Linux
-    yet: the structure panel and path bar, updates, show whitespace, bracket matching, overtype, high contrast.
+    yet: the structure panel and path bar, show whitespace, bracket matching, overtype, high contrast. Help → Open
+    files with Slate… (`make_default`) makes Slate the default for the desktop file's MimeType list through GIO
+    (`~/.config/mimeapps.list`; Linux lets an app do that itself). File dialogs (`FileChooserNative`) must be kept
+    alive until answered (`keep_until_answered`): GTK drops them otherwise. The menu bar's items don't take the
+    keyboard, and commands leave it in the text.
     `SLATE_TIMING=1` prints how long painting and keys take.
 - `src/ui/` — the Win32 app (see the module docs at the top of each file).
   - `src/highlight.rs` (+ `highlight/code.rs`, `highlight/markup.rs`, `highlight/config.rs`; shared, `ui` reaches it

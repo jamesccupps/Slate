@@ -81,7 +81,8 @@ sudo apt install /tmp/slate.deb
 ```
 
 Slate is then in the menu (Accessories), opens files from the file manager, and `slate notes.txt` opens a file from
-a terminal. The package also adds Slate's own apt repository (signed; `/etc/apt/sources.list.d/slate.list`), so
+a terminal; **Help → Open files with Slate…** makes it the app that opens text, Markdown, CSV, JSON, XML, YAML, log
+and code files when they're double-clicked. The package also adds Slate's own apt repository (signed; `/etc/apt/sources.list.d/slate.list`), so
 `sudo apt upgrade` keeps Slate up to date along with the rest of the system; removing Slate removes that too. The
 [latest release](https://github.com/jamesccupps/Slate/releases/latest) also has the packages to download yourself
 (`slate-linux-arm64.deb` for 64-bit ARM like the Pi, `slate-linux-amd64.deb` for PCs; install one with

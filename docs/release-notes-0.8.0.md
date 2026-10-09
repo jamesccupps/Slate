@@ -15,6 +15,7 @@ Or download `slate-linux-arm64.deb` (64-bit ARM, like the Pi) or `slate-linux-am
 - The same engine as on Windows: huge files open instantly (an 826 MB JSON file in a quarter of a second, its lines counted in another quarter), search, Replace all, JSON and XML format, minify and check, and the line tools work the same way, on other threads.
 - The same 52 languages' colors and editing: tabs, find and replace, go to line, comments, moving and duplicating lines, word wrap (wrapped lines continue under their indentation), line numbers, zoom, dark and light (following the desktop).
 - Tabs and their unsaved text come back after a restart; files changed by other programs are noticed and reloaded when they have no unsaved changes.
+- Help → Open files with Slate… makes Slate the app that opens text, Markdown, CSV, JSON, XML, YAML, log and code files when they're double-clicked (Linux lets Slate do that itself; on Windows the same menu item sets it up and opens Default apps).
 - Linux habits: one Slate per session (opening a file from the file manager or `slate notes.txt` in a terminal adds a tab), files dropped on the window open, selecting text makes it available to middle-click paste, new files get LF line breaks.
 - Updates come through apt: the package adds Slate's own apt repository (signed with Slate's key, which the package brings), so `sudo apt upgrade` installs new versions with everything else. Removing Slate removes the repository too.
 - Not on Linux yet: the JSON/XML structure panel and path bar, show whitespace, bracket matching and overtype.
