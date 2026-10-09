@@ -282,6 +282,7 @@ impl App {
         }
         self.tab_drag = None;
         self.down = Hit::None;
+        self.middle_down = Hit::None;
         self.struct_drag = None;
         if self.split_drag.take().is_some() {
             self.settings.save();
@@ -2568,21 +2569,16 @@ impl App {
                 true
             }
             VK_TAB if !m.ctrl => {
-                // In order: the find box, the replace box (when it shows), then the text; Shift+Tab goes back.
-                let (find, replace) = (self.find.find_edit, self.find.replace_edit);
-                let next = match (self.find.mode, m.shift) {
-                    (BarMode::Replace, false) if edit == find => Some(replace),
-                    (BarMode::Replace, true) if edit == replace => Some(find),
-                    _ => None,
-                };
-                match next {
-                    Some(h) => {
-                        FindBar::focus(h);
-                        FindBar::select_all(h);
-                    }
-                    None => unsafe {
+                // With the replace box, between the two boxes (Esc goes back to the text, where a habitual second Tab
+                // would type over the match selected there).
+                if self.find.mode == BarMode::Replace {
+                    let next = if edit == self.find.find_edit { self.find.replace_edit } else { self.find.find_edit };
+                    FindBar::focus(next);
+                    FindBar::select_all(next);
+                } else {
+                    unsafe {
                         let _ = SetFocus(self.hwnd);
-                    },
+                    }
                 }
                 self.invalidate();
                 true
@@ -2616,7 +2612,12 @@ impl App {
         self.disarm_menu_bar();
         self.hide_tip();
         let hit = self.hit(x, y);
-        self.down = hit;
+        // Only a left press is drawn pressed: the others aren't captured, so their release can come anywhere.
+        match button {
+            0 if std::mem::replace(&mut self.down, hit) != hit => self.invalidate(),
+            2 => self.middle_down = hit,
+            _ => {}
+        }
         let capture = |h: HWND| unsafe {
             SetCapture(h);
         };
@@ -2923,7 +2924,11 @@ impl App {
 
     pub fn on_mouse_up(&mut self, x: f32, y: f32, button: u8) {
         let hit = self.hit(x, y);
-        let down = std::mem::replace(&mut self.down, Hit::None);
+        let down = match button {
+            0 => std::mem::replace(&mut self.down, Hit::None),
+            2 => std::mem::replace(&mut self.middle_down, Hit::None),
+            _ => Hit::None,
+        };
         unsafe {
             let _ = ReleaseCapture();
         }
@@ -2965,6 +2970,11 @@ impl App {
     pub fn on_mouse_leave(&mut self) {
         self.mouse_tracking = false;
         self.hide_tip();
+        if unsafe { GetCapture() } != self.hwnd {
+            // (a press whose release can't come here any more)
+            self.down = Hit::None;
+            self.middle_down = Hit::None;
+        }
         if self.hover != Hit::None {
             self.hover = Hit::None;
             self.invalidate();
@@ -3725,7 +3735,7 @@ impl App {
                     recent.push(enabled(Cmd::ClearRecent, "No recent files", "", false));
                 } else {
                     recent.push(Item::Sep);
-                    recent.push(item(Cmd::ClearRecent, "&Clear list", ""));
+                    recent.push(item(Cmd::ClearRecent, "Clear list", ""));
                 }
                 vec![
                     item(Cmd::NewTab, "&New tab", "Ctrl+N"),

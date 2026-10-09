@@ -38,6 +38,11 @@ use super::win;
 
 pub type Cell = Rc<RefCell<App>>;
 
+thread_local! {
+    /// How many times the window was asked to repaint (test mode's `print:invalidated`).
+    pub static INVALIDATED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 pub struct SaveTask {
     pub job: Job<Result<Saved, SaveError>>,
     pub state: u64,
@@ -409,7 +414,10 @@ pub struct App {
     pub notice_rects: Vec<Rect>,
     pub tab_scroll: f32,
     pub hover: Hit,
+    /// What the left button was pressed on (drawn pressed while it's held there).
     pub down: Hit,
+    /// What the middle button was pressed on (a tab closes when it's released on it).
+    pub middle_down: Hit,
     pub tab_drag: Option<(usize, f32, bool)>,
     pub caret_on: bool,
     /// When the caret last moved (or the text last changed): it stops blinking a while after (`caret_timeout`).
@@ -520,6 +528,7 @@ impl App {
             tab_scroll: 0.0,
             hover: Hit::None,
             down: Hit::None,
+            middle_down: Hit::None,
             tab_drag: None,
             caret_on: true,
             caret_since: Instant::now(),
@@ -570,6 +579,7 @@ impl App {
     }
 
     pub fn invalidate(&self) {
+        INVALIDATED.with(|n| n.set(n.get() + 1));
         unsafe {
             let _ = InvalidateRect(self.hwnd, None, false);
         }

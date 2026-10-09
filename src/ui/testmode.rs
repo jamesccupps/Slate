@@ -18,8 +18,9 @@
 //! shown in this mode; `asked` lists the prompts so far), `set:restore_session=true`.
 //!
 //! Lower level: `down:<x>,<y>` / `move:<x>,<y>` / `up:<x>,<y>` (left button, for drags; also where drag scrolling
-//! sees the pointer), `wheelraw:<delta>` or `wheelraw:ctrl,<delta>` (one WM_MOUSEWHEEL; touchpads send small
-//! deltas), `char:<hex>[,<hex>…]` (WM_CHAR through the window procedure, e.g. `char:d83d,de00`), `altkey` (Alt
+//! sees the pointer; `down:<x>,<y>,right` or `,middle` for the others), `leave` (WM_MOUSELEAVE), `wheelraw:<delta>`
+//! or `wheelraw:ctrl,<delta>` (one WM_MOUSEWHEEL; touchpads send small deltas), `char:<hex>[,<hex>…]` (WM_CHAR
+//! through the window procedure, e.g. `char:d83d,de00`), `altkey` (Alt
 //! pressed and released alone: WM_SYSCOMMAND SC_KEYMENU), `altgr:on|off` (pretend Ctrl+Alt+letter types a
 //! character, like AltGr on a Polish keyboard), `activate` / `deactivate` (WM_ACTIVATE), `cancelmode`
 //! (WM_CANCELMODE: something took the mouse capture), `timer:<id>` (run a timer's tick now; 3 = disk check, 4 = drag
@@ -29,7 +30,8 @@
 //! (light, dark or high contrast), `syscaret` (whether the hidden system caret is where the caret is: `follows`),
 //! `statusbar` (all its texts), `closed` (tabs Reopen closed tab would bring back), `tablist` (the list of all
 //! tabs, or `hidden` while they all fit), `bracket` (the bracket pair at the caret), `overtype`, `tip` (the tooltip
-//! showing: `hover:` a part, then `timer:10`), `caret` (blinked on or off; `timer:1` blinks it).
+//! showing: `hover:` a part, then `timer:10`), `caret` (blinked on or off; `timer:1` blinks it), `pressed` (the part
+//! drawn pressed), `invalidated` (repaints asked for since the last time).
 //! `contrast:on|off|system` pretends Windows' high contrast is on or off (and tells the window it changed).
 //!
 //! Also: `args:<path>` (open it as if named on the command line: a missing file becomes a new one), `lang:<name>`
@@ -506,6 +508,9 @@ fn describe(cell: &Cell, what: &str) -> String {
         }
         "overtype" => a.overtype.to_string(),
         "tip" => a.tip.text.clone().unwrap_or_default(),
+        "pressed" if a.down != Hit::None && a.down == a.hover => format!("{:?}", a.down),
+        "pressed" => "none".into(),
+        "invalidated" => super::app::INVALIDATED.with(|n| n.replace(0)).to_string(),
         "caret" => (if a.caret_on { "on" } else { "off" }).into(),
         k if k.starts_with("keys") => {
             // keys0 … keys4: each item's access key (the letter after '&'; '?' for none), submenus in brackets
@@ -936,17 +941,25 @@ pub fn run(args: &[String]) -> i32 {
                 out.push_str(&format!("session {arg}: {:.1} ms\n", t.elapsed().as_secs_f64() * 1000.0));
             }
             "down" | "move" | "up" => {
-                let (x, y) = arg.split_once(',').map(|(x, y)| (x.parse().unwrap_or(0.0), y.parse().unwrap_or(0.0))).unwrap_or((0.0, 0.0));
+                // (`down:<x>,<y>,right` or `,middle`: another button)
+                let parts: Vec<&str> = arg.split(',').map(str::trim).collect();
+                let num = |i: usize| parts.get(i).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+                let (x, y) = (num(0), num(1));
+                let b = match parts.get(2) {
+                    Some(&"right") => 1,
+                    Some(&"middle") => 2,
+                    _ => 0,
+                };
                 super::actions::TEST_POINTER.with(|p| p.set(Some((x, y))));
                 {
                     let mut a = cell.borrow_mut();
                     match op {
                         "down" => {
                             a.on_mouse_move(x, y);
-                            a.on_mouse_down(x, y, 0);
+                            a.on_mouse_down(x, y, b);
                         }
                         "move" => a.on_mouse_move(x, y),
-                        _ => a.on_mouse_up(x, y, 0),
+                        _ => a.on_mouse_up(x, y, b),
                     }
                 }
                 drain_pending(&cell);
@@ -991,6 +1004,8 @@ pub fn run(args: &[String]) -> i32 {
                 // what Windows sends when high contrast goes on or off
                 unsafe { SendMessageW(hwnd, WM_SETTINGCHANGE, WPARAM(SPI_SETHIGHCONTRAST.0 as usize), LPARAM(0)) };
             }
+            // the mouse left the window (WM_MOUSELEAVE)
+            "leave" => cell.borrow_mut().on_mouse_leave(),
             "activate" | "deactivate" | "cancelmode" => {
                 use windows::Win32::Foundation::{LPARAM, WPARAM};
                 use windows::Win32::UI::WindowsAndMessaging::{SendMessageW, WA_ACTIVE, WA_INACTIVE, WM_ACTIVATE, WM_CANCELMODE};
