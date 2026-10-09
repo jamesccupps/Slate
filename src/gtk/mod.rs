@@ -126,6 +126,14 @@ pub fn run(args: Vec<String>) -> i32 {
     if application.run_with_args(&argv) == glib::ExitCode::SUCCESS { 0 } else { 1 }
 }
 
+/// GTK doesn't keep a native dialog alive while it's shown: dropped when the function showing it returns, its file
+/// chooser was taken down at once (GTK 4.8 then said "The folder contents could not be displayed"). The response
+/// handler holds this reference and lets it go once the dialog is answered.
+#[allow(deprecated)]
+fn keep_until_answered(chooser: &gtk4::FileChooserNative) -> RefCell<Option<gtk4::FileChooserNative>> {
+    RefCell::new(Some(chooser.clone()))
+}
+
 /// Whether the desktop asks for dark: GNOME's color scheme, GTK's own setting, or a dark GTK theme (Raspberry Pi
 /// OS's PiXnoir).
 fn system_dark() -> bool {
@@ -142,7 +150,17 @@ fn system_dark() -> bool {
         }
     }
     let Some(gs) = gtk4::Settings::default() else { return false };
-    if gs.is_gtk_application_prefer_dark_theme() {
+    thread_local! {
+        /// GTK's prefer-dark setting as the desktop gave it: Slate sets it itself afterwards (for its own menus and
+        /// boxes), so reading it again would only give Slate's own choice back.
+        static DESKTOP_PREFERS_DARK: Cell<Option<bool>> = const { Cell::new(None) };
+    }
+    let prefers = DESKTOP_PREFERS_DARK.with(|c| {
+        let v = c.get().unwrap_or_else(|| gs.is_gtk_application_prefer_dark_theme());
+        c.set(Some(v));
+        v
+    });
+    if prefers {
         return true;
     }
     gs.gtk_theme_name().is_some_and(|n| {
@@ -241,6 +259,13 @@ pub fn window(application: &gtk4::Application, test: Option<Rc<testmode::Test>>)
     notice.set_visible(false);
 
     let menubar = gtk4::PopoverMenuBar::from_model(Some(&menu_model()));
+    // A menu bar item clicked kept the keyboard once its menu closed (typing went nowhere, as Ctrl+N's new tab
+    // showed): as on Windows, the keyboard stays in the text, and the menus open in popovers of their own.
+    let mut item = menubar.first_child();
+    while let Some(w) = item {
+        w.set_focusable(false);
+        item = w.next_sibling();
+    }
     let middle = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
     middle.append(&text);
     middle.append(&vbar);
@@ -721,9 +746,16 @@ fn actions(ui: &Rc<Ui>) {
 }
 
 fn section(items: &[(&str, &str)]) -> gio::Menu {
+    let commands = commands();
     let m = gio::Menu::new();
     for (label, action) in items {
-        m.append(Some(label), Some(&format!("win.{action}")));
+        let item = gio::MenuItem::new(Some(label), Some(&format!("win.{action}")));
+        // GTK shows no shortcut for an action that has more than one (New tab, Redo, Zoom in): the first is the one
+        // shown, as on Windows.
+        if let Some((_, _, accels)) = commands.iter().find(|(n, _, a)| n == action && a.len() > 1) {
+            item.set_attribute_value("accel", Some(&accels[0].to_variant()));
+        }
+        m.append_item(&item);
     }
     m
 }
@@ -865,10 +897,16 @@ impl Ui {
                 self.find_entry.grab_focus();
                 self.find_entry.select_region(0, -1);
             }
-            Cmd::CloseFind => {
+            // A new tab is for typing; other commands leave the keyboard in the text too (wherever it was, a menu
+            // or a button), unless it's in the find bar's boxes.
+            Cmd::CloseFind | Cmd::NewTab => {
                 self.text.grab_focus();
             }
-            _ => {}
+            _ => {
+                if !GtkWindowExt::focus(&self.window).is_some_and(|f| f.is_ancestor(&self.find_box)) {
+                    self.text.grab_focus();
+                }
+            }
         }
     }
 
@@ -1400,8 +1438,9 @@ impl Ui {
                 let chooser = gtk4::FileChooserNative::new(Some("Open"), Some(&self.window), gtk4::FileChooserAction::Open, Some("_Open"), Some("_Cancel"));
                 #[allow(deprecated)]
                 chooser.set_select_multiple(true);
+                let keep = keep_until_answered(&chooser);
                 #[allow(deprecated)]
-                chooser.connect_response(|c, r| {
+                chooser.connect_response(move |c, r| {
                     if r == gtk4::ResponseType::Accept {
                         let files = c.files();
                         let paths: Vec<PathBuf> = (0..files.n_items()).filter_map(|k| files.item(k).and_downcast::<gio::File>()).filter_map(|f| f.path()).collect();
@@ -1409,6 +1448,7 @@ impl Ui {
                             ui.with(|a| a.open_paths(&paths));
                         }
                     }
+                    keep.take();
                     c.destroy();
                 });
                 #[allow(deprecated)]
@@ -1424,6 +1464,7 @@ impl Ui {
                     #[allow(deprecated)]
                     chooser.set_current_name("Untitled.txt");
                 }
+                let keep = keep_until_answered(&chooser);
                 #[allow(deprecated)]
                 chooser.connect_response(move |c, r| {
                     if r == gtk4::ResponseType::Accept {
@@ -1435,6 +1476,7 @@ impl Ui {
                     } else if let Some(ui) = get_ui() {
                         ui.with(|a| a.quitting = false);
                     }
+                    keep.take();
                     c.destroy();
                 });
                 #[allow(deprecated)]
