@@ -1252,7 +1252,10 @@ pub(super) fn gcode_line(l: &[u8], _col0: bool, bol: bool, o: &mut Out) {
         let c = l[i];
         match c {
             b';' => {
-                o.put(i, n, Tok::Comment);
+                // a comment (Marlin, LinuxCNC…), or alone at the line's end Fanuc's end of block (whose comments are
+                // in parentheses)
+                let eob = l[i + 1..].iter().all(|&b| is_ws(b));
+                o.put(i, n, if eob { Tok::Punct } else { Tok::Comment });
                 return;
             }
             b'[' | b']' => {
@@ -1855,6 +1858,10 @@ mod tests {
         assert!(line_has(&v[8], "%", Tok::Section) && line_has(&v[9], "O1001", Tok::Section));
         assert!(line_has(&v[10], "o100", Tok::Section) && line_has(&v[10], "sub", Tok::Keyword));
         assert!(line_has(&v[11], "g1", Tok::Keyword) && line_has(&v[11], "x", Tok::Attr) && line_has(&v[11], "6", Tok::Num));
+        // Fanuc's `;` at a line's end ends the block: it's no (empty) comment
+        let v = view(Lang::GCode, "O1001 (BRACKET; OP1);\nN10 G90 G21 ;\r\n");
+        assert!(line_has(&v[0], "(BRACKET; OP1)", Tok::Comment) && line_has(&v[0], ";", Tok::Punct));
+        assert!(line_has(&v[1], ";\r", Tok::Punct) && !v[1].iter().any(|t| t.1 == Tok::Comment));
     }
 
     #[test]

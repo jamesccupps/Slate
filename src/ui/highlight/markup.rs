@@ -1,7 +1,7 @@
 //! Markup and data languages: XML and HTML (with the scripts and styles inside HTML pages), Markdown and YAML.
 
 use super::code;
-use super::{Lang, Out, State, Tok, at, find, is_num_word, line_end, scan_str};
+use super::{Lang, Out, Span, State, Tok, at, find, is_num_word, line_end, scan_str};
 
 // ---- XML and HTML ----
 
@@ -551,8 +551,62 @@ fn md_line(full: &[u8], nl: bool, col0: bool, bol: bool, mut st: State, o: &mut 
             i = ind + m;
         }
     }
+    let first = o.v.as_ref().map_or(0, |v| v.len());
     md_inline(l, i, o, &mut st);
+    if let Some(v) = o.v.as_mut() {
+        uncross(v, first);
+    }
     st
+}
+
+/// Drops the spans of `v[from..]` that cross another (emphasis is looked for on its own: `*a [b* c](d)`), so no
+/// byte's color depends on which of two came last: emphasis first, then a link's, and of two alike the later one.
+fn uncross(v: &mut Vec<Span>, from: usize) {
+    if v.len() < from + 2 {
+        return;
+    }
+    let rank = |t: Tok| match t {
+        Tok::Bold | Tok::Italic => 0,
+        Tok::Link | Tok::Dim => 1,
+        _ => 2,
+    };
+    let spans = &mut v[from..];
+    // (the outer of two nested spans first, as the inner one's color goes over it)
+    spans.sort_unstable_by_key(|s| (s.0, std::cmp::Reverse(s.1)));
+    // the spans the one looked at is inside of, innermost last; a dropped one is made empty
+    let (mut open, mut depth) = ([0usize; 8], 0);
+    for k in 0..spans.len() {
+        let (s, e, tok) = spans[k];
+        let mut keep = true;
+        while depth > 0 {
+            let top = open[depth - 1];
+            if spans[top].1 <= s {
+                depth -= 1;
+            } else if spans[top].1 >= e {
+                break;
+            } else if rank(tok) <= rank(spans[top].2) {
+                keep = false;
+                break;
+            } else {
+                spans[top].1 = spans[top].0;
+                depth -= 1;
+            }
+        }
+        if keep && depth < open.len() {
+            open[depth] = k;
+            depth += 1;
+        } else {
+            spans[k].1 = s;
+        }
+    }
+    let mut w = from;
+    for k in from..v.len() {
+        if v[k].0 < v[k].1 {
+            v[w] = v[k];
+            w += 1;
+        }
+    }
+    v.truncate(w);
 }
 
 /// How far ahead the end of `code`, a link's (url) or a <tag> is looked for.
@@ -563,12 +617,33 @@ const MD_CODE_LOOK: usize = 512;
 /// looked 2 KB ahead for each star).
 const SHORT_LOOK: usize = 256;
 
-/// The closing run of `k` `c` characters for emphasis opened before `from`.
+/// An inline code span whose backticks start at `i` (`code`, ``co`de``), its closing run looked for before `look`:
+/// the length of the opening run, and where the span ends (None: the backticks are just characters).
+fn code_span(l: &[u8], i: usize, look: usize) -> (usize, Option<usize>) {
+    let run = l[i..].iter().take_while(|&&b| b == b'`').count();
+    let mut p = i + run;
+    while let Some(q) = memchr::memchr(b'`', &l[p.min(look)..look]) {
+        let s = p + q;
+        let r = l[s..].iter().take_while(|&&b| b == b'`').count();
+        if r == run {
+            return (run, Some(s + r));
+        }
+        p = s + r;
+    }
+    (run, None)
+}
+
+/// The closing run of `k` `c` characters for emphasis opened before `from` (not one in `code`: code goes first).
 fn emphasis_close(l: &[u8], from: usize, c: u8, k: usize) -> Option<usize> {
     let end = l.len().min(from + SHORT_LOOK);
     let mut p = from;
-    while let Some(q) = memchr::memchr(c, &l[p.min(end)..end]) {
+    while let Some(q) = memchr::memchr2(c, b'`', &l[p.min(end)..end]) {
         let s = p + q;
+        if l[s] == b'`' {
+            let (run, e) = code_span(l, s, end);
+            p = e.unwrap_or(s + run);
+            continue;
+        }
         if s + k <= l.len()
             && l[s..s + k].iter().all(|&b| b == c)
             && s > from
@@ -593,29 +668,13 @@ fn md_inline(l: &[u8], mut i: usize, o: &mut Out, st: &mut State) {
         let c = l[i];
         match c {
             b'\\' => i += 2,
-            b'`' => {
-                // `code`, ``co`de``
-                let run = l[i..].iter().take_while(|&&b| b == b'`').count();
-                let look = n.min(i + run + MD_CODE_LOOK);
-                let mut p = i + run;
-                let mut found = None;
-                while let Some(q) = memchr::memchr(b'`', &l[p.min(look)..look]) {
-                    let s = p + q;
-                    let r = l[s..].iter().take_while(|&&b| b == b'`').count();
-                    if r == run {
-                        found = Some(s + r);
-                        break;
-                    }
-                    p = s + r;
+            b'`' => match code_span(l, i, n.min(i + MD_CODE_LOOK)) {
+                (_, Some(e)) => {
+                    o.put(i, e, Tok::Str);
+                    i = e;
                 }
-                match found {
-                    Some(e) => {
-                        o.put(i, e, Tok::Str);
-                        i = e;
-                    }
-                    None => i += run,
-                }
-            }
+                (run, None) => i += run,
+            },
             b'<' => {
                 if l[i..].starts_with(b"<!--") {
                     match find(l, i + 4, b"-->") {
@@ -696,7 +755,8 @@ fn md_inline(l: &[u8], mut i: usize, o: &mut Out, st: &mut State) {
                         url_from = e;
                     }
                 }
-                i += 1;
+                // (an image's `[` is looked at already)
+                i = s + 1;
             }
             b'h' if i >= url_from
                 && (l[i..].starts_with(b"http://") || l[i..].starts_with(b"https://"))
@@ -1078,6 +1138,13 @@ mod tests {
         assert_eq!(toks(Lang::Markdown, "# *x*", st), vec![("# *x*".into(), Tok::Comment)]);
         let st = end_state(Lang::Markdown, "```\ncode\n```\n");
         assert_eq!(toks(Lang::Markdown, "# After", st), vec![("# After".into(), Tok::Heading)]);
+        // a star in code closes nothing, a closing star opens nothing more, an image's link is colored once
+        has(Lang::Markdown, "*all `*.log` files*", &[("*all `*.log` files*", Tok::Italic), ("`*.log`", Tok::Str)]);
+        assert_eq!(toks(Lang::Markdown, "*a*b*", State::START), vec![("*a*".into(), Tok::Italic)]);
+        assert_eq!(toks(Lang::Markdown, "**a**b**c**", State::START), vec![("**a**".into(), Tok::Bold), ("**c**".into(), Tok::Bold)]);
+        assert_eq!(toks(Lang::Markdown, "![logo](x.png)", State::START), vec![("![logo]".into(), Tok::Link), ("(x.png)".into(), Tok::Dim)]);
+        // what still crosses is dropped, emphasis first
+        assert_eq!(toks(Lang::Markdown, "*a [b* c](d)", State::START), vec![("[b* c]".into(), Tok::Link), ("(d)".into(), Tok::Dim)]);
         // emphasis or links that never close cost little to look for
         let start = std::time::Instant::now();
         for p in ["*a ", "#["] {

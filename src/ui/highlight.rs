@@ -355,6 +355,7 @@ impl Lang {
             "ts" | "tsx" | "mts" | "cts" => Lang::TypeScript,
             "c" => Lang::C,
             "h" if objc_like(head) => Lang::ObjC,
+            "h" if cpp_like(head) => Lang::Cpp,
             "h" => Lang::C,
             // Objective-C, or MATLAB (left to what the content says)
             "m" => return objc_like(head).then_some(Lang::ObjC),
@@ -579,6 +580,40 @@ fn objc_like(head: &[u8]) -> bool {
         }
         if let Some(p) = memchr::memmem::find(l, b"/*") {
             comment = memchr::memmem::find(&l[p + 2..], b"*/").is_none();
+        }
+    }
+    false
+}
+
+/// Whether a `.h` file reads like C++: a line starts with `class Name`, `namespace`, `template <` or `using
+/// namespace`, is a `public:`-style label, uses `std::`, or includes a standard header without `.h` (`<vector>`).
+/// (Comments don't count.)
+fn cpp_like(head: &[u8]) -> bool {
+    let mut comment = false;
+    for l in head.split(|&b| b == b'\n').map(|l| l.trim_ascii()) {
+        if comment {
+            comment = memchr::memmem::find(l, b"*/").is_none();
+            continue;
+        }
+        let code = &l[..memchr::memmem::find(l, b"//").unwrap_or(l.len())];
+        let word = |w: &[u8]| code.starts_with(w) && matches!(code.get(w.len()), Some(b' ' | b'\t' | b'<') | None);
+        if word(b"class")
+            || word(b"namespace")
+            || word(b"template")
+            || code.starts_with(b"using namespace ")
+            || matches!(code.trim_ascii_end(), b"public:" | b"private:" | b"protected:")
+            || memchr::memmem::find(code, b"std::").is_some()
+        {
+            return true;
+        }
+        if let Some(rest) = code.strip_prefix(b"#include").map(|r| r.trim_ascii_start()) {
+            let name = rest.strip_prefix(b"<").and_then(|r| r.split(|&b| b == b'>').next()).unwrap_or(b"");
+            if !name.is_empty() && name.iter().all(|&b| b.is_ascii_alphanumeric() || b == b'_' || b == b'/') {
+                return true;
+            }
+        }
+        if let Some(p) = memchr::memmem::find(code, b"/*") {
+            comment = memchr::memmem::find(&code[p + 2..], b"*/").is_none();
         }
     }
     false
@@ -1201,15 +1236,27 @@ fn log_line(t: &[u8], col0: bool, _bol: bool, o: &mut Out) {
             o.put(0, e, Tok::Dim);
             i = e;
         }
+    } else if let Some(e) = ipv4_end(t).filter(|_| col0) {
+        // a web server's access log: the client, then the time in brackets (`10.0.0.1 - - [07/Oct/2026:12:00:01 +0000]`)
+        if let Some(s) = t[e..n.min(e + 48)].iter().position(|&b| b == b'[').map(|p| e + p) {
+            if let Some(c) = t[s..n.min(s + 40)].iter().position(|&b| b == b']') {
+                o.put(s, s + c + 1, Tok::Dim);
+                i = s + c + 1;
+            }
+        }
     } else if col0 {
-        // A timestamp at the start: digits and date/time punctuation.
+        // A timestamp at the start: digits and date/time punctuation (`T` between a date and a time, `Z` after one:
+        // not the T of `TRACE`).
         let mut j = 0;
         let mut digits = 0;
         while j < n.min(40) {
             let b = t[j];
             if b.is_ascii_digit() {
                 digits += 1;
-            } else if !matches!(b, b'-' | b':' | b'.' | b',' | b'/' | b'T' | b'Z' | b' ' | b'[' | b']' | b'+') {
+            } else if !(matches!(b, b'-' | b':' | b'.' | b',' | b'/' | b' ' | b'[' | b']' | b'+')
+                || (b == b'T' && at(t, j + 1).is_ascii_digit())
+                || (b == b'Z' && j > 0 && t[j - 1].is_ascii_digit()))
+            {
                 break;
             }
             j += 1;
@@ -1657,6 +1704,18 @@ mod tests {
         assert_eq!(d(Some("Greeter.h"), b"@interface Greeter : NSObject\n@end\n"), Lang::ObjC);
         assert_eq!(d(Some("util.h"), b"#include <stdio.h>\nint f(void);\n"), Lang::C);
         assert_eq!(d(Some("util.h"), b"/* @interface in a comment */\n"), Lang::C);
+        // .h is C++ too when it reads like it
+        for text in [
+            &b"#pragma once\n#include <vector>\n"[..],
+            b"namespace app {\nclass Widget;\n}\n",
+            b"template <class T>\nT f(T a);\n",
+            b"struct A {\npublic:\n  int x;\n};\n",
+        ] {
+            assert_eq!(d(Some("widget.h"), text), Lang::Cpp, "{:?}", String::from_utf8_lossy(text));
+        }
+        for text in [&b"#include <stdio.h>\n// unlike std::vector\nint f(void);\n"[..], b"/* class Foo\n namespace */\nint classify(int);\n"] {
+            assert_eq!(d(Some("util.h"), text), Lang::C, "{:?}", String::from_utf8_lossy(text));
+        }
         // .nc is G-code, or NetCDF data
         assert_eq!(d(Some("part.nc"), b"G21\nG90\n"), Lang::GCode);
         assert_ne!(d(Some("ocean.nc"), b"CDF\x01\x00\x00\x00\x00"), Lang::GCode);
@@ -1714,8 +1773,8 @@ mod tests {
             assert_eq!(d(Some("list.txt"), text), Lang::Plain, "{:?}", String::from_utf8_lossy(text));
         }
         assert_eq!(d(Some("part.txt"), b"G21\nG90\nG1 X10 Y10 F1200\nM5\n"), Lang::GCode);
-        // a C header with `@class` in a comment, a type library's #import, Octave's #import
-        assert_eq!(d(Some("widget.h"), b"/*!\n @class Widget\n */\nclass Widget {};\n"), Lang::C);
+        // a header with `@class` in a comment (C++ by its class), a type library's #import, Octave's #import
+        assert_eq!(d(Some("widget.h"), b"/*!\n @class Widget\n */\nclass Widget {};\n"), Lang::Cpp);
         assert_eq!(d(Some("com.h"), b"#import \"msxml6.dll\" rename_namespace(\"x\")\n"), Lang::C);
         assert_eq!(d(Some("data.m"), b"#import data\nx = 1;\n"), Lang::Plain);
         assert_eq!(d(Some("View.h"), b"// a header\n#import <Foundation/Foundation.h>\n@interface View : NSObject\n"), Lang::ObjC);
@@ -1732,6 +1791,11 @@ mod tests {
             ("DBG", Tok::Dim),
         ]);
         has(Lang::Log, "Oct  7 12:00:01 host sshd[1]: Failed", &[("Oct  7 12:00:01", Tok::Dim)]);
+        // an access log's time (not its client), and a level right after a time
+        let t = toks(Lang::Log, "10.0.0.7 - - [08/Oct/2026:09:00:13 +0000] \"GET / HTTP/1.1\" 200", State::START);
+        assert_eq!(t, vec![("[08/Oct/2026:09:00:13 +0000]".into(), Tok::Dim)]);
+        has(Lang::Log, "2026-10-08 09:00:14,220 TRACE x", &[("2026-10-08 09:00:14,220", Tok::Dim), ("TRACE", Tok::Dim)]);
+        has(Lang::Log, "2026-10-08T09:00:09Z level=warn", &[("2026-10-08T09:00:09Z", Tok::Dim), ("warn", Tok::Warn)]);
         assert!(toks(Lang::Log, "the errors and terrors", State::START).is_empty());
         // `key: value` needs a one-word key: nginx's `proxy_pass http://…` has none
         assert!(toks(Lang::Ini, "    proxy_pass http://backend:8080;", State::START).is_empty());
@@ -1905,6 +1969,31 @@ mod tests {
                     }
                     let split = lex(lang, &t[cut..], lex(lang, &t[..cut], State::START, None), None);
                     assert_eq!(split, whole, "{lang:?} cut after byte {cut} of {:?}", String::from_utf8_lossy(&t));
+                }
+            }
+        }
+    }
+
+    /// Spans may nest (code inside emphasis in Markdown) but never cross: the color of a byte mustn't depend on
+    /// which of two spans came last. And coloring a text ends in the state lexing it without colors does (the view
+    /// colors each line in the state the lines before end in, worked out without colors).
+    #[test]
+    fn spans_never_cross() {
+        let mut r = 0x9E37_79B9_7F4A_7C15u64;
+        for lang in Lang::ALL {
+            for _ in 0..300 {
+                let len = 10 + (r % 80) as usize;
+                let t = tricky_text(lang, &mut r, len);
+                let mut v = Vec::new();
+                let cut = (r as usize % t.len()).max(1);
+                let st = lex(lang, &t[..cut], State::START, None);
+                let colored = lex(lang, &t[cut..], st, Some(&mut v));
+                assert_eq!(colored, lex(lang, &t[cut..], st, None), "{lang:?} after {cut} of {:?}", String::from_utf8_lossy(&t));
+                for (k, a) in v.iter().enumerate() {
+                    for b in &v[k + 1..] {
+                        let crossed = (a.0 < b.0 && b.0 < a.1 && a.1 < b.1) || (b.0 < a.0 && a.0 < b.1 && b.1 < a.1);
+                        assert!(!crossed, "{lang:?}: {a:?} and {b:?} cross in {:?}", String::from_utf8_lossy(&t));
+                    }
                 }
             }
         }
