@@ -628,7 +628,7 @@ mod text_renderer {
         held: RefCell<Vec<Held>>,
     }
 
-    /// A glyph run copied out of the layout until its row is done.
+    /// The part in view of a glyph run, copied out of the layout until its row is done.
     struct Held {
         x: f32,
         y: f32,
@@ -817,19 +817,33 @@ mod text_renderer {
                     let snap = D2D1_COLOR_BITMAP_GLYPH_SNAP_OPTION_DEFAULT;
                     dc.DrawGlyphRunWithColorSupport(at, run, Some(desc), &brush, None::<&ID2D1SvgGlyphStyle>, 0, mode, snap);
                 }
-                // left to right: kept to be drawn with the rest of its row
+                // left to right: what's in view of it (a row of plain text without word wrap is one run of up to
+                // 8 KiB), kept to be drawn with the rest of its row
                 (_, Some(f)) if r.bidiLevel & 1 == 0 && !r.isSideways.as_bool() && w > 0.0 => {
+                    let (mut a, mut ax) = (0, x);
+                    while a < n && ax + advances[a] + em < v.left {
+                        ax += advances[a];
+                        a += 1;
+                    }
+                    let (mut b, mut bx) = (a, ax);
+                    while b < n && bx - em <= v.right {
+                        bx += advances[b];
+                        b += 1;
+                    }
+                    if a == b {
+                        return S_OK;
+                    }
                     let offsets = if r.glyphOffsets.is_null() { &[] } else { std::slice::from_raw_parts(r.glyphOffsets, n) };
                     c.held.borrow_mut().push(Held {
-                        x,
+                        x: ax,
                         y,
                         face: f.clone(),
                         em,
                         mode,
                         brush,
-                        glyphs: std::slice::from_raw_parts(r.glyphIndices, n).to_vec(),
-                        advances: advances.to_vec(),
-                        offsets: offsets.to_vec(),
+                        glyphs: std::slice::from_raw_parts(r.glyphIndices, n)[a..b].to_vec(),
+                        advances: advances[a..b].to_vec(),
+                        offsets: offsets.get(a..b).unwrap_or_default().to_vec(),
                     });
                 }
                 _ => c.rt.DrawGlyphRun(at, run, &brush, mode),
@@ -936,6 +950,7 @@ pub(crate) mod tests {
         // the kanji between runs in the main one, combining accents; emoji
         let code = "let x = \"two\" + 3; // in colors\tand a tab, then \u{65E5}\u{672C} in between, e\u{301}, more words";
         in_view_looks_the_same(code, false);
+        in_view_looks_the_same(&"a long run of plain text in one color, ".repeat(8), false);
         in_view_looks_the_same("emoji \u{1F600}\u{2764}\u{FE0F} \u{65E5}\u{672C} x", true);
     }
 
@@ -968,5 +983,9 @@ pub(crate) mod tests {
         assert!(below.iter().all(|&b| b == 0xFF));
         let right = render(&mut g, draw(Some(Rect::new(400.0, 0.0, 100.0, 120.0))));
         assert!(right.iter().all(|&b| b == 0xFF));
+        // in view, runs cut down to what's in view look the same
+        let part = render(&mut g, draw(Some(Rect::new(100.0, 0.0, 80.0, 120.0))));
+        let cols = |px: &[u8]| -> Vec<u8> { px.chunks(300 * 4).flat_map(|row| row[100 * 4..180 * 4].to_vec()).collect() };
+        assert!(cols(&part) == cols(&whole), "the same pixels in view: {s}");
     }
 }
