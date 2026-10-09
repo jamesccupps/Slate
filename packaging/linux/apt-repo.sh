@@ -21,7 +21,9 @@ for f in "$debs"/*.deb; do
 done
 
 cd "$repo"
-for arch in amd64 arm64; do
+# armhf and i386 have no Slate, but systems that also take those (Raspberry Pi OS 64-bit takes armhf, PCs with
+# i386 for Wine or Steam) look for them in every repository: empty lists keep apt from noting it each time.
+for arch in amd64 arm64 armhf i386; do
     dir=dists/stable/main/binary-$arch
     mkdir -p "$dir"
     apt-ftparchive --arch "$arch" packages pool > "$dir/Packages"
@@ -32,7 +34,7 @@ apt-ftparchive \
     -o APT::FTPArchive::Release::Label=Slate \
     -o APT::FTPArchive::Release::Suite=stable \
     -o APT::FTPArchive::Release::Codename=stable \
-    -o APT::FTPArchive::Release::Architectures="amd64 arm64" \
+    -o APT::FTPArchive::Release::Architectures="amd64 arm64 armhf i386" \
     -o APT::FTPArchive::Release::Components=main \
     -o APT::FTPArchive::Release::Description="Slate, a fast text editor for files of any size" \
     release dists/stable > Release
