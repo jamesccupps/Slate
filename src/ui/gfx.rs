@@ -34,8 +34,9 @@ use windows::Win32::Graphics::Dxgi::{
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_ALPHA_MODE_IGNORE, DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC};
 use windows::Win32::Graphics::DirectWrite::{
-    DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_METRICS, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
-    DWRITE_FONT_WEIGHT, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT,
+    DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_METRICS, DWRITE_FONT_SIMULATIONS_BOLD, DWRITE_FONT_STRETCH_NORMAL,
+    DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT, DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_WEIGHT_NORMAL,
+    DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT,
     DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_TEXT_ALIGNMENT_TRAILING,
     DWRITE_TEXT_METRICS, DWRITE_TRIMMING, DWRITE_TRIMMING_GRANULARITY_CHARACTER, DWRITE_WORD_WRAPPING_NO_WRAP,
     DWriteCreateFactory, IDWriteFactory, IDWriteFont1, IDWriteFontCollection, IDWriteTextFormat,
@@ -576,6 +577,8 @@ pub struct FontInfo {
     pub line_height: f32,
     pub baseline: f32,
     pub monospace: bool,
+    /// It has a bold face of its own (Windows draws the bold it simulates for one that hasn't wider: Lucida Console).
+    pub bold: bool,
 }
 
 pub fn font_info(dw: &IDWriteFactory, family: &str, size: f32) -> Option<FontInfo> {
@@ -599,10 +602,13 @@ pub fn font_info(dw: &IDWriteFactory, family: &str, size: f32) -> Option<FontInf
         let descent = m.descent as f32 * size / em;
         let gap = m.lineGap as f32 * size / em;
         let monospace = font.cast::<IDWriteFont1>().map(|f| f.IsMonospacedFont().as_bool()).unwrap_or(false);
+        let bold = fam
+            .GetFirstMatchingFont(DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL)
+            .is_ok_and(|f| f.GetSimulations().0 & DWRITE_FONT_SIMULATIONS_BOLD.0 == 0);
         // A little extra air between lines reads better than the font's tight default.
         let line_height = ((ascent + descent + gap) * 1.12).round().max(size.ceil());
         let baseline = ((line_height - (ascent + descent)) / 2.0 + ascent).round();
-        Some(FontInfo { line_height, baseline, monospace })
+        Some(FontInfo { line_height, baseline, monospace, bold })
     }
 }
 

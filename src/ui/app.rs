@@ -1740,7 +1740,7 @@ pub fn make_style(g: &Gfx, s: &Settings, generation: u64) -> Style {
     let size = s.font_size * 96.0 / 72.0 * s.zoom;
     let family = if font_info(&g.dw, &s.font, size).is_some() { s.font.clone() } else { "Consolas".to_string() };
     let info = font_info(&g.dw, &family, size)
-        .unwrap_or(super::gfx::FontInfo { line_height: (size * 1.35).round(), baseline: (size * 1.05).round(), monospace: true });
+        .unwrap_or(super::gfx::FontInfo { line_height: (size * 1.35).round(), baseline: (size * 1.05).round(), monospace: true, bold: true });
     let make = |wrap: bool| {
         let f = g.format(&family, size, DWRITE_FONT_WEIGHT_NORMAL);
         unsafe {
@@ -1761,6 +1761,7 @@ pub fn make_style(g: &Gfx, s: &Settings, generation: u64) -> Style {
         format_wrap,
         format_nowrap,
         row_h: info.line_height,
+        real_bold: info.bold,
         char_w,
         digit_w: char_w,
         wrap: s.wrap,

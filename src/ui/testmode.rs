@@ -15,7 +15,7 @@
 //! as the window does every 2 s; then `jobs`), `shot:<file.png>`, `print:<what>`
 //! (`text`, `sel`, `status`, `lines`, `title`, `top`, `find`, `tabs`, `dirty`, `asked`, `clipboard`, `window`,
 //! `saving`, `busy`: what `jobs` waits for, `mem`: private bytes and working set), `expect:<what>=<value>`, `answer:save,dont,cancel` (answers for the next prompts, which are never
-//! shown in this mode; `asked` lists the prompts so far), `set:restore_session=true`.
+//! shown in this mode; `asked` lists the prompts so far), `set:restore_session=true` (also `font=<family>`).
 //!
 //! Lower level: `down:<x>,<y>` / `move:<x>,<y>` / `up:<x>,<y>` (left button, for drags; also where drag scrolling
 //! sees the pointer), `wheelraw:<delta>` or `wheelraw:ctrl,<delta>` (one WM_MOUSEWHEEL; touchpads send small
@@ -29,7 +29,8 @@
 //! (light, dark or high contrast), `syscaret` (whether the hidden system caret is where the caret is: `follows`),
 //! `statusbar` (all its texts), `closed` (tabs Reopen closed tab would bring back), `tablist` (the list of all
 //! tabs, or `hidden` while they all fit), `bracket` (the bracket pair at the caret), `overtype`, `tip` (the tooltip
-//! showing: `hover:` a part, then `timer:10`), `caret` (blinked on or off; `timer:1` blinks it).
+//! showing: `hover:` a part, then `timer:10`), `caret` (blinked on or off; `timer:1` blinks it), `realbold` (the
+//! font has a bold face of its own).
 //! `contrast:on|off|system` pretends Windows' high contrast is on or off (and tells the window it changed).
 //!
 //! Also: `args:<path>` (open it as if named on the command line: a missing file becomes a new one), `lang:<name>`
@@ -505,6 +506,7 @@ fn describe(cell: &Cell, what: &str) -> String {
             }
         }
         "overtype" => a.overtype.to_string(),
+        "realbold" => a.style.real_bold.to_string(),
         "tip" => a.tip.text.clone().unwrap_or_default(),
         "caret" => (if a.caret_on { "on" } else { "off" }).into(),
         k if k.starts_with("keys") => {
@@ -720,6 +722,7 @@ pub fn run(args: &[String]) -> i32 {
                     "font_size" => a.settings.font_size = v.parse().unwrap_or(11.0),
                     "restore_session" => a.settings.restore_session = v == "true",
                     "show_whitespace" => a.settings.show_whitespace = v == "true",
+                    "font" => a.settings.font = v.to_string(),
                     _ => {}
                 }
                 a.rebuild_style();
