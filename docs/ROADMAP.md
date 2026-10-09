@@ -125,8 +125,9 @@ the structure panel, a hanging indent with word wrap. Details in the [0.7.0 rele
 - The path bar and structure panel scan a big JSON file again after each edit (in the background, ~1.5 s for
   800 MB): wait for typing to pause, or keep the lists for edits that don't change the structure (S–M). Line tools
   on a selection run on the UI thread (sorting 16 MB takes ~0.2 s): run them like the whole document's (S).
-- Engine: a piece tree with O(log n) lookups for documents with hundreds of thousands of edits (M); regex matches
-  longer than 1 MiB that cross a search window (M); UTF-16 files with unpaired surrogates kept byte-exact (S);
+- Engine: a piece tree with O(log n) lookups for documents with hundreds of thousands of edits (M); in files over
+  64 MiB, regex matches longer than 1 MiB (Find next/previous) or 16 MiB (Count all, Replace all) that cross a
+  search window: carry the regex's state across windows (M); UTF-16 files with unpaired surrogates kept byte-exact (S);
   saving where Slate can't create files, and keeping hard links (S–M); trimming what undo history keeps alive (S);
   Home/End on a big file whose lines are still being counted shouldn't read far (S).
 - Colors: a misdetected heredoc should end sooner than at its end word; exact states for lexers with look-ahead at
