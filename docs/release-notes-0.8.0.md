@@ -2,7 +2,14 @@
 
 Slate now runs on Linux too, Raspberry Pi included.
 
-**Download:** on Windows, `Slate.exe` below (64-bit Windows 10 or 11); if you have 0.2.0 or newer, it offers this update in its status bar by itself. On Linux, the `.deb` for your machine: `slate_0.8.0_arm64.deb` for a Raspberry Pi 4 or 5 (64-bit Raspberry Pi OS) and other 64-bit ARM computers, `slate_0.8.0_amd64.deb` for PCs. It needs GTK 4.8 or newer: Debian 12, Raspberry Pi OS 12 (Bookworm), Ubuntu 23.04 and newer. Install it with `sudo apt install ./slate_0.8.0_arm64.deb`; the `.tar.gz` files are the same program to run without installing.
+**Download:** on Windows, `Slate.exe` below (64-bit Windows 10 or 11); if you have 0.2.0 or newer, it offers this update in its status bar by itself. On Linux (64-bit, with GTK 4.8 or newer: Debian 12, Raspberry Pi OS 12 (Bookworm) on a Raspberry Pi 4 or 5, Ubuntu 23.04 and newer), run these two lines in a terminal; they get the package for your computer, and the same two lines install a newer version later:
+
+```
+wget -O /tmp/slate.deb https://github.com/jamesccupps/Slate/releases/latest/download/slate-linux-$(dpkg --print-architecture).deb
+sudo apt install /tmp/slate.deb
+```
+
+Or download `slate-linux-arm64.deb` (64-bit ARM, like the Pi) or `slate-linux-amd64.deb` (PCs) below and install it with `sudo apt install ./slate-linux-arm64.deb`; the `.tar.gz` files are the same program to run without installing.
 
 ### Linux
 - The same engine as on Windows: huge files open instantly (an 826 MB JSON file in a quarter of a second, its lines counted in another quarter), search, Replace all, JSON and XML format, minify and check, and the line tools work the same way, on other threads.

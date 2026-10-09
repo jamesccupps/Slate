@@ -1,6 +1,7 @@
 #!/bin/sh
 # Packages a Linux build of Slate: a .deb (Debian 12, Raspberry Pi OS 12, Ubuntu 23.04 and newer: GTK 4.8 or later)
-# and a tarball of the same files, each with a .sha256 next to it.
+# and a tarball of the same files, each with a .sha256 next to it. Their names have no version
+# (slate-linux-arm64.deb), so .../releases/latest/download/slate-linux-<arch>.deb always gets the newest one.
 #   packaging/linux/package.sh <binary> <version> <deb arch: amd64|arm64> <out dir>
 set -eu
 bin=$1
@@ -44,7 +45,7 @@ Description: fast, simple text editor that opens files of any size
  saves like a small one), with tabs and unsaved changes that come back after a
  restart, syntax colors for 52 languages, JSON and XML tools and line tools.
 EOF
-deb="slate_${ver}_${arch}.deb"
+deb="slate-linux-$arch.deb"
 dpkg-deb --root-owner-group --build "$root" "$out/$deb"
 
 # the same files as a tarball, to run without installing
@@ -52,10 +53,11 @@ tdir="slate-$ver-linux-$machine"
 mkdir -p "$root/$tdir"
 cp "$root/usr/bin/slate" "$root/$tdir/slate"
 cp "$here/LICENSE" "$here/README.md" "$here/THIRD-PARTY-NOTICES.md" "$root/$tdir/"
-tar -C "$root" -czf "$out/$tdir.tar.gz" "$tdir"
+tar=slate-linux-$arch.tar.gz
+tar -C "$root" -czf "$out/$tar" "$tdir"
 
 cd "$out"
-for f in "$deb" "$tdir.tar.gz"; do
+for f in "$deb" "$tar"; do
     sha256sum "$f" > "$f.sha256"
     cat "$f.sha256"
 done

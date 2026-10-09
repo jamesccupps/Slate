@@ -71,19 +71,22 @@ check the download.
 
 ### Linux and Raspberry Pi
 
-The [latest release](https://github.com/jamesccupps/Slate/releases/latest) has a `.deb` for 64-bit PCs
-(`slate_<version>_amd64.deb`) and for 64-bit ARM, Raspberry Pi 4 and 5 (`slate_<version>_arm64.deb`). It needs GTK
-4.8 or newer: Debian 12, Raspberry Pi OS 12 (Bookworm), Ubuntu 23.04 and newer, or similar. Install it with
+Slate runs on 64-bit Linux with GTK 4.8 or newer: Debian 12, Raspberry Pi OS 12 (Bookworm, on a Raspberry Pi 4 or
+5), Ubuntu 23.04 and newer, or similar. To install it, run these two lines in a terminal; they get the package for
+your computer from the latest release, and the same two lines install a newer version later:
 
 ```
-sudo apt install ./slate_<version>_arm64.deb
+wget -O /tmp/slate.deb https://github.com/jamesccupps/Slate/releases/latest/download/slate-linux-$(dpkg --print-architecture).deb
+sudo apt install /tmp/slate.deb
 ```
 
 Slate is then in the menu (Accessories), opens files from the file manager, and `slate notes.txt` opens a file from
-a terminal. The `.tar.gz` next to it is the same program to run without installing. The Linux version has the same
-engine, colors and editing as on Windows, in a GTK window; it doesn't update itself yet (install a newer `.deb`),
-and doesn't have the JSON/XML structure panel and path bar yet. Its settings and session are in
-`~/.local/share/slate`.
+a terminal. The [latest release](https://github.com/jamesccupps/Slate/releases/latest) also has the packages to
+download yourself (`slate-linux-arm64.deb` for 64-bit ARM like the Pi, `slate-linux-amd64.deb` for PCs; install one
+with `sudo apt install ./slate-linux-arm64.deb`) and `.tar.gz` files with the same program to run without
+installing. The Linux version has the same engine, colors and editing as on Windows, in a GTK window; it doesn't
+update itself yet (run the two lines again) and doesn't have the JSON/XML structure panel and path bar yet. Its
+settings and session are in `~/.local/share/slate`.
 
 ## Where Slate keeps things
 
