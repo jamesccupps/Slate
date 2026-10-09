@@ -362,7 +362,7 @@ Find and replace
   Alt+C / Alt+W / Alt+R         Match case / Whole word / Regular expression
   Enter                         Replace this match (in the replace box)
   Ctrl+Alt+Enter                Replace all (in the replace box)
-  Tab / Shift+Tab               Next / previous box (from the last one: back to the text)
+  Tab                           Switch between the find and replace boxes
   Esc                           Close the find bar
 
 View

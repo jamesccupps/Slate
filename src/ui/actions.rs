@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use windows::Win32::Foundation::{HWND, POINT};
+use windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
 use windows::Win32::Globalization::{GetDateFormatEx, GetTimeFormatEx, TIME_NOSECONDS};
 use windows::Win32::System::SystemInformation::GetLocalTime;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
@@ -23,7 +23,7 @@ use windows::core::{HSTRING, PCWSTR, w};
 
 use crate::core::document::{Document, EditKind, Sel};
 use crate::core::io::{self as fileio, Loading, MEM_LIMIT, SaveError};
-use crate::core::job::{Ctx as JobCtx, Job};
+use crate::core::job::{Ctx as JobCtx, Job, Notify};
 use crate::core::json::{self, Mode as JsonMode};
 use crate::core::lines::{self, CaseOp, LineOp};
 use crate::core::xml;
@@ -42,6 +42,9 @@ use super::settings::{ThemeMode, data_dir};
 use super::win;
 
 pub const WM_APP_JOB: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 1;
+/// The look at the open files on disk (`check_disk`) is done: unlike the other jobs, nothing repaints for it unless it
+/// found something (every 2 s, even in a window in the background).
+pub const WM_APP_DISK: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 2;
 pub const TIMER_CARET: usize = 1;
 pub const TIMER_JOBS: usize = 2;
 pub const TIMER_DISK: usize = 3;
@@ -282,6 +285,7 @@ impl App {
         }
         self.tab_drag = None;
         self.down = Hit::None;
+        self.middle_down = Hit::None;
         self.struct_drag = None;
         if self.split_drag.take().is_some() {
             self.settings.save();
@@ -1102,7 +1106,8 @@ impl App {
     pub fn check_disk(&mut self) {
         // (and tabs from the session whose files didn't answer: look again when it's time)
         self.retry_restores();
-        if self.disk_job.is_some() {
+        // (a look that's done but whose message didn't get through is picked up here)
+        if self.disk_job.is_some() && self.poll_disk() {
             return; // the last look hasn't finished (a slow drive): the next one waits for it
         }
         let mut asks = Vec::new();
@@ -1118,7 +1123,12 @@ impl App {
         if asks.is_empty() {
             return;
         }
-        self.disk_job = Some(Job::spawn(0, self.notify.clone(), move |_| {
+        let hwnd = self.hwnd.0 as isize;
+        let notify: Notify = Arc::new(move || unsafe {
+            use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
+            let _ = PostMessageW(HWND(hwnd as *mut _), WM_APP_DISK, WPARAM(0), LPARAM(0));
+        });
+        self.disk_job = Some(Job::spawn(0, notify, move |_| {
             // (a file that doesn't answer just now says nothing: it isn't taken for one that was deleted)
             asks.into_iter()
                 .filter_map(|(id, path, old, sources)| {
@@ -1133,8 +1143,8 @@ impl App {
         }));
     }
 
-    /// Acts on a finished `check_disk`; returns whether one is still running.
-    fn poll_disk(&mut self) -> bool {
+    /// Acts on a finished `check_disk` (repainting only for what it found); returns whether one is still running.
+    pub fn poll_disk(&mut self) -> bool {
         let Some(job) = self.disk_job.as_mut() else { return false };
         let Some(found) = job.take() else { return true };
         self.disk_job = None;
@@ -2572,21 +2582,16 @@ impl App {
                 true
             }
             VK_TAB if !m.ctrl => {
-                // In order: the find box, the replace box (when it shows), then the text; Shift+Tab goes back.
-                let (find, replace) = (self.find.find_edit, self.find.replace_edit);
-                let next = match (self.find.mode, m.shift) {
-                    (BarMode::Replace, false) if edit == find => Some(replace),
-                    (BarMode::Replace, true) if edit == replace => Some(find),
-                    _ => None,
-                };
-                match next {
-                    Some(h) => {
-                        FindBar::focus(h);
-                        FindBar::select_all(h);
-                    }
-                    None => unsafe {
+                // With the replace box, between the two boxes (Esc goes back to the text, where a habitual second Tab
+                // would type over the match selected there).
+                if self.find.mode == BarMode::Replace {
+                    let next = if edit == self.find.find_edit { self.find.replace_edit } else { self.find.find_edit };
+                    FindBar::focus(next);
+                    FindBar::select_all(next);
+                } else {
+                    unsafe {
                         let _ = SetFocus(self.hwnd);
-                    },
+                    }
                 }
                 self.invalidate();
                 true
@@ -2620,7 +2625,12 @@ impl App {
         self.disarm_menu_bar();
         self.hide_tip();
         let hit = self.hit(x, y);
-        self.down = hit;
+        // Only a left press is drawn pressed: the others aren't captured, so their release can come anywhere.
+        match button {
+            0 if std::mem::replace(&mut self.down, hit) != hit => self.invalidate(),
+            2 => self.middle_down = hit,
+            _ => {}
+        }
         let capture = |h: HWND| unsafe {
             SetCapture(h);
         };
@@ -2927,7 +2937,11 @@ impl App {
 
     pub fn on_mouse_up(&mut self, x: f32, y: f32, button: u8) {
         let hit = self.hit(x, y);
-        let down = std::mem::replace(&mut self.down, Hit::None);
+        let down = match button {
+            0 => std::mem::replace(&mut self.down, Hit::None),
+            2 => std::mem::replace(&mut self.middle_down, Hit::None),
+            _ => Hit::None,
+        };
         unsafe {
             let _ = ReleaseCapture();
         }
@@ -2969,6 +2983,11 @@ impl App {
     pub fn on_mouse_leave(&mut self) {
         self.mouse_tracking = false;
         self.hide_tip();
+        if unsafe { GetCapture() } != self.hwnd {
+            // (a press whose release can't come here any more)
+            self.down = Hit::None;
+            self.middle_down = Hit::None;
+        }
         if self.hover != Hit::None {
             self.hover = Hit::None;
             self.invalidate();
@@ -3729,7 +3748,7 @@ impl App {
                     recent.push(enabled(Cmd::ClearRecent, "No recent files", "", false));
                 } else {
                     recent.push(Item::Sep);
-                    recent.push(item(Cmd::ClearRecent, "&Clear list", ""));
+                    recent.push(item(Cmd::ClearRecent, "Clear list", ""));
                 }
                 vec![
                     item(Cmd::NewTab, "&New tab", "Ctrl+N"),

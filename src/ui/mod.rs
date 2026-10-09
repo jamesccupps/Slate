@@ -43,7 +43,7 @@ use windows::core::{PCWSTR, w};
 
 const WM_MOUSELEAVE: u32 = 0x02A3;
 
-use actions::{TIMER_DISK, WM_APP_JOB};
+use actions::{TIMER_DISK, WM_APP_DISK, WM_APP_JOB};
 use app::{App, Cell, Deferred, Hit};
 use commands::Cmd;
 
@@ -556,6 +556,12 @@ fn handle(cell: &Cell, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<L
                 let _ = SetForegroundWindow(hwnd);
             }
             Some(LRESULT(1))
+        }
+        WM_APP_DISK => {
+            if let Ok(mut a) = cell.try_borrow_mut() {
+                a.poll_disk();
+            }
+            Some(LRESULT(0))
         }
         WM_APP_JOB => {
             if let Ok(mut a) = cell.try_borrow_mut() {
