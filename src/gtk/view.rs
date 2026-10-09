@@ -3,12 +3,18 @@
 //! scrolling and hit testing. Rows have one height (the font's), so a row is found by its y alone. The scroll
 //! position is the segment at the top and the row in it, and the scrollbar maps bytes, not rows: nothing ever lays
 //! out more than what's on screen, so an 800 MB line scrolls like a small file.
+//!
+//! Colors aren't Pango attributes: thousands of them per segment (minified JSON) made Pango shape the text in as
+//! many pieces, a few milliseconds per segment. The text is laid out plain (bold and italic aside, which change the
+//! font) and each row is drawn glyph by glyph with cairo, only the glyphs in view, in the colors of their bytes
+//! (`draw_row`).
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 
 use gtk4::cairo;
+use gtk4::glib::prelude::Cast;
 use gtk4::pango;
 
 use crate::core::document::{Document, Sel};
@@ -88,10 +94,18 @@ pub struct Lay {
     pub layout: pango::Layout,
     pub map: Vec<u32>,
     pub line_y: Vec<i32>,
+    /// The colored display ranges `[a, b)` (sorted, never crossing) and their colors.
+    pub colors: Vec<(u32, u32, u32)>,
     bytes: usize,
 }
 
 impl Lay {
+    /// The color of display byte `i` (None: the text's own).
+    fn color_at(&self, i: u32) -> Option<u32> {
+        let k = self.colors.partition_point(|c| c.1 <= i);
+        self.colors.get(k).filter(|c| c.0 <= i).map(|c| c.2)
+    }
+
     pub fn lines(&self) -> usize {
         self.line_y.len().max(1)
     }
@@ -202,6 +216,9 @@ pub struct View {
     /// The layout settings the cache is for (width, wrap, font...).
     shape: u64,
     spans: Vec<Span>,
+    /// Each segment's cache key, for one version of the document (no reading and hashing it every frame).
+    keys: HashMap<(u64, u64), u64>,
+    keys_version: u64,
 }
 
 impl Default for View {
@@ -214,11 +231,6 @@ impl Default for View {
 pub fn set_color(cr: &cairo::Context, argb: u32) {
     let f = |s: u32| ((argb >> s) & 0xFF) as f64 / 255.0;
     cr.set_source_rgba(f(16), f(8), f(0), f(24));
-}
-
-fn pango_rgb(argb: u32) -> (u16, u16, u16) {
-    let f = |s: u32| (((argb >> s) & 0xFF) * 257) as u16;
-    (f(16), f(8), f(0))
 }
 
 pub fn tok_color(t: &Theme, tok: Tok) -> u32 {
@@ -313,6 +325,8 @@ impl View {
             hl: HlIndex::default(),
             shape: 0,
             spans: Vec::new(),
+            keys: HashMap::new(),
+            keys_version: u64::MAX,
         }
     }
 
@@ -336,6 +350,7 @@ impl View {
     /// Forgets the laid out text (another font, theme or language).
     pub fn clear_cache(&mut self) {
         self.cache.clear();
+        self.keys.clear();
         self.cache_bytes = 0;
         self.hl.reset();
         self.rows.clear();
@@ -416,8 +431,18 @@ impl View {
         let shape = Self::shape_of(cx);
         if shape != self.shape {
             self.cache.clear();
+            self.keys.clear();
             self.cache_bytes = 0;
             self.shape = shape;
+        }
+        if self.keys_version != cx.doc.version {
+            self.keys.clear();
+            self.keys_version = cx.doc.version;
+        }
+        self.tick += 1;
+        if let Some(e) = self.keys.get(&(seg.start, seg.end)).and_then(|k| self.cache.get_mut(k)) {
+            e.used = self.tick;
+            return e.lay.clone();
         }
         let st = self.hl_state(cx, seg);
         let bytes = cx.doc.read(seg.start, seg.end);
@@ -427,7 +452,7 @@ impl View {
         seg.line_start.hash(&mut h);
         cx.lang.hash(&mut h);
         let key = h.finish();
-        self.tick += 1;
+        self.keys.insert((seg.start, seg.end), key);
         if let Some(e) = self.cache.get_mut(&key) {
             e.used = self.tick;
             return e.lay.clone();
@@ -468,7 +493,8 @@ impl View {
             }
         }
         layout.set_text(&text);
-        // colors
+        // colors (drawn with the glyphs), and bold and italic (fonts: on the layout)
+        let mut colors = Vec::new();
         if cx.lang != Lang::Plain && !cx.theme.hc {
             self.spans.clear();
             highlight::lex(cx.lang, bytes, st, Some(&mut self.spans));
@@ -479,11 +505,12 @@ impl View {
                 if b <= a {
                     continue;
                 }
-                let (r, g, bl) = pango_rgb(tok_color(cx.theme, tok));
-                let mut c = pango::AttrColor::new_foreground(r, g, bl);
-                c.set_start_index(a);
-                c.set_end_index(b);
-                attrs.insert(c);
+                let color = tok_color(cx.theme, tok);
+                match colors.last_mut() {
+                    // (neighbours of one color as one range)
+                    Some((_, end, c)) if *end == a && *c == color => *end = b,
+                    _ => colors.push((a, b, color)),
+                }
                 if matches!(tok, Tok::Bold | Tok::Heading | Tok::Error) {
                     let mut w = pango::AttrInt::new_weight(pango::Weight::Bold);
                     w.set_start_index(a);
@@ -506,8 +533,8 @@ impl View {
                 break;
             }
         }
-        let bytes_kept = text.len() * 6 + map.len() * 4 + 256;
-        Lay { layout, map, line_y, bytes: bytes_kept }
+        let bytes_kept = text.len() * 6 + map.len() * 4 + colors.len() * 12 + 256;
+        Lay { layout, map, line_y, colors, bytes: bytes_kept }
     }
 
     // ---- rows ----
@@ -864,8 +891,7 @@ impl View {
             let Some(line) = r.lay.layout.line_readonly(r.line as i32) else { continue };
             // (the line's own x in the layout: an indent, a wrapped row hanging under the indentation)
             let lx = r.lay.x_of(line.start_index()) - line_x_from_start(&r.lay, r.line);
-            cr.move_to(x0 + lx, r.y + cx.style.baseline);
-            pangocairo::functions::show_layout_line(cr, &line);
+            draw_row(cr, &r.lay, &line, x0 + lx, r.y + cx.style.baseline, ox, ox + cx.width, t.text);
         }
         // the caret
         if focused && caret_on {
@@ -884,6 +910,76 @@ impl View {
         }
         cr.restore().ok();
         self.rows = rows;
+    }
+}
+
+const GLYPH_EMPTY: u32 = 0x0FFF_FFFF;
+const GLYPH_UNKNOWN: u32 = 0x1000_0000;
+
+/// Draws the glyphs of `line` (from x `x`, on baseline `y`) that are between `a` and `b`, each in the color of its
+/// byte (`text`: the text's own color). Runs without a font of cairo's (glyphs no font has, which Pango draws as
+/// boxes) are drawn by Pango, in their first byte's color.
+#[allow(clippy::too_many_arguments)]
+fn draw_row(cr: &cairo::Context, lay: &Lay, line: &pango::LayoutLine, x: f64, y: f64, a: f64, b: f64, text: u32) {
+    use pangocairo::prelude::PangoCairoFontExt;
+    let scale = pango::SCALE as f64;
+    let mut rx = x;
+    let mut batch: Vec<cairo::Glyph> = Vec::new();
+    let flush = |batch: &mut Vec<cairo::Glyph>, color: Option<u32>| {
+        if let (Some(c), false) = (color, batch.is_empty()) {
+            set_color(cr, c);
+            let _ = cr.show_glyphs(batch);
+        }
+        batch.clear();
+    };
+    for mut run in line.runs() {
+        let gs = run.glyph_string();
+        let w = gs.width() as f64 / scale;
+        if rx + w < a {
+            rx += w;
+            continue;
+        }
+        if rx > b {
+            break;
+        }
+        let item = run.item();
+        let offset = item.offset() as u32;
+        let infos = gs.glyph_info();
+        let clusters = gs.log_clusters();
+        let sf = item.analysis().font().dynamic_cast::<pangocairo::Font>().ok().and_then(|f| f.scaled_font());
+        let unknown = infos.iter().any(|g| g.glyph() & GLYPH_UNKNOWN != 0);
+        match sf {
+            Some(sf) if !unknown => {
+                cr.set_scaled_font(&sf);
+                let mut gx = rx;
+                let mut color = None;
+                for (k, g) in infos.iter().enumerate() {
+                    let geo = g.geometry();
+                    let gw = geo.width() as f64 / scale;
+                    if gx + gw >= a && g.glyph() != GLYPH_EMPTY {
+                        let c = lay.color_at(offset + clusters.get(k).copied().unwrap_or(0) as u32).unwrap_or(text);
+                        if Some(c) != color {
+                            flush(&mut batch, color);
+                            color = Some(c);
+                        }
+                        let gy = y + geo.y_offset() as f64 / scale;
+                        batch.push(cairo::Glyph::new(g.glyph() as _, gx + geo.x_offset() as f64 / scale, gy));
+                    }
+                    gx += gw;
+                    if gx > b {
+                        break;
+                    }
+                }
+                flush(&mut batch, color);
+            }
+            _ => {
+                set_color(cr, lay.color_at(offset).unwrap_or(text));
+                cr.move_to(rx, y);
+                let t = lay.layout.text();
+                pangocairo::functions::show_glyph_item(cr, t.as_str(), &mut run);
+            }
+        }
+        rx += w;
     }
 }
 

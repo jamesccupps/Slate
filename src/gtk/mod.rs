@@ -29,6 +29,20 @@ use app::{App, Ask, Cmd};
 use view::{Geom, set_color};
 
 pub const APP_ID: &str = "io.github.jamesccupps.Slate";
+
+/// `SLATE_TIMING=1`: how long painting and keys take, on stderr (for measuring).
+struct Timing(&'static str, Instant);
+
+impl Drop for Timing {
+    fn drop(&mut self) {
+        thread_local! {
+            static ON: bool = std::env::var_os("SLATE_TIMING").is_some();
+        }
+        if ON.with(|o| *o) {
+            eprintln!("{} {:.2} ms", self.0, self.1.elapsed().as_secs_f64() * 1000.0);
+        }
+    }
+}
 /// Space between the gutter (or the window's edge) and the text.
 const PAD: f64 = 8.0;
 const BLINK_MS: u64 = 530;
@@ -875,6 +889,7 @@ impl Ui {
     }
 
     fn key(&self, keyval: gdk::Key, state: gdk::ModifierType) -> bool {
+        let _timing = Timing("key", Instant::now());
         self.touch();
         let g = self.geom();
         let handled = match self.app.try_borrow_mut() {
@@ -1247,6 +1262,8 @@ impl Ui {
     }
 
     fn paint_text(&self, area: &gtk4::DrawingArea, cr: &cairo::Context, w: f64, h: f64) {
+        let started = Instant::now();
+        let _timing = Timing("paint", started);
         let Ok(mut a) = self.app.try_borrow_mut() else { return };
         set_color(cr, a.theme.surface);
         cr.paint().ok();

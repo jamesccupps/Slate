@@ -249,13 +249,18 @@ async fn script(lines: Vec<String>, test: Rc<Test>) -> i32 {
             "wait" => settle(arg.parse().unwrap_or(100)).await,
             "jobs" => jobs().await,
             "shot" => {
-                settle(30).await;
-                match shot(arg) {
-                    Ok(()) => {}
-                    Err(e) => {
-                        log(&mut out, format!("shot {arg}: {e}"));
-                        failures += 1;
+                // (a window that's being resized or mapped draws nothing for a moment: tried again then)
+                let mut r = Err(String::new());
+                for _ in 0..20 {
+                    settle(30).await;
+                    r = shot(arg);
+                    if r.is_ok() {
+                        break;
                     }
+                }
+                if let Err(e) = r {
+                    log(&mut out, format!("shot {arg}: {e}"));
+                    failures += 1;
                 }
             }
             "print" => {
