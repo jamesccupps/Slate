@@ -464,8 +464,10 @@ fn scan_core(
             let lv = stack.last_mut().unwrap();
             if let Some(last) = lv.scalar_last {
                 if c == C_OTHER {
-                    lv.scalar_last = Some(p);
-                    i += 1;
+                    // the rest of the scalar at once (a `/` may start a comment: that's looked at on its own)
+                    let k = chunk[i + 1..].iter().position(|&x| CLASS[x as usize] != C_OTHER || x == b'/');
+                    i = k.map_or(n, |k| i + 1 + k);
+                    lv.scalar_last = Some(base + i as u64 - 1);
                     continue;
                 }
                 let s = lv.val_start.take().unwrap_or(last);

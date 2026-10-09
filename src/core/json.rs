@@ -71,7 +71,9 @@ pub struct Formatter<'w> {
     stack: Vec<bool>,
     /// An opening bracket not written yet (so empty containers come out as `{}` / `[]`).
     pending_open: Option<u8>,
-    indent: Vec<u8>,
+    /// A line break followed by `MAX_INDENT` indentation units (`unit` bytes each): what `newline` writes.
+    nl: Vec<u8>,
+    unit: usize,
     eol: Vec<u8>,
     out: Vec<u8>,
     w: Option<&'w mut dyn Write>,
@@ -110,7 +112,8 @@ impl<'w> Formatter<'w> {
             st: St::Value,
             stack: Vec::new(),
             pending_open: None,
-            indent: indent.to_vec(),
+            nl: [eol, &indent.repeat(MAX_INDENT)].concat(),
+            unit: indent.len(),
             eol: eol.to_vec(),
             out: Vec::with_capacity(1 << 20),
             w,
@@ -151,14 +154,11 @@ impl<'w> Formatter<'w> {
 
     fn newline(&mut self, depth: usize) {
         if self.mode == Mode::Pretty {
-            let eol = std::mem::take(&mut self.eol);
-            self.emit(&eol);
-            self.eol = eol;
-            let ind = std::mem::take(&mut self.indent);
-            for _ in 0..depth.min(MAX_INDENT) {
-                self.emit(&ind);
-            }
-            self.indent = ind;
+            // (the line break and the indentation in one piece)
+            let n = self.eol.len() + depth.min(MAX_INDENT) * self.unit;
+            let nl = std::mem::take(&mut self.nl);
+            self.emit(&nl[..n]);
+            self.nl = nl;
         }
     }
 
@@ -274,6 +274,13 @@ impl<'w> Formatter<'w> {
                     self.st = if n == 3 { St::Str { key } } else { St::Hex { key, n: n + 1 } };
                 }
                 St::Num(n) => {
+                    if matches!(n, Num::Int | Num::Frac | Num::ExpInt) && b.is_ascii_digit() {
+                        // a run of digits at once (the state stays)
+                        let k = data[i..].iter().position(|c| !c.is_ascii_digit()).unwrap_or(data.len() - i);
+                        self.emit(&data[i..i + k]);
+                        i += k;
+                        continue;
+                    }
                     let next = match (n, b) {
                         (Num::Minus, b'0') => Some(Num::Zero),
                         (Num::Minus, b'1'..=b'9') => Some(Num::Int),
@@ -554,6 +561,52 @@ mod tests {
         assert_eq!(fmt(Mode::Validate, "1/").unwrap_err().msg, "Unexpected '/' after the value");
         // a slash inside a string is fine
         assert_eq!(fmt(Mode::Minify, "{\"url\": \"http://x/*y*/\"}").unwrap(), "{\"url\":\"http://x/*y*/\"}");
+    }
+
+    /// `input` run through `mode` in pieces of `step` bytes.
+    fn fmt_in(mode: Mode, input: &[u8], step: usize) -> Result<Vec<u8>, JsonError> {
+        let mut out = Vec::new();
+        {
+            let mut f = Formatter::new(mode, b"\t", b"\r\n", Some(&mut out), None);
+            for c in input.chunks(step) {
+                f.feed(c)?;
+            }
+            f.finish()?;
+        }
+        Ok(out)
+    }
+
+    #[test]
+    fn long_strings_and_numbers_in_any_pieces() {
+        // (strings and digits are taken a run at a time: the same result wherever a piece ends)
+        let mut s = String::from("[");
+        for i in 0..300 {
+            let long = "ab\\\"c é\\u00e9 ".repeat(i % 9);
+            let j = i + 1;
+            s.push_str(&format!("{{\"k{i}\": \"{long}\", \"n\": -{j}{i}.{i}0e+{i}, \"x\": [{j}{i}{i}, \"\", 0]}},\n"));
+        }
+        s.push_str("123456789012345678901234567890]");
+        let want_value: serde_json::Value = serde_json::from_str(&s).unwrap();
+        for mode in [Mode::Pretty, Mode::Minify] {
+            let whole = fmt_in(mode, s.as_bytes(), s.len()).unwrap();
+            for step in [1, 3, 31, 33, 4096] {
+                assert!(fmt_in(mode, s.as_bytes(), step).unwrap() == whole, "{mode:?} in pieces of {step}");
+            }
+            let value: serde_json::Value = serde_json::from_slice(&whole).unwrap();
+            assert_eq!(value, want_value);
+        }
+        // a control character in a long string, wherever it is
+        for at in [0, 5, 31, 32, 33, 100] {
+            let mut bad = format!("{{\"a\": \"{}", "x".repeat(at)).into_bytes();
+            let offset = bad.len() as u64;
+            bad.extend_from_slice(b"\x01 and more text after it\"}");
+            for step in [1, 7, bad.len()] {
+                let e = fmt_in(Mode::Validate, &bad, step).unwrap_err();
+                assert_eq!((e.offset, e.msg.as_str()), (offset, "Line break or control character inside a string"));
+            }
+        }
+        assert!(fmt_in(Mode::Validate, b"[0123]", 2).is_err());
+        assert!(fmt_in(Mode::Validate, b"[1.23e45, -0, 1E+2]", 1).is_ok());
     }
 
     #[test]
