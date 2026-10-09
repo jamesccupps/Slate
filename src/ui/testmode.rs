@@ -27,7 +27,8 @@
 //! (each menu item's access key), `scrollx`, `zoom`, `topline`, `drag`, `wintitle`, `tabnames`, `indent`, `theme`
 //! (light, dark or high contrast), `syscaret` (whether the hidden system caret is where the caret is: `follows`),
 //! `statusbar` (all its texts), `closed` (tabs Reopen closed tab would bring back), `tablist` (the list of all
-//! tabs, or `hidden` while they all fit), `bracket` (the bracket pair at the caret), `overtype`.
+//! tabs, or `hidden` while they all fit), `bracket` (the bracket pair at the caret), `overtype`, `caret` (blinked on
+//! or off; `timer:1` blinks it).
 //! `contrast:on|off|system` pretends Windows' high contrast is on or off (and tells the window it changed).
 //!
 //! Also: `args:<path>` (open it as if named on the command line: a missing file becomes a new one), `lang:<name>`
@@ -470,6 +471,7 @@ fn describe(cell: &Cell, what: &str) -> String {
             }
         }
         "overtype" => a.overtype.to_string(),
+        "caret" => (if a.caret_on { "on" } else { "off" }).into(),
         k if k.starts_with("keys") => {
             // keys0 … keys4: each item's access key (the letter after '&'; '?' for none), submenus in brackets
             fn keys(items: &[super::commands::Item]) -> String {

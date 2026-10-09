@@ -409,6 +409,8 @@ pub struct App {
     pub down: Hit,
     pub tab_drag: Option<(usize, f32, bool)>,
     pub caret_on: bool,
+    /// When the caret last moved (or the text last changed): it stops blinking a while after (`caret_timeout`).
+    pub caret_since: Instant,
     pub focused: bool,
     pub flash: Option<(String, Instant, bool)>,
     pub pending: Vec<Deferred>,
@@ -511,6 +513,7 @@ impl App {
             down: Hit::None,
             tab_drag: None,
             caret_on: true,
+            caret_since: Instant::now(),
             focused: true,
             flash: None,
             pending: Vec::new(),
