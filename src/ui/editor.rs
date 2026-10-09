@@ -30,7 +30,11 @@ const WINDOW_EXTRA: u64 = 64 * 1024;
 const PREFIX_MAX: u64 = 4096;
 /// How far before a grid point a long line may be cut at a space or comma instead.
 const CUT_BACK: u64 = 256;
+/// Layouts kept of segments shown recently: at most this many...
 const CACHE_MAX: usize = 4000;
+/// ...and this much of their text: a colored 8 KiB segment's layout takes half a MB, so the count alone let a long line
+/// scrolled through without word wrap fill gigabytes.
+const CACHE_BYTES: usize = 1 << 20;
 /// Documents up to this size get exact coloring of what spans lines (block comments, multi-line strings, tags...).
 const HL_EXACT_MAX: u64 = 32 << 20;
 /// How often lexer states are kept along the document.
@@ -527,7 +531,11 @@ pub struct View {
     pub content_w: f32,
     win: TextWindow,
     cache: HashMap<u64, CacheEntry>,
+    /// The text the cached layouts hold, in bytes.
+    cache_bytes: usize,
     tick: u64,
+    /// `tick` when the rows on screen were last laid out (what they use is never dropped from the cache).
+    frame_tick: u64,
     max_top: Option<((u64, u64, u32, usize), u64)>,
     spans: Vec<(u32, u32, Tok)>,
     hl: HlIndex,
@@ -563,7 +571,9 @@ impl View {
             content_w: 0.0,
             win: TextWindow::default(),
             cache: HashMap::new(),
+            cache_bytes: 0,
             tick: 0,
+            frame_tick: 0,
             max_top: None,
             spans: Vec::new(),
             hl: HlIndex::default(),
@@ -589,6 +599,7 @@ impl View {
     /// Forgets cached layouts (font, theme or wrap changed).
     pub fn clear_cache(&mut self) {
         self.cache.clear();
+        self.cache_bytes = 0;
         self.ws_clusters.clear();
         self.max_top = None;
     }
@@ -693,13 +704,18 @@ impl View {
             // No render target yet (colors need its brushes): use this layout once, don't keep it.
             return lay;
         }
-        if self.cache.len() >= CACHE_MAX {
+        if !self.cache.is_empty() && (self.cache.len() >= CACHE_MAX || self.cache_bytes > CACHE_BYTES) {
+            // the older half, but nothing the rows on screen use
             let mut ages: Vec<u64> = self.cache.values().map(|e| e.used).collect();
             ages.sort_unstable();
-            let cut = ages[ages.len() / 2];
+            let cut = ages[ages.len() / 2].min(self.frame_tick);
             self.cache.retain(|_, e| e.used > cut);
+            self.cache_bytes = self.cache.values().map(|e| e.bytes.len()).sum();
         }
-        self.cache.insert(key, CacheEntry { bytes: bytes.to_vec(), layout: lay.clone(), used: self.tick });
+        self.cache_bytes += bytes.len();
+        if let Some(old) = self.cache.insert(key, CacheEntry { bytes, layout: lay.clone(), used: self.tick }) {
+            self.cache_bytes -= old.bytes.len();
+        }
         lay
     }
 
@@ -759,6 +775,7 @@ impl View {
     /// Lays out the rows that fill the view (into `self.rows`).
     pub fn layout_rows(&mut self, cx: &Ctx) {
         self.hl_guess = false;
+        self.frame_tick = self.tick;
         self.rows.clear();
         let len = cx.doc.len();
         let row_h = cx.style.row_h;
