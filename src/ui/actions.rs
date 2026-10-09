@@ -3154,6 +3154,10 @@ impl App {
                 let r = if cmd == Cmd::Undo { tab.doc.undo() } else { tab.doc.redo() };
                 if let Some(sel) = r {
                     tab.view.sel = sel;
+                    tab.view.upstream = false;
+                    // (An edit out of view comes back into the middle of it, not at its edge.)
+                    tab.view.sync(&mut tab.doc);
+                    self.reveal_caret(true);
                     self.after_edit();
                 }
             }
