@@ -123,7 +123,9 @@ Commits use the GitHub no-reply address (repo-local git config); GitHub refuses 
     numbered lines. Only the eleven dotted operators split a word (`ROOM.MIN.TEMP` is one name); Toggle comment puts
     the `C` after each line's number); PHP files are HTML with PHP inside. Backtick names (Kotlin, Scala, Swift) are
     plain names and Scala's `'sym` a literal; a `;` ending a G-code line is Fanuc's end of block; Markdown's inline
-    spans never cross (`uncross`); errors are drawn bold. A Markdown
+    spans never cross (`uncross`); errors are drawn bold (when the font has a bold face of its own: `Style::real_bold`,
+    so columns stay put); in CSS an at-rule's condition (`@media (…)`, up to its `{` or `;`) is never a selector (a
+    flag in the top bit of the state's `b`). A Markdown
     ``` block is colored as the language it names, that lexer's state kept in the Markdown state (`mode` holds the
     language; where its state doesn't fit, each line is colored from its line start). Where a quote is easily a
     stray one (shell, SQL, PHP...), a string left open gives up at a blank line or after 40 lines. Language is
@@ -291,7 +293,10 @@ Commits use the GitHub no-reply address (repo-local git config); GitHub refuses 
   what wakes it), `print:busy` (what `jobs` waits for), `print:mem` (private bytes, working set). `copydata:<path>`
   hands a file over the way a second Slate does; `dpi:<n>` acts as if the window moved to a monitor at that DPI
   (WM_DPICHANGED); `prompt:<png>|tall` draws a prompt with more text than a screen holds; `print:tip` (after
-  `hover:` and `timer:10`) the tooltip; `print:caret` whether the caret is blinked on.
+  `hover:` and `timer:10`) the tooltip; `print:caret` whether the caret is blinked on; `down:<x>,<y>,right|middle`,
+  `leave`, `print:pressed` and `print:invalidated` (repaints asked for) for the pressed states; `set:font=<family>`
+  and `print:realbold`; `print:datadir` (`empty` or not). `session:`, `persist` and `crash` refuse to run without
+  `SLATE_DATA_DIR`.
 - `SLATE_TEST_VISIBLE=1` runs the same scripts in the real window (on top, without taking the focus), drawing
   through the real swap chain; `shot:` then captures the screen.
 - Don't drive the user's desktop with real mouse/keyboard input.
