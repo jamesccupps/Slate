@@ -75,7 +75,7 @@ icons) and a tarball, each with a `.sha256`.
    reads them: with another key, apt refuses the repository until a `.deb` bringing the new key is installed by
    hand.
 
-5. winget: the package is `JamesCupps.Slate` in microsoft/winget-pkgs (first submitted with 0.8.1:
+5. winget: the package is `JamesCupps.Slate` in microsoft/winget-pkgs (first submitted with 0.8.1, moved to 0.8.2 before it was merged, as 0.8.1's --install registered .bat:
    microsoft/winget-pkgs#449740, from the user's fork `jamesccupps/winget-pkgs`). Its installer is the release's
    `Slate.exe`, `InstallerType: exe`, `Scope: user`, silent switch `--install`, `ProductCode: Slate` (the Installed
    apps key), `UpgradeBehavior: install`. Each new version needs its own manifest PR (three files under
