@@ -1059,8 +1059,9 @@ impl App {
         self.start_save_lossy(i, path, encoding, close_after, false)
     }
 
-    /// `start_save`; `lossy_ok`: the user agreed that characters ANSI can't hold become "?" (otherwise such a save
-    /// stops before writing anything and asks, see `Deferred::AskLossy`).
+    /// `start_save`; `lossy_ok`: the user agreed that characters ANSI can't hold become "?", and that parts of a
+    /// damaged UTF-16 file stay U+FFFD (`Document::bad_units`); otherwise such a save stops before writing anything
+    /// and asks, see `Deferred::AskLossy`.
     pub fn start_save_lossy(
         &mut self,
         i: usize,
@@ -1091,7 +1092,13 @@ impl App {
         let p = path.clone();
         let bom = tab.doc.bom;
         let saving = snap.clone();
-        let job = Job::spawn(snap.len(), notify, move |ctx| fileio::save(&saving, &p, encoding, bom, lossy_ok, ctx));
+        let damaged = tab.doc.bad_units > 0 && !lossy_ok;
+        let job = Job::spawn(snap.len(), notify, move |ctx| {
+            if damaged {
+                return Err(SaveError::Lossy);
+            }
+            fileio::save(&saving, &p, encoding, bom, lossy_ok, ctx)
+        });
         let doc = tab.doc.id();
         tab.save = Some(SaveTask { job, state, version, snap, doc, path, encoding, close_after, again: false });
         tab.doc.seal();
@@ -1438,20 +1445,18 @@ impl App {
                 running = true;
             }
         }
-        // Find next / previous on a big document.
-        if let Some((job, version)) = self.tabs[i].find_job.as_mut() {
-            let version = *version;
-            if let Some(r) = job.take() {
-                self.tabs[i].find_job = None;
-                if i == self.active && self.tabs[i].doc.version == version {
+        // Find next / previous, or the search as you type, on another thread.
+        if let Some(f) = self.tabs[i].find_job.as_mut() {
+            if let Some(r) = f.job.take() {
+                let f = self.tabs[i].find_job.take().unwrap();
+                // (not if the text or the selection changed meanwhile: the user clicked elsewhere, or typed)
+                let tab = &self.tabs[i];
+                if i == self.active && tab.doc.version == f.version && tab.view.sel == f.sel {
+                    let r = r.map(|(s, e, wrapped)| ((s, e), wrapped));
                     match r {
-                        Some((s, e, wrapped)) => {
-                            self.select_match(s, e);
-                            if wrapped {
-                                self.flash_search("Search wrapped around", false);
-                            }
-                        }
-                        None => self.flash_search("No results", true),
+                        Some(((s, e), _)) if f.live => self.select_match(s, e),
+                        _ if f.live => {}
+                        r => self.found_next(r),
                     }
                 }
             } else {
@@ -1492,6 +1497,8 @@ impl App {
                 tab.doc.encoding = st.encoding;
                 tab.doc.disk = saved.disk;
                 tab.doc.mark_saved_at(st.state);
+                // (parts of a damaged file are saved as U+FFFD now, as the user agreed: the file has what the text has)
+                tab.doc.bad_units = 0;
                 tab.seen_disk = None;
                 // A big file: the text reads from the saved file from now on (what was typed meanwhile aside).
                 if let Some((src, start, nl)) = saved.rebase {
@@ -2353,7 +2360,7 @@ impl App {
         let origin = self.find.origin.unwrap_or(self.tab().view.sel.start());
         let len = self.tab().doc.len();
         if len > m.sync_limit() {
-            self.find_async(m, origin, true);
+            self.find_async(m, origin, true, true);
             return;
         }
         let doc = &self.tab().doc;
@@ -2363,11 +2370,12 @@ impl App {
         }
     }
 
-    fn find_async(&mut self, m: Arc<Matcher>, from: u64, forward: bool) {
+    /// `live`: the search as you type (see `FindJob`).
+    fn find_async(&mut self, m: Arc<Matcher>, from: u64, forward: bool, live: bool) {
         let notify = self.notify.clone();
         let tab = self.tab_mut();
         let snap = tab.doc.snapshot();
-        let version = tab.doc.version;
+        let (version, sel) = (tab.doc.version, tab.view.sel);
         let job = Job::spawn(snap.len(), notify, move |ctx| {
             let len = snap.len();
             if forward {
@@ -2380,8 +2388,41 @@ impl App {
                 })
             }
         });
-        tab.find_job = Some((job, version));
+        tab.find_job = Some(FindJob { job, version, sel, live });
         self.timer(TIMER_JOBS, 100);
+    }
+
+    /// Shows what Find next / previous found (the match, and whether it wrapped around), or that it found nothing.
+    fn found_next(&mut self, r: Option<((u64, u64), bool)>) {
+        match r {
+            Some(((s, e), wrapped)) => {
+                self.select_match(s, e);
+                self.find.origin = Some(s);
+                if wrapped {
+                    self.flash_search("Search wrapped around", false);
+                }
+            }
+            None => self.flash_search("No results", true),
+        }
+    }
+
+    /// The match before `from` from a finished count of this search in this text (exact, and at once; for a
+    /// regex in a big document the search itself can only guess where a match before the caret starts). None if
+    /// there's no such count; Some(None) if it found no match there, nor wrapping around.
+    fn counted_previous(&self, from: u64) -> Option<Option<((u64, u64), bool)>> {
+        let tab = self.tab();
+        let q = &self.find.query;
+        let key = (q.text.clone(), q.match_case, q.whole_word, q.regex, tab.doc.version);
+        let f = tab.search.found.as_ref().filter(|f| f.complete && f.positions.len() as u64 == f.count)?;
+        if tab.search.key.as_ref() != Some(&key) {
+            return None;
+        }
+        // (the last that ends at or before `from`, else, wrapping around, the last one if it starts at or after it)
+        let k = f.positions.partition_point(|p| p.1 <= from);
+        Some(match k {
+            0 => f.positions.last().filter(|p| p.0 >= from).map(|&p| (p, true)),
+            k => Some((f.positions[k - 1], false)),
+        })
     }
 
     pub fn find_next(&mut self, forward: bool) {
@@ -2402,8 +2443,14 @@ impl App {
             from = tab.doc.next_char(from);
         }
         self.find.origin = Some(if forward { sel.end() } else { sel.start() });
+        if !forward {
+            if let Some(r) = self.counted_previous(from) {
+                self.found_next(r);
+                return;
+            }
+        }
         if len > m.sync_limit() {
-            self.find_async(m, from, forward);
+            self.find_async(m, from, forward, false);
             return;
         }
         let doc = &self.tab().doc;
@@ -2412,16 +2459,7 @@ impl App {
         } else {
             m.find_back(doc, 0, from, None).map(|x| (x, false)).or_else(|| m.find_back(doc, from, len, None).map(|x| (x, true)))
         };
-        match r {
-            Some(((s, e), wrapped)) => {
-                self.select_match(s, e);
-                self.find.origin = Some(s);
-                if wrapped {
-                    self.flash_search("Search wrapped around", false);
-                }
-            }
-            None => self.flash_search("No results", true),
-        }
+        self.found_next(r);
     }
 
     pub fn schedule_count(&mut self) {
@@ -4546,13 +4584,30 @@ fn tab_index(cell: &Cell, id: u64) -> Option<usize> {
 /// save it as UTF-8 instead (carrying on with closing, if that's what it was for), save as ANSI anyway (the
 /// characters become "?"; the tab then stays open, with the text still in it), or don't save.
 fn ask_lossy(cell: &Cell, id: u64) {
-    let (hwnd, title, (path, close_after, closing)) = {
+    let (hwnd, title, (path, close_after, closing), damaged) = {
         let mut a = cell.borrow_mut();
         let hwnd = a.hwnd;
         let Some(t) = a.tabs.iter_mut().find(|t| t.id == id) else { return };
         let Some(ask) = t.ask_lossy.take() else { return };
-        (hwnd, t.title(), ask)
+        let damaged = (t.doc.bad_units > 0).then(|| (t.doc.bad_units, t.doc.encoding));
+        (hwnd, t.title(), ask, damaged)
     };
+    if let Some((n, enc)) = damaged {
+        // A file that wasn't all text in its encoding: what wasn't shows as U+FFFD, and can't be saved back.
+        let q = format!("Parts of {title} weren't {} text", enc.label());
+        let what = if n == 1 { "One place shows".to_string() } else { format!("{n} places show") };
+        let detail = format!("{what} \"\u{FFFD}\" where the file had something else, and would be saved that way.");
+        let choice = win::ask(hwnd, "Slate", &q, &detail, &["&Save anyway", "Cancel"]);
+        let Some(i) = tab_index(cell, id) else { return };
+        if choice == Some(0) {
+            let enc = cell.borrow().tabs[i].doc.encoding;
+            let started = cell.borrow_mut().start_save_lossy(i, path, enc, close_after, true);
+            if started && closing {
+                run_cmd(cell, Cmd::Exit);
+            }
+        }
+        return;
+    }
     let q = format!("Some characters in {title} can't be saved as ANSI");
     let detail = format!(
         "In {} they would become \"?\". UTF-8 keeps every character, and nearly every program reads it.",

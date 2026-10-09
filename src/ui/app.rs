@@ -17,7 +17,7 @@ use windows::Win32::Graphics::DirectWrite::{
 use windows::Win32::Graphics::Gdi::InvalidateRect;
 use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
 
-use crate::core::document::Document;
+use crate::core::document::{Document, Sel};
 use crate::core::io::{SaveError, Saved};
 use crate::core::job::{Job, Notify};
 use crate::core::lines::LineOp;
@@ -156,6 +156,16 @@ pub struct Notice {
     pub actions: Vec<(String, NoticeAction)>,
 }
 
+/// A search for the next or previous match on another thread: its result (start, end, whether it wrapped around),
+/// what it's for (the document version and the selection when it started: it's dropped if either changed), and
+/// whether it's the search as you type (which doesn't move where Find next goes on from, and says nothing).
+pub struct FindJob {
+    pub job: Job<Option<(u64, u64, bool)>>,
+    pub version: u64,
+    pub sel: Sel,
+    pub live: bool,
+}
+
 pub struct Tab {
     pub id: u64,
     pub doc: Document,
@@ -175,8 +185,8 @@ pub struct Tab {
     pub save: Option<SaveTask>,
     pub task: Option<Task>,
     pub search: Search,
-    /// A find next/previous running in the background (big documents): result and the doc version it's for.
-    pub find_job: Option<(Job<Option<(u64, u64, bool)>>, u64)>,
+    /// A find next/previous or a search as you type running in the background (big documents, regexes).
+    pub find_job: Option<FindJob>,
     pub notice: Option<Notice>,
     /// The session backup file of this tab (unique, so it never collides with another tab's from an earlier run)
     /// and the document version last written to it.

@@ -107,8 +107,8 @@ pub fn detect_encoding(sample: &[u8], truncated: bool) -> (Encoding, usize) {
     if sample.starts_with(&[0xFE, 0xFF]) {
         return (Encoding::Utf16Be, 2);
     }
-    // UTF-16 without a BOM: mostly-ASCII text has a zero in every other byte (and it must read as UTF-16, like
-    // ANSI: what doesn't would come back changed when saved, so it's kept as it is, as UTF-8).
+    // UTF-16 without a BOM: mostly-ASCII text has a zero in every other byte (and reads as UTF-16, but for a few
+    // halves of characters without their other half: a damaged file is still text, see `Utf16Decoder::bad`).
     let n = sample.len().min(8192) & !1;
     if n >= 16 {
         let (mut even, mut odd) = (0usize, 0usize);
@@ -117,10 +117,10 @@ pub fn detect_encoding(sample: &[u8], truncated: bool) -> (Encoding, usize) {
             odd += (sample[i + 1] == 0) as usize;
         }
         let half = n / 2;
-        if odd * 10 > half * 4 && even * 20 < half && utf16_clean(sample, n, false, !truncated) {
+        if odd * 10 > half * 4 && even * 20 < half && utf16_mostly(sample, n, false) {
             return (Encoding::Utf16Le, 0);
         }
-        if even * 10 > half * 4 && odd * 20 < half && utf16_clean(sample, n, true, !truncated) {
+        if even * 10 > half * 4 && odd * 20 < half && utf16_mostly(sample, n, true) {
             return (Encoding::Utf16Be, 0);
         }
     }
@@ -135,22 +135,18 @@ pub fn detect_encoding(sample: &[u8], truncated: bool) -> (Encoding, usize) {
     }
 }
 
-/// Whether the first `n` (even) bytes of `sample` are UTF-16 without an unpaired surrogate (a pair cut off at `n`
-/// may go on after it). `whole`: the sample is all of the file, which then can't end in half a unit or a pair.
-fn utf16_clean(sample: &[u8], n: usize, be: bool, whole: bool) -> bool {
-    if whole && sample.len() % 2 == 1 {
-        return false;
-    }
-    let mut high = false;
+/// Whether the first `n` (even) bytes of `sample` read as UTF-16 but for a few unpaired surrogates (at most one
+/// unit in 32; a pair cut off at `n` may go on after it). Only these bytes count, so a file's first 8 KiB decide
+/// for opening it and for `io::looks_binary` alike.
+fn utf16_mostly(sample: &[u8], n: usize, be: bool) -> bool {
+    let (mut bad, mut high) = (0, false);
     for p in sample[..n].chunks_exact(2) {
         let u = if be { u16::from_be_bytes([p[0], p[1]]) } else { u16::from_le_bytes([p[0], p[1]]) };
         let low = (0xDC00..0xE000).contains(&u);
-        if high != low {
-            return false;
-        }
+        bad += (high != low) as usize;
         high = (0xD800..0xDC00).contains(&u);
     }
-    !(high && whole && n == sample.len())
+    bad * 32 <= n / 2
 }
 
 /// Whether `bytes` has some multi-byte UTF-8 characters, and at least as many of them as invalid sequences.
@@ -304,17 +300,17 @@ pub fn detect_eol(sample: &[u8]) -> Eol {
 }
 
 /// Converts UTF-16 bytes to UTF-8, streaming: `carry` holds an odd byte or a lone high surrogate between calls.
-/// Unpaired surrogates (and an odd byte at the end) become U+FFFD, and `lossy` says so: saving won't give them back.
+/// Unpaired surrogates (and an odd byte at the end) become U+FFFD; `bad` counts them, as saving can't give them back.
 pub struct Utf16Decoder {
     big_endian: bool,
     odd: Option<u8>,
     high: Option<u16>,
-    pub lossy: bool,
+    pub bad: u64,
 }
 
 impl Utf16Decoder {
     pub fn new(big_endian: bool) -> Self {
-        Utf16Decoder { big_endian, odd: None, high: None, lossy: false }
+        Utf16Decoder { big_endian, odd: None, high: None, bad: 0 }
     }
 
     pub fn push(&mut self, mut input: &[u8], out: &mut Vec<u8>) {
@@ -355,13 +351,13 @@ impl Utf16Decoder {
                 out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
                 return;
             }
-            self.lossy = true;
+            self.bad += 1;
             out.extend_from_slice("\u{FFFD}".as_bytes());
         }
         if (0xD800..0xDC00).contains(&u) {
             self.high = Some(u);
         } else if (0xDC00..0xE000).contains(&u) {
-            self.lossy = true;
+            self.bad += 1;
             out.extend_from_slice("\u{FFFD}".as_bytes());
         } else {
             let c = char::from_u32(u as u32).unwrap_or('\u{FFFD}');
@@ -371,7 +367,7 @@ impl Utf16Decoder {
 
     pub fn finish(&mut self, out: &mut Vec<u8>) {
         if self.high.take().is_some() || self.odd.take().is_some() {
-            self.lossy = true;
+            self.bad += 1;
             out.extend_from_slice("\u{FFFD}".as_bytes());
         }
     }
