@@ -184,6 +184,9 @@ jobs:
       - name: Package
         run: |
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          # A build that isn't a release gets a version just below it (0.8.0~dev42): such a test package installs
+          # over the release before, and the release installs over it.
+          case "$GITHUB_REF" in refs/tags/v*) ;; *) version="$version~dev$GITHUB_RUN_NUMBER" ;; esac
           sh packaging/linux/package.sh target/release/Slate "$version" ${{ matrix.arch }} out
 
       - uses: actions/upload-artifact@v6

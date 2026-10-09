@@ -48,7 +48,9 @@ icons) and a tarball, each with a `.sha256`.
 2. Commit and push to `main`; then `git tag vX.Y.Z` and `git push origin vX.Y.Z`.
 3. The Build workflow (`.github/workflows/build.yml`) tests, builds, runs the exe through `tests/smoke.txt`; the
    Linux jobs (x86-64 and ARM64, in a `debian:12` container so the result runs on Debian 12 / Raspberry Pi OS 12
-   and newer) test, build, run `tests/smoke-linux.txt` under Xvfb and package; then a release job (the only one
+   and newer) test, build, run `tests/smoke-linux.txt` under Xvfb and package (a build that isn't from a tag as
+   `<version>~dev<run>`, just below the release, so a test package installs over the last release and the release
+   over it); then a release job (the only one
    with write access) drafts the release with `Slate.exe`, `Slate.exe.sha256` and the `.deb`s and tarballs (with
    their `.sha256`). The user publishes it — Slate's updater (`src/ui/update.rs`) only sees published releases.
    Before the draft, the `sign` job signs `Slate.exe` in Azure Artifact Signing (account `SlateAccount`, certificate
