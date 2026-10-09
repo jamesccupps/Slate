@@ -633,7 +633,8 @@ fn code_span(l: &[u8], i: usize, look: usize) -> (usize, Option<usize>) {
     (run, None)
 }
 
-/// The closing run of `k` `c` characters for emphasis opened before `from` (not one in `code`: code goes first).
+/// The closing run of `k` `c` characters for emphasis opened before `from`: the start of a run of them (not one in
+/// `code`, as code goes first; nor for a single `*` a run of two, bold's inside it: `*a **b** c*`).
 fn emphasis_close(l: &[u8], from: usize, c: u8, k: usize) -> Option<usize> {
     let end = l.len().min(from + SHORT_LOOK);
     let mut p = from;
@@ -644,15 +645,16 @@ fn emphasis_close(l: &[u8], from: usize, c: u8, k: usize) -> Option<usize> {
             p = e.unwrap_or(s + run);
             continue;
         }
-        if s + k <= l.len()
-            && l[s..s + k].iter().all(|&b| b == c)
+        let run = l[s..].iter().take_while(|&&b| b == c).count();
+        if run >= k
+            && !(k == 1 && run == 2)
             && s > from
             && !l[s - 1].is_ascii_whitespace()
             && !(c == b'_' && at(l, s + k).is_ascii_alphanumeric())
         {
             return Some(s);
         }
-        p = s + 1;
+        p = s + run;
     }
     None
 }
@@ -1143,6 +1145,14 @@ mod tests {
         assert_eq!(toks(Lang::Markdown, "*a*b*", State::START), vec![("*a*".into(), Tok::Italic)]);
         assert_eq!(toks(Lang::Markdown, "**a**b**c**", State::START), vec![("**a**".into(), Tok::Bold), ("**c**".into(), Tok::Bold)]);
         assert_eq!(toks(Lang::Markdown, "![logo](x.png)", State::START), vec![("![logo]".into(), Tok::Link), ("(x.png)".into(), Tok::Dim)]);
+        // bold inside italics: a single star doesn't close on bold's two
+        for (text, italic, bold) in [
+            ("*a **b** c*", "*a **b** c*", "**b**"),
+            ("This is *very **important** stuff* here.", "*very **important** stuff*", "**important**"),
+            ("_a __b__ c_", "_a __b__ c_", "__b__"),
+        ] {
+            assert_eq!(toks(Lang::Markdown, text, State::START), vec![(italic.into(), Tok::Italic), (bold.into(), Tok::Bold)]);
+        }
         // what still crosses is dropped, emphasis first
         assert_eq!(toks(Lang::Markdown, "*a [b* c](d)", State::START), vec![("[b* c]".into(), Tok::Link), ("(d)".into(), Tok::Dim)]);
         // emphasis or links that never close cost little to look for

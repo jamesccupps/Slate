@@ -233,8 +233,9 @@ fn tok_color(t: &Theme, tok: Tok) -> u32 {
 fn color_layout(cx: &Ctx, layout: &IDWriteTextLayout, spans: &[Span], map: &[u32], at: u32, end: u32, colors: bool) {
     let t = cx.theme;
     for &(s, e, tok) in spans {
-        // (an error bold too: it mustn't pass for a string, PPCL's values, in any theme)
-        let bold = matches!(tok, Tok::Bold | Tok::Heading | Tok::Error);
+        // (an error bold too: it mustn't pass for a string, PPCL's values, in any theme; not in a simulated bold,
+        // which would widen it)
+        let bold = matches!(tok, Tok::Bold | Tok::Heading) || (tok == Tok::Error && cx.style.real_bold);
         let italic = matches!(tok, Tok::Italic);
         if !colors && !bold && !italic {
             continue;
@@ -373,6 +374,8 @@ pub struct Style {
     pub format_wrap: IDWriteTextFormat,
     pub format_nowrap: IDWriteTextFormat,
     pub row_h: f32,
+    /// The font has a bold face of its own (one Windows simulates is wider, so errors aren't drawn in it).
+    pub real_bold: bool,
     pub char_w: f32,
     pub digit_w: f32,
     pub wrap: bool,
