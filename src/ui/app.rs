@@ -360,6 +360,8 @@ pub enum Hit {
     StructRow(usize, bool),
     StructClose,
     StructSplitter,
+    /// The structure panel's scrollbar.
+    StructBar,
     Gutter,
     Text,
     VBar,
@@ -397,6 +399,8 @@ pub struct App {
     pub r_struct: Rect,
     /// Dragging the structure panel's edge: (pointer x at start, width at start).
     pub split_drag: Option<(f32, f32)>,
+    /// Dragging the structure panel's scrollbar thumb: where in the thumb it was taken.
+    pub struct_drag: Option<f32>,
     pub tab_rects: Vec<(Rect, Rect)>,
     pub newtab_rect: Rect,
     pub menu_rects: Vec<Rect>,
@@ -504,6 +508,7 @@ impl App {
             r_path: Rect::default(),
             r_struct: Rect::default(),
             split_drag: None,
+            struct_drag: None,
             tab_rects: Vec::new(),
             newtab_rect: Rect::default(),
             menu_rects: Vec::new(),
@@ -820,6 +825,9 @@ impl App {
             }
             if super::structure::close_rect(self.r_struct).contains(x, y) {
                 return Hit::StructClose;
+            }
+            if self.tab().structure.scrollbar(self.r_struct).is_some_and(|(track, _, _)| track.contains(x, y)) {
+                return Hit::StructBar;
             }
             return match self.tab().structure.row_at(self.r_struct, x, y) {
                 Some((i, chevron)) => Hit::StructRow(i, chevron),
@@ -1209,7 +1217,8 @@ impl App {
         }
         if panel_open {
             let row_hover = if let Hit::StructRow(i, _) = hover { Some(i) } else { None };
-            tab.structure.paint_panel(&self.g, &t, &ui, &bold, &icons, r_struct, row_hover, hover == Hit::StructClose);
+            let (close_hot, bar_hot) = (hover == Hit::StructClose, hover == Hit::StructBar || self.struct_drag.is_some());
+            tab.structure.paint_panel(&self.g, &t, &ui, &bold, &icons, r_struct, row_hover, close_hot, bar_hot);
             if hover == Hit::StructSplitter || self.split_drag.is_some() {
                 self.g.fill(self.g.snap_rect(Rect::new(r_struct.x, r_struct.y, 2.0, r_struct.h)), t.accent);
             }

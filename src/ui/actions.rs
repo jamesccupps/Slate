@@ -283,6 +283,7 @@ impl App {
         }
         self.tab_drag = None;
         self.down = Hit::None;
+        self.struct_drag = None;
         if self.split_drag.take().is_some() {
             self.settings.save();
         }
@@ -2664,6 +2665,10 @@ impl App {
                 self.split_drag = Some((x, self.r_struct.w));
                 capture(self.hwnd);
             }
+            (0, Hit::StructBar) => {
+                self.struct_bar_down(y);
+                capture(self.hwnd);
+            }
             (0, _) => capture(self.hwnd),
             (1, Hit::Text) => {
                 // Right-click outside the selection moves the caret there first.
@@ -2678,6 +2683,20 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// A press on the structure panel's scrollbar: on the thumb it's taken to drag; above or below it, a page up or
+    /// down.
+    fn struct_bar_down(&mut self, y: f32) {
+        let Some((track, thumb, _)) = self.tab().structure.scrollbar(self.r_struct) else { return };
+        if y >= thumb.y && y < thumb.bottom() {
+            self.struct_drag = Some(y - thumb.y);
+        } else {
+            let page = (track.h - super::structure::ROW_H).max(super::structure::ROW_H);
+            let s = &mut self.tab_mut().structure;
+            s.scroll = (s.scroll + if y > thumb.y { page } else { -page }).max(0.0);
+        }
+        self.invalidate();
     }
 
     fn click_count(&mut self, x: f32, y: f32) -> u32 {
@@ -2766,6 +2785,15 @@ impl App {
             self.settings.structure_width = (w0 - (x - x0)).clamp(200.0, (self.size.0 * 0.6).max(200.0));
             self.layout();
             self.invalidate();
+            return;
+        }
+        if let Some(grab) = self.struct_drag {
+            // the thumb follows the pointer
+            if let Some((track, thumb, max)) = self.tab().structure.scrollbar(self.r_struct) {
+                let f = (y - grab - track.y) / (track.h - thumb.h).max(1.0);
+                self.tab_mut().structure.scroll = f.clamp(0.0, 1.0) * max;
+                self.invalidate();
+            }
             return;
         }
         if let Some(drag) = self.tab().view.drag {
@@ -2904,6 +2932,7 @@ impl App {
         if self.split_drag.take().is_some() {
             self.settings.save();
         }
+        self.struct_drag = None;
         if !self.tabs.is_empty() {
             self.tab_mut().view.drag = None;
         }
