@@ -50,9 +50,18 @@ use commands::Cmd;
 pub const CLASS: PCWSTR = w!("SlateMainWindow");
 
 /// The main window's class. A Slate running as administrator uses its own, so a normal Slate never finds (and tries
-/// to hand files to) a window Windows won't let it talk to.
+/// to hand files to) a window Windows won't let it talk to; so do a Slate that opened on its own (`settings::guest`)
+/// and one in test mode, which a Slate starting later mustn't take for the running one.
 pub fn class() -> PCWSTR {
-    if win::elevated() { w!("SlateMainWindow.Admin") } else { CLASS }
+    if win::SCRIPTED.with(|s| s.borrow().is_some()) {
+        w!("SlateTestWindow")
+    } else if settings::guest() {
+        w!("SlateGuestWindow")
+    } else if win::elevated() {
+        w!("SlateMainWindow.Admin")
+    } else {
+        CLASS
+    }
 }
 const COPYDATA_OPEN: usize = 0x51A7E;
 
@@ -669,21 +678,33 @@ enum Running {
 /// If Slate is already running, hands it the files. A Slate running as administrator is a separate one, with its
 /// own lock, window class and session.
 fn forward_to_running(paths: &[PathBuf]) -> Running {
-    unsafe {
-        let name = if win::elevated() { w!("Local\\Slate.SingleInstance.Admin") } else { w!("Local\\Slate.SingleInstance") };
-        if let Ok(h) = CreateMutexW(None, false, name) {
-            if GetLastError() != ERROR_ALREADY_EXISTS {
-                // We're first; keep the lock while we run.
-                INSTANCE_LOCK.store(h.0 as isize, std::sync::atomic::Ordering::Relaxed);
-                return Running::No;
+    let lock = if win::elevated() { w!("Local\\Slate.SingleInstance.Admin") } else { w!("Local\\Slate.SingleInstance") };
+    let text = paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join("\n");
+    hand_over(lock, class(), &text, 100)
+}
+
+/// `forward_to_running` with the lock and window class given (the tests use their own), trying `tries` times
+/// 100 ms apart: the running Slate may be starting (its window not there yet, or not ready for files) or closing
+/// (its window gone, its lock not yet), and then this one becomes the Slate.
+fn hand_over(lock: PCWSTR, class: PCWSTR, text: &str, tries: u32) -> Running {
+    let text: Vec<u16> = text.encode_utf16().collect();
+    for _ in 0..tries {
+        unsafe {
+            match CreateMutexW(None, false, lock) {
+                // We're first (or the one before has ended); keep the lock while we run.
+                Ok(h) if GetLastError() != ERROR_ALREADY_EXISTS => {
+                    INSTANCE_LOCK.store(h.0 as isize, std::sync::atomic::Ordering::Relaxed);
+                    return Running::No;
+                }
+                // (not kept: it would keep the lock there after the running one has ended)
+                Ok(h) => {
+                    let _ = windows::Win32::Foundation::CloseHandle(h);
+                }
+                // (it can't be opened at all: look for the window anyway)
+                Err(_) => {}
             }
-        }
-        // Running already (or the lock can't be opened at all: then look for the window anyway). It may be starting.
-        for _ in 0..100 {
-            if let Ok(h) = FindWindowW(class(), None) {
+            if let Ok(h) = FindWindowW(class, None) {
                 if !h.is_invalid() {
-                    let text: Vec<u16> =
-                        paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join("\n").encode_utf16().collect();
                     let cds = COPYDATASTRUCT {
                         dwData: COPYDATA_OPEN,
                         cbData: (text.len() * 2) as u32,
@@ -703,13 +724,20 @@ fn forward_to_running(paths: &[PathBuf]) -> Running {
                         10_000,
                         Some(&mut res),
                     );
-                    return if sent.0 != 0 { Running::Took } else { Running::Busy };
+                    if sent.0 != 0 && res != 0 {
+                        return Running::Took;
+                    }
+                    // Busy or hung, its window still there: a window of its own. The window gone meanwhile, or not
+                    // ready for files yet: look again.
+                    if sent.0 == 0 && IsWindow(h).as_bool() {
+                        return Running::Busy;
+                    }
                 }
             }
-            std::thread::sleep(std::time::Duration::from_millis(100));
         }
-        Running::Busy
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
+    Running::Busy
 }
 
 pub fn register_class() -> HINSTANCE {
@@ -1189,3 +1217,92 @@ pub fn message_loop(cell: &Cell, hwnd: HWND) -> i32 {
     msg.wParam.0 as i32
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::core::HSTRING;
+
+    /// What the window of `another_slate` answers to the files sent to it, in turn (the last one from then on), and
+    /// what it took.
+    static ANSWERS: Mutex<Vec<isize>> = Mutex::new(Vec::new());
+    static TOOK: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    extern "system" fn another_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+        if msg == WM_COPYDATA {
+            let cds = unsafe { &*(lp.0 as *const COPYDATASTRUCT) };
+            let units = unsafe { std::slice::from_raw_parts(cds.lpData as *const u16, cds.cbData as usize / 2) };
+            let mut answers = ANSWERS.lock().unwrap();
+            let answer = if answers.len() > 1 { answers.remove(0) } else { answers[0] };
+            if answer != 0 {
+                TOOK.lock().unwrap().push(String::from_utf16_lossy(units));
+            }
+            return LRESULT(answer);
+        }
+        unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
+    }
+
+    /// Another Slate's window (hidden, of class `class`) on a thread of its own, until `quit`.
+    fn another_slate(class: &HSTRING, quit: std::sync::mpsc::Receiver<()>) -> std::thread::JoinHandle<()> {
+        let class = class.clone();
+        let (ready, is_ready) = std::sync::mpsc::channel();
+        let t = std::thread::spawn(move || unsafe {
+            let wc = WNDCLASSEXW {
+                cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+                lpfnWndProc: Some(another_wndproc),
+                lpszClassName: PCWSTR(class.as_ptr()),
+                ..Default::default()
+            };
+            RegisterClassExW(&wc);
+            let hwnd = CreateWindowExW(WINDOW_EX_STYLE(0), &class, &class, WS_OVERLAPPED, 0, 0, 10, 10, None, None, None, None)
+                .unwrap();
+            ready.send(()).unwrap();
+            let mut msg = MSG::default();
+            while quit.try_recv().is_err() {
+                while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                    DispatchMessageW(&msg);
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let _ = DestroyWindow(hwnd);
+        });
+        is_ready.recv().unwrap();
+        t
+    }
+
+    #[test]
+    fn files_go_to_the_running_slate_once_it_can_take_them_or_this_one_becomes_it() {
+        // (names of this test's own: never a real Slate's)
+        let lock = HSTRING::from(format!("Local\\Slate.Test.{}", std::process::id()));
+        let class = HSTRING::from(format!("SlateTest.{}", std::process::id()));
+        let (lock_w, class_w) = (PCWSTR(lock.as_ptr()), PCWSTR(class.as_ptr()));
+        // none running: this one is the Slate, and holds the lock
+        assert!(matches!(hand_over(lock_w, class_w, "a.txt", 20), Running::No));
+        release_instance_lock();
+        // one running, which isn't ready for files at first (its window is there before the rest of it)
+        let held = unsafe { CreateMutexW(None, false, lock_w) }.unwrap();
+        *ANSWERS.lock().unwrap() = vec![0, 0, 1];
+        let (stop, quit) = std::sync::mpsc::channel();
+        let other = another_slate(&class, quit);
+        assert!(matches!(hand_over(lock_w, class_w, "b.txt\nc.txt", 20), Running::Took));
+        assert_eq!(*TOOK.lock().unwrap(), ["b.txt\nc.txt"]);
+        // one that's closing: its window is gone, its lock still there for a moment; then this one is the Slate
+        stop.send(()).unwrap();
+        other.join().unwrap();
+        let held = held.0 as isize;
+        let closing = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            unsafe {
+                let _ = CloseHandle(windows::Win32::Foundation::HANDLE(held as *mut _));
+            }
+        });
+        let start = Instant::now();
+        assert!(matches!(hand_over(lock_w, class_w, "d.txt", 20), Running::No));
+        assert!(start.elapsed() >= Duration::from_millis(250));
+        closing.join().unwrap();
+        release_instance_lock();
+        assert_eq!(TOOK.lock().unwrap().len(), 1);
+    }
+}
