@@ -1,19 +1,33 @@
-//! Colors and sizes. Light and dark palettes follow Windows 11 Notepad's look: the active tab, menu bar and text
-//! area share one surface; the tab strip and status bar sit on a slightly darker (or lighter) frame. While Windows'
-//! high contrast is on, every color comes from Windows instead (`Theme::high_contrast`).
+//! Colors and sizes, shared by the Windows and Linux windows. Light and dark palettes follow Windows 11 Notepad's
+//! look: the active tab, menu bar and text area share one surface; the tab strip and status bar sit on a slightly
+//! darker (or lighter) frame. While Windows' high contrast is on, every color comes from Windows instead
+//! (`Theme::high_contrast`).
 
+#[cfg(windows)]
 use windows::Win32::Graphics::Gdi::{
     COLOR_GRAYTEXT, COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT, COLOR_HOTLIGHT, COLOR_WINDOW, COLOR_WINDOWTEXT, GetSysColor,
     SYS_COLOR_INDEX,
 };
+#[cfg(windows)]
 use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
+#[cfg(windows)]
 use windows::Win32::UI::Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW};
+#[cfg(windows)]
 use windows::Win32::UI::WindowsAndMessaging::{
     SPI_GETHIGHCONTRAST, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SystemParametersInfoW,
 };
+#[cfg(windows)]
 use windows::core::w;
 
-use super::gfx::{rgb, rgba};
+/// Opaque color from 0xRRGGBB.
+pub const fn rgb(c: u32) -> u32 {
+    0xFF00_0000 | c
+}
+
+/// Color with alpha (0..=255) from 0xRRGGBB.
+pub const fn rgba(c: u32, a: u32) -> u32 {
+    (a << 24) | (c & 0xFF_FFFF)
+}
 
 #[derive(Clone, Debug)]
 pub struct Theme {
@@ -227,6 +241,7 @@ impl Theme {
     /// text in the window text color; selections, the accent and focus use the highlight colors. The few in-between
     /// shades (hover, matches, an unfocused selection) are see-through tints of those, so the text on them keeps
     /// its contrast.
+    #[cfg(windows)]
     pub fn high_contrast() -> Theme {
         let window = sys_color(COLOR_WINDOW);
         let text = sys_color(COLOR_WINDOWTEXT);
@@ -295,23 +310,26 @@ impl Theme {
 }
 
 /// A Windows system color as 0xFFRRGGBB (GetSysColor gives 0x00BBGGRR).
+#[cfg(windows)]
 fn sys_color(i: SYS_COLOR_INDEX) -> u32 {
     let c = unsafe { GetSysColor(i) };
     rgb(((c & 0xFF) << 16) | (c & 0xFF00) | ((c >> 16) & 0xFF))
 }
 
 /// Relative brightness of 0xAARRGGBB, 0..1 (rough: no gamma).
-fn luminance(c: u32) -> f32 {
+pub fn luminance(c: u32) -> f32 {
     let (r, g, b) = ((c >> 16) & 0xFF, (c >> 8) & 0xFF, c & 0xFF);
     (0.2126 * r as f32 + 0.7152 * g as f32 + 0.0722 * b as f32) / 255.0
 }
 
+#[cfg(windows)]
 thread_local! {
     /// Test mode: pretend high contrast is on (or off), whatever Windows says.
     pub static FORCED_HIGH_CONTRAST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 /// Whether Windows' high contrast is on (Settings → Accessibility → Contrast themes).
+#[cfg(windows)]
 pub fn high_contrast_on() -> bool {
     if let Some(on) = FORCED_HIGH_CONTRAST.with(|f| f.get()) {
         return on;
@@ -329,6 +347,7 @@ pub fn high_contrast_on() -> bool {
     ok && hc.dwFlags.0 & HCF_HIGHCONTRASTON.0 != 0
 }
 
+#[cfg(windows)]
 fn reg_dword(path: windows::core::PCWSTR, name: windows::core::PCWSTR) -> Option<u32> {
     let mut v = 0u32;
     let mut size = 4u32;
@@ -349,6 +368,7 @@ fn reg_dword(path: windows::core::PCWSTR, name: windows::core::PCWSTR) -> Option
 }
 
 /// Whether Windows is set to dark mode for apps.
+#[cfg(windows)]
 pub fn system_prefers_dark() -> bool {
     reg_dword(
         w!(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"),
@@ -359,6 +379,7 @@ pub fn system_prefers_dark() -> bool {
 }
 
 /// The Windows accent color as 0xFFRRGGBB.
+#[cfg(windows)]
 pub fn system_accent() -> u32 {
     // AccentColor is stored as 0xAABBGGRR.
     match reg_dword(w!(r"Software\Microsoft\Windows\DWM"), w!("AccentColor")) {

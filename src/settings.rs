@@ -1,5 +1,5 @@
-//! User settings, stored as JSON in settings.json in the data folder (`data_dir`: %LOCALAPPDATA%\Slate, or the
-//! `data` folder next to a portable Slate.exe).
+//! User settings, stored as JSON in settings.json in the data folder (`data_dir`: %LOCALAPPDATA%\Slate on Windows,
+//! ~/.local/share/slate on Linux, or the `data` folder next to a portable Slate).
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -58,7 +58,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Settings {
-            font: "Cascadia Mono".into(),
+            font: if cfg!(windows) { "Cascadia Mono" } else { "Monospace" }.into(),
             font_size: 11.0,
             zoom: 1.0,
             wrap: true,
@@ -121,8 +121,16 @@ pub fn data_dir() -> PathBuf {
                 return d.join("data");
             }
         }
-        let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
-        base.join("Slate")
+        #[cfg(windows)]
+        return std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir).join("Slate");
+        // (XDG: $XDG_DATA_HOME, else ~/.local/share)
+        #[cfg(not(windows))]
+        return std::env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local").join("share")))
+            .unwrap_or_else(std::env::temp_dir)
+            .join("slate");
     })
     .clone()
 }

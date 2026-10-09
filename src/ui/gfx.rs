@@ -84,15 +84,7 @@ pub fn color(argb: u32) -> D2D1_COLOR_F {
     }
 }
 
-/// Opaque color from 0xRRGGBB.
-pub const fn rgb(c: u32) -> u32 {
-    0xFF00_0000 | c
-}
-
-/// Color with alpha (0..=255) from 0xRRGGBB.
-pub const fn rgba(c: u32, a: u32) -> u32 {
-    (a << 24) | (c & 0xFF_FFFF)
-}
+pub use crate::theme::{rgb, rgba};
 
 pub fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().collect()

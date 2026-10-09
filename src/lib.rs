@@ -3,5 +3,7 @@
 
 pub mod core;
 pub mod highlight;
+pub mod settings;
+pub mod theme;
 #[cfg(windows)]
 pub mod ui;

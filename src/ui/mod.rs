@@ -9,13 +9,13 @@ pub mod findbar;
 pub mod gfx;
 /// (shared with the other platforms; `super::highlight` keeps working here)
 pub use crate::highlight;
+pub use crate::settings;
+pub use crate::theme;
 pub mod install;
 pub mod prompt;
 pub mod session;
-pub mod settings;
 pub mod structure;
 pub mod testmode;
-pub mod theme;
 pub mod update;
 pub mod win;
 
