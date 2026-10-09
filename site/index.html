@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Slate: a fast text editor for files of any size</title>
+<meta name="description" content="Slate is a fast, simple, free text editor for Windows and Linux (Raspberry Pi included) that opens files of any size: an 810 MB JSON file is on screen in 14 ms.">
+<link rel="canonical" href="https://jamesccupps.github.io/Slate/">
+<meta property="og:type" content="website">
+<meta property="og:title" content="Slate: a fast text editor for files of any size">
+<meta property="og:description" content="Free and open source, for Windows and Linux. Opens an 810 MB JSON file in 14 ms and finds 435,571 matches in 0.3 s.">
+<meta property="og:url" content="https://jamesccupps.github.io/Slate/">
+<meta property="og:image" content="https://jamesccupps.github.io/Slate/images/social-preview.png">
+<meta property="og:image:width" content="1280">
+<meta property="og:image:height" content="640">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" type="image/png" sizes="32x32" href="images/icon-32.png">
+<link rel="apple-touch-icon" href="images/icon-256.png">
+<meta name="color-scheme" content="light dark">
+<style>
+  :root {
+    --bg: #f7f8fa; --panel: #ffffff; --text: #1d2330; --muted: #5a6476; --line: #e2e6ee;
+    --accent: #0e639c; --accent-text: #ffffff; --code: #eef1f6; --hero: linear-gradient(160deg, #0d365c 0%, #12121a 100%);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #15171c; --panel: #1d2027; --text: #e6e9ef; --muted: #9aa3b2; --line: #2c313b; --code: #262a33; }
+  }
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 16px/1.55 "Segoe UI", system-ui, -apple-system, Ubuntu, "DejaVu Sans", sans-serif; }
+  a { color: var(--accent); }
+  @media (prefers-color-scheme: dark) { a { color: #6cb6ff; } }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 0 20px; }
+  header.hero { background: var(--hero); color: #fff; padding: 56px 0 40px; }
+  .brand { display: flex; align-items: center; gap: 16px; }
+  .brand img { width: 64px; height: 64px; }
+  .brand h1 { margin: 0; font-size: 44px; font-weight: 600; letter-spacing: -0.5px; }
+  .tagline { font-size: 22px; margin: 18px 0 6px; max-width: 640px; }
+  .facts { color: #a9c6e2; margin: 0 0 26px; }
+  .actions { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
+  .btn { display: inline-flex; align-items: center; gap: 10px; padding: 12px 22px; border-radius: 8px; font-weight: 600;
+         text-decoration: none; background: #fff; color: #0d365c; font-size: 17px; }
+  .btn:hover { background: #e6f0fa; }
+  .btn.ghost { background: transparent; color: #fff; border: 1px solid rgba(255,255,255,.45); font-weight: 500; font-size: 15px; padding: 10px 16px; }
+  .btn.ghost:hover { background: rgba(255,255,255,.1); }
+  .btn small { font-weight: 400; opacity: .75; font-size: 13px; }
+  .sub { color: #a9c6e2; font-size: 14px; margin-top: 12px; }
+  .sub a { color: #d8e8f7; }
+  .demo { margin: 34px 0 0; }
+  .demo img { width: 100%; height: auto; display: block; border-radius: 8px; box-shadow: 0 18px 50px rgba(0,0,0,.45); }
+  section { padding: 44px 0 8px; }
+  h2 { font-size: 26px; margin: 0 0 18px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 16px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 18px 20px; }
+  .card h3 { margin: 0 0 6px; font-size: 17px; }
+  .card p { margin: 0; color: var(--muted); font-size: 15px; }
+  .shots { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; }
+  .shots figure { margin: 0; }
+  .shots img { width: 100%; height: auto; border-radius: 8px; border: 1px solid var(--line); display: block; }
+  .shots figcaption { color: var(--muted); font-size: 14px; margin-top: 6px; }
+  .install { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px; }
+  pre { background: var(--code); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; overflow-x: auto;
+        font: 13.5px/1.5 Consolas, "DejaVu Sans Mono", monospace; margin: 10px 0 0; }
+  .copy { float: right; margin: -4px -4px 0 8px; font: 12px "Segoe UI", system-ui, sans-serif; padding: 3px 9px; border-radius: 5px;
+          border: 1px solid var(--line); background: var(--panel); color: var(--text); cursor: pointer; }
+  footer { color: var(--muted); font-size: 14px; padding: 40px 0 50px; border-top: 1px solid var(--line); margin-top: 44px; }
+  @media (max-width: 600px) {
+    header.hero { padding: 36px 0 28px; }
+    .brand h1 { font-size: 36px; }
+    .brand img { width: 52px; height: 52px; }
+    .tagline { font-size: 19px; }
+  }
+</style>
+</head>
+<body>
+<header class="hero">
+  <div class="wrap">
+    <div class="brand"><img src="images/icon-256.png" alt=""><h1>Slate</h1></div>
+    <p class="tagline">A fast, simple text editor that opens files of any size.</p>
+    <p class="facts">An 810 MB JSON file on screen in 14 ms. All 435,571 matches of a search in it counted in 0.3 s.</p>
+    <div class="actions">
+      <a class="btn" id="primary" href="https://github.com/jamesccupps/Slate/releases/latest/download/Slate.exe">Download for Windows <small id="primary-note">Slate.exe, signed</small></a>
+      <a class="btn ghost" id="secondary" href="#linux">Linux and Raspberry Pi</a>
+      <a class="btn ghost" href="https://github.com/jamesccupps/Slate">Source on GitHub</a>
+    </div>
+    <p class="sub"><span id="version">Free and open source (MIT).</span> Windows 10 and 11 (64-bit); Debian 12, Raspberry Pi OS 12, Ubuntu 23.04 and newer. <a href="https://github.com/jamesccupps/Slate/releases">All releases</a></p>
+    <div class="demo"><img src="images/slate-demo.gif" width="1264" height="797" alt="Slate opening an 810 MB JSON file, jumping to its last line, finding 435,571 matches in 0.3 seconds, and showing the structure of a 2-million-item list"></div>
+  </div>
+</header>
+
+<main class="wrap">
+  <section>
+    <h2>A better Notepad, for files of any size</h2>
+    <div class="grid">
+      <div class="card"><h3>Huge files, instantly</h3><p>Nothing is loaded up front: only what's on screen is read and drawn. Logs, database dumps and exports of hundreds of megabytes open, scroll and search like small ones.</p></div>
+      <div class="card"><h3>Fast find and replace</h3><p>Match case, whole word and regular expressions. The matches are counted as you type, on files of any size, without freezing the window.</p></div>
+      <div class="card"><h3>Never loses your work</h3><p>Tabs and unsaved changes come back after a restart, big files included. Anything Slate can't keep is asked about first.</p></div>
+      <div class="card"><h3>Colors for 52 languages</h3><p>Python, PowerShell, C, C#, Rust, JavaScript, SQL, HTML, CSS, Markdown, YAML, logs, CSV with a color per column, G-code, PPCL and more.</p></div>
+      <div class="card"><h3>JSON and XML tools</h3><p>Format, minify and check. A path bar shows where the cursor is (<code>orders › [1203] › name</code>) and a structure panel browses the tree, on huge files too.</p></div>
+      <div class="card"><h3>Small, signed, up to date</h3><p>One signed <code>Slate.exe</code> on Windows that updates itself; a <code>.deb</code> with its own apt repository on Linux. No accounts, no tracking.</p></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Windows and Linux</h2>
+    <div class="shots">
+      <figure><img src="images/slate-windows-dark.png" width="1384" height="741" alt="Slate on Windows in the dark theme, with a JSON file, the path bar and the structure panel" loading="lazy"><figcaption>Windows, dark theme: a JSON file with the path bar and the structure panel.</figcaption></figure>
+      <figure><img src="images/slate-linux.png" width="1100" height="620" alt="Slate on Linux showing a Python file" loading="lazy"><figcaption>Linux (GTK 4), light theme: the same engine, colors and editing.</figcaption></figure>
+    </div>
+  </section>
+
+  <section>
+    <h2>Install</h2>
+    <div class="install">
+      <div class="card" id="windows">
+        <h3>Windows 10 and 11</h3>
+        <p><a href="https://github.com/jamesccupps/Slate/releases/latest/download/Slate.exe">Download Slate.exe</a> and run it from any folder; <em>Help → Open files with Slate…</em> adds it to the Start menu and to "Open with". It's signed by James Cupps. It checks for updates once a day and installs them with one click.</p>
+      </div>
+      <div class="card" id="linux">
+        <h3>Linux and Raspberry Pi (64-bit)</h3>
+        <p>In a terminal; the package adds Slate's apt repository, so <code>sudo apt upgrade</code> keeps it up to date:</p>
+        <pre><button class="copy" type="button">Copy</button>wget -O /tmp/slate.deb https://github.com/jamesccupps/Slate/releases/latest/download/slate-linux-$(dpkg --print-architecture).deb
+sudo apt install /tmp/slate.deb</pre>
+        <p style="margin-top:10px">Or add the repository yourself and install it by name:</p>
+        <pre><button class="copy" type="button">Copy</button>sudo wget -O /usr/share/keyrings/slate-archive-keyring.gpg https://jamesccupps.github.io/Slate/apt/slate-archive-keyring.gpg
+echo "deb [signed-by=/usr/share/keyrings/slate-archive-keyring.gpg] https://jamesccupps.github.io/Slate/apt stable main" | sudo tee /etc/apt/sources.list.d/slate.list
+sudo apt update && sudo apt install slate</pre>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Feedback</h2>
+    <p>Slate is young and improving quickly. Found a bug or have an idea? <a href="https://github.com/jamesccupps/Slate/issues/new/choose">Open an issue</a> or say hello in <a href="https://github.com/jamesccupps/Slate/discussions">Discussions</a>. On Windows, <em>Help → Report a problem…</em> fills in the version for you.</p>
+  </section>
+</main>
+
+<footer>
+  <div class="wrap">Slate is free and open source under the MIT license, made by <a href="https://jamesccupps.github.io/">James Cupps</a>. <a href="https://github.com/jamesccupps/Slate">github.com/jamesccupps/Slate</a></div>
+</footer>
+
+<script>
+(function () {
+  // The big button offers what fits this computer: Slate.exe on Windows, the apt lines on Linux.
+  var ua = navigator.userAgent || "";
+  var platform = (navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || "";
+  var linux = /Linux|X11|CrOS/i.test(platform + " " + ua) && !/Android/i.test(ua);
+  var mac = /Mac/i.test(platform) && !/iPhone|iPad/i.test(ua);
+  var primary = document.getElementById("primary"), note = document.getElementById("primary-note");
+  var secondary = document.getElementById("secondary");
+  if (linux) {
+    primary.href = "#linux";
+    primary.firstChild.nodeValue = "Install on Linux ";
+    note.textContent = "apt, 64-bit";
+    secondary.href = "https://github.com/jamesccupps/Slate/releases/latest/download/Slate.exe";
+    secondary.textContent = "Windows";
+  } else if (mac) {
+    note.textContent = "Windows and Linux only for now";
+  }
+  // The latest version, from GitHub (the page works without it).
+  try {
+    fetch("https://api.github.com/repos/jamesccupps/Slate/releases/latest").then(function (r) { return r.ok ? r.json() : null; }).then(function (d) {
+      if (d && d.tag_name) document.getElementById("version").textContent = "Version " + d.tag_name.replace(/^v/, "") + ", free and open source (MIT).";
+    }).catch(function () {});
+  } catch (e) {}
+  // Copy buttons on the commands
+  document.querySelectorAll("button.copy").forEach(function (b) {
+    b.addEventListener("click", function () {
+      var text = b.parentNode.textContent.replace(/^Copy(ied)?/, "").trim();
+      navigator.clipboard.writeText(text).then(function () { b.textContent = "Copied"; setTimeout(function () { b.textContent = "Copy"; }, 1500); });
+    });
+  });
+})();
+</script>
+</body>
+</html>

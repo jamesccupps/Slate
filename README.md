@@ -9,9 +9,11 @@ JSON file opens instantly, scrolls smoothly, and can be searched, edited, format
 
 **[⬇ Download for Windows](https://github.com/jamesccupps/Slate/releases/latest/download/Slate.exe)** (one signed
 `Slate.exe`, 64-bit Windows 10 or 11) · **[Linux and Raspberry Pi](#linux-and-raspberry-pi)** (apt) ·
-[All releases](https://github.com/jamesccupps/Slate/releases)
+[All releases](https://github.com/jamesccupps/Slate/releases) · [Website](https://jamesccupps.github.io/Slate/)
 
-![Slate on Windows, dark theme: a JSON file, the path bar above it showing where the cursor is, and the structure panel](docs/images/slate-windows-dark.png)
+![Slate opening an 810 MB JSON file in 14 ms, jumping to its last line, finding all 435,571 matches of a search in 0.3 s, and showing where the cursor is in a 2-million-item list](docs/images/slate-demo.gif)
+
+<sub>Measured on a Windows PC with an NVMe drive, the file already in Windows' memory cache; the 810 MB file is made-up shop orders.</sub>
 
 - Opens huge files instantly: nothing is loaded up front, only what's on screen is read and drawn. Files open in the
   background, so a slow network drive never freezes the window.

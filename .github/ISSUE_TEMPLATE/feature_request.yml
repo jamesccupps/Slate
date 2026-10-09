@@ -1,0 +1,27 @@
+name: Idea or feature request
+description: Something Slate could do, or do better
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Slate tries to stay quick and simple: a better Notepad, not an IDE. Ideas that make everyday text editing nicer are the most welcome. For a looser chat, there's [Discussions](https://github.com/jamesccupps/Slate/discussions).
+  - type: textarea
+    id: what
+    attributes:
+      label: What would you like Slate to do?
+    validations:
+      required: true
+  - type: textarea
+    id: why
+    attributes:
+      label: What would it help with?
+      description: The files you work with, what you do today instead.
+  - type: dropdown
+    id: system
+    attributes:
+      label: Where you'd use it
+      multiple: true
+      options:
+        - Windows
+        - Linux / Raspberry Pi

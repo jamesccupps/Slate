@@ -1,7 +1,8 @@
 #!/bin/sh
 # Makes Slate's apt repository from a release's .deb files: <out>/apt/{pool,dists/stable}, the Release file signed
 # with the key in $APT_SIGNING_KEY (ASCII-armored, no passphrase), and the public key next to it. The Pages workflow
-# (.github/workflows/apt.yml) publishes <out> at https://jamesccupps.github.io/Slate/ when a release is published.
+# (.github/workflows/apt.yml) publishes <out> at https://jamesccupps.github.io/Slate/ (with the site's pages from
+# site/) when a release is published.
 # Users' systems read it through /etc/apt/sources.list.d/slate.list, which the package itself adds:
 #   deb [signed-by=/usr/share/keyrings/slate-archive-keyring.gpg] https://jamesccupps.github.io/Slate/apt stable main
 #   packaging/linux/apt-repo.sh <dir with the .debs> <out dir>
@@ -55,13 +56,4 @@ mv signer.gpg slate-archive-keyring.gpg
 gpgconf --kill gpg-agent
 rm -rf "$GNUPGHOME"
 
-# Pages' front page: the project
-cat > "$out/index.html" <<'EOF'
-<!doctype html>
-<meta charset="utf-8">
-<title>Slate</title>
-<meta http-equiv="refresh" content="0; url=https://github.com/jamesccupps/Slate">
-<p>Slate's apt repository is in <a href="apt/">apt/</a>. Slate is at
-<a href="https://github.com/jamesccupps/Slate">github.com/jamesccupps/Slate</a>.</p>
-EOF
 find "$out" -type f | sort

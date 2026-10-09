@@ -1,0 +1,6 @@
+# Blank issues stay allowed: Slate's Help → Report a problem… opens one with the version and system filled in.
+blank_issues_enabled: true
+contact_links:
+  - name: Questions, ideas and showing what you use Slate for
+    url: https://github.com/jamesccupps/Slate/discussions
+    about: Ask anything or share ideas in Discussions.

@@ -1,0 +1,55 @@
+name: Bug report
+description: Something in Slate doesn't work the way it should
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time! On Windows, **Help → Report a problem…** in Slate opens an issue with the version filled in.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect?
+  - type: textarea
+    id: steps
+    attributes:
+      label: How to make it happen, if you know
+      placeholder: |
+        1. Open a 2 GB log file
+        2. Press Ctrl+End
+        3. …
+  - type: input
+    id: version
+    attributes:
+      label: Slate version
+      description: Help → About Slate
+      placeholder: "0.8.1"
+    validations:
+      required: true
+  - type: dropdown
+    id: system
+    attributes:
+      label: System
+      options:
+        - Windows 11
+        - Windows 10
+        - Raspberry Pi OS
+        - Debian
+        - Ubuntu
+        - Other Linux
+    validations:
+      required: true
+  - type: textarea
+    id: more
+    attributes:
+      label: Anything else
+      description: >
+        Screenshots, what kind of file and how big. If Slate crashed: crash.log and any crash-*.dmp file in Slate's
+        settings folder (Help → Open settings folder) help find out why. They can contain bits of the text you had
+        open, so attach them only if that's all right.

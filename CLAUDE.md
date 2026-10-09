@@ -63,7 +63,8 @@ icons) and a tarball, each with a `.sha256`.
    trusts only `repo:jamesccupps@148652101/Slate@1409482725:environment:release` (GitHub's immutable subject:
    owner and repository IDs, the repo's default), and the `release` environment only `v*` tags; the
    repository secrets `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID` say which app.
-4. Publishing the release runs `.github/workflows/apt.yml` (it starts itself again on `main`, as GitHub Pages only
+4. Publishing the release runs `.github/workflows/apt.yml` (named "apt repository"; it also publishes the website, and
+   runs again when `site/` or `docs/images/` change on `main`) (it starts itself again on `main`, as GitHub Pages only
    publishes from there): `packaging/linux/apt-repo.sh` makes the apt repository from the latest release's `.deb`s,
    signed with the secret `APT_SIGNING_KEY`, and Pages (Source: GitHub Actions) publishes it at
    `https://jamesccupps.github.io/Slate/apt` (suite `stable`, component `main`). Every `.deb` brings the public key
@@ -90,6 +91,18 @@ version before it (see update.rs). A copy deployed from a local build also updat
 version is published (unless its automatic check is off).
 
 Commits use the GitHub no-reply address (repo-local git config); GitHub refuses pushes that would publish another one.
+
+## Website and images
+
+`site/index.html` is the website at `https://jamesccupps.github.io/Slate/` (one page, no scripts from elsewhere; the
+big button picks Windows or Linux from the browser): `apt.yml` publishes it with the apt repository, copying
+`docs/images/*` and two icon sizes into `images/`. `docs/images` also feeds the README: `slate-demo.gif` (four frames
+from Windows' test mode on a made-up 850 MB orders JSON, timings from `t:` marks in the same runs, captions drawn
+with System.Drawing; the find box's text drawn in, as offscreen frames don't capture native edit boxes),
+`slate-windows-dark.png`, `slate-linux.png` (test-mode shots of made-up sample files) and `social-preview.png`
+(1280x640, the repository's Settings → Social preview; the user uploads it). Never put the user's own files in
+them. Numbers in captions must be what was measured: an 810 MB file is editable once its lines are counted (0.13 s
+there); the JSON outline for the path bar takes ~2 s more in the background and blocks nothing.
 
 ## Layout
 

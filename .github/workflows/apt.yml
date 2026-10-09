@@ -1,12 +1,17 @@
-# Slate's apt repository (https://jamesccupps.github.io/Slate/apt) on GitHub Pages: made again from the latest
-# release's .deb files whenever a release is published, signed with APT_SIGNING_KEY (packaging/linux/apt-repo.sh).
-# Installed packages add it (/etc/apt/sources.list.d/slate.list), so apt upgrade brings the new version.
-# A published release runs this on its tag, which Pages doesn't publish from: it starts it again on main.
+# Slate's site on GitHub Pages (https://jamesccupps.github.io/Slate/): the page in site/ with the images from
+# docs/images, and the apt repository in apt/, made again from the latest release's .deb files and signed with
+# APT_SIGNING_KEY (packaging/linux/apt-repo.sh). Installed packages add the repository
+# (/etc/apt/sources.list.d/slate.list), so apt upgrade brings the new version.
+# Runs when a release is published (on its tag, which Pages doesn't publish from, so it starts itself again on main)
+# and when the page or its images change on main.
 name: apt repository
 
 on:
   release:
     types: [published]
+  push:
+    branches: [main]
+    paths: ["site/**", "docs/images/**", ".github/workflows/apt.yml"]
   workflow_dispatch:
 
 permissions:
@@ -29,8 +34,8 @@ jobs:
         run: gh workflow run apt.yml --repo "$GITHUB_REPOSITORY" --ref main
 
   build:
-    name: Make the repository
-    if: github.event_name == 'workflow_dispatch'
+    name: Make the repository and the site
+    if: github.event_name != 'release'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6
@@ -45,11 +50,20 @@ jobs:
           APT_SIGNING_KEY: ${{ secrets.APT_SIGNING_KEY }}
         run: |
           command -v apt-ftparchive > /dev/null || { sudo apt-get update && sudo apt-get install -y apt-utils; }
-          sh packaging/linux/apt-repo.sh debs site
+          sh packaging/linux/apt-repo.sh debs pages
+
+      - name: The page and its images
+        run: |
+          cp -r site/. pages/
+          mkdir -p pages/images
+          cp docs/images/*.png docs/images/*.gif pages/images/
+          cp res/icon/s32.png pages/images/icon-32.png
+          cp res/icon/s256.png pages/images/icon-256.png
+          find pages -maxdepth 2 | sort
 
       - uses: actions/upload-pages-artifact@v5
         with:
-          path: site
+          path: pages
 
   deploy:
     name: Publish
