@@ -12,7 +12,7 @@
 //! `wheel:<rows>`, `wait:<ms>`, `jobs` (wait for background work), `checkdisk` (look for files changed on disk,
 //! as the window does every 2 s; then `jobs`), `shot:<file.png>`, `print:<what>`
 //! (`text`, `sel`, `status`, `lines`, `title`, `top`, `find`, `tabs`, `dirty`, `asked`, `clipboard`, `window`,
-//! `saving`), `expect:<what>=<value>`, `answer:save,dont,cancel` (answers for the next prompts, which are never
+//! `saving`, `busy`: what `jobs` waits for, `mem`: private bytes and working set), `expect:<what>=<value>`, `answer:save,dont,cancel` (answers for the next prompts, which are never
 //! shown in this mode; `asked` lists the prompts so far), `set:restore_session=true`.
 //!
 //! Lower level: `down:<x>,<y>` / `move:<x>,<y>` / `up:<x>,<y>` (left button, for drags; also where drag scrolling
@@ -527,6 +527,49 @@ fn describe(cell: &Cell, what: &str) -> String {
             .unwrap_or_default(),
         "window" => (unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindow(a.hwnd) }.as_bool()).to_string(),
         "saving" => a.tabs.iter().filter(|t| t.save.is_some()).count().to_string(),
+        "busy" => {
+            // what `jobs` waits for
+            let mut v = Vec::new();
+            for t in &a.tabs {
+                let parts = [
+                    ("load", t.load_job.is_some()),
+                    ("restore", t.restore.as_ref().is_some_and(|r| r.running())),
+                    ("index", t.index_job.is_some()),
+                    ("save", t.save.is_some()),
+                    ("task", t.task.is_some()),
+                    ("count", t.search.job.is_some()),
+                    ("find", t.find_job.is_some()),
+                    ("structure", t.structure.busy()),
+                ];
+                v.extend(parts.iter().filter(|p| p.1).map(|p| p.0));
+            }
+            let parts = [("disk", a.disk_job.is_some()), ("words", a.count_job.is_some()), ("session", a.session_job.is_some())];
+            v.extend(parts.iter().filter(|p| p.1).map(|p| p.0));
+            v.join(" ")
+        }
+        "mem" => {
+            // this process's private bytes and working set (PROCESS_MEMORY_COUNTERS_EX)
+            #[repr(C)]
+            #[derive(Default)]
+            struct Counters {
+                cb: u32,
+                faults: u32,
+                peak_ws: usize,
+                ws: usize,
+                pools: [usize; 4],
+                pagefile: usize,
+                peak_pagefile: usize,
+                private: usize,
+            }
+            #[link(name = "kernel32")]
+            unsafe extern "system" {
+                fn K32GetProcessMemoryInfo(process: isize, counters: *mut Counters, cb: u32) -> i32;
+            }
+            let mut c = Counters { cb: std::mem::size_of::<Counters>() as u32, ..Default::default() };
+            // (-1: this process)
+            unsafe { K32GetProcessMemoryInfo(-1, &mut c, c.cb) };
+            format!("private {} MB, working set {} MB, peak {} MB", c.private >> 20, c.ws >> 20, c.peak_ws >> 20)
+        }
         "notice" => a.tab().notice.as_ref().map(|n| n.text.clone()).unwrap_or_default(),
         "focus" => {
             let f = unsafe { GetFocus() };

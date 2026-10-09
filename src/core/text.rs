@@ -2,6 +2,8 @@
 //! classes for word movement. Documents are stored as UTF-8 internally; files in other encodings are converted
 //! when opened and converted back when saved.
 
+use std::sync::{Arc, Mutex};
+
 use serde::{Deserialize, Serialize};
 use windows::Win32::Globalization::{
     CPINFO, GetACP, GetCPInfo, IsDBCSLeadByteEx, MULTI_BYTE_TO_WIDE_CHAR_FLAGS, MultiByteToWideChar,
@@ -105,7 +107,8 @@ pub fn detect_encoding(sample: &[u8], truncated: bool) -> (Encoding, usize) {
     if sample.starts_with(&[0xFE, 0xFF]) {
         return (Encoding::Utf16Be, 2);
     }
-    // UTF-16 without a BOM: mostly-ASCII text has a zero in every other byte.
+    // UTF-16 without a BOM: mostly-ASCII text has a zero in every other byte (and it must read as UTF-16, like
+    // ANSI: what doesn't would come back changed when saved, so it's kept as it is, as UTF-8).
     let n = sample.len().min(8192) & !1;
     if n >= 16 {
         let (mut even, mut odd) = (0usize, 0usize);
@@ -114,10 +117,10 @@ pub fn detect_encoding(sample: &[u8], truncated: bool) -> (Encoding, usize) {
             odd += (sample[i + 1] == 0) as usize;
         }
         let half = n / 2;
-        if odd * 10 > half * 4 && even * 20 < half {
+        if odd * 10 > half * 4 && even * 20 < half && utf16_clean(sample, n, false, !truncated) {
             return (Encoding::Utf16Le, 0);
         }
-        if even * 10 > half * 4 && odd * 20 < half {
+        if even * 10 > half * 4 && odd * 20 < half && utf16_clean(sample, n, true, !truncated) {
             return (Encoding::Utf16Be, 0);
         }
     }
@@ -130,6 +133,24 @@ pub fn detect_encoding(sample: &[u8], truncated: bool) -> (Encoding, usize) {
         Err(_) if mostly_utf8(sample, truncated) => (Encoding::Utf8, 0),
         Err(_) => (Encoding::Ansi, 0),
     }
+}
+
+/// Whether the first `n` (even) bytes of `sample` are UTF-16 without an unpaired surrogate (a pair cut off at `n`
+/// may go on after it). `whole`: the sample is all of the file, which then can't end in half a unit or a pair.
+fn utf16_clean(sample: &[u8], n: usize, be: bool, whole: bool) -> bool {
+    if whole && sample.len() % 2 == 1 {
+        return false;
+    }
+    let mut high = false;
+    for p in sample[..n].chunks_exact(2) {
+        let u = if be { u16::from_be_bytes([p[0], p[1]]) } else { u16::from_le_bytes([p[0], p[1]]) };
+        let low = (0xDC00..0xE000).contains(&u);
+        if high != low {
+            return false;
+        }
+        high = (0xD800..0xDC00).contains(&u);
+    }
+    !(high && whole && n == sample.len())
 }
 
 /// Whether `bytes` has some multi-byte UTF-8 characters, and at least as many of them as invalid sequences.
@@ -169,6 +190,10 @@ pub fn ansi_round_trips(text: &[u8], bytes: &[u8]) -> bool {
 }
 
 fn round_trips_cp(text: &[u8], bytes: &[u8], cp: u32) -> bool {
+    if let Some(t) = single_byte(cp) {
+        // (one byte, one character: each byte must come back as itself)
+        return bytes.iter().all(|&b| t.same[b as usize]);
+    }
     let mut enc = AnsiEncoder::with_codepage(cp);
     let mut back = Vec::new();
     let mut at = 0;
@@ -229,6 +254,11 @@ impl AnsiCheck {
         if !self.ok {
             return;
         }
+        if let Some(t) = &self.enc.sbcs {
+            // (one byte, one character: each byte must come back as itself)
+            self.ok = input.iter().all(|&b| t.same[b as usize]);
+            return;
+        }
         self.ahead.extend_from_slice(input);
         let mut back = Vec::with_capacity(text.len());
         self.enc.push(text, &mut back);
@@ -242,6 +272,9 @@ impl AnsiCheck {
 
     /// After the decoder's last output (`text`): whether everything converted back exactly.
     pub fn finish(mut self, text: &[u8]) -> bool {
+        if self.enc.sbcs.is_some() {
+            return self.ok;
+        }
         if self.ok {
             let mut back = Vec::new();
             self.enc.push(text, &mut back);
@@ -271,26 +304,27 @@ pub fn detect_eol(sample: &[u8]) -> Eol {
 }
 
 /// Converts UTF-16 bytes to UTF-8, streaming: `carry` holds an odd byte or a lone high surrogate between calls.
-/// Unpaired surrogates become U+FFFD.
+/// Unpaired surrogates (and an odd byte at the end) become U+FFFD, and `lossy` says so: saving won't give them back.
 pub struct Utf16Decoder {
     big_endian: bool,
     odd: Option<u8>,
     high: Option<u16>,
+    pub lossy: bool,
 }
 
 impl Utf16Decoder {
     pub fn new(big_endian: bool) -> Self {
-        Utf16Decoder { big_endian, odd: None, high: None }
+        Utf16Decoder { big_endian, odd: None, high: None, lossy: false }
     }
 
     pub fn push(&mut self, mut input: &[u8], out: &mut Vec<u8>) {
-        let mut units: Vec<u16> = Vec::with_capacity(input.len() / 2 + 1);
+        out.reserve(input.len() / 2 * 3 + 4);
         if let Some(b) = self.odd.take() {
             if input.is_empty() {
                 self.odd = Some(b);
                 return;
             }
-            units.push(self.unit(b, input[0]));
+            self.emit(self.unit(b, input[0]), out);
             input = &input[1..];
         }
         let pairs = input.chunks_exact(2);
@@ -298,10 +332,13 @@ impl Utf16Decoder {
             self.odd = Some(*b);
         }
         for p in pairs {
-            units.push(self.unit(p[0], p[1]));
-        }
-        for u in units {
-            self.emit(u, out);
+            let u = self.unit(p[0], p[1]);
+            // (most text is ASCII)
+            if u < 0x80 && self.high.is_none() {
+                out.push(u as u8);
+            } else {
+                self.emit(u, out);
+            }
         }
     }
 
@@ -318,11 +355,13 @@ impl Utf16Decoder {
                 out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
                 return;
             }
+            self.lossy = true;
             out.extend_from_slice("\u{FFFD}".as_bytes());
         }
         if (0xD800..0xDC00).contains(&u) {
             self.high = Some(u);
         } else if (0xDC00..0xE000).contains(&u) {
+            self.lossy = true;
             out.extend_from_slice("\u{FFFD}".as_bytes());
         } else {
             let c = char::from_u32(u as u32).unwrap_or('\u{FFFD}');
@@ -332,6 +371,7 @@ impl Utf16Decoder {
 
     pub fn finish(&mut self, out: &mut Vec<u8>) {
         if self.high.take().is_some() || self.odd.take().is_some() {
+            self.lossy = true;
             out.extend_from_slice("\u{FFFD}".as_bytes());
         }
     }
@@ -404,6 +444,7 @@ pub struct AnsiDecoder {
     /// Lead bytes of a double-byte code page (Japanese, Chinese, Korean); all false for single-byte ones.
     lead: [bool; 256],
     dbcs: bool,
+    sbcs: Option<Arc<SingleByte>>,
     pending: Option<u8>,
 }
 
@@ -439,12 +480,16 @@ impl AnsiDecoder {
                 }
             }
         }
-        AnsiDecoder { cp, lead, dbcs, pending: None }
+        let sbcs = if dbcs { None } else { single_byte(cp) };
+        AnsiDecoder { cp, lead, dbcs, sbcs, pending: None }
     }
 
     pub fn push(&mut self, input: &[u8], out: &mut Vec<u8>) {
         if !self.dbcs {
-            out.extend_from_slice(&ansi_to_utf8_cp(input, self.cp));
+            match &self.sbcs {
+                Some(t) => t.decode(input, out),
+                None => out.extend_from_slice(&ansi_to_utf8_cp(input, self.cp)),
+            }
             return;
         }
         let mut data = Vec::with_capacity(input.len() + 1);
@@ -515,9 +560,97 @@ fn utf8_to_cp(text: &[u8], cp: u32) -> (Vec<u8>, bool) {
     (out, lossy.as_bool())
 }
 
+/// A single-byte code page (Windows-1252 and the like) as tables, made once from what Windows converts each byte
+/// to and back, so converting needn't ask it for every piece of text: the same result, many times faster.
+struct SingleByte {
+    /// Each byte as UTF-8 (its length in the last of the four).
+    utf8: [[u8; 4]; 256],
+    /// The characters bytes read as (sorted), with the byte each is written as again.
+    back: Vec<(char, u8)>,
+    /// The byte reads as a character that's written as that very byte again.
+    same: [bool; 256],
+    /// What a character the code page hasn't got is written as.
+    default: u8,
+}
+
+/// The tables of code page `cp`, if it's a single-byte one (made once per code page).
+fn single_byte(cp: u32) -> Option<Arc<SingleByte>> {
+    static TABLES: Mutex<Vec<(u32, Option<Arc<SingleByte>>)>> = Mutex::new(Vec::new());
+    let mut tables = TABLES.lock().unwrap();
+    if let Some((_, t)) = tables.iter().find(|t| t.0 == cp) {
+        return t.clone();
+    }
+    let mut info = CPINFO::default();
+    let t = (unsafe { GetCPInfo(cp, &mut info) }.is_ok() && info.MaxCharSize == 1).then(|| {
+        let mut t = SingleByte { utf8: [[0; 4]; 256], back: Vec::new(), same: [false; 256], default: info.DefaultChar[0] };
+        for b in 0..=255u8 {
+            let s = ansi_to_utf8_cp(&[b], cp);
+            let n = s.len().min(3);
+            t.utf8[b as usize][..n].copy_from_slice(&s[..n]);
+            t.utf8[b as usize][3] = n as u8;
+            let (again, lossy) = utf8_to_cp(&s, cp);
+            t.same[b as usize] = !lossy && again == [b] && n == s.len();
+            if let (Some(c), [a], false) = (std::str::from_utf8(&s).ok().and_then(|x| x.chars().next()), &again[..], lossy) {
+                t.back.push((c, *a));
+            }
+        }
+        t.back.sort_unstable();
+        t.back.dedup_by_key(|e| e.0);
+        Arc::new(t)
+    });
+    tables.push((cp, t.clone()));
+    t
+}
+
+impl SingleByte {
+    fn decode(&self, bytes: &[u8], out: &mut Vec<u8>) {
+        out.reserve(bytes.len());
+        let mut rest = bytes;
+        while !rest.is_empty() {
+            // (most text is ASCII: a run at a time)
+            let k = rest.iter().position(|&b| b >= 0x80).unwrap_or(rest.len());
+            out.extend_from_slice(&rest[..k]);
+            let Some(&b) = rest.get(k) else { break };
+            let e = &self.utf8[b as usize];
+            out.extend_from_slice(&e[..e[3] as usize]);
+            rest = &rest[k + 1..];
+        }
+    }
+
+    /// Converts UTF-8 text (bytes that aren't UTF-8 read as U+FFFD, as for Windows); returns whether a character
+    /// had to become `default`.
+    fn encode(&self, text: &[u8], out: &mut Vec<u8>) -> bool {
+        let mut lossy = false;
+        let mut put = |c: char, out: &mut Vec<u8>| match self.back.binary_search_by_key(&c, |e| e.0) {
+            Ok(i) => out.push(self.back[i].1),
+            Err(_) => {
+                // (one for each half of a character outside the BMP, as Windows writes them)
+                out.extend(std::iter::repeat_n(self.default, c.len_utf16()));
+                lossy = true;
+            }
+        };
+        out.reserve(text.len());
+        for chunk in text.utf8_chunks() {
+            let mut rest = chunk.valid();
+            while !rest.is_empty() {
+                let k = rest.bytes().position(|b| !b.is_ascii()).unwrap_or(rest.len());
+                out.extend_from_slice(&rest.as_bytes()[..k]);
+                let Some(c) = rest[k..].chars().next() else { break };
+                put(c, out);
+                rest = &rest[k + c.len_utf8()..];
+            }
+            if !chunk.invalid().is_empty() {
+                put('\u{FFFD}', out);
+            }
+        }
+        lossy
+    }
+}
+
 /// Splits UTF-8 into chunks at character boundaries for the ANSI encoder (streaming).
 pub struct AnsiEncoder {
     cp: u32,
+    sbcs: Option<Arc<SingleByte>>,
     pending: Vec<u8>,
     pub lossy: bool,
 }
@@ -534,34 +667,47 @@ impl AnsiEncoder {
     }
 
     fn with_codepage(cp: u32) -> Self {
-        AnsiEncoder { cp, pending: Vec::new(), lossy: false }
+        AnsiEncoder { cp, sbcs: single_byte(cp), pending: Vec::new(), lossy: false }
     }
+
+    fn encode(&mut self, text: &[u8], out: &mut Vec<u8>) {
+        match &self.sbcs {
+            Some(t) => self.lossy |= t.encode(text, out),
+            None => {
+                let (bytes, lossy) = utf8_to_cp(text, self.cp);
+                self.lossy |= lossy;
+                out.extend_from_slice(&bytes);
+            }
+        }
+    }
+
     pub fn push(&mut self, input: &[u8], out: &mut Vec<u8>) {
-        self.pending.extend_from_slice(input);
+        let joined;
+        let data: &[u8] = if self.pending.is_empty() {
+            input
+        } else {
+            self.pending.extend_from_slice(input);
+            joined = std::mem::take(&mut self.pending);
+            &joined
+        };
         // Keep an incomplete trailing sequence for the next chunk.
-        let mut cut = self.pending.len();
-        let start = cut.saturating_sub(3);
-        for i in (start..self.pending.len()).rev() {
-            let b = self.pending[i];
+        let mut cut = data.len();
+        for i in (data.len().saturating_sub(3)..data.len()).rev() {
+            let b = data[i];
             if b & 0xC0 != 0x80 {
-                let need = utf8_len(b);
-                if i + need > self.pending.len() {
+                if i + utf8_len(b) > data.len() {
                     cut = i;
                 }
                 break;
             }
         }
-        let rest = self.pending.split_off(cut);
-        let (bytes, lossy) = utf8_to_cp(&self.pending, self.cp);
-        self.lossy |= lossy;
-        out.extend_from_slice(&bytes);
-        self.pending = rest;
+        self.encode(&data[..cut], out);
+        self.pending = data[cut..].to_vec();
     }
+
     pub fn finish(&mut self, out: &mut Vec<u8>) {
-        let (bytes, lossy) = utf8_to_cp(&self.pending, self.cp);
-        self.lossy |= lossy;
-        out.extend_from_slice(&bytes);
-        self.pending.clear();
+        let rest = std::mem::take(&mut self.pending);
+        self.encode(&rest, out);
     }
 }
 
@@ -867,6 +1013,50 @@ mod tests {
             dec.finish(&mut text);
             assert!(check.finish(&text));
         }
+    }
+
+    #[test]
+    fn single_byte_tables_convert_as_windows_does() {
+        let mut r = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            r ^= r << 13;
+            r ^= r >> 7;
+            r ^= r << 17;
+            r
+        };
+        // Western, Central European, Cyrillic, Greek (with bytes it hasn't got), Hebrew, Thai
+        for cp in [1252, 1250, 1251, 1253, 1255, 874] {
+            let Some(t) = single_byte(cp) else { continue };
+            let all: Vec<u8> = (0..=255).collect();
+            let mut text = Vec::new();
+            t.decode(&all, &mut text);
+            assert_eq!(text, ansi_to_utf8_cp(&all, cp), "code page {cp}");
+            // random bytes: decoded, and whether they come back
+            for _ in 0..50 {
+                let bytes: Vec<u8> = (0..next() % 300).map(|_| next() as u8).collect();
+                let mut text = Vec::new();
+                t.decode(&bytes, &mut text);
+                assert_eq!(text, ansi_to_utf8_cp(&bytes, cp));
+                let (back, lossy) = utf8_to_cp(&text, cp);
+                assert_eq!(round_trips_cp(&text, &bytes, cp), !lossy && back == bytes, "code page {cp}");
+            }
+            // random text (with characters it hasn't got, and bytes that aren't UTF-8): encoded
+            let parts: [&[u8]; 9] = [b"plain ", "café".as_bytes(), "€ – “q”".as_bytes(), "Ωμέγα".as_bytes(), "Жж".as_bytes(), "שלום".as_bytes(), "ไทย".as_bytes(), "🌍".as_bytes(), b"\xFF\xE2\x82"];
+            for _ in 0..200 {
+                let text: Vec<u8> = (0..next() % 8).flat_map(|_| parts[(next() % 9) as usize].to_vec()).collect();
+                let mut out = Vec::new();
+                let lossy = t.encode(&text, &mut out);
+                assert_eq!((out, lossy), utf8_to_cp(&text, cp), "code page {cp}: {:?}", String::from_utf8_lossy(&text));
+            }
+        }
+        // the streaming encoder: a character cut between pieces waits for the rest
+        let mut enc = AnsiEncoder::with_codepage(1252);
+        let mut out = Vec::new();
+        for piece in "café €".as_bytes().chunks(1) {
+            enc.push(piece, &mut out);
+        }
+        enc.finish(&mut out);
+        assert_eq!((out, enc.lossy), (b"caf\xE9 \x80".to_vec(), false));
     }
 
     #[test]

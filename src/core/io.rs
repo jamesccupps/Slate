@@ -36,7 +36,7 @@ use windows::core::PCWSTR;
 use super::buffer::{Buffer, Snapshot};
 use super::document::{DiskInfo, Document};
 use super::job::{Ctx, Failure, Job, Notify};
-use super::source::{IndexBuilder, Source, create_temp_file};
+use super::source::{FileId, IndexBuilder, Source, create_temp_file, stamp_of};
 use super::text::{
     self, AnsiCheck, AnsiDecoder, AnsiEncoder, Encoding, Utf16Decoder, Utf16Encoder, detect_encoding, detect_eol,
 };
@@ -219,8 +219,8 @@ pub fn open_with(
     let total = src.len();
     Ok(Loading::Converting(Job::spawn(total, notify, move |ctx| {
         let mut doc = match convert_to_temp(&src, encoding, bom as u64, force.is_none(), ctx) {
-            // Detected as ANSI, but further on it doesn't convert to text and back exactly: keep its bytes as they
-            // are instead (UTF-8, read straight from the file like any big file).
+            // Detected as ANSI (or UTF-16 without a BOM), but further on it doesn't convert to text and back
+            // exactly: keep its bytes as they are instead (UTF-8, read straight from the file like any big file).
             Err(e) if e.kind() == io::ErrorKind::InvalidData => {
                 if !src.build_index(&ctx.cancel, &ctx.progress) {
                     let why = src.index_error().unwrap_or_else(|| "cancelled".into());
@@ -286,7 +286,13 @@ pub fn document_from_bytes_as(mut data: Vec<u8>, force: Option<Encoding>) -> Doc
             let mut d = Utf16Decoder::new(encoding == Encoding::Utf16Be);
             d.push(&data[bom..], &mut out);
             d.finish(&mut out);
-            out
+            if force.is_none() && bom == 0 && d.lossy {
+                // Taken for UTF-16 without a BOM, but not all of it is: keep its bytes as they are (like ANSI).
+                encoding = Encoding::Utf8;
+                data
+            } else {
+                out
+            }
         }
         Encoding::Ansi => {
             let mut out = Vec::with_capacity(data.len() + data.len() / 8);
@@ -311,11 +317,13 @@ pub fn document_from_bytes_as(mut data: Vec<u8>, force: Option<Encoding>) -> Doc
     doc
 }
 
-/// Converts a big file to UTF-8 in a temp file. `verify` (ANSI that was detected, not chosen): stop with
-/// `InvalidData` as soon as the text doesn't convert back to exactly the file's bytes.
+/// Converts a big file to UTF-8 in a temp file. `verify` (an encoding that was detected, not chosen): stop with
+/// `InvalidData` as soon as the text doesn't convert back to exactly the file's bytes (ANSI, or UTF-16 without a
+/// BOM that isn't all UTF-16).
 fn convert_to_temp(src: &Source, encoding: Encoding, bom: u64, verify: bool, ctx: &Ctx) -> io::Result<Document> {
     let mut check = (verify && encoding == Encoding::Ansi).then(AnsiCheck::new);
-    let not_ansi = || io::Error::new(io::ErrorKind::InvalidData, "not text in the ANSI code page");
+    let strict16 = verify && bom == 0 && encoding != Encoding::Ansi;
+    let not_ansi = || io::Error::new(io::ErrorKind::InvalidData, "not text in this encoding");
     let (file, temp_path) = create_temp_file()?;
     let mut idx = IndexBuilder::new();
     let mut out_len = 0u64;
@@ -353,6 +361,9 @@ fn convert_to_temp(src: &Source, encoding: Encoding, bom: u64, verify: bool, ctx
                     return Err(not_ansi());
                 }
             }
+            if strict16 && u16d.lossy {
+                return Err(not_ansi());
+            }
             emit(&out)?;
             ctx.set(pos);
         }
@@ -361,7 +372,7 @@ fn convert_to_temp(src: &Source, encoding: Encoding, bom: u64, verify: bool, ctx
             Encoding::Ansi => ansi.finish(&mut out),
             _ => u16d.finish(&mut out),
         }
-        if check.take().is_some_and(|c| !c.finish(&out)) {
+        if check.take().is_some_and(|c| !c.finish(&out)) || (strict16 && u16d.lossy) {
             return Err(not_ansi());
         }
         emit(&out)?;
@@ -756,6 +767,8 @@ pub fn save(
     // sharing, as Slate keeps big files); where the file system doesn't have those (network shares, FAT drives)
     // a plain rename, and if that can't replace the file because Slate still has it open, ReplaceFile.
     let posix = posix_rename(&file, &verbatim(&target)).is_ok();
+    // (which file was written: after a POSIX rename, the one now at `target` must still be it)
+    let written = posix.then(|| stamp_of(&file).map(|s| s.1)).flatten();
     drop(file);
     let mut set_aside = None;
     let renamed = posix
@@ -784,14 +797,21 @@ pub fn save(
     let rebase = match idx {
         Some(idx) if content_len > MEM_LIMIT && content_len == snap.len() => {
             let nl = idx.newlines();
-            OpenOptions::new().read(true).share_mode(0x7).open(&target).ok().and_then(|f| {
-                let len = f.metadata().ok()?.len();
-                Some((Arc::new(Source::from_file(f, len, target.clone(), false, Some(idx.finish()))), bom_len, nl))
-            })
+            reopen_saved(&target, bom_len + snap.len(), written, idx).map(|s| (s, bom_len, nl))
         }
         _ => None,
     };
     Ok(Saved { disk, rebase, lossy, canon: fs::canonicalize(path).ok() })
+}
+
+/// The file just saved at `target` as a source of the `len` bytes written to it (whose index is `idx`): not what
+/// another program may have added to it since, and none if the file there isn't `written` (when that's known).
+fn reopen_saved(target: &Path, len: u64, written: Option<FileId>, idx: IndexBuilder) -> Option<Arc<Source>> {
+    let f = OpenOptions::new().read(true).share_mode(0x7).open(target).ok()?;
+    if written.is_some_and(|w| stamp_of(&f).map(|s| s.1) != Some(w)) || f.metadata().ok()?.len() < len {
+        return None;
+    }
+    Some(Arc::new(Source::from_file(f, len, target.to_path_buf(), false, Some(idx.finish()))))
 }
 
 /// Whether two paths name the same file (compares canonical paths).
@@ -1103,6 +1123,80 @@ mod tests {
         let saved = save(&snap, &path, Encoding::Ansi, false, true, &ctx()).unwrap();
         assert!(saved.lossy);
         assert_eq!(fs::read(&path).unwrap(), b"? ? caf\xE9\r\n");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_saved_file_is_read_as_written() {
+        // After a big save the text reads the saved file: only what was written to it, from the file written.
+        let dir = test_dir("reopen");
+        let path = dir.join("big.log");
+        let text: Vec<u8> = (0..50_000u32).flat_map(|i| format!("line {i}\n").into_bytes()).collect();
+        let index = |data: &[u8]| {
+            let mut b = IndexBuilder::new();
+            b.push(data);
+            b
+        };
+        fs::write(&path, &text).unwrap();
+        let id = stamp_of(&File::open(&path).unwrap()).map(|s| s.1);
+        // another program added a line right after the save
+        OpenOptions::new().append(true).open(&path).unwrap().write_all(b"appended\n").unwrap();
+        let src = reopen_saved(&path, text.len() as u64, id, index(&text)).unwrap();
+        let mut back = Vec::new();
+        src.read_into(0, src.len(), &mut back);
+        assert!(back == text);
+        assert_eq!(src.count_nl(0, src.len()), 50_000);
+        // or put another file in its place
+        fs::write(dir.join("other.log"), &text).unwrap();
+        fs::rename(dir.join("other.log"), &path).unwrap();
+        assert!(reopen_saved(&path, text.len() as u64, id, index(&text)).is_none());
+        // (where it can't be told which file it is, the bytes are still only those written)
+        assert!(reopen_saved(&path, text.len() as u64, None, index(&text)).is_some());
+        assert!(reopen_saved(&path, text.len() as u64 + 1, None, index(&text)).is_none());
+        drop(src);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn utf16_without_bom_is_only_taken_when_all_of_it_is() {
+        let le = |s: &str| -> Vec<u8> { s.encode_utf16().flat_map(|u| u.to_le_bytes()).collect() };
+        // a lone surrogate (or an odd byte at the end) wouldn't come back when saved: the bytes stay as they are
+        let mut lone = le(&"plain text, no byte order mark\r\n".repeat(50));
+        lone.extend_from_slice(&0xD800u16.to_le_bytes());
+        lone.extend_from_slice(&le("more\r\n"));
+        let mut odd = le(&"text\r\n".repeat(50));
+        odd.push(b'x');
+        for bytes in [&lone, &odd] {
+            let mut doc = document_from_bytes(bytes.clone());
+            assert!(!matches!(doc.encoding, Encoding::Utf16Le | Encoding::Utf16Be));
+            let dir = test_dir("u16strict");
+            let path = dir.join("t.txt");
+            save(&doc.snapshot(), &path, doc.encoding, doc.bom, false, &ctx()).unwrap();
+            assert_eq!(&fs::read(&path).unwrap(), bytes);
+            let _ = fs::remove_dir_all(&dir);
+        }
+        // the same in a big file, found while converting it (after the part that was looked at)
+        let dir = test_dir("u16strict-big");
+        let path = dir.join("big.txt");
+        let mut big = le(&"line of text\r\n".repeat(20_000));
+        big.extend_from_slice(&0xDC00u16.to_le_bytes());
+        fs::write(&path, &big).unwrap();
+        let src = Source::open_file(&path).unwrap();
+        let r = convert_to_temp(&src, Encoding::Utf16Le, 0, true, &ctx());
+        assert!(matches!(r, Err(e) if e.kind() == io::ErrorKind::InvalidData));
+        // with a byte order mark (or chosen by the user) it's UTF-16, its stray halves shown as U+FFFD
+        let mut bom = vec![0xFF, 0xFE];
+        bom.extend_from_slice(&lone);
+        let doc = document_from_bytes(bom);
+        assert_eq!(doc.encoding, Encoding::Utf16Le);
+        assert!(convert_to_temp(&src, Encoding::Utf16Le, 0, false, &ctx()).is_ok());
+        // clean text without a BOM is still UTF-16, also with a pair cut off where a sample ends
+        let mut ok = le(&"text 😃\r\n".repeat(2000));
+        assert_eq!(document_from_bytes(ok.clone()).encoding, Encoding::Utf16Le);
+        ok.truncate(18 * 400 + 12);
+        assert_eq!(detect_encoding(&ok, true).0, Encoding::Utf16Le);
+        assert_ne!(detect_encoding(&ok, false).0, Encoding::Utf16Le);
+        drop(src);
         let _ = fs::remove_dir_all(&dir);
     }
 

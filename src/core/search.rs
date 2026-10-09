@@ -1,6 +1,11 @@
 //! Find and replace over documents of any size. The text is searched in windows of a few MB (zero-copy when a
 //! window sits in one in-memory piece), so even multi-GB files stream through at disk speed. Every query becomes
 //! a byte regex (plain text is escaped), which also gives fast literal search.
+//!
+//! A match that starts in a window is looked for in it and the overlap after it: one that runs into the end of
+//! that is looked for again in a bigger window, but one that ends further on can't be told from no match there (a
+//! regex like `"[^"]*"` over a long string). So regexes get a bigger overlap: their matches up to 1 MiB long are
+//! found exactly as in one search of the whole text; longer ones may be cut short or missed at a seam.
 
 use std::io::{self, Write};
 
@@ -21,8 +26,13 @@ pub struct Query {
 
 /// Bytes before a window kept for look-behind (`^`, `\b`).
 const CTX: u64 = 16;
-/// Extra bytes after a window so matches that start inside it can finish.
-const OVERLAP: u64 = 64 * 1024;
+/// Extra bytes after a window so matches that start inside it can finish (plain text: as long as the query; small
+/// in tests, so they cross many seams).
+const OVERLAP: u64 = if cfg!(test) { 64 } else { 64 * 1024 };
+/// The same for regexes, whose matches can be of any length (see the module docs).
+const OVERLAP_REGEX: u64 = if cfg!(test) { 1024 } else { 1 << 20 };
+/// The window searched at a time (small in tests, so they cross many seams).
+const WINDOW: u64 = if cfg!(test) { 1000 } else { 8 << 20 };
 /// Largest window tried when a match keeps running into the window's end.
 const MAX_WINDOW: u64 = 256 << 20;
 
@@ -55,6 +65,8 @@ impl Haystack for Document {
 pub struct Matcher {
     re: Regex,
     regex_mode: bool,
+    /// Bytes after a window a match that starts in it may need (see `OVERLAP`).
+    overlap: u64,
 }
 
 fn is_word_char(c: char) -> bool {
@@ -88,13 +100,22 @@ impl Matcher {
                 regex::Error::CompiledTooBig(_) => "Pattern is too big".into(),
                 _ => "Invalid pattern".into(),
             })?;
-        Ok(Matcher { re, regex_mode: q.regex })
+        // (plain text: what the query can match, a letter of other case taking up to three times its bytes)
+        let overlap = if q.regex { OVERLAP_REGEX } else { OVERLAP.max(4 * q.text.len() as u64 + CTX) };
+        Ok(Matcher { re, regex_mode: q.regex, overlap })
+    }
+
+    /// How long a text can be to search it on the UI thread: plain text is searched at several GB/s (32 MB in a few
+    /// ms), but some regexes go at a few dozen MB/s (`\b\w{30,}\b` over text that isn't all ASCII), which would
+    /// freeze the window for seconds.
+    pub fn sync_limit(&self) -> u64 {
+        if self.regex_mode { 256 << 10 } else { 32 << 20 }
     }
 
     /// First match starting in `[from, to)`.
     pub fn find_fwd(&self, h: &dyn Haystack, from: u64, to: u64, ctx: Option<&Ctx>) -> Option<(u64, u64)> {
         let mut found = None;
-        self.each(h, from, to, ctx, 8 << 20, &mut |_, _, s, e| {
+        self.each(h, from, to, ctx, WINDOW, &mut |_, _, s, e| {
             found = Some((s, e));
             false
         });
@@ -115,7 +136,7 @@ impl Matcher {
             }
             let start = end.saturating_sub(win).max(from);
             let hs = start.saturating_sub(CTX);
-            let he = (end + OVERLAP).min(len);
+            let he = (end + self.overlap).min(len);
             let hay = h.hay(hs, he, &mut scratch);
             let mut best = None;
             let mut at = (start - hs) as usize;
@@ -151,6 +172,23 @@ impl Matcher {
         window: u64,
         f: &mut dyn FnMut(&[u8], u64, u64, u64) -> bool,
     ) {
+        self.windows(h, from, to, ctx, window, &mut |hay, hs, hit| match hit {
+            Hit::Match(s, e) => f(hay, hs, s, e),
+            Hit::Done(_) => true,
+        });
+    }
+
+    /// `each`, also telling `f` when a window is done: no match starts before `Hit::Done`'s offset that wasn't
+    /// reported (so the text up to there can be taken from that window's `hay` while it's there).
+    fn windows(
+        &self,
+        h: &dyn Haystack,
+        from: u64,
+        to: u64,
+        ctx: Option<&Ctx>,
+        window: u64,
+        f: &mut dyn FnMut(&[u8], u64, Hit) -> bool,
+    ) {
         let len = h.hay_len();
         let to = to.min(len);
         let mut pos = from;
@@ -165,7 +203,7 @@ impl Matcher {
                 c.set(pos);
             }
             let hs = pos.saturating_sub(CTX);
-            let he = (pos + win + OVERLAP).min(len);
+            let he = (pos + win + self.overlap).min(len);
             let limit = if he == len { u64::MAX } else { pos + win };
             let hay = h.hay(hs, he, &mut scratch);
             let mut at = (pos - hs) as usize;
@@ -189,7 +227,7 @@ impl Matcher {
                     grow = win < MAX_WINDOW;
                     if !grow {
                         // Give up on extending; report what we have.
-                        if !f(hay, hs, ms, me) {
+                        if !f(hay, hs, Hit::Match(ms, me)) {
                             return;
                         }
                         next = me.max(ms + 1);
@@ -197,7 +235,7 @@ impl Matcher {
                     break;
                 }
                 // Skip an empty match right where the previous match ended.
-                if !(m.start() == m.end() && last_end == Some(ms)) && !f(hay, hs, ms, me) {
+                if !(m.start() == m.end() && last_end == Some(ms)) && !f(hay, hs, Hit::Match(ms, me)) {
                     return;
                 }
                 last_end = Some(me);
@@ -211,6 +249,9 @@ impl Matcher {
             }
             if next <= pos && !grow {
                 next = pos + 1;
+            }
+            if !f(hay, hs, Hit::Done(next)) {
+                return;
             }
             pos = next;
         }
@@ -238,7 +279,8 @@ impl Matcher {
 
     /// The replacement for the match at `[s, e)` of `hay` (expands `$1`, `${name}` in regex mode).
     pub fn expand(&self, hay: &[u8], s: usize, replacement: &[u8], out: &mut Vec<u8>) {
-        if !self.regex_mode {
+        // (without a `$` there's nothing to expand: no need to find the groups)
+        if !self.regex_mode || !replacement.contains(&b'$') {
             out.extend_from_slice(replacement);
             return;
         }
@@ -261,32 +303,41 @@ impl Matcher {
         let mut copied = 0u64;
         let mut err: Option<io::Error> = None;
         let mut buf = Vec::new();
-        let copy = |a: u64, b: u64, w: &mut dyn Write, idx: &mut IndexBuilder| -> io::Result<()> {
+        let put = |c: &[u8], w: &mut dyn Write, idx: &mut IndexBuilder| {
+            idx.push(c);
+            w.write_all(c)
+        };
+        // The text between matches, from the window it was searched in (read again only where it isn't in it).
+        let copy = |hay: &[u8], hs: u64, a: u64, b: u64, w: &mut dyn Write, idx: &mut IndexBuilder| {
+            if a >= b {
+                return Ok(());
+            }
+            let he = hs + hay.len() as u64;
+            if a >= hs && b <= he {
+                return put(&hay[(a - hs) as usize..(b - hs) as usize], w, idx);
+            }
             let mut e = None;
             snap.chunks(a, b, &mut |c| {
-                idx.push(c);
-                if let Err(x) = w.write_all(c) {
-                    e = Some(x);
-                    return false;
-                }
-                true
+                e = put(c, w, idx).err();
+                e.is_none()
             });
             e.map_or(Ok(()), Err)
         };
-        self.each(snap, 0, snap.len(), Some(ctx), 8 << 20, &mut |hay, hs, s, e| {
-            if let Err(x) = copy(copied, s, w, idx) {
+        self.windows(snap, 0, snap.len(), Some(ctx), WINDOW, &mut |hay, hs, hit| {
+            let r = match hit {
+                Hit::Done(upto) => copy(hay, hs, copied, upto, w, idx).map(|_| copied = copied.max(upto)),
+                Hit::Match(s, e) => copy(hay, hs, copied, s, w, idx).and_then(|_| {
+                    buf.clear();
+                    self.expand(hay, (s - hs) as usize, replacement, &mut buf);
+                    copied = e;
+                    count += 1;
+                    put(&buf, w, idx)
+                }),
+            };
+            if let Err(x) = r {
                 err = Some(x);
                 return false;
             }
-            buf.clear();
-            self.expand(hay, (s - hs) as usize, replacement, &mut buf);
-            idx.push(&buf);
-            if let Err(x) = w.write_all(&buf) {
-                err = Some(x);
-                return false;
-            }
-            copied = e;
-            count += 1;
             true
         });
         if let Some(e) = err {
@@ -295,9 +346,15 @@ impl Matcher {
         if ctx.cancelled() {
             return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
         }
-        copy(copied, snap.len(), w, idx)?;
+        copy(&[], 0, copied, snap.len(), w, idx)?;
         Ok(count)
     }
+}
+
+/// What `Matcher::windows` reports: a match, or that the window it searched is done up to an offset.
+enum Hit {
+    Match(u64, u64),
+    Done(u64),
 }
 
 /// Where to continue after match `m` (one character further after an empty match).
@@ -321,7 +378,7 @@ pub const MAX_POSITIONS: usize = 1_000_000;
 
 pub fn count_all(m: &Matcher, snap: &Snapshot, ctx: &Ctx) -> Found {
     let mut found = Found::default();
-    m.each(snap, 0, snap.len(), Some(ctx), 8 << 20, &mut |_, _, s, e| {
+    m.each(snap, 0, snap.len(), Some(ctx), WINDOW, &mut |_, _, s, e| {
         found.count += 1;
         if found.positions.len() < MAX_POSITIONS {
             found.positions.push((s, e));
@@ -421,6 +478,115 @@ mod tests {
         assert_eq!(n(Query { regex: true, ..q(r"f\w+") }), 5);
         assert_eq!(n(Query { regex: true, whole_word: true, ..q("fo+") }), 3);
         assert!(Matcher::new(&Query { regex: true, ..q("(") }).is_err());
+    }
+
+    /// The matches of a search of the whole text in one piece, with `each`'s rules for empty matches.
+    fn whole(m: &Matcher, text: &[u8]) -> Vec<(u64, u64)> {
+        let (mut v, mut at, mut last_end) = (Vec::new(), 0, None);
+        while at <= text.len() {
+            let Some(x) = m.re.find_at(text, at) else { break };
+            if !(x.start() == x.end() && last_end == Some(x.start())) {
+                v.push((x.start() as u64, x.end() as u64));
+            }
+            last_end = Some(x.end());
+            at = next_at(text, &x);
+        }
+        v
+    }
+
+    #[test]
+    fn windows_find_what_the_whole_text_has() {
+        // seams everywhere (tiny windows, and a tiny overlap in tests): the same matches as one search of it all
+        let words = ["foo", "bar", "Foo", "é", "É", "\r\n", "\n", " ", "x", "aaaa", "\t", "foobar", "1.5", "日本", "\r"];
+        let mut r = 0x2545_F491_4F6C_DD1Du64;
+        let mut text = Vec::new();
+        for _ in 0..4000 {
+            r ^= r << 13;
+            r ^= r >> 7;
+            r ^= r << 17;
+            text.extend_from_slice(words[(r % words.len() as u64) as usize].as_bytes());
+        }
+        let snap = fragmented(&text);
+        let pats = [
+            "foo", r"\bfoo\b", "^", "$", r"^\s*$", "x*", r"\b", "a+", "é", "o$", r"\w+$", r"^\w", "é|É", r"\s+", "(?s).",
+            r"foo\s+bar", "[^a]{20,}",
+        ];
+        for pat in pats {
+            for case in [true, false] {
+                let m = Matcher::new(&Query { regex: true, match_case: case, ..q(pat) }).unwrap();
+                let want = whole(&m, &text);
+                for window in [1, 5, 64, 1000] {
+                    let mut got = Vec::new();
+                    m.each(&snap, 0, snap.len(), None, window, &mut |_, _, s, e| {
+                        got.push((s, e));
+                        true
+                    });
+                    assert_eq!(got.len(), want.len(), "{pat} (case {case}), window {window}");
+                    assert_eq!(got, want, "{pat} (case {case}), window {window}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn long_matches_across_seams_are_found_whole() {
+        // strings longer than a literal search's overlap: a match cut off by a window's end isn't a match at all
+        // there, and a search that went on from that window's end would find the wrong ones (`", "`)
+        let mut text = Vec::new();
+        for i in 0..300 {
+            text.extend_from_slice(format!("{{\"k\": \"{}\", \"n\": {i}}}\n", "x".repeat(i % 7 * 50)).as_bytes());
+        }
+        let snap = fragmented(&text);
+        for pat in [r#""[^"]*""#, r#"\{[^}]*\}"#, r#"(?s)"k".*?\}"#] {
+            let m = Matcher::new(&Query { regex: true, ..q(pat) }).unwrap();
+            let want = whole(&m, &text);
+            for window in [1, 100, 1000] {
+                let mut got = Vec::new();
+                m.each(&snap, 0, snap.len(), None, window, &mut |_, _, s, e| {
+                    got.push((s, e));
+                    true
+                });
+                assert_eq!(got, want, "{pat}, window {window}");
+            }
+            let found = count_all(&m, &snap, &ctx());
+            assert_eq!(found.positions, want);
+        }
+    }
+
+    #[test]
+    fn replace_all_across_windows_is_one_replace_of_the_whole_text() {
+        // (the text between matches is written from the window it was searched in)
+        let mut text = Vec::new();
+        for i in 0..2000 {
+            text.extend_from_slice(format!("id={i} name=\"n{}\" {}\r\n", i % 13, "pad ".repeat(i % 5)).as_bytes());
+        }
+        let snap = fragmented(&text);
+        for (pat, regex, repl) in [
+            ("id=", false, "ID:"),
+            ("pad", false, ""),
+            (r"(\w+)=(\d+)", true, "$2<-$1"),
+            (r#""[^"]*""#, true, "'q'"),
+            ("^", true, "> "),
+            (r"\s+$", true, ""),
+            ("x*", true, "-"),
+        ] {
+            let m = Matcher::new(&Query { regex, match_case: true, ..q(pat) }).unwrap();
+            let mut want = Vec::new();
+            let mut at = 0;
+            let found = whole(&m, &text);
+            for &(s, e) in &found {
+                want.extend_from_slice(&text[at..s as usize]);
+                m.expand(&text, s as usize, repl.as_bytes(), &mut want);
+                at = e as usize;
+            }
+            want.extend_from_slice(&text[at..]);
+            let mut out = Vec::new();
+            let mut idx = IndexBuilder::new();
+            let n = m.replace_all_to(&snap, repl.as_bytes(), &mut out, &mut idx, &ctx()).unwrap();
+            assert_eq!(n, found.len() as u64, "{pat}");
+            assert!(out == want, "{pat}");
+            assert_eq!(idx.newlines(), bytecount::count(&want, b'\n') as u64);
+        }
     }
 
     #[test]

@@ -57,8 +57,6 @@ pub const TIMER_COUNT: usize = 9;
 /// The mouse has rested on a part with a tooltip: show it.
 pub const TIMER_TIP: usize = 10;
 
-/// Documents up to this size are searched on the UI thread (fast enough to feel instant).
-const SYNC_SEARCH: u64 = 32 << 20;
 const BIG_CLIPBOARD: u64 = 64 << 20;
 
 thread_local! {
@@ -2339,7 +2337,7 @@ impl App {
         let Some(m) = self.find.matcher.clone() else { return };
         let origin = self.find.origin.unwrap_or(self.tab().view.sel.start());
         let len = self.tab().doc.len();
-        if len > SYNC_SEARCH {
+        if len > m.sync_limit() {
             self.find_async(m, origin, true);
             return;
         }
@@ -2389,7 +2387,7 @@ impl App {
             from = tab.doc.next_char(from);
         }
         self.find.origin = Some(if forward { sel.end() } else { sel.start() });
-        if len > SYNC_SEARCH {
+        if len > m.sync_limit() {
             self.find_async(m, from, forward);
             return;
         }

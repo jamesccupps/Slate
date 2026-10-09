@@ -25,13 +25,19 @@ pub enum CaseOp {
 /// "1.25" before "1.5". A number glued to a word or to another number's dot is a whole number, so versions and
 /// addresses sort by their parts ("v1.9" before "v1.10", "1.2.3" before "1.10.0").
 pub fn natural_cmp(a: &[u8], b: &[u8]) -> Ordering {
-    natural(a, b, true).then_with(|| natural(a, b, false))
+    // What both start with compares equal: start where they differ, back at the start of the character or number
+    // there (the byte before is then a character of its own in both, so both passes would get there together).
+    let mut k = a.iter().zip(b).position(|(x, y)| x != y).unwrap_or(a.len().min(b.len()));
+    while k > 0 && (a[k - 1] >= 0x80 || a[k - 1].is_ascii_digit() || a[k - 1] == b'.' || a[k - 1] == b'-') {
+        k -= 1;
+    }
+    natural(a, b, k, true).then_with(|| natural(a, b, k, false))
 }
 
-/// One pass of `natural_cmp`; `base`: letters compare by their plain letter.
-fn natural(a: &[u8], b: &[u8], base: bool) -> Ordering {
+/// One pass of `natural_cmp` from `k` (in both); `base`: letters compare by their plain letter.
+fn natural(a: &[u8], b: &[u8], k: usize, base: bool) -> Ordering {
     let class = |n: &Number| if n.neg { b'-' as u32 } else { b'0' as u32 };
-    let (mut i, mut j) = (0, 0);
+    let (mut i, mut j) = (k, k);
     while i < a.len() && j < b.len() {
         let c = match (number_at(a, i), number_at(b, j)) {
             (Some(x), Some(y)) => {
@@ -186,7 +192,8 @@ pub fn apply(op: LineOp, text: &[u8]) -> (Vec<u8>, u64) {
     match op {
         LineOp::SortAsc | LineOp::SortDesc => {
             let was = lines.clone();
-            lines.sort_by(|a, b| natural_cmp(a, b).then_with(|| a.cmp(b)));
+            // (lines that compare equal are the same bytes: an unstable sort gives the same result)
+            lines.sort_unstable_by(|a, b| natural_cmp(a, b).then_with(|| a.cmp(b)));
             if op == LineOp::SortDesc {
                 lines.reverse();
             }
@@ -252,31 +259,55 @@ pub fn change_case(text: &[u8], op: CaseOp) -> Vec<u8> {
             }
         };
     };
+    // (most text is ASCII, which goes a run at a time; a selection can be 16 MB)
+    let mut out = Vec::with_capacity(s.len());
+    let put = |out: &mut Vec<u8>, cs: &mut dyn Iterator<Item = char>| {
+        for c in cs {
+            out.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes());
+        }
+    };
     match op {
-        CaseOp::Upper => s.to_uppercase().into_bytes(),
-        CaseOp::Lower => s.to_lowercase().into_bytes(),
+        // (a Greek capital sigma lowercases by the letters around it, which only the whole text knows)
+        CaseOp::Lower if s.contains('Σ') => return s.to_lowercase().into_bytes(),
+        CaseOp::Upper | CaseOp::Lower => {
+            let upper = op == CaseOp::Upper;
+            let mut rest = s;
+            while !rest.is_empty() {
+                let k = rest.bytes().position(|b| !b.is_ascii()).unwrap_or(rest.len());
+                let from = out.len();
+                out.extend_from_slice(&rest.as_bytes()[..k]);
+                if upper { out[from..].make_ascii_uppercase() } else { out[from..].make_ascii_lowercase() }
+                let wide = &rest[k..];
+                let m = wide.bytes().position(|b| b.is_ascii()).unwrap_or(wide.len());
+                for c in wide[..m].chars() {
+                    if upper { put(&mut out, &mut c.to_uppercase()) } else { put(&mut out, &mut c.to_lowercase()) }
+                }
+                rest = &wide[m..];
+            }
+        }
         CaseOp::Title => {
-            let mut out = String::with_capacity(s.len());
             let mut start = true;
             for c in s.chars() {
                 if c.is_alphanumeric() {
-                    if start {
-                        out.extend(c.to_uppercase());
+                    if c.is_ascii() {
+                        out.push(if start { c.to_ascii_uppercase() } else { c.to_ascii_lowercase() } as u8);
+                    } else if start {
+                        put(&mut out, &mut c.to_uppercase());
                     } else {
-                        out.extend(c.to_lowercase());
+                        put(&mut out, &mut c.to_lowercase());
                     }
                     start = false;
                 } else {
-                    out.push(c);
+                    put(&mut out, &mut std::iter::once(c));
                     // "don't" stays one word; spaces, dashes and brackets start a new one
                     if c.is_whitespace() || "-_/([{\"".contains(c) {
                         start = true;
                     }
                 }
             }
-            out.into_bytes()
         }
     }
+    out
 }
 
 #[cfg(test)]
@@ -344,6 +375,19 @@ mod tests {
         }
         let mut v = lines.clone();
         v.sort_by(|a, b| natural_cmp(a, b).then_with(|| a.cmp(b)));
+        // (`apply` gives that order too)
+        let text: Vec<u8> = lines.iter().flat_map(|l| [l.as_slice(), b"\n"].concat()).collect();
+        let want: Vec<u8> = v.iter().flat_map(|l| [l.as_slice(), b"\n"].concat()).collect();
+        assert!(apply(LineOp::SortAsc, &text).0 == want);
+        // what two lines start with is skipped: the same order as comparing them from the start
+        let heads = ["", "x", "file-1", "v1.2", "2026-10-0", "Éa", "a b ", "-"];
+        let long: Vec<Vec<u8>> = lines.iter().enumerate().map(|(k, l)| [heads[k % heads.len()].as_bytes(), l].concat()).collect();
+        for a in long.iter().chain(&lines) {
+            for b in long.iter().chain(&lines) {
+                let whole = natural(a, b, 0, true).then_with(|| natural(a, b, 0, false));
+                assert_eq!(natural_cmp(a, b), whole, "{a:?} {b:?}");
+            }
+        }
     }
 
     #[test]
@@ -353,6 +397,36 @@ mod tests {
         assert_eq!(run(LineOp::RemoveBlank, "\n\n").0, "");
         assert_eq!(run(LineOp::TrimTrailing, "a  \nb\t\nc\r\n"), ("a\nb\nc\n".into(), 2));
         assert_eq!(run(LineOp::TrimTrailing, "keep  \r\nmore\r\n"), ("keep\r\nmore\r\n".into(), 1));
+    }
+
+    #[test]
+    fn letter_case_a_run_at_a_time_is_the_same() {
+        // (ASCII goes a run at a time: the same as converting it all in one go)
+        let parts = ["abc DEF", " ", "Grüße", "ß", "İstanbul", "ΟΔΟΣ", "Σ", "aΣ b", "ŉ", "日本", "x-y_z", "\"q\"", "ǅ", "1a"];
+        let mut r = 0x2545_F491_4F6C_DD1Du64;
+        for _ in 0..300 {
+            let mut s = String::new();
+            for _ in 0..1 + r % 9 {
+                r ^= r << 13;
+                r ^= r >> 7;
+                r ^= r << 17;
+                s.push_str(parts[(r % parts.len() as u64) as usize]);
+            }
+            assert_eq!(change_case(s.as_bytes(), CaseOp::Upper), s.to_uppercase().as_bytes(), "{s}");
+            assert_eq!(change_case(s.as_bytes(), CaseOp::Lower), s.to_lowercase().as_bytes(), "{s}");
+            let mut title = String::new();
+            let mut start = true;
+            for c in s.chars() {
+                if c.is_alphanumeric() {
+                    if start { title.extend(c.to_uppercase()) } else { title.extend(c.to_lowercase()) }
+                    start = false;
+                } else {
+                    title.push(c);
+                    start |= c.is_whitespace() || "-_/([{\"".contains(c);
+                }
+            }
+            assert_eq!(change_case(s.as_bytes(), CaseOp::Title), title.as_bytes(), "{s}");
+        }
     }
 
     #[test]
