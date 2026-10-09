@@ -939,7 +939,8 @@ enum Restored {
     Missing,
     /// Its file (on a network share) didn't answer in time: a tab that waits for it.
     Unreachable,
-    /// Its unsaved changes (a big document's pieces) can't be read back: set aside, the file opened as it is.
+    /// Its unsaved changes can't be read back (a big document's pieces, or a copy a power cut left as zeros): set
+    /// aside, the file opened as it is.
     Damaged,
 }
 
@@ -999,13 +1000,14 @@ fn restore_tab(
             }
         }
     }
-    let outcome = |r: Restored| if set_aside { Restored::Damaged } else { r };
     let mut i = None;
     if let Some(name) = &st.backup {
         if let Some(bytes) = session::read_backup(name) {
             if session::is_damaged(&bytes) {
-                // Written just before a power cut: the file on disk, if any, is the better copy.
+                // Written just before a power cut: the file on disk, if any, is the better copy (and the user is
+                // told the changes didn't come back).
                 session::set_aside(name);
+                set_aside = true;
             } else {
                 let mut doc = Document::from_text(&bytes);
                 doc.path = st.path.clone();
@@ -1025,6 +1027,7 @@ fn restore_tab(
             }
         }
     }
+    let outcome = |r: Restored| if set_aside { Restored::Damaged } else { r };
     if i.is_none() && st.path.is_some() {
         match there {
             Some(true) => {}
