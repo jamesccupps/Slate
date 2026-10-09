@@ -1160,11 +1160,13 @@ pub(crate) mod tests {
         let whole = render(&mut g, draw(None));
         assert!(whole.iter().any(|&b| b < 0x80), "something is drawn");
         assert!(render(&mut g, draw(Some(Rect::new(0.0, 0.0, 300.0, 120.0)))) == whole, "the same pixels: {s}");
-        // runs out of view aren't drawn
-        let below = render(&mut g, draw(Some(Rect::new(0.0, 200.0, 300.0, 20.0))));
-        assert!(below.iter().all(|&b| b == 0xFF));
-        let right = render(&mut g, draw(Some(Rect::new(400.0, 0.0, 100.0, 120.0))));
-        assert!(right.iter().all(|&b| b == 0xFF));
+        // runs out of view aren't drawn (text with color glyphs is drawn whole without Windows 11's Direct2D)
+        if !color_glyphs || g.rt().cast::<windows::Win32::Graphics::Direct2D::ID2D1DeviceContext7>().is_ok() {
+            let below = render(&mut g, draw(Some(Rect::new(0.0, 200.0, 300.0, 20.0))));
+            assert!(below.iter().all(|&b| b == 0xFF));
+            let right = render(&mut g, draw(Some(Rect::new(400.0, 0.0, 100.0, 120.0))));
+            assert!(right.iter().all(|&b| b == 0xFF));
+        }
         // in view, runs cut down to what's in view look the same
         let part = render(&mut g, draw(Some(Rect::new(100.0, 0.0, 80.0, 120.0))));
         let cols = |px: &[u8]| -> Vec<u8> { px.chunks(300 * 4).flat_map(|row| row[100 * 4..180 * 4].to_vec()).collect() };
