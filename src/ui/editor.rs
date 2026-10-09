@@ -164,12 +164,12 @@ fn maybe_color(u: u16) -> bool {
 }
 
 impl Part {
-    /// x of the start of the character at `u` (counted from the part's start), from the part's left edge.
-    fn layout_x(&self, u: u32) -> f32 {
+    /// x of the end of the character at `u` (counted from the part's start), from the part's left edge.
+    fn end_x(&self, u: u32) -> f32 {
         let (mut x, mut y) = (0f32, 0f32);
         let mut m = DWRITE_HIT_TEST_METRICS::default();
         unsafe {
-            let _ = self.layout.HitTestTextPosition(u, BOOL(0), &mut x, &mut y, &mut m);
+            let _ = self.layout.HitTestTextPosition(u, BOOL(1), &mut x, &mut y, &mut m);
         }
         x
     }
@@ -780,7 +780,8 @@ impl View {
             let numbered = matches!(cx.lang.comment(), Some(CommentStyle::AfterNumber(_)));
             let k = map.partition_point(|&m| (m as usize) < text_start(bytes, numbered)) as u32;
             let r1 = rows[0].1;
-            let ind = if k > 0 && k < r1 { parts[0].layout_x(k) } else { 0.0 };
+            // (where the indentation ends: the start of the text after it is its right end if it's right to left)
+            let ind = if k > 0 && k < r1 { parts[0].end_x(k - 1) } else { 0.0 };
             if ind >= 1.0 && ind <= max_w / 2.0 {
                 let first = cx.g.layout(&u[..r1 as usize], fmt, max_w, 1.0e7);
                 let rest = cx.g.layout(&u[r1 as usize..], fmt, max_w - ind, 1.0e7);
@@ -2747,6 +2748,14 @@ mod tests {
             // a short line doesn't wrap: one layout
             let seg = v.segment_at(cx.doc, line.len() as u64 + 1);
             assert_eq!(v.layout_of(cx, &seg).parts.len(), 1);
+        });
+        // a line whose text starts right to left: under its start all the same (not under that word's right end)
+        let hebrew = "    \u{5E9}\u{5DC}\u{5D5}\u{5DD} \u{5E2}\u{5D5}\u{5DC}\u{5DD} and then more words that go on to wrap the line";
+        view_on(hebrew.as_bytes(), Lang::Plain, |v, cx| {
+            let seg = v.segment_at(cx.doc, 0);
+            let lay = v.layout_of(cx, &seg);
+            assert_eq!(lay.parts.len(), 2);
+            assert!((lay.parts[1].x - lay.parts[0].end_x(3)).abs() < 0.01 && lay.parts[1].x < cx.style.char_w * 6.0);
         });
         // PPCL: under the statement, after the line number
         view_on(&text, Lang::Ppcl, |v, cx| {
