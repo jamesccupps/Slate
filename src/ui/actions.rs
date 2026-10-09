@@ -4644,6 +4644,8 @@ pub fn close_tab(cell: &Cell, i: usize) -> bool {
 
 /// Closes the window: unsaved work is kept in the session (or asked about when it can't be).
 pub fn close_window(cell: &Cell) {
+    // (files another Slate hands over meanwhile wait: they'd go down with the window)
+    let _closing = super::Closing::now();
     // Keep what can be kept first; whatever that doesn't cover is asked about.
     let session_ok = cell.borrow_mut().save_session();
     let restore = cell.borrow().settings.restore_session;

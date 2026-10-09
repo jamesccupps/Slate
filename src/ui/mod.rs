@@ -149,13 +149,14 @@ pub fn drain_pending(cell: &Cell) {
     let _done = Done;
     loop {
         let next = match cell.try_borrow_mut() {
-            Ok(mut a) if !a.pending.is_empty() => Some(a.pending.remove(0)),
             Ok(mut a) => {
+                // Files first: an Exit queued meanwhile would close the window before they're in it. (In a tab,
+                // they're kept in the session like the rest.)
                 let late = LATE_FILES.with(|l| std::mem::take(&mut *l.borrow_mut()));
                 for (paths, args) in late {
                     if args { a.open_command_line(&paths) } else { a.open_paths(&paths) }
                 }
-                None
+                (!a.pending.is_empty()).then(|| a.pending.remove(0))
             }
             _ => None,
         };
@@ -170,6 +171,24 @@ thread_local! {
     /// Files dropped on the window or sent by another Slate while the app was busy; opened right after.
     /// (and whether they're from a command line: another Slate's)
     static LATE_FILES: RefCell<Vec<(Vec<PathBuf>, bool)>> = const { RefCell::new(Vec::new()) };
+    /// The window is being closed (`Closing`).
+    static CLOSING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Closing the window (`actions::close_window`, while it asks about unsaved changes): another Slate's files aren't
+/// taken meanwhile (see WM_COPYDATA). Until it's dropped.
+pub struct Closing(bool);
+
+impl Closing {
+    pub fn now() -> Closing {
+        Closing(CLOSING.with(|c| c.replace(true)))
+    }
+}
+
+impl Drop for Closing {
+    fn drop(&mut self) {
+        CLOSING.with(|c| c.set(self.0));
+    }
 }
 
 /// Opens `paths` now, or as soon as the app isn't busy.
@@ -517,6 +536,13 @@ fn handle(cell: &Cell, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<L
             let cds = unsafe { &*(lp.0 as *const COPYDATASTRUCT) };
             if cds.dwData != COPYDATA_OPEN {
                 return None;
+            }
+            // Closing (asking about unsaved changes, or saving for it): not taken, as the window may be gone in a
+            // moment. The other Slate tries again: once this one has ended, it's the Slate (with the session); if
+            // the close is called off, this one takes them then. (After 10 s of asking it opens a window of its
+            // own, as for a Slate that's busy.)
+            if CLOSING.with(|c| c.get()) || cell.try_borrow().is_ok_and(|a| a.closing) {
+                return Some(LRESULT(0));
             }
             let units = unsafe { std::slice::from_raw_parts(cds.lpData as *const u16, cds.cbData as usize / 2) };
             let text = String::from_utf16_lossy(units);

@@ -1032,7 +1032,8 @@ pub fn run(args: &[String]) -> i32 {
                 use windows::Win32::UI::WindowsAndMessaging::{SendMessageW, WM_COPYDATA};
                 let text: Vec<u16> = arg.encode_utf16().collect();
                 let cds = COPYDATASTRUCT { dwData: super::COPYDATA_OPEN, cbData: (text.len() * 2) as u32, lpData: text.as_ptr() as *mut _ };
-                unsafe { SendMessageW(hwnd, WM_COPYDATA, WPARAM(0), LPARAM(&cds as *const _ as isize)) };
+                let took = unsafe { SendMessageW(hwnd, WM_COPYDATA, WPARAM(0), LPARAM(&cds as *const _ as isize)) };
+                out.push_str(&format!("copydata: {}\n", if took.0 != 0 { "taken" } else { "not taken" }));
                 pump(&cell, 0);
             }
             _ => {
