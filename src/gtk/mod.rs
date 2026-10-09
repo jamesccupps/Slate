@@ -320,9 +320,7 @@ pub fn window(application: &gtk4::Application, test: Option<Rc<testmode::Test>>)
     });
     glib::timeout_add_local(Duration::from_secs(2), || {
         if let Some(ui) = get_ui() {
-            if ui.window.is_active() {
-                ui.with(|a| a.check_disk());
-            }
+            ui.with(|a| a.check_disk());
         }
         glib::ControlFlow::Continue
     });
@@ -642,6 +640,8 @@ fn commands() -> Vec<(&'static str, Cmd, &'static [&'static str])> {
         ("replace", Cmd::Replace, &["<Control>h"]),
         ("find-next", Cmd::FindNext, &["F3"]),
         ("find-prev", Cmd::FindPrev, &["<Shift>F3"]),
+        ("replace-one", Cmd::ReplaceOne, &[]),
+        ("replace-all", Cmd::ReplaceAll, &["<Control><Alt>Return"]),
         ("goto-line", Cmd::GotoLine, &["<Control>g"]),
         ("toggle-comment", Cmd::ToggleComment, &["<Control>slash"]),
         ("duplicate-line", Cmd::DuplicateLine, &["<Control>d"]),
@@ -1232,11 +1232,15 @@ impl Ui {
             None => self.notice.set_visible(false),
         }
         self.hbar.set_visible(!a.style.wrap);
+        let find_open = a.find.open;
         self.syncing.set(false);
         let dark = a.theme.dark;
         drop(a);
         if self.css_dark.get() != Some(dark) {
             self.apply_theme();
+        }
+        if !find_open && GtkWindowExt::focus(&self.window).is_some_and(|f| f.is_ancestor(&self.find_box)) {
+            self.text.grab_focus();
         }
         self.queue_all();
     }

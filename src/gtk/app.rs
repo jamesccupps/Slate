@@ -223,6 +223,8 @@ pub struct App {
     /// Text for the clipboard, and a paste asked for (the window does both: GTK's clipboard is the window's).
     pub copy_out: Option<String>,
     pub paste_wanted: bool,
+    /// The whole line copied with nothing selected: pasting just that puts it above the caret's line.
+    copied_line: Option<String>,
     pub quitting: bool,
     pub session_dirty: bool,
     /// The caret should be shown (scrolled to) once the text is laid out; `reveal_center`: in the middle.
@@ -264,6 +266,7 @@ impl App {
             dirty_title: true,
             copy_out: None,
             paste_wanted: false,
+            copied_line: None,
             quitting: false,
             session_dirty: false,
             reveal_pending: false,
@@ -760,8 +763,19 @@ impl App {
         if !self.editable() {
             return;
         }
+        let line = self.copied_line.as_deref() == Some(text);
         let tab = &mut self.tabs[self.active];
         let fixed = edit::normalize_eols(text.as_bytes(), tab.doc.eol.as_bytes());
+        if line && tab.view.sel.is_empty() {
+            // a whole line (copied with nothing selected) goes above the caret's line, the caret staying where it is
+            let caret = tab.view.sel.caret;
+            let at = tab.doc.line_start_of(caret);
+            edit::replace_selection(&mut tab.doc, Sel::at(at), &fixed, EditKind::Other);
+            tab.doc.seal();
+            tab.view.sel = Sel::at(caret + fixed.len() as u64);
+            self.after_edit(true);
+            return;
+        }
         let new = edit::replace_selection(&mut tab.doc, tab.view.sel, &fixed, EditKind::Other);
         tab.doc.seal();
         tab.view.sel = new;
@@ -848,8 +862,9 @@ impl App {
             Key::Down | Key::KP_Down if ctrl => moving(self, &mut |v, c| v.scroll_rows(c, 1)),
             Key::Up | Key::KP_Up => moving(self, &mut |v, c| v.move_rows(c, -1, shift)),
             Key::Down | Key::KP_Down => moving(self, &mut |v, c| v.move_rows(c, 1, shift)),
-            Key::Page_Up | Key::KP_Page_Up => moving(self, &mut |v, c| v.page(c, false, shift)),
-            Key::Page_Down | Key::KP_Page_Down => moving(self, &mut |v, c| v.page(c, true, shift)),
+            // (Ctrl+PgUp / PgDn switch tabs: the menu's shortcuts)
+            Key::Page_Up | Key::KP_Page_Up if !ctrl => moving(self, &mut |v, c| v.page(c, false, shift)),
+            Key::Page_Down | Key::KP_Page_Down if !ctrl => moving(self, &mut |v, c| v.page(c, true, shift)),
             Key::Home | Key::KP_Home if ctrl => moving(self, &mut |v, _| {
                 v.set_caret(0, shift);
                 v.want_x = None;
@@ -975,7 +990,10 @@ impl App {
                 }
             }
             Cmd::Copy => match self.selected_text() {
-                Some(t) => self.copy_out = Some(t),
+                Some(t) => {
+                    self.copied_line = self.tab().view.sel.is_empty().then(|| t.clone());
+                    self.copy_out = Some(t);
+                }
                 None => self.flash("That's too much text to copy.", true),
             },
             Cmd::Cut => {
@@ -986,6 +1004,7 @@ impl App {
                     self.flash("That's too much text to cut.", true);
                     return;
                 };
+                self.copied_line = self.tab().view.sel.is_empty().then(|| t.clone());
                 self.copy_out = Some(t);
                 let tab = &mut self.tabs[self.active];
                 let sel = tab.view.sel;
