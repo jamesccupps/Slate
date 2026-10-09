@@ -4192,10 +4192,6 @@ fn show_menu_bar(cell: &Cell, mut idx: usize) {
         }
         if let Some(cmd) = chosen {
             run_cmd(cell, cmd);
-        } else if unsafe { GetKeyState(VK_ESCAPE.0 as i32) } < 0 {
-            // Esc closed it: the menu bar keeps the keyboard, as in Windows' own menus (Esc again lets go).
-            cell.borrow_mut().menu_armed = Some(idx);
-            cell.borrow().invalidate();
         }
         break;
     }
