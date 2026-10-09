@@ -22,9 +22,12 @@ regex = "1.13.1"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 # 0.58 is the newest version that links with the GNU toolchain's bundled linker (later versions use raw-dylib,
 # which needs an assembler that isn't bundled). See CLAUDE.md "Build".
-[dependencies.windows]
+[target.'cfg(windows)'.dependencies.windows]
 version = "=0.58.0"
 features = [
     "Foundation_Numerics",

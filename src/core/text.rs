@@ -5,10 +5,12 @@
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
+#[cfg(windows)]
 use windows::Win32::Globalization::{
     CPINFO, GetACP, GetCPInfo, IsDBCSLeadByteEx, MULTI_BYTE_TO_WIDE_CHAR_FLAGS, MultiByteToWideChar,
     WC_NO_BEST_FIT_CHARS, WideCharToMultiByte,
 };
+#[cfg(windows)]
 use windows::core::PCSTR;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -47,11 +49,16 @@ impl Encoding {
 
 /// The code page "ANSI" stands for: the system's, except with the "Use Unicode UTF-8 for worldwide language
 /// support" option (code page 65001), where files that aren't UTF-8 are taken as Windows-1252, the code page most
-/// of them were written in (and one in which every byte converts back to itself).
+/// of them were written in (and one in which every byte converts back to itself). Elsewhere (Linux), where text is
+/// UTF-8, files that aren't are taken as Windows-1252 too.
 pub fn ansi_codepage() -> u32 {
-    effective_codepage(unsafe { GetACP() })
+    #[cfg(windows)]
+    return effective_codepage(unsafe { GetACP() });
+    #[cfg(not(windows))]
+    return 1252;
 }
 
+#[cfg(windows)]
 fn effective_codepage(acp: u32) -> u32 {
     if acp == 65001 { 1252 } else { acp }
 }
@@ -456,9 +463,13 @@ impl AnsiDecoder {
     }
 
     fn with_codepage(cp: u32) -> Self {
+        #[allow(unused_mut)]
         let mut lead = [false; 256];
-        let mut info = CPINFO::default();
+        #[allow(unused_mut)]
         let mut dbcs = false;
+        #[cfg(windows)]
+        let mut info = CPINFO::default();
+        #[cfg(windows)]
         if unsafe { GetCPInfo(cp, &mut info) }.is_ok() && info.MaxCharSize > 1 {
             dbcs = true;
             for r in info.LeadByte.chunks(2) {
@@ -530,6 +541,21 @@ fn ansi_to_utf8_cp(bytes: &[u8], cp: u32) -> Vec<u8> {
     if bytes.is_ascii() {
         return bytes.to_vec();
     }
+    #[cfg(not(windows))]
+    return {
+        let mut out = Vec::new();
+        match single_byte(cp) {
+            Some(t) => t.decode(bytes, &mut out),
+            None => out.extend_from_slice(String::from_utf8_lossy(bytes).as_bytes()),
+        }
+        out
+    };
+    #[cfg(windows)]
+    return ansi_to_utf8_windows(bytes, cp);
+}
+
+#[cfg(windows)]
+fn ansi_to_utf8_windows(bytes: &[u8], cp: u32) -> Vec<u8> {
     let n = unsafe { MultiByteToWideChar(cp, MULTI_BYTE_TO_WIDE_CHAR_FLAGS(0), bytes, None) };
     let mut wide = vec![0u16; n.max(0) as usize];
     unsafe { MultiByteToWideChar(cp, MULTI_BYTE_TO_WIDE_CHAR_FLAGS(0), bytes, Some(&mut wide)) };
@@ -546,6 +572,24 @@ fn utf8_to_cp(text: &[u8], cp: u32) -> (Vec<u8>, bool) {
     if text.is_ascii() {
         return (text.to_vec(), false);
     }
+    #[cfg(not(windows))]
+    return {
+        let mut out = Vec::new();
+        let lossy = match single_byte(cp) {
+            Some(t) => t.encode(text, &mut out),
+            None => {
+                out.extend(text.iter().map(|&b| if b.is_ascii() { b } else { b'?' }));
+                true
+            }
+        };
+        (out, lossy)
+    };
+    #[cfg(windows)]
+    return utf8_to_cp_windows(text, cp);
+}
+
+#[cfg(windows)]
+fn utf8_to_cp_windows(text: &[u8], cp: u32) -> (Vec<u8>, bool) {
     let wide: Vec<u16> = String::from_utf8_lossy(text).encode_utf16().collect();
     let mut lossy = windows::Win32::Foundation::BOOL(0);
     let n = unsafe {
@@ -569,13 +613,41 @@ struct SingleByte {
     default: u8,
 }
 
-/// The tables of code page `cp`, if it's a single-byte one (made once per code page).
+/// The tables of code page `cp`, if it's a single-byte one (made once per code page). Outside Windows only
+/// Windows-1252 is there, from `CP1252_HIGH`.
 fn single_byte(cp: u32) -> Option<Arc<SingleByte>> {
     static TABLES: Mutex<Vec<(u32, Option<Arc<SingleByte>>)>> = Mutex::new(Vec::new());
     let mut tables = TABLES.lock().unwrap();
     if let Some((_, t)) = tables.iter().find(|t| t.0 == cp) {
         return t.clone();
     }
+    #[cfg(not(windows))]
+    let t = (cp == 1252).then(|| Arc::new(SingleByte::from_chars(cp1252_char, b'?')));
+    #[cfg(windows)]
+    let t = single_byte_windows(cp);
+    tables.push((cp, t.clone()));
+    t
+}
+
+/// Windows-1252's bytes 0x80 to 0x9F as Windows reads them (the five it has no character for read as the C1
+/// controls of the same value, and are written as those bytes again); the others read as the Latin-1 character of
+/// the same value.
+const CP1252_HIGH: [u16; 32] = [
+    0x20AC, 0x0081, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021, 0x02C6, 0x2030, 0x0160, 0x2039, 0x0152, 0x008D,
+    0x017D, 0x008F, 0x0090, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014, 0x02DC, 0x2122, 0x0161, 0x203A,
+    0x0153, 0x009D, 0x017E, 0x0178,
+];
+
+#[cfg_attr(windows, allow(dead_code))]
+fn cp1252_char(b: u8) -> char {
+    match b {
+        0x80..=0x9F => char::from_u32(CP1252_HIGH[(b - 0x80) as usize] as u32).unwrap(),
+        _ => b as char,
+    }
+}
+
+#[cfg(windows)]
+fn single_byte_windows(cp: u32) -> Option<Arc<SingleByte>> {
     let mut info = CPINFO::default();
     let t = (unsafe { GetCPInfo(cp, &mut info) }.is_ok() && info.MaxCharSize == 1).then(|| {
         let mut t = SingleByte { utf8: [[0; 4]; 256], back: Vec::new(), same: [false; 256], default: info.DefaultChar[0] };
@@ -594,11 +666,26 @@ fn single_byte(cp: u32) -> Option<Arc<SingleByte>> {
         t.back.dedup_by_key(|e| e.0);
         Arc::new(t)
     });
-    tables.push((cp, t.clone()));
     t
 }
 
 impl SingleByte {
+    /// The tables of a code page in which byte `b` reads as `char_of(b)`, and every character that reads is written
+    /// as its byte again (characters it hasn't got as `default`).
+    #[cfg_attr(windows, allow(dead_code))]
+    fn from_chars(char_of: fn(u8) -> char, default: u8) -> SingleByte {
+        let mut t = SingleByte { utf8: [[0; 4]; 256], back: Vec::new(), same: [true; 256], default };
+        for b in 0..=255u8 {
+            let c = char_of(b);
+            let n = c.encode_utf8(&mut t.utf8[b as usize][..3]).len();
+            t.utf8[b as usize][3] = n as u8;
+            t.back.push((c, b));
+        }
+        t.back.sort_unstable();
+        t.back.dedup_by_key(|e| e.0);
+        t
+    }
+
     fn decode(&self, bytes: &[u8], out: &mut Vec<u8>) {
         out.reserve(bytes.len());
         let mut rest = bytes;
@@ -986,16 +1073,19 @@ mod tests {
         assert!(fits_cp(&all, false, 1252));
         assert!(fits_cp(&latin1, false, 1252));
         // ...but in a double-byte code page (Japanese) not every byte sequence is text: not taken as ANSI there
-        let mut not_sjis = "naïve café ✓\r\n".repeat(10).into_bytes();
-        not_sjis.push(0xFF);
-        assert!(!fits_cp(&not_sjis, false, 932));
-        let (sjis, lossy) = utf8_to_cp("日本語のテキスト\r\n".repeat(10).as_bytes(), 932);
-        assert!(!lossy && fits_cp(&sjis, false, 932));
-        // (cut in the middle of a double-byte character at the end of a sample: fine)
-        assert!(fits_cp(&sjis[..sjis.len() - 3], true, 932));
-        // the "UTF-8 for worldwide language support" option: ANSI means Windows-1252 then
-        assert_eq!(effective_codepage(65001), 1252);
-        assert_eq!(effective_codepage(932), 932);
+        #[cfg(windows)]
+        {
+            let mut not_sjis = "naïve café ✓\r\n".repeat(10).into_bytes();
+            not_sjis.push(0xFF);
+            assert!(!fits_cp(&not_sjis, false, 932));
+            let (sjis, lossy) = utf8_to_cp("日本語のテキスト\r\n".repeat(10).as_bytes(), 932);
+            assert!(!lossy && fits_cp(&sjis, false, 932));
+            // (cut in the middle of a double-byte character at the end of a sample: fine)
+            assert!(fits_cp(&sjis[..sjis.len() - 3], true, 932));
+            // the "UTF-8 for worldwide language support" option: ANSI means Windows-1252 then
+            assert_eq!(effective_codepage(65001), 1252);
+            assert_eq!(effective_codepage(932), 932);
+        }
         // the streaming check used while converting big files, fed in pieces
         if ansi_codepage() == 1252 {
             let mut check = AnsiCheck::new();
@@ -1044,6 +1134,13 @@ mod tests {
                 let lossy = t.encode(&text, &mut out);
                 assert_eq!((out, lossy), utf8_to_cp(&text, cp), "code page {cp}: {:?}", String::from_utf8_lossy(&text));
             }
+        }
+        // the Windows-1252 table used where Windows can't be asked (Linux) is the one Windows makes
+        #[cfg(windows)]
+        {
+            let (ours, windows) = (SingleByte::from_chars(cp1252_char, b'?'), single_byte(1252).unwrap());
+            assert_eq!((ours.utf8, ours.same, ours.default), (windows.utf8, windows.same, windows.default));
+            assert_eq!(ours.back, windows.back);
         }
         // the streaming encoder: a character cut between pieces waits for the rest
         let mut enc = AnsiEncoder::with_codepage(1252);

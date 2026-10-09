@@ -8,6 +8,7 @@ pub mod job;
 pub mod json;
 pub mod jsonnav;
 pub mod lines;
+pub mod os;
 pub mod search;
 pub mod source;
 pub mod text;

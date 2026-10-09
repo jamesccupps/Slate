@@ -7,7 +7,8 @@ pub mod crash;
 pub mod editor;
 pub mod findbar;
 pub mod gfx;
-pub mod highlight;
+/// (shared with the other platforms; `super::highlight` keeps working here)
+pub use crate::highlight;
 pub mod install;
 pub mod prompt;
 pub mod session;

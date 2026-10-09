@@ -17,29 +17,20 @@
 //! window's block reads would otherwise wait behind them.
 
 use std::collections::HashMap;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{self, Write};
-use std::os::windows::fs::{FileExt, OpenOptionsExt};
-use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use windows::Win32::Foundation::{GENERIC_READ, HANDLE};
-use windows::Win32::Storage::FileSystem::{
-    BY_HANDLE_FILE_INFORMATION, FILE_BASIC_INFO, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_MODE, FileBasicInfo,
-    GetFileInformationByHandle, GetFileInformationByHandleEx, ReOpenFile,
-};
+
+use super::os;
+pub use super::os::stamp_of;
 
 pub const BLOCK: u64 = 64 * 1024;
 const CACHE_BLOCKS: usize = 512; // 32 MiB per file source
-const SHARE_ALL: u32 = 0x1 | 0x2 | 0x4; // FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
-const FILE_FLAG_DELETE_ON_CLOSE: u32 = 0x0400_0000;
-const FILE_READ_ATTRIBUTES: u32 = 0x80;
-const FILE_ATTRIBUTE_TEMPORARY: u32 = 0x100;
-const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
 /// Complete blocks a fingerprint samples, spread over the file (plus its last complete block).
 const SAMPLES: u64 = 32;
 /// Waits before trying a failed index read again (a network drive that dropped for a moment, a region another
@@ -177,29 +168,6 @@ pub struct FileId {
     pub index: u64,
 }
 
-/// The stamp and identity of the file `file` is open on (None if the file system won't say).
-pub fn stamp_of(file: &File) -> Option<(Stamp, FileId)> {
-    let h = HANDLE(file.as_raw_handle());
-    let mut info = BY_HANDLE_FILE_INFORMATION::default();
-    let mut basic = FILE_BASIC_INFO::default();
-    unsafe {
-        GetFileInformationByHandle(h, &mut info).ok()?;
-        GetFileInformationByHandleEx(
-            h,
-            FileBasicInfo,
-            &mut basic as *mut _ as *mut core::ffi::c_void,
-            std::mem::size_of::<FILE_BASIC_INFO>() as u32,
-        )
-        .ok()?;
-    }
-    let size = ((info.nFileSizeHigh as u64) << 32) | info.nFileSizeLow as u64;
-    let index = ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64;
-    Some((
-        Stamp { size, written: basic.LastWriteTime, changed: basic.ChangeTime },
-        FileId { volume: info.dwVolumeSerialNumber, index },
-    ))
-}
-
 /// What a file held when it was indexed: hashes of sample blocks (complete ones spread over it) and of the
 /// incomplete block at its end, if any (where a file that only grows is written next).
 #[derive(Clone, Debug)]
@@ -334,18 +302,11 @@ pub struct Identity {
     pub tail: Option<u64>,
 }
 
-/// A second handle on the file `file` is open on (that very file, even if another one took its name since).
-fn reopen(file: &File) -> Option<File> {
-    let h = HANDLE(file.as_raw_handle());
-    let h = unsafe { ReOpenFile(h, GENERIC_READ.0, FILE_SHARE_MODE(SHARE_ALL), FILE_FLAGS_AND_ATTRIBUTES(0)) }.ok()?;
-    Some(unsafe { File::from_raw_handle(h.0) })
-}
-
 /// Reads all of `buf` at `off` (an error if the file ends first). Counts nothing.
 fn read_exact_at(file: &File, off: u64, buf: &mut [u8]) -> io::Result<()> {
     let mut done = 0;
     while done < buf.len() {
-        match file.seek_read(&mut buf[done..], off + done as u64) {
+        match os::read_at(file, &mut buf[done..], off + done as u64) {
             Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
             Ok(n) => done += n,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
@@ -376,11 +337,12 @@ fn read_retrying(file: &File, off: u64, buf: &mut [u8], cancel: &AtomicBool) -> 
 
 /// Why a read failed, in a few words for the user.
 fn read_failure(e: &io::Error) -> String {
-    match (e.kind(), e.raw_os_error()) {
-        (io::ErrorKind::UnexpectedEof, _) => "it got shorter while Slate was reading it".into(),
-        (_, Some(33)) => "another program has locked part of it".into(),
-        (_, Some(53 | 59 | 64 | 121 | 1231)) => "the network drive stopped answering".into(),
-        _ => {
+    if e.kind() == io::ErrorKind::UnexpectedEof {
+        return "it got shorter while Slate was reading it".into();
+    }
+    match os::read_failure(e) {
+        Some(why) => why.into(),
+        None => {
             let s = e.to_string();
             match s.find(" (os error") {
                 Some(i) => s[..i].trim_end_matches('.').to_string(),
@@ -405,15 +367,7 @@ pub fn create_temp_file() -> io::Result<(File, PathBuf)> {
     for _ in 0..100 {
         let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
         let path = dir.join(format!("slate-{}-{}.tmp", std::process::id(), n));
-        match OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .share_mode(SHARE_ALL)
-            .custom_flags(FILE_FLAG_DELETE_ON_CLOSE)
-            .attributes(FILE_ATTRIBUTE_TEMPORARY | FILE_ATTRIBUTE_HIDDEN)
-            .open(&path)
-        {
+        match os::create_self_deleting(&path) {
             Ok(f) => return Ok((f, path)),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e),
@@ -447,7 +401,7 @@ impl Source {
     /// Opens a file for on-demand reading without blocking anyone else from writing, renaming or deleting it.
     /// The newline index starts empty; call `build_index` (usually on a background thread).
     pub fn open_file(path: &Path) -> io::Result<Source> {
-        let file = OpenOptions::new().read(true).share_mode(SHARE_ALL).open(path)?;
+        let file = os::shared().read(true).open(path)?;
         let len = file.metadata()?.len();
         Ok(Source::from_file(file, len, path.to_path_buf(), false, None))
     }
@@ -461,7 +415,7 @@ impl Source {
     /// Opens the first `len` bytes of a file of Slate's session folder (text kept from an earlier run; nobody else
     /// writes it, and Slate only ever adds to its end). The index starts empty, as for `open_file`.
     pub fn open_session_file(path: &Path, len: u64) -> io::Result<Source> {
-        let file = OpenOptions::new().read(true).share_mode(SHARE_ALL).open(path)?;
+        let file = os::shared().read(true).open(path)?;
         if file.metadata()?.len() < len {
             return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "the session file is shorter than its list says"));
         }
@@ -561,14 +515,10 @@ impl Source {
         if self.is_gone() || id.index == 0 {
             return;
         }
-        // (attributes only: no sharing conflicts with anyone)
-        match OpenOptions::new().access_mode(FILE_READ_ATTRIBUTES).share_mode(SHARE_ALL).open(path) {
-            Ok(f) => {
-                if stamp_of(&f).is_some_and(|(_, now)| now.index != 0 && now != *id) {
-                    self.mark_gone();
-                }
-            }
-            Err(e) if e.raw_os_error() == Some(2) && path.parent().is_some_and(Path::is_dir) => self.mark_gone(),
+        match os::id_at(path) {
+            Ok(Some(now)) if now.index != 0 && now != *id => self.mark_gone(),
+            Ok(_) => {}
+            Err(e) if os::is_not_found(&e) && path.parent().is_some_and(Path::is_dir) => self.mark_gone(),
             Err(_) => {}
         }
     }
@@ -678,7 +628,7 @@ impl Source {
     /// The handle for reading a lot at once (see the module docs): the second one, or `file` if there's none.
     fn bulk(&self) -> &File {
         let Store::File { file, bulk, .. } = &self.store else { unreachable!() };
-        bulk.get_or_init(|| reopen(file)).as_ref().unwrap_or(file)
+        bulk.get_or_init(|| os::reopen(file)).as_ref().unwrap_or(file)
     }
 
     /// Reads `buf.len()` bytes at `off`; missing bytes become zeros and count as a read error. Returns whether
@@ -686,7 +636,7 @@ impl Source {
     fn file_read(&self, file: &File, off: u64, buf: &mut [u8]) -> bool {
         let mut done = 0;
         while done < buf.len() {
-            match file.seek_read(&mut buf[done..], off + done as u64) {
+            match os::read_at(file, &mut buf[done..], off + done as u64) {
                 Ok(0) => break,
                 Ok(n) => done += n,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
@@ -1196,8 +1146,8 @@ mod tests {
             }
         }
         let expect = bytecount::count(&rewritten, b'\n') as u64;
-        let f = OpenOptions::new().write(true).share_mode(0x7).open(&path).unwrap();
-        f.seek_write(&rewritten, 0).unwrap();
+        let f = os::shared().write(true).open(&path).unwrap();
+        os::write_at(&f, &rewritten, 0).unwrap();
         drop(f);
         let newer = Source::open_file(&path).unwrap();
         assert!(!newer.reuse_index_from(&new));
@@ -1241,8 +1191,8 @@ mod tests {
     }
 
     fn write_at(path: &Path, off: u64, data: &[u8]) {
-        let f = OpenOptions::new().write(true).share_mode(0x7).open(path).unwrap();
-        f.seek_write(data, off).unwrap();
+        let f = os::shared().write(true).open(path).unwrap();
+        os::write_at(&f, data, off).unwrap();
     }
 
     #[test]
@@ -1257,7 +1207,7 @@ mod tests {
         assert!(!grew.changed_in_place());
         // only new times (opened for writing, nothing changed)
         let (p, touched) = indexed(&dir, "touched.txt", &data);
-        let f = OpenOptions::new().write(true).share_mode(0x7).open(&p).unwrap();
+        let f = os::shared().write(true).open(&p).unwrap();
         f.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(60)).unwrap();
         drop(f);
         assert!(!touched.changed_in_place());
@@ -1271,7 +1221,7 @@ mod tests {
         assert!(end.changed_in_place());
         // cut short
         let (p, cut) = indexed(&dir, "cut.txt", &data);
-        OpenOptions::new().write(true).share_mode(0x7).open(&p).unwrap().set_len(1000).unwrap();
+        os::shared().write(true).open(&p).unwrap().set_len(1000).unwrap();
         assert!(cut.changed_in_place());
         drop((same, grew, touched, rewritten, end, cut));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1285,7 +1235,7 @@ mod tests {
         let path = dir.join("blip.txt");
         std::fs::write(&path, &data).unwrap();
         let s = Source::open_file(&path).unwrap();
-        OpenOptions::new().write(true).share_mode(0x7).open(&path).unwrap().set_len(1000).unwrap();
+        os::shared().write(true).open(&path).unwrap().set_len(1000).unwrap();
         let restore = {
             let (path, data) = (path.clone(), data.clone());
             std::thread::spawn(move || {
@@ -1301,7 +1251,7 @@ mod tests {
         let path = dir.join("gone.txt");
         std::fs::write(&path, &data).unwrap();
         let s = Source::open_file(&path).unwrap();
-        OpenOptions::new().write(true).share_mode(0x7).open(&path).unwrap().set_len(1000).unwrap();
+        os::shared().write(true).open(&path).unwrap().set_len(1000).unwrap();
         assert!(!s.build_index(&AtomicBool::new(false), &AtomicU64::new(0)));
         assert!(!s.index_complete());
         assert!(s.index_error().is_some_and(|w| w.contains("shorter")), "{:?}", s.index_error());
@@ -1318,7 +1268,11 @@ mod tests {
         // the index was read through a second handle, on the very same file
         let Store::File { file, bulk, .. } = &s.store else { unreachable!() };
         let second = bulk.get().and_then(Option::as_ref).expect("a second handle");
-        assert_ne!(second.as_raw_handle(), file.as_raw_handle());
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            assert_ne!(second.as_raw_handle(), file.as_raw_handle());
+        }
         assert_eq!(stamp_of(second).map(|s| s.1), stamp_of(file).map(|s| s.1));
         // another file put in its place: both still read the old one
         std::fs::write(dir.join("new.txt"), sample(700_000, 12)).unwrap();
@@ -1384,7 +1338,7 @@ mod tests {
         let (path, s) = indexed(&dir, "a.txt", &data);
         let id = s.identity().unwrap();
         let at = std::fs::metadata(&path).unwrap().modified().unwrap();
-        let set = |t| OpenOptions::new().write(true).share_mode(0x7).open(&path).unwrap().set_modified(t).unwrap();
+        let set = |t| os::shared().write(true).open(&path).unwrap().set_modified(t).unwrap();
         set(at + Duration::from_secs(3600));
         assert_eq!(Source::open_file(&path).unwrap().same_as(&id), Ok(()));
         set(at - Duration::from_secs(3600));

@@ -2030,7 +2030,8 @@ mod tests {
         }
     }
 
-    /// The CPU cycles this thread has run.
+    /// The CPU cycles this thread has run (elsewhere than Windows: nanoseconds of its CPU time).
+    #[cfg(windows)]
     fn thread_cycles() -> u64 {
         unsafe extern "system" {
             fn QueryThreadCycleTime(thread: isize, cycles: *mut u64) -> i32;
@@ -2039,6 +2040,13 @@ mod tests {
         let mut c = 0;
         unsafe { QueryThreadCycleTime(GetCurrentThread(), &mut c) };
         c
+    }
+
+    #[cfg(unix)]
+    fn thread_cycles() -> u64 {
+        let mut t = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut t) };
+        t.tv_sec as u64 * 1_000_000_000 + t.tv_nsec as u64
     }
 
     /// Lexer speed and detection time, from sample files: `SLATE_HL_SAMPLES=<folder> cargo test --release --lib

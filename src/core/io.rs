@@ -12,30 +12,21 @@
 //! Saving writes a hidden temp file next to the target and then swaps it into place with a POSIX-semantics
 //! rename, which works even while Slate still reads the old file (big files, undo history): open handles keep
 //! seeing the old content. Where that rename isn't supported (network shares, FAT drives) a plain rename is
-//! tried, and for a file Slate still has open, ReplaceFile. A failed or cancelled save leaves the original
-//! untouched. Saving refuses to write text that ANSI can't hold (unless asked to) and text read from a file
+//! tried, and for a file Slate still has open, ReplaceFile. On Linux a rename is all it takes (it's atomic, and
+//! open files keep reading the old one); the new file gets the old one's permissions and owner where it may. A
+//! failed or cancelled save leaves the original untouched. Saving refuses to write text that ANSI can't hold (unless asked to) and text read from a file
 //! another program has written into meanwhile (see `Source::changed_in_place`).
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
-use std::os::windows::ffi::OsStrExt;
-use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
-use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use windows::Win32::Foundation::HANDLE;
-use windows::Win32::Storage::FileSystem::{
-    FILE_ATTRIBUTE_HIDDEN as HIDDEN, FILE_BASIC_INFO, FILE_RENAME_INFO, FileBasicInfo, FileRenameInfoEx,
-    MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW, REPLACEFILE_IGNORE_ACL_ERRORS,
-    REPLACEFILE_IGNORE_MERGE_ERRORS, ReplaceFileW, SetFileAttributesW, SetFileInformationByHandle,
-};
-use windows::core::PCWSTR;
-
 use super::buffer::{Buffer, Snapshot};
 use super::document::{DiskInfo, Document};
 use super::job::{Ctx, Failure, Job, Notify};
+use super::os;
 use super::source::{FileId, IndexBuilder, Source, create_temp_file, stamp_of};
 use super::text::{
     self, AnsiCheck, AnsiDecoder, AnsiEncoder, Encoding, Utf16Decoder, Utf16Encoder, detect_encoding, detect_eol,
@@ -86,30 +77,19 @@ pub fn disk_answer(path: &Path) -> Option<Option<DiskInfo>> {
 /// Whether `e` (from opening `path`) means the file isn't there any more: not found in a folder that is. A drive or
 /// folder that isn't there (a USB stick, a VHD that isn't attached, a share) may come back, so that doesn't count.
 pub fn not_there(path: &Path, e: &io::Error) -> bool {
-    e.raw_os_error() == Some(2) && path.parent().is_some_and(Path::is_dir)
+    os::is_not_found(e) && path.parent().is_some_and(Path::is_dir)
 }
 
 /// Whether opening `path` failed (`e`) for something that may pass by itself: another program has the file, a
 /// network drive doesn't answer, a drive or folder isn't there (a USB stick that isn't plugged in).
 pub fn transient(path: &Path, e: &io::Error) -> bool {
-    match e.raw_os_error() {
-        Some(2) => !not_there(path, e),
-        // path not found, invalid drive, not ready, sharing / lock violation
-        Some(3 | 15 | 21 | 32 | 33) => true,
-        // the network ones
-        Some(51 | 53..=55 | 59 | 64 | 65 | 67 | 121 | 1203 | 1222 | 1231 | 1232 | 1236 | 2250) => true,
-        _ => matches!(e.kind(), io::ErrorKind::TimedOut | io::ErrorKind::Interrupted),
+    if os::is_not_found(e) {
+        return !not_there(path, e);
     }
+    os::is_transient(e)
 }
 
-/// Bytes free for this user on the drive of `dir` (None if it doesn't say).
-pub fn free_space(dir: &Path) -> Option<u64> {
-    let w = wide(dir);
-    let mut free = 0u64;
-    unsafe { windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW(PCWSTR(w.as_ptr()), Some(&mut free), None, None) }
-        .ok()?;
-    Some(free)
-}
+pub use os::free_space;
 
 /// Opening reports its progress in these steps (`Ctx::set`): the file's size isn't known before it starts.
 pub const OPEN_STEPS: u64 = 1000;
@@ -428,11 +408,10 @@ pub fn friendly_io(e: &io::Error) -> String {
                                             may not have permission to change it."
             .into(),
         io::ErrorKind::NotFound => "The file or folder wasn't found.".into(),
-        _ => match e.raw_os_error() {
-            Some(32) | Some(33) => "Another program is using the file.".into(),
-            Some(112) => "The disk is full.".into(),
-            _ => e.to_string(),
-        },
+        io::ErrorKind::StorageFull => "The disk is full.".into(),
+        #[cfg(windows)]
+        _ if matches!(e.raw_os_error(), Some(32 | 33)) => "Another program is using the file.".into(),
+        _ => e.to_string(),
     }
 }
 
@@ -447,108 +426,216 @@ pub struct Saved {
     pub canon: Option<PathBuf>,
 }
 
-const GENERIC_READ: u32 = 0x8000_0000;
-const GENERIC_WRITE: u32 = 0x4000_0000;
-const DELETE: u32 = 0x0001_0000;
-const SHARE_READ_DELETE: u32 = 0x1 | 0x4;
-const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
-const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
-const KEEP_ATTRIBUTES: u32 = 0x2 | 0x4 | 0x20 | 0x2000; // hidden, system, archive, not content indexed
-const FILE_RENAME_FLAG_REPLACE_IF_EXISTS: u32 = 0x1;
-const FILE_RENAME_FLAG_POSIX_SEMANTICS: u32 = 0x2;
-
 static SAVE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-fn wide(p: &Path) -> Vec<u16> {
-    p.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
-}
+/// Saving's steps that differ between Windows and Linux.
+#[cfg(windows)]
+mod place {
+    use super::*;
+    use std::fs::OpenOptions;
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use std::os::windows::io::AsRawHandle;
 
-/// The `\\?\` form of an absolute path, which isn't limited to 260 characters.
-fn verbatim(p: &Path) -> PathBuf {
-    let abs = std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
-    let s = abs.as_os_str().to_string_lossy();
-    if s.starts_with(r"\\?\") {
-        abs
-    } else if let Some(unc) = s.strip_prefix(r"\\") {
-        PathBuf::from(format!(r"\\?\UNC\{unc}"))
-    } else {
-        PathBuf::from(format!(r"\\?\{s}"))
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_HIDDEN as HIDDEN, FILE_BASIC_INFO, FILE_RENAME_INFO, FileBasicInfo, FileRenameInfoEx,
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW, REPLACEFILE_IGNORE_ACL_ERRORS,
+        REPLACEFILE_IGNORE_MERGE_ERRORS, ReplaceFileW, SetFileAttributesW, SetFileInformationByHandle,
+    };
+    use windows::core::PCWSTR;
+
+    const GENERIC_READ: u32 = 0x8000_0000;
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const DELETE: u32 = 0x0001_0000;
+    const SHARE_READ_DELETE: u32 = 0x1 | 0x4;
+    const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
+    const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
+    const KEEP_ATTRIBUTES: u32 = 0x2 | 0x4 | 0x20 | 0x2000; // hidden, system, archive, not content indexed
+    const FILE_RENAME_FLAG_REPLACE_IF_EXISTS: u32 = 0x1;
+    const FILE_RENAME_FLAG_POSIX_SEMANTICS: u32 = 0x2;
+
+    pub fn wide(p: &Path) -> Vec<u16> {
+        p.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
     }
-}
 
-/// Renames the open file `file` to `target`, replacing it even if it is open elsewhere (NTFS, Windows 10 1809+).
-fn posix_rename(file: &File, target: &Path) -> io::Result<()> {
-    let name: Vec<u16> = target.as_os_str().encode_wide().collect();
-    let size = std::mem::size_of::<FILE_RENAME_INFO>() + name.len() * 2;
-    let mut buf = vec![0u64; size.div_ceil(8)];
-    let info = buf.as_mut_ptr() as *mut FILE_RENAME_INFO;
-    unsafe {
-        (*info).Anonymous.Flags = FILE_RENAME_FLAG_REPLACE_IF_EXISTS | FILE_RENAME_FLAG_POSIX_SEMANTICS;
-        (*info).FileNameLength = (name.len() * 2) as u32;
-        std::ptr::copy_nonoverlapping(name.as_ptr(), (*info).FileName.as_mut_ptr(), name.len());
-        SetFileInformationByHandle(
-            HANDLE(file.as_raw_handle()),
-            FileRenameInfoEx,
-            info as *const core::ffi::c_void,
-            size as u32,
-        )
+    /// The `\\?\` form of an absolute path, which isn't limited to 260 characters.
+    fn verbatim(p: &Path) -> PathBuf {
+        let abs = std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
+        let s = abs.as_os_str().to_string_lossy();
+        if s.starts_with(r"\\?\") {
+            abs
+        } else if let Some(unc) = s.strip_prefix(r"\\") {
+            PathBuf::from(format!(r"\\?\UNC\{unc}"))
+        } else {
+            PathBuf::from(format!(r"\\?\{s}"))
+        }
     }
-    .map_err(|e| io::Error::from_raw_os_error(e.code().0 & 0xFFFF))
-}
 
-/// Renames the closed file `from` to `to`, replacing it (fails if `to` is open, even with delete sharing).
-fn move_file(from: &Path, to: &Path) -> bool {
-    let (f, t) = (wide(&verbatim(from)), wide(&verbatim(to)));
-    unsafe { MoveFileExW(PCWSTR(f.as_ptr()), PCWSTR(t.as_ptr()), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) }
-        .is_ok()
-}
-
-/// Puts the closed file `temp` in place of the existing `target` with ReplaceFile, which works where a rename
-/// over a file that is still open doesn't (Slate reading a big file from a network share or a FAT drive): it
-/// moves the old file aside under a backup name, then moves `temp` in. That isn't atomic, so it is only the last
-/// thing tried; if it stops half way (the old file moved aside, the new one not in), the old one is moved back.
-/// After it worked the backup (the old file, which open handles still read) is deleted. ReplaceFile also gives
-/// the new file the old one's security settings, alternate streams and attributes.
-/// Ok(false): not replaced, the original is as it was. Err(backup): ReplaceFile stopped halfway and the original,
-/// which it had moved to `backup`, couldn't be put back.
-fn replace_file(temp: &Path, target: &Path, dir: &Path) -> Result<bool, PathBuf> {
-    let n = SAVE_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let backup = dir.join(format!(".slate-bak-{}-{n}.tmp", std::process::id()));
-    let (t, r, b) = (wide(&verbatim(target)), wide(&verbatim(temp)), wide(&verbatim(&backup)));
-    let flags = REPLACEFILE_IGNORE_MERGE_ERRORS | REPLACEFILE_IGNORE_ACL_ERRORS;
-    let ok = unsafe { ReplaceFileW(PCWSTR(t.as_ptr()), PCWSTR(r.as_ptr()), PCWSTR(b.as_ptr()), flags, None, None) }
-        .is_ok();
-    if ok {
-        // (it may stay in the folder until Slate lets go of it, on a network share: hidden)
+    /// Renames the open file `file` to `target`, replacing it even if it is open elsewhere (NTFS, Windows 10 1809+).
+    fn posix_rename(file: &File, target: &Path) -> io::Result<()> {
+        let name: Vec<u16> = target.as_os_str().encode_wide().collect();
+        let size = std::mem::size_of::<FILE_RENAME_INFO>() + name.len() * 2;
+        let mut buf = vec![0u64; size.div_ceil(8)];
+        let info = buf.as_mut_ptr() as *mut FILE_RENAME_INFO;
         unsafe {
-            let _ = SetFileAttributesW(PCWSTR(b.as_ptr()), HIDDEN);
+            (*info).Anonymous.Flags = FILE_RENAME_FLAG_REPLACE_IF_EXISTS | FILE_RENAME_FLAG_POSIX_SEMANTICS;
+            (*info).FileNameLength = (name.len() * 2) as u32;
+            std::ptr::copy_nonoverlapping(name.as_ptr(), (*info).FileName.as_mut_ptr(), name.len());
+            SetFileInformationByHandle(
+                HANDLE(file.as_raw_handle()),
+                FileRenameInfoEx,
+                info as *const core::ffi::c_void,
+                size as u32,
+            )
         }
-        let _ = fs::remove_file(&backup);
-    } else if !target.exists() && backup.exists() {
-        let back = unsafe { MoveFileExW(PCWSTR(b.as_ptr()), PCWSTR(t.as_ptr()), MOVEFILE_WRITE_THROUGH) }.is_ok();
-        if !back {
-            // (Not hidden, so `clean_stale_temps` never takes it for a leftover.)
-            return Err(backup);
+        .map_err(|e| io::Error::from_raw_os_error(e.code().0 & 0xFFFF))
+    }
+
+    /// Renames the closed file `from` to `to`, replacing it (fails if `to` is open, even with delete sharing).
+    fn move_file(from: &Path, to: &Path) -> bool {
+        let (f, t) = (wide(&verbatim(from)), wide(&verbatim(to)));
+        unsafe { MoveFileExW(PCWSTR(f.as_ptr()), PCWSTR(t.as_ptr()), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) }
+            .is_ok()
+    }
+
+    /// Puts the closed file `temp` in place of the existing `target` with ReplaceFile, which works where a rename
+    /// over a file that is still open doesn't (Slate reading a big file from a network share or a FAT drive): it
+    /// moves the old file aside under a backup name, then moves `temp` in. That isn't atomic, so it is only the last
+    /// thing tried; if it stops half way (the old file moved aside, the new one not in), the old one is moved back.
+    /// After it worked the backup (the old file, which open handles still read) is deleted. ReplaceFile also gives
+    /// the new file the old one's security settings, alternate streams and attributes.
+    /// Ok(false): not replaced, the original is as it was. Err(backup): ReplaceFile stopped halfway and the original,
+    /// which it had moved to `backup`, couldn't be put back.
+    pub fn replace_file(temp: &Path, target: &Path, dir: &Path) -> Result<bool, PathBuf> {
+        let n = SAVE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let backup = dir.join(format!(".slate-bak-{}-{n}.tmp", std::process::id()));
+        let (t, r, b) = (wide(&verbatim(target)), wide(&verbatim(temp)), wide(&verbatim(&backup)));
+        let flags = REPLACEFILE_IGNORE_MERGE_ERRORS | REPLACEFILE_IGNORE_ACL_ERRORS;
+        let ok = unsafe { ReplaceFileW(PCWSTR(t.as_ptr()), PCWSTR(r.as_ptr()), PCWSTR(b.as_ptr()), flags, None, None) }
+            .is_ok();
+        if ok {
+            // (it may stay in the folder until Slate lets go of it, on a network share: hidden)
+            unsafe {
+                let _ = SetFileAttributesW(PCWSTR(b.as_ptr()), HIDDEN);
+            }
+            let _ = fs::remove_file(&backup);
+        } else if !target.exists() && backup.exists() {
+            let back = unsafe { MoveFileExW(PCWSTR(b.as_ptr()), PCWSTR(t.as_ptr()), MOVEFILE_WRITE_THROUGH) }.is_ok();
+            if !back {
+                // (Not hidden, so `clean_stale_temps` never takes it for a leftover.)
+                return Err(backup);
+            }
+        }
+        Ok(ok)
+    }
+
+    /// Gives the new file the old one's creation time and attributes (and clears our temp "hidden" flag).
+    pub fn copy_identity(file: &File, old: Option<&fs::Metadata>) {
+        let mut info = FILE_BASIC_INFO::default();
+        let attrs = old.map_or(0, |m| m.file_attributes() & KEEP_ATTRIBUTES);
+        info.FileAttributes = if attrs == 0 { FILE_ATTRIBUTE_NORMAL } else { attrs };
+        if let Some(m) = old {
+            info.CreationTime = m.creation_time() as i64;
+        }
+        unsafe {
+            let _ = SetFileInformationByHandle(
+                HANDLE(file.as_raw_handle()),
+                FileBasicInfo,
+                &info as *const _ as *const core::ffi::c_void,
+                std::mem::size_of::<FILE_BASIC_INFO>() as u32,
+            );
         }
     }
-    Ok(ok)
+
+    /// Creates the hidden temp file a save writes (`p` mustn't exist).
+    pub fn create_temp(p: &Path) -> io::Result<File> {
+        // (std refuses create_new without write(true), even with an explicit access mode)
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .access_mode(GENERIC_READ | GENERIC_WRITE | DELETE)
+            .share_mode(SHARE_READ_DELETE)
+            .create_new(true)
+            .attributes(FILE_ATTRIBUTE_HIDDEN)
+            .open(p)
+    }
+
+    /// Puts the written temp file (`file`, at `temp_path`) in place of `target` (see the module docs). Returns
+    /// whether it's there, which file was written (after a POSIX rename, the one now at `target` must still be it),
+    /// and where the original went if ReplaceFile stopped halfway.
+    pub fn swap_in(
+        file: File,
+        temp_path: &Path,
+        target: &Path,
+        replacing: bool,
+        dir: &Path,
+    ) -> (bool, Option<FileId>, Option<PathBuf>) {
+        let posix = posix_rename(&file, &verbatim(target)).is_ok();
+        let written = posix.then(|| stamp_of(&file).map(|s| s.1)).flatten();
+        drop(file);
+        let mut set_aside = None;
+        let renamed = posix
+            || move_file(temp_path, target)
+            || (replacing
+                && replace_file(temp_path, target, dir).unwrap_or_else(|backup| {
+                    set_aside = Some(backup);
+                    false
+                }));
+        (renamed, written, set_aside)
+    }
+
+    /// Whether the save leftover `name` (`.slate-save-…` or `.slate-bak-…`, its metadata `m`) may be deleted once
+    /// the Slate that made it is gone. A .slate-bak is a leftover only when it's hidden (ReplaceFile worked and the
+    /// share still held the old file); one that isn't is an original that couldn't be put back: never deleted.
+    pub fn leftover(name: &str, m: Option<&fs::Metadata>) -> bool {
+        !name.starts_with(".slate-bak-") || m.is_some_and(|m| m.file_attributes() & FILE_ATTRIBUTE_HIDDEN != 0)
+    }
 }
 
-/// Gives the new file the old one's creation time and attributes (and clears our temp "hidden" flag).
-fn copy_identity(file: &File, old: Option<&fs::Metadata>) {
-    let mut info = FILE_BASIC_INFO::default();
-    let attrs = old.map_or(0, |m| m.file_attributes() & KEEP_ATTRIBUTES);
-    info.FileAttributes = if attrs == 0 { FILE_ATTRIBUTE_NORMAL } else { attrs };
-    if let Some(m) = old {
-        info.CreationTime = m.creation_time() as i64;
+#[cfg(unix)]
+mod place {
+    use super::*;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    /// Creates the temp file a save writes (`p` mustn't exist; its name starts with a dot, so it's hidden).
+    pub fn create_temp(p: &Path) -> io::Result<File> {
+        std::fs::OpenOptions::new().read(true).write(true).create_new(true).mode(0o666).open(p)
     }
-    unsafe {
-        let _ = SetFileInformationByHandle(
-            HANDLE(file.as_raw_handle()),
-            FileBasicInfo,
-            &info as *const _ as *const core::ffi::c_void,
-            std::mem::size_of::<FILE_BASIC_INFO>() as u32,
-        );
+
+    /// Gives the new file the old one's permissions, and its owner and group where that's allowed.
+    pub fn copy_identity(file: &File, old: Option<&fs::Metadata>) {
+        if let Some(m) = old {
+            let _ = file.set_permissions(m.permissions());
+            let _ = std::os::unix::fs::fchown(file, Some(m.uid()), Some(m.gid()));
+            // (not allowed to give it away: keep the group at least, which may be)
+            let _ = std::os::unix::fs::fchown(file, None, Some(m.gid()));
+        }
+    }
+
+    /// Puts the written temp file (`file`, at `temp_path`) in place of `target`: a rename, atomic, and open files
+    /// keep reading the old one. Returns whether it's there, which file was written, and (never here) where an
+    /// original went.
+    pub fn swap_in(
+        file: File,
+        temp_path: &Path,
+        target: &Path,
+        _replacing: bool,
+        dir: &Path,
+    ) -> (bool, Option<FileId>, Option<PathBuf>) {
+        if fs::rename(temp_path, target).is_err() {
+            return (false, None, None);
+        }
+        // (the rename itself on disk too, before the save counts as done)
+        if let Ok(d) = File::open(dir) {
+            let _ = d.sync_all();
+        }
+        (true, stamp_of(&file).map(|s| s.1), None)
+    }
+
+    /// Whether the save leftover `name` may be deleted once the Slate that made it is gone.
+    pub fn leftover(name: &str, _m: Option<&fs::Metadata>) -> bool {
+        name.starts_with(".slate-save-")
     }
 }
 
@@ -638,7 +725,6 @@ fn write_content(
 /// Removes hidden temp files of saves that never finished (Slate was killed or crashed mid-save) in `dir`, and
 /// old versions a `replace_file` couldn't delete.
 fn clean_stale_temps(dir: &Path) {
-    use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
     let Ok(rd) = fs::read_dir(dir) else { return };
     let me = std::process::id();
     for e in rd.flatten() {
@@ -654,15 +740,11 @@ fn clean_stale_temps(dir: &Path) {
         if pid == me {
             continue;
         }
-        // A .slate-bak is a leftover only when it's hidden (ReplaceFile worked and the share still held the old
-        // file). One that isn't is an original that couldn't be put back: never deleted.
-        if name.starts_with(".slate-bak-") && e.metadata().map_or(true, |m| m.file_attributes() & FILE_ATTRIBUTE_HIDDEN == 0) {
+        if !place::leftover(&name, e.metadata().ok().as_ref()) {
             continue;
         }
         // Only if that Slate is gone and the file is a few minutes old.
-        let running = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }
-            .map(|h| unsafe { windows::Win32::Foundation::CloseHandle(h) })
-            .is_ok();
+        let running = os::process_running(pid);
         let old = e
             .metadata()
             .and_then(|m| m.modified())
@@ -709,17 +791,7 @@ pub fn save(
     let temp = (0..50).find_map(|_| {
         let n = SAVE_COUNTER.fetch_add(1, Ordering::Relaxed);
         let p = dir.join(format!(".slate-save-{}-{n}.tmp", std::process::id()));
-        // (std refuses create_new without write(true), even with an explicit access mode)
-        OpenOptions::new()
-            .read(true)
-            .write(true)
-            .access_mode(GENERIC_READ | GENERIC_WRITE | DELETE)
-            .share_mode(SHARE_READ_DELETE)
-            .create_new(true)
-            .attributes(FILE_ATTRIBUTE_HIDDEN)
-            .open(&p)
-            .ok()
-            .map(|f| (f, p))
+        place::create_temp(&p).ok().map(|f| (f, p))
     });
 
     // Never write over the original directly: a cancelled or failed save must leave it as it was.
@@ -746,7 +818,7 @@ pub fn save(
             return Err(SaveError::Changed);
         }
         file.sync_all()?;
-        copy_identity(&file, old.as_ref());
+        place::copy_identity(&file, old.as_ref());
         Ok(r)
     })();
     let (idx, lossy) = match result {
@@ -758,21 +830,10 @@ pub fn save(
         }
     };
 
-    // Swap the new file into place: a POSIX rename (atomic, and it replaces a file still open with delete
-    // sharing, as Slate keeps big files); where the file system doesn't have those (network shares, FAT drives)
-    // a plain rename, and if that can't replace the file because Slate still has it open, ReplaceFile.
-    let posix = posix_rename(&file, &verbatim(&target)).is_ok();
-    // (which file was written: after a POSIX rename, the one now at `target` must still be it)
-    let written = posix.then(|| stamp_of(&file).map(|s| s.1)).flatten();
-    drop(file);
-    let mut set_aside = None;
-    let renamed = posix
-        || move_file(&temp_path, &target)
-        || (old.is_some()
-            && replace_file(&temp_path, &target, dir).unwrap_or_else(|backup| {
-                set_aside = Some(backup);
-                false
-            }));
+    // Swap the new file into place: on Windows a POSIX rename (atomic, and it replaces a file still open with
+    // delete sharing, as Slate keeps big files); where the file system doesn't have those (network shares, FAT
+    // drives) a plain rename, and if that can't replace the file because Slate still has it open, ReplaceFile.
+    let (renamed, written, set_aside) = place::swap_in(file, &temp_path, &target, old.is_some(), dir);
     if !renamed {
         let _ = fs::remove_file(&temp_path);
         return Err(SaveError::Io(match set_aside {
@@ -781,7 +842,9 @@ pub fn save(
                  keep your text.",
                 b.display()
             ),
-            None => "Windows didn't let Slate replace the file (it may be in use). Try again, or use Save As.".into(),
+            None => "Slate couldn't put the new file in place of the old one (it may be in use). Try again, or use \
+                     Save As."
+                .into(),
         }));
     }
 
@@ -802,7 +865,7 @@ pub fn save(
 /// The file just saved at `target` as a source of the `len` bytes written to it (whose index is `idx`): not what
 /// another program may have added to it since, and none if the file there isn't `written` (when that's known).
 fn reopen_saved(target: &Path, len: u64, written: Option<FileId>, idx: IndexBuilder) -> Option<Arc<Source>> {
-    let f = OpenOptions::new().read(true).share_mode(0x7).open(target).ok()?;
+    let f = os::shared().read(true).open(target).ok()?;
     if written.is_some_and(|w| stamp_of(&f).map(|s| s.1) != Some(w)) || f.metadata().ok()?.len() < len {
         return None;
     }
@@ -888,10 +951,18 @@ mod tests {
         let here = dir.join("x.txt");
         let away = dir.join("gone").join("x.txt");
         let os = io::Error::from_raw_os_error;
+        // (not found is 2 on both)
         assert!(!transient(&here, &os(2)) && not_there(&here, &os(2)));
         assert!(transient(&away, &os(2)) && !not_there(&away, &os(2)));
+        #[cfg(windows)]
         assert!(transient(&here, &os(3)) && transient(&here, &os(32)) && transient(&here, &os(53)));
-        assert!(!transient(&here, &os(5)) && !transient(&here, &io::Error::other("That is a folder, not a file.")));
+        #[cfg(windows)]
+        assert!(!transient(&here, &os(5)));
+        #[cfg(unix)]
+        assert!(transient(&here, &os(libc::ESTALE)) && transient(&here, &os(libc::EHOSTDOWN)));
+        #[cfg(unix)]
+        assert!(!transient(&here, &os(libc::EACCES)));
+        assert!(!transient(&here, &io::Error::other("That is a folder, not a file.")));
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -975,7 +1046,7 @@ mod tests {
         doc.insert(0, b"edit\n");
         doc.end(Default::default());
         // Another program cuts the file in half; the view reads the missing tail (zeros, counted as errors).
-        let f = OpenOptions::new().write(true).share_mode(0x7).open(&path).unwrap();
+        let f = os::shared().write(true).open(&path).unwrap();
         f.set_len(original.len() as u64 / 2).unwrap();
         drop(f);
         let mid = doc.len() * 3 / 4;
@@ -1036,8 +1107,11 @@ mod tests {
         v
     }
 
+    #[cfg(windows)]
     #[test]
     fn an_original_replace_file_left_aside_is_never_cleaned_up() {
+        use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_HIDDEN as HIDDEN, SetFileAttributesW};
+        use windows::core::PCWSTR;
         let dir = test_dir("setaside");
         let yesterday = std::time::SystemTime::now() - std::time::Duration::from_secs(86_400);
         // Left by a Slate that's gone (no such process): the original, which couldn't be put back, and a hidden
@@ -1047,7 +1121,7 @@ mod tests {
             f.set_modified(yesterday).unwrap();
             drop(f);
             if hidden {
-                let w = wide(&dir.join(name));
+                let w = place::wide(&dir.join(name));
                 unsafe { SetFileAttributesW(PCWSTR(w.as_ptr()), HIDDEN) }.unwrap();
             }
         }
@@ -1079,7 +1153,7 @@ mod tests {
         fs::write(&path, &original).unwrap();
         let (mut doc, src) = edited(&path);
         // A log being written: fine, the text is what it was (saving it drops what came after).
-        let mut f = OpenOptions::new().append(true).share_mode(0x7).open(&path).unwrap();
+        let mut f = os::shared().append(true).open(&path).unwrap();
         f.write_all(b"one more line\n").unwrap();
         drop(f);
         let copy = dir.join("copy.log");
@@ -1135,7 +1209,7 @@ mod tests {
         fs::write(&path, &text).unwrap();
         let id = stamp_of(&File::open(&path).unwrap()).map(|s| s.1);
         // another program added a line right after the save
-        OpenOptions::new().append(true).open(&path).unwrap().write_all(b"appended\n").unwrap();
+        fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(b"appended\n").unwrap();
         let src = reopen_saved(&path, text.len() as u64, id, index(&text)).unwrap();
         let mut back = Vec::new();
         src.read_into(0, src.len(), &mut back);
@@ -1205,8 +1279,12 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    #[cfg(windows)]
     #[test]
     fn replace_file_puts_a_file_in_place_of_one_still_open() {
+        use place::replace_file;
+        use std::fs::OpenOptions;
+        use std::os::windows::fs::OpenOptionsExt;
         let dir = test_dir("replacefile");
         let target = dir.join("t.txt");
         fs::write(&target, b"old content of the file").unwrap();
@@ -1237,6 +1315,7 @@ mod tests {
     /// A file Slate reads from disk, saved on a network share (where the POSIX rename isn't supported and a plain
     /// one can't replace a file still open). Needs `SLATE_TEST_SHARE`: a folder on a share (e.g. reached through
     /// `\\localhost\C$\...`); skipped without it.
+    #[cfg(windows)]
     #[test]
     fn files_read_from_a_share_save_over_it() {
         let Some(share) = std::env::var_os("SLATE_TEST_SHARE") else { return };

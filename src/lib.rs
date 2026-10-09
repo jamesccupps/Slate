@@ -1,4 +1,7 @@
-//! Slate: a fast, simple text editor for Windows that handles huge files.
+//! Slate: a fast, simple text editor that handles huge files. The engine (`core`) and the syntax coloring
+//! (`highlight`) are shared; each platform has its own window: `ui` on Windows (Win32 and Direct2D), `gtk` on Linux.
 
 pub mod core;
+pub mod highlight;
+#[cfg(windows)]
 pub mod ui;
