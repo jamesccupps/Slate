@@ -108,8 +108,7 @@ open as fast as on Windows; colors are drawn with the glyphs, only what's in vie
 
 ## Later
 
-- **Linux, the rest (M each unless said):** the JSON/XML structure panel and path bar; updates (an apt repository,
-  or the release's `.deb` offered in the status bar like on Windows); keeping big unsaved documents in the session
+- **Linux, the rest (M each unless said):** the JSON/XML structure panel and path bar; keeping big unsaved documents in the session
   (`.pieces`/`.data`, as on Windows); show whitespace, bracket matching, overtype, word counts and the tab list (S
   each); the status bar's encoding and indentation menus, Open recent in the menu (S); following GNOME's dark/light
   switch while running (S); Flatpak or AppImage for distributions without GTK 4.8 (S–M); an accessibility pass with

@@ -1,6 +1,7 @@
 # Builds and tests Slate on every push: the Windows exe, and the Linux packages for x86-64 and ARM64 (Raspberry Pi).
-# For a version tag (v1.2.3) it also drafts a GitHub release with all of them attached; publishing the draft is what
-# makes Slate's built-in updater on Windows offer it (it reads only Slate.exe and Slate.exe.sha256).
+# For a version tag (v1.2.3) it also signs Slate.exe and drafts a GitHub release with all of them attached; publishing
+# the draft is what makes Slate's built-in updater on Windows offer it (it reads only Slate.exe and Slate.exe.sha256)
+# and what updates the apt repository (apt.yml).
 name: Build
 
 on:
@@ -73,6 +74,67 @@ jobs:
           name: Slate
           path: out/
 
+  sign:
+    # Signs a release's Slate.exe with the certificate in Azure Artifact Signing (account SlateAccount, profile
+    # Slate), signing in to Azure with GitHub's OIDC token: no password is stored anywhere. Azure trusts only jobs in
+    # the "release" environment of this repository, and that environment only version tags.
+    name: Sign Slate.exe
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: windows-latest
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/download-artifact@v6
+        with:
+          name: Slate
+          path: out
+
+      - uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - uses: azure/artifact-signing-action@v2
+        with:
+          endpoint: ENDPOINT_TBD
+          signing-account-name: SlateAccount
+          certificate-profile-name: Slate
+          files: ${{ github.workspace }}\out\Slate.exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: Check the signature, test the signed exe, hash it again
+        shell: pwsh
+        timeout-minutes: 5
+        run: |
+          $s = Get-AuthenticodeSignature out\Slate.exe
+          "$($s.Status): $($s.SignerCertificate.Subject)"
+          if ($s.Status -ne 'Valid') { throw "Slate.exe isn't validly signed: $($s.StatusMessage)" }
+          $dir = Join-Path $env:RUNNER_TEMP smoke
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          $env:SLATE_DATA_DIR = Join-Path $dir data
+          $env:SLATE_TEST_LOG = Join-Path $dir log.txt
+          $p = Start-Process -FilePath out\Slate.exe -ArgumentList '--test', "$PWD\tests\smoke.txt" -WorkingDirectory $dir -Wait -PassThru -NoNewWindow
+          if (Test-Path $env:SLATE_TEST_LOG) { Get-Content $env:SLATE_TEST_LOG }
+          if ($p.ExitCode -ne 0) { throw "The smoke test failed on the signed exe (exit code $($p.ExitCode))" }
+          # The updater checks the download against this, so it's the signed file's hash.
+          $hash = (Get-FileHash out\Slate.exe -Algorithm SHA256).Hash.ToLower()
+          "$hash  Slate.exe" | Out-File -FilePath out\Slate.exe.sha256 -Encoding ascii -NoNewline
+          Get-Content out\Slate.exe.sha256
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: Slate
+          path: out/
+          overwrite: true
+
   linux:
     name: Linux ${{ matrix.arch }}
     strategy:
@@ -132,7 +194,7 @@ jobs:
   release:
     name: Draft the release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [build, linux]
+    needs: [build, sign, linux]
     runs-on: ubuntu-latest
     permissions:
       contents: write

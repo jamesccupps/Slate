@@ -25,6 +25,7 @@ for s in 16 24 32 48 64 128 256; do
     install -Dm644 "$here/res/icon/s$s.png" "$root/usr/share/icons/hicolor/${s}x${s}/apps/$id.png"
 done
 install -Dm644 "$here/res/icon/slate.svg" "$root/usr/share/icons/hicolor/scalable/apps/$id.svg"
+install -Dm644 "$here/packaging/linux/slate-archive-keyring.gpg" "$root/usr/share/keyrings/slate-archive-keyring.gpg"
 install -Dm644 "$here/LICENSE" "$root/usr/share/doc/slate/copyright"
 install -Dm644 "$here/THIRD-PARTY-NOTICES.md" "$root/usr/share/doc/slate/THIRD-PARTY-NOTICES.md"
 
@@ -45,6 +46,27 @@ Description: fast, simple text editor that opens files of any size
  saves like a small one), with tabs and unsaved changes that come back after a
  restart, syntax colors for 52 languages, JSON and XML tools and line tools.
 EOF
+# Installing adds Slate's apt repository (signed with the key above), so apt upgrade updates Slate from then on;
+# removing Slate removes it again. A slate.list that's there already is left as it is.
+cat > "$root/DEBIAN/postinst" <<'EOF'
+#!/bin/sh
+set -e
+list=/etc/apt/sources.list.d/slate.list
+if [ "$1" = configure ] && [ ! -e "$list" ]; then
+    cat > "$list" <<'LIST'
+# Slate's updates (added by the slate package, removed with it)
+deb [signed-by=/usr/share/keyrings/slate-archive-keyring.gpg] https://jamesccupps.github.io/Slate/apt stable main
+LIST
+fi
+EOF
+cat > "$root/DEBIAN/postrm" <<'EOF'
+#!/bin/sh
+set -e
+case "$1" in
+    remove|purge) rm -f /etc/apt/sources.list.d/slate.list ;;
+esac
+EOF
+chmod 755 "$root/DEBIAN/postinst" "$root/DEBIAN/postrm"
 deb="slate-linux-$arch.deb"
 dpkg-deb --root-owner-group --build "$root" "$out/$deb"
 

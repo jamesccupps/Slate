@@ -73,7 +73,7 @@ check the download.
 
 Slate runs on 64-bit Linux with GTK 4.8 or newer: Debian 12, Raspberry Pi OS 12 (Bookworm, on a Raspberry Pi 4 or
 5), Ubuntu 23.04 and newer, or similar. To install it, run these two lines in a terminal; they get the package for
-your computer from the latest release, and the same two lines install a newer version later:
+your computer from the latest release:
 
 ```
 wget -O /tmp/slate.deb https://github.com/jamesccupps/Slate/releases/latest/download/slate-linux-$(dpkg --print-architecture).deb
@@ -81,12 +81,13 @@ sudo apt install /tmp/slate.deb
 ```
 
 Slate is then in the menu (Accessories), opens files from the file manager, and `slate notes.txt` opens a file from
-a terminal. The [latest release](https://github.com/jamesccupps/Slate/releases/latest) also has the packages to
-download yourself (`slate-linux-arm64.deb` for 64-bit ARM like the Pi, `slate-linux-amd64.deb` for PCs; install one
-with `sudo apt install ./slate-linux-arm64.deb`) and `.tar.gz` files with the same program to run without
-installing. The Linux version has the same engine, colors and editing as on Windows, in a GTK window; it doesn't
-update itself yet (run the two lines again) and doesn't have the JSON/XML structure panel and path bar yet. Its
-settings and session are in `~/.local/share/slate`.
+a terminal. The package also adds Slate's own apt repository (signed; `/etc/apt/sources.list.d/slate.list`), so
+`sudo apt upgrade` keeps Slate up to date along with the rest of the system; removing Slate removes that too. The
+[latest release](https://github.com/jamesccupps/Slate/releases/latest) also has the packages to download yourself
+(`slate-linux-arm64.deb` for 64-bit ARM like the Pi, `slate-linux-amd64.deb` for PCs; install one with
+`sudo apt install ./slate-linux-arm64.deb`) and `.tar.gz` files with the same program to run without installing
+(those don't update). The Linux version has the same engine, colors and editing as on Windows, in a GTK window; it
+doesn't have the JSON/XML structure panel and path bar yet. Its settings and session are in `~/.local/share/slate`.
 
 ## Where Slate keeps things
 

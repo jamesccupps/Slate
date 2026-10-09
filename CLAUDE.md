@@ -51,6 +51,21 @@ icons) and a tarball, each with a `.sha256`.
    and newer) test, build, run `tests/smoke-linux.txt` under Xvfb and package; then a release job (the only one
    with write access) drafts the release with `Slate.exe`, `Slate.exe.sha256` and the `.deb`s and tarballs (with
    their `.sha256`). The user publishes it — Slate's updater (`src/ui/update.rs`) only sees published releases.
+   Before the draft, the `sign` job signs `Slate.exe` in Azure Artifact Signing (account `SlateAccount`, certificate
+   profile `Slate`), checks the signature, runs the smoke test on the signed exe and hashes it again.
+   It signs in to Azure with GitHub's OIDC token (no password anywhere): the app registration "Slate signing"
+   trusts only `repo:jamesccupps/Slate:environment:release`, and the `release` environment only `v*` tags; the
+   repository secrets `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID` say which app.
+4. Publishing the release runs `.github/workflows/apt.yml` (it starts itself again on `main`, as GitHub Pages only
+   publishes from there): `packaging/linux/apt-repo.sh` makes the apt repository from the latest release's `.deb`s,
+   signed with the secret `APT_SIGNING_KEY`, and Pages (Source: GitHub Actions) publishes it at
+   `https://jamesccupps.github.io/Slate/apt` (suite `stable`, component `main`). Every `.deb` brings the public key
+   (`packaging/linux/slate-archive-keyring.gpg` → `/usr/share/keyrings/`) and adds
+   `/etc/apt/sources.list.d/slate.list` when installed (removed with the package), so `apt upgrade` updates Slate.
+   The private key's only other copy is on the development PC in `%USERPROFILE%\.slate-apt-key` (never in the
+   repo). The repository's URL, suite, component, keyring path and key can never change, as every installed Slate
+   reads them: with another key, apt refuses the repository until a `.deb` bringing the new key is installed by
+   hand.
 
 What the updater reads from a release can never change, as every version out there reads it: the tag `vX.Y.Z` (no
 pre-release suffix), assets named exactly `Slate.exe` and `Slate.exe.sha256` (`<64 hex digits>  Slate.exe`), this
