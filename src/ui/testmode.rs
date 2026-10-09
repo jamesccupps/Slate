@@ -109,6 +109,7 @@ fn idle(ms: u32) -> String {
             let what = match msg.message {
                 WM_TIMER => format!("timer {}", msg.wParam.0),
                 super::actions::WM_APP_JOB => "job".into(),
+                super::actions::WM_APP_DISK => "disk".into(),
                 m => format!("{m:#06x}"),
             };
             *seen.entry(what).or_default() += 1;

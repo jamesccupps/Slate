@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use windows::Win32::Foundation::{HWND, POINT};
+use windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
 use windows::Win32::Globalization::{GetDateFormatEx, GetTimeFormatEx, TIME_NOSECONDS};
 use windows::Win32::System::SystemInformation::GetLocalTime;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
@@ -23,7 +23,7 @@ use windows::core::{HSTRING, PCWSTR, w};
 
 use crate::core::document::{Document, EditKind, Sel};
 use crate::core::io::{self as fileio, Loading, MEM_LIMIT, SaveError};
-use crate::core::job::{Ctx as JobCtx, Job};
+use crate::core::job::{Ctx as JobCtx, Job, Notify};
 use crate::core::json::{self, Mode as JsonMode};
 use crate::core::lines::{self, CaseOp, LineOp};
 use crate::core::xml;
@@ -42,6 +42,9 @@ use super::settings::{ThemeMode, data_dir};
 use super::win;
 
 pub const WM_APP_JOB: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 1;
+/// The look at the open files on disk (`check_disk`) is done: unlike the other jobs, nothing repaints for it unless it
+/// found something (every 2 s, even in a window in the background).
+pub const WM_APP_DISK: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 2;
 pub const TIMER_CARET: usize = 1;
 pub const TIMER_JOBS: usize = 2;
 pub const TIMER_DISK: usize = 3;
@@ -1099,7 +1102,8 @@ impl App {
     pub fn check_disk(&mut self) {
         // (and tabs from the session whose files didn't answer: look again when it's time)
         self.retry_restores();
-        if self.disk_job.is_some() {
+        // (a look that's done but whose message didn't get through is picked up here)
+        if self.disk_job.is_some() && self.poll_disk() {
             return; // the last look hasn't finished (a slow drive): the next one waits for it
         }
         let mut asks = Vec::new();
@@ -1115,7 +1119,12 @@ impl App {
         if asks.is_empty() {
             return;
         }
-        self.disk_job = Some(Job::spawn(0, self.notify.clone(), move |_| {
+        let hwnd = self.hwnd.0 as isize;
+        let notify: Notify = Arc::new(move || unsafe {
+            use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
+            let _ = PostMessageW(HWND(hwnd as *mut _), WM_APP_DISK, WPARAM(0), LPARAM(0));
+        });
+        self.disk_job = Some(Job::spawn(0, notify, move |_| {
             // (a file that doesn't answer just now says nothing: it isn't taken for one that was deleted)
             asks.into_iter()
                 .filter_map(|(id, path, old, sources)| {
@@ -1130,8 +1139,8 @@ impl App {
         }));
     }
 
-    /// Acts on a finished `check_disk`; returns whether one is still running.
-    fn poll_disk(&mut self) -> bool {
+    /// Acts on a finished `check_disk` (repainting only for what it found); returns whether one is still running.
+    pub fn poll_disk(&mut self) -> bool {
         let Some(job) = self.disk_job.as_mut() else { return false };
         let Some(found) = job.take() else { return true };
         self.disk_job = None;
