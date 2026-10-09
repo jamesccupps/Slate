@@ -135,7 +135,8 @@ pub struct Part {
 }
 
 pub struct SegLayout {
-    /// The text's layouts, in order.
+    /// The text in one layout; or, wrapped with the line indented, its first row and then the rows after it, laid out
+    /// narrower to hang under the line's indentation (as VS Code does).
     pub parts: Vec<Part>,
     /// Byte offset (from the segment start) of each UTF-16 unit, plus one for the end.
     pub map: Vec<u32>,
@@ -153,6 +154,18 @@ pub struct SegLayout {
 fn maybe_color(u: u16) -> bool {
     matches!(u, 0xD800..=0xDFFF | 0x2190..=0x23FF | 0x2460..=0x2BFF | 0xFE0F | 0x00A9 | 0x00AE | 0x203C | 0x2049)
         || matches!(u, 0x2122 | 0x2139 | 0x3030 | 0x303D | 0x3297 | 0x3299)
+}
+
+impl Part {
+    /// x of the start of the character at `u` (counted from the part's start), from the part's left edge.
+    fn layout_x(&self, u: u32) -> f32 {
+        let (mut x, mut y) = (0f32, 0f32);
+        let mut m = DWRITE_HIT_TEST_METRICS::default();
+        unsafe {
+            let _ = self.layout.HitTestTextPosition(u, BOOL(0), &mut x, &mut y, &mut m);
+        }
+        x
+    }
 }
 
 /// The rows of a layout of the segment's text from `at` to `end`, as UTF-16 ranges of the segment.
@@ -662,9 +675,11 @@ impl View {
         let st = self.hl_state(cx, seg);
         let bytes = self.window(cx.doc, seg.start, seg.end).to_vec();
         let width = if cx.style.wrap { (cx.geom.text_w * 2.0).round() as u64 } else { 0 };
+        // (Only a line that is one segment hangs its wrapped rows under its indentation.)
+        let whole_line = seg.line_start && seg.line_end;
         let mut h = std::collections::hash_map::DefaultHasher::new();
         bytes.hash(&mut h);
-        (width, cx.style.generation, cx.lang as u8, st).hash(&mut h);
+        (width, cx.style.generation, cx.lang as u8, st, whole_line).hash(&mut h);
         let key = h.finish();
         self.tick += 1;
         if let Some(e) = self.cache.get_mut(&key) {
@@ -673,7 +688,7 @@ impl View {
                 return e.layout.clone();
             }
         }
-        let lay = Rc::new(self.build_layout(cx, &bytes, st));
+        let lay = Rc::new(self.build_layout(cx, &bytes, st, whole_line));
         if !cx.g.has_target() {
             // No render target yet (colors need its brushes): use this layout once, don't keep it.
             return lay;
@@ -688,7 +703,7 @@ impl View {
         lay
     }
 
-    fn build_layout(&mut self, cx: &Ctx, bytes: &[u8], st: HlState) -> SegLayout {
+    fn build_layout(&mut self, cx: &Ctx, bytes: &[u8], st: HlState, whole_line: bool) -> SegLayout {
         let mut u = Vec::with_capacity(bytes.len());
         let mut map = Vec::with_capacity(bytes.len() + 1);
         text::decode_display(bytes, &mut u, &mut map);
@@ -705,12 +720,35 @@ impl View {
         let total = u.len() as u32;
         let layout = cx.g.layout(&u, fmt, max_w, 1.0e7);
         color_layout(cx, &layout, &spans, &map, 0, total);
-        let rows = layout_rows_of(&layout, 0, total);
+        let mut rows = layout_rows_of(&layout, 0, total);
         let mut tm = DWRITE_TEXT_METRICS::default();
         unsafe {
             let _ = layout.GetMetrics(&mut tm);
         }
-        let parts = vec![Part { layout, at: 0, x: 0.0, row0: 0 }];
+        let mut parts = vec![Part { layout, at: 0, x: 0.0, row0: 0 }];
+        // Word wrap: the rows after the first line up under the line's indentation (after a PPCL line number), unless
+        // that's more than half the width.
+        if cx.style.wrap && whole_line && rows.len() > 1 {
+            let numbered = matches!(cx.lang.comment(), Some(CommentStyle::AfterNumber(_)));
+            let k = map.partition_point(|&m| (m as usize) < text_start(bytes, numbered)) as u32;
+            let r1 = rows[0].1;
+            let ind = if k > 0 && k < r1 { parts[0].layout_x(k) } else { 0.0 };
+            if ind >= 1.0 && ind <= max_w / 2.0 {
+                let first = cx.g.layout(&u[..r1 as usize], fmt, max_w, 1.0e7);
+                let rest = cx.g.layout(&u[r1 as usize..], fmt, max_w - ind, 1.0e7);
+                let first_rows = layout_rows_of(&first, 0, r1);
+                if first_rows.len() == 1 {
+                    color_layout(cx, &first, &spans, &map, 0, r1);
+                    color_layout(cx, &rest, &spans, &map, r1, total);
+                    rows = first_rows;
+                    rows.extend(layout_rows_of(&rest, r1, total));
+                    parts = vec![
+                        Part { layout: first, at: 0, x: 0.0, row0: 0 },
+                        Part { layout: rest, at: r1, x: ind, row0: 1 },
+                    ];
+                }
+            }
+        }
         self.spans = spans;
         let plain = !u.iter().any(|&c| maybe_color(c));
         SegLayout { parts, map, rows, width: tm.widthIncludingTrailingWhitespace, plain }
@@ -2603,6 +2641,61 @@ mod tests {
         let s = duplicate(&mut d, Sel::at(end)).unwrap();
         assert!(d.read(0, d.len()).ends_with(b"\nb\r\nb"));
         assert_eq!(s, Sel::at(d.len()));
+    }
+
+    /// A view on `text` 300 DIPs wide (Consolas when the default font isn't there), with word wrap.
+    fn view_on(text: &[u8], lang: Lang, f: impl FnOnce(&mut View, &Ctx)) {
+        let g = Gfx::new().unwrap();
+        let settings = crate::ui::settings::Settings { wrap: true, ..Default::default() };
+        let style = crate::ui::app::make_style(&g, &settings, 1);
+        let theme = Theme::light(0xFF0078D4);
+        let doc = Document::from_text(text);
+        let geom = View::geometry(&doc, &style, Rect::new(0.0, 0.0, 300.0, 400.0));
+        let cx = Ctx { doc: &doc, g: &g, style: &style, theme: &theme, lang, geom };
+        f(&mut View::new(), &cx);
+    }
+
+    #[test]
+    fn wrapped_rows_hang_under_the_indentation() {
+        let line = b"    let x = aaaa(bbbb, cccc, dddd, eeee, ffff, gggg, hhhh, iiii, jjjj, kkkk, llll, mmmm, nnnn);";
+        let mut text = line.to_vec();
+        text.extend_from_slice(b"\n\tx = 1\n00100     SET(1, \"A LONG POINT NAME\", \"ANOTHER POINT\", \"AND ANOTHER ONE\")\n");
+        view_on(&text, Lang::Plain, |v, cx| {
+            let seg = v.segment_at(cx.doc, 0);
+            let lay = v.layout_of(cx, &seg);
+            assert!(lay.rows.len() >= 3, "it wraps: {:?}", lay.rows);
+            assert_eq!(lay.parts.len(), 2);
+            // every row after the first starts where the text of the first does, after its 4 spaces
+            let ind = lay.x_of(4, false);
+            assert!(ind > 10.0);
+            for r in &lay.rows[1..] {
+                assert!((lay.x_of(r.0, false) - ind).abs() < 0.01, "row {r:?}");
+            }
+            // every position, from where it is on its row, hit-tests back to itself
+            for pos in 0..=line.len() as u64 {
+                for up in [false, true] {
+                    let (seg, lay, row, x) = v.caret_place(cx, pos, up);
+                    let rs = seg.start + lay.row_bytes(row).0;
+                    let (back, back_up) = v.pos_in_row(cx, rs, x + 0.25);
+                    assert_eq!(back, pos, "{pos} {up}");
+                    if back_up {
+                        assert_eq!(v.caret_place(cx, back, true).2, row);
+                    }
+                }
+            }
+            // a short line doesn't wrap: one layout
+            let seg = v.segment_at(cx.doc, line.len() as u64 + 1);
+            assert_eq!(v.layout_of(cx, &seg).parts.len(), 1);
+        });
+        // PPCL: under the statement, after the line number
+        view_on(&text, Lang::Ppcl, |v, cx| {
+            let at = text.windows(5).position(|w| w == b"00100").unwrap() as u64;
+            let seg = v.segment_at(cx.doc, at);
+            let lay = v.layout_of(cx, &seg);
+            assert!(lay.rows.len() >= 2);
+            let set = lay.x_of(10, false);
+            assert!((lay.x_of(lay.rows[1].0, false) - set).abs() < 0.01);
+        });
     }
 
     #[test]
