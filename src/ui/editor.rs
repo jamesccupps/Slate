@@ -2662,8 +2662,14 @@ mod tests {
 
     /// A view on `text` 300 DIPs wide (Consolas when the default font isn't there), with word wrap.
     fn view_on(text: &[u8], lang: Lang, f: impl FnOnce(&mut View, &Ctx)) {
-        let g = Gfx::new().unwrap();
-        let settings = crate::ui::settings::Settings { wrap: true, ..Default::default() };
+        view_wrapped(text, lang, true, f)
+    }
+
+    fn view_wrapped(text: &[u8], lang: Lang, wrap: bool, f: impl FnOnce(&mut View, &Ctx)) {
+        let mut g = Gfx::new().unwrap();
+        // (layouts are kept only with a render target)
+        let _bitmap = crate::ui::gfx::tests::bitmap_target(&mut g, 8, 8);
+        let settings = crate::ui::settings::Settings { wrap, ..Default::default() };
         let style = crate::ui::app::make_style(&g, &settings, 1);
         let theme = Theme::light(0xFF0078D4);
         let doc = Document::from_text(text);
@@ -2713,6 +2719,28 @@ mod tests {
             let set = lay.x_of(10, false);
             assert!((lay.x_of(lay.rows[1].0, false) - set).abs() < 0.01);
         });
+    }
+
+    #[test]
+    fn every_caret_place_hit_tests_back_to_itself() {
+        // tabs, kanji (another font), emoji, a letter with its accent, and a line long enough to be cut in segments
+        let mut text = "\tab\tc 日本語の text 👍🏽 and e\u{301}x, \t \u{1F468}\u{200D}\u{1F469} end\n".repeat(3).into_bytes();
+        text.extend("word 日本 ".repeat(1200).as_bytes());
+        text.push(b'\n');
+        for wrap in [true, false] {
+            view_wrapped(&text, Lang::Plain, wrap, |v, cx| {
+                let mut pos = 0;
+                while pos < text.len() as u64 {
+                    for up in [false, true] {
+                        let (seg, lay, row, x) = v.caret_place(cx, pos, up);
+                        let rs = seg.start + lay.row_bytes(row).0;
+                        let (back, _) = v.pos_in_row(cx, rs, x + 0.25);
+                        assert_eq!(back, pos, "{pos} {up} {wrap}");
+                    }
+                    pos = next_cluster(cx.doc, pos);
+                }
+            });
+        }
     }
 
     #[test]

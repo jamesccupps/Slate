@@ -889,20 +889,20 @@ mod text_renderer {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use windows::Win32::Graphics::DirectWrite::DWRITE_TEXT_RANGE;
     use windows::Win32::Graphics::Imaging::{
-        CLSID_WICImagingFactory, GUID_WICPixelFormat32bppPBGRA, IWICImagingFactory, WICBitmapCacheOnLoad,
+        CLSID_WICImagingFactory, GUID_WICPixelFormat32bppPBGRA, IWICBitmap, IWICImagingFactory, WICBitmapCacheOnLoad,
     };
     use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx};
 
-    /// The pixels of what `f` draws into a fresh 300×120 bitmap (white).
-    fn render(g: &mut Gfx, f: impl Fn(&Gfx)) -> Vec<u8> {
+    /// Gives `g` a render target: a bitmap of `w`×`h` pixels.
+    pub(crate) fn bitmap_target(g: &mut Gfx, w: u32, h: u32) -> IWICBitmap {
         unsafe {
             let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
             let wic: IWICImagingFactory = CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER).unwrap();
-            let bmp = wic.CreateBitmap(300, 120, &GUID_WICPixelFormat32bppPBGRA, WICBitmapCacheOnLoad).unwrap();
+            let bmp = wic.CreateBitmap(w, h, &GUID_WICPixelFormat32bppPBGRA, WICBitmapCacheOnLoad).unwrap();
             let props = D2D1_RENDER_TARGET_PROPERTIES {
                 r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
                 pixelFormat: offscreen_pixel_format(),
@@ -912,6 +912,14 @@ mod tests {
                 minLevel: D2D1_FEATURE_LEVEL_DEFAULT,
             };
             g.use_target(g.d2d.CreateWicBitmapRenderTarget(&bmp, &props).unwrap(), 96.0);
+            bmp
+        }
+    }
+
+    /// The pixels of what `f` draws into a fresh 300×120 bitmap (white).
+    fn render(g: &mut Gfx, f: impl Fn(&Gfx)) -> Vec<u8> {
+        let bmp = bitmap_target(g, 300, 120);
+        unsafe {
             g.rt().BeginDraw();
             g.rt().Clear(Some(&color(rgb(0xFFFFFF))));
             f(g);
