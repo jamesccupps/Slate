@@ -59,10 +59,12 @@
   .shots img { width: 100%; height: auto; border-radius: 8px; border: 1px solid var(--line); display: block; }
   .shots figcaption { color: var(--muted); font-size: 14px; margin-top: 6px; }
   .install { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px; }
-  pre { background: var(--code); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; overflow-x: auto;
-        font: 13.5px/1.5 Consolas, "DejaVu Sans Mono", monospace; margin: 10px 0 0; }
-  .copy { float: right; margin: -4px -4px 0 8px; font: 12px "Segoe UI", system-ui, sans-serif; padding: 3px 9px; border-radius: 5px;
+  .cmd { position: relative; margin: 10px 0 0; }
+  pre { background: var(--code); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; padding-top: 34px; overflow-x: auto;
+        font: 13.5px/1.5 Consolas, "DejaVu Sans Mono", monospace; margin: 0; }
+  .copy { position: absolute; top: 6px; right: 6px; font: 12px "Segoe UI", system-ui, sans-serif; padding: 3px 10px; border-radius: 5px;
           border: 1px solid var(--line); background: var(--panel); color: var(--text); cursor: pointer; }
+  .copy:hover { border-color: var(--muted); }
   footer { color: var(--muted); font-size: 14px; padding: 40px 0 50px; border-top: 1px solid var(--line); margin-top: 44px; }
   @media (max-width: 600px) {
     header.hero { padding: 36px 0 28px; }
@@ -119,12 +121,12 @@
       <div class="card" id="linux">
         <h3>Linux and Raspberry Pi (64-bit)</h3>
         <p>In a terminal; the package adds Slate's apt repository, so <code>sudo apt upgrade</code> keeps it up to date:</p>
-        <pre><button class="copy" type="button">Copy</button>wget -O /tmp/slate.deb https://github.com/jamesccupps/Slate/releases/latest/download/slate-linux-$(dpkg --print-architecture).deb
-sudo apt install /tmp/slate.deb</pre>
+        <div class="cmd"><button class="copy" type="button">Copy</button><pre>wget -O /tmp/slate.deb https://github.com/jamesccupps/Slate/releases/latest/download/slate-linux-$(dpkg --print-architecture).deb
+sudo apt install /tmp/slate.deb</pre></div>
         <p style="margin-top:10px">Or add the repository yourself and install it by name:</p>
-        <pre><button class="copy" type="button">Copy</button>sudo wget -O /usr/share/keyrings/slate-archive-keyring.gpg https://jamesccupps.github.io/Slate/apt/slate-archive-keyring.gpg
+        <div class="cmd"><button class="copy" type="button">Copy</button><pre>sudo wget -O /usr/share/keyrings/slate-archive-keyring.gpg https://jamesccupps.github.io/Slate/apt/slate-archive-keyring.gpg
 echo "deb [signed-by=/usr/share/keyrings/slate-archive-keyring.gpg] https://jamesccupps.github.io/Slate/apt stable main" | sudo tee /etc/apt/sources.list.d/slate.list
-sudo apt update && sudo apt install slate</pre>
+sudo apt update && sudo apt install slate</pre></div>
       </div>
     </div>
   </section>
@@ -166,7 +168,7 @@ sudo apt update && sudo apt install slate</pre>
   // Copy buttons on the commands
   document.querySelectorAll("button.copy").forEach(function (b) {
     b.addEventListener("click", function () {
-      var text = b.parentNode.textContent.replace(/^Copy(ied)?/, "").trim();
+      var text = b.parentNode.querySelector("pre").textContent.trim();
       navigator.clipboard.writeText(text).then(function () { b.textContent = "Copied"; setTimeout(function () { b.textContent = "Copy"; }, 1500); });
     });
   });
