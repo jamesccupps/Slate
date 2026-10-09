@@ -125,13 +125,116 @@ impl Seg {
     }
 }
 
-pub struct SegLayout {
+/// A DirectWrite layout of a segment's text from UTF-16 position `at` on, whose first row is the segment's row
+/// `row0`, drawn `x` to the right of the text's left edge.
+pub struct Part {
     pub layout: IDWriteTextLayout,
+    pub at: u32,
+    pub x: f32,
+    pub row0: usize,
+}
+
+pub struct SegLayout {
+    /// The text's layouts, in order.
+    pub parts: Vec<Part>,
     /// Byte offset (from the segment start) of each UTF-16 unit, plus one for the end.
     pub map: Vec<u32>,
     /// Rows as UTF-16 ranges `[start, end)`; a row's end is the next row's start.
     pub rows: Vec<(u32, u32)>,
     pub width: f32,
+    /// No character that may show as a color glyph (emoji), which only Windows 11 draws a run at a time
+    /// (`Gfx::draw_layout_in`).
+    pub plain: bool,
+}
+
+/// A UTF-16 unit of a character that may show as a color glyph: emoji (all outside the BMP, the symbols and dingbats
+/// of U+2190…U+2BFF, the emoji variation selector) and the few others with an emoji form. (Not the stand-ins for
+/// control characters, U+2400…U+243F.)
+fn maybe_color(u: u16) -> bool {
+    matches!(u, 0xD800..=0xDFFF | 0x2190..=0x23FF | 0x2460..=0x2BFF | 0xFE0F | 0x00A9 | 0x00AE | 0x203C | 0x2049)
+        || matches!(u, 0x2122 | 0x2139 | 0x3030 | 0x303D | 0x3297 | 0x3299)
+}
+
+/// The rows of a layout of the segment's text from `at` to `end`, as UTF-16 ranges of the segment.
+fn layout_rows_of(layout: &IDWriteTextLayout, at: u32, end: u32) -> Vec<(u32, u32)> {
+    let mut count = 0u32;
+    unsafe {
+        let _ = layout.GetLineMetrics(None, &mut count);
+    }
+    let mut lm = vec![DWRITE_LINE_METRICS::default(); count.max(1) as usize];
+    unsafe {
+        let _ = layout.GetLineMetrics(Some(&mut lm), &mut count);
+    }
+    lm.truncate(count.max(1) as usize);
+    let mut rows = Vec::with_capacity(lm.len());
+    let mut pos = at;
+    for m in &lm {
+        let e = (pos + m.length).min(end);
+        rows.push((pos, e));
+        pos = e;
+    }
+    if let Some(last) = rows.last_mut() {
+        last.1 = end;
+    }
+    rows
+}
+
+fn tok_color(t: &Theme, tok: Tok) -> u32 {
+    match tok {
+        Tok::Key => t.syn_key,
+        Tok::Str => t.syn_string,
+        Tok::Num => t.syn_number,
+        Tok::Lit => t.syn_literal,
+        Tok::Punct => t.syn_punct,
+        Tok::Comment => t.syn_comment,
+        Tok::Section => t.syn_section,
+        Tok::Error => t.syn_error,
+        Tok::Warn => t.syn_warn,
+        Tok::Info => t.syn_info,
+        Tok::Dim => t.syn_dim,
+        Tok::Keyword => t.syn_keyword,
+        Tok::Control => t.syn_control,
+        Tok::Type => t.syn_type,
+        Tok::Func => t.syn_func,
+        Tok::Tag => t.syn_tag,
+        Tok::Attr => t.syn_attr,
+        Tok::Var => t.syn_var,
+        Tok::Heading => t.syn_heading,
+        Tok::Link => t.syn_link,
+        Tok::Added => t.syn_added,
+        Tok::Removed => t.syn_removed,
+        Tok::Col(k) => t.syn_cols[k as usize % 8],
+        Tok::Bold | Tok::Italic => t.text,
+    }
+}
+
+/// Colors a layout of the segment's text from UTF-16 position `at` to `end` with the spans (byte ranges of the
+/// segment) that fall in it.
+fn color_layout(cx: &Ctx, layout: &IDWriteTextLayout, spans: &[(u32, u32, Tok)], map: &[u32], at: u32, end: u32) {
+    let t = cx.theme;
+    for &(s, e, tok) in spans {
+        let us = (map.partition_point(|&m| m < s) as u32).max(at);
+        let ue = (map.partition_point(|&m| m < e) as u32).min(end);
+        if ue <= us {
+            continue;
+        }
+        let range = DWRITE_TEXT_RANGE { startPosition: us - at, length: ue - us };
+        unsafe {
+            // (High contrast: all text in the one text color, which selected text is drawn over in its own.)
+            if !t.hc {
+                let _ = layout.SetDrawingEffect(&cx.g.brush(tok_color(t, tok)), range);
+            }
+            match tok {
+                Tok::Bold | Tok::Heading => {
+                    let _ = layout.SetFontWeight(DWRITE_FONT_WEIGHT_BOLD, range);
+                }
+                Tok::Italic => {
+                    let _ = layout.SetFontStyle(DWRITE_FONT_STYLE_ITALIC, range);
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 impl SegLayout {
@@ -155,38 +258,67 @@ impl SegLayout {
         let (a, b) = self.rows[i];
         (self.rel_of(a), self.rel_of(b))
     }
+    /// The part with the text at UTF-16 position `u` (the last one for the end).
+    pub fn part_at(&self, u: u32) -> &Part {
+        &self.parts[self.parts.partition_point(|p| p.at <= u).max(1) - 1]
+    }
+    /// The part with row `i`.
+    pub fn part_of_row(&self, i: usize) -> &Part {
+        &self.parts[self.parts.partition_point(|p| p.row0 <= i).max(1) - 1]
+    }
     fn x_of(&self, u: u32, trailing: bool) -> f32 {
+        let p = self.part_at(u);
         let (mut x, mut y) = (0f32, 0f32);
         let mut m = DWRITE_HIT_TEST_METRICS::default();
         unsafe {
-            let _ = self.layout.HitTestTextPosition(u, BOOL(trailing as i32), &mut x, &mut y, &mut m);
+            let _ = p.layout.HitTestTextPosition(u - p.at, BOOL(trailing as i32), &mut x, &mut y, &mut m);
         }
-        x
+        p.x + x
     }
 
-    /// Each cluster's text position, x from the start of its row, and width: one call for the whole layout, where a
-    /// hit test per position gets dearer the further into a long line it is.
+    /// Where the text `[us, ue)` of row `i` is: (x, width), from the text's left edge.
+    fn range_x(&self, i: usize, us: u32, ue: u32) -> Vec<(f32, f32)> {
+        let p = self.part_of_row(i);
+        let hit = |m: &mut Vec<DWRITE_HIT_TEST_METRICS>, n: &mut u32| unsafe {
+            p.layout.HitTestTextRange(us - p.at, ue - us, 0.0, 0.0, Some(&mut m[..]), n).is_ok()
+        };
+        let (mut m, mut count) = (vec![DWRITE_HIT_TEST_METRICS::default(); 8], 0u32);
+        // (one rectangle for each run of one direction: more than 8 only with mixed right-to-left text)
+        let mut ok = hit(&mut m, &mut count);
+        if !ok && count as usize > m.len() {
+            m.resize(count as usize, DWRITE_HIT_TEST_METRICS::default());
+            ok = hit(&mut m, &mut count);
+        }
+        m.truncate(if ok { (count as usize).min(m.len()) } else { 0 });
+        m.iter().map(|m| (p.x + m.left, m.width)).collect()
+    }
+
+    /// Each cluster's text position, x from the text's left edge, and width: one call for each layout, where a hit
+    /// test per position gets dearer the further into a long line it is.
     fn clusters(&self) -> Vec<(u32, f32, f32)> {
-        let mut n = 0u32;
-        // (the first call says how many there are)
-        unsafe {
-            let _ = self.layout.GetClusterMetrics(None, &mut n);
-        }
-        let mut m = vec![DWRITE_CLUSTER_METRICS::default(); n as usize];
-        if n == 0 || unsafe { self.layout.GetClusterMetrics(Some(&mut m), &mut n) }.is_err() {
-            return Vec::new();
-        }
-        let mut out = Vec::with_capacity(m.len());
-        let (mut pos, mut x, mut row) = (0u32, 0f32, 0usize);
-        for c in &m[..(n as usize).min(m.len())] {
-            // (rows start at x 0: the text is left-aligned, and only left to right)
-            while row + 1 < self.rows.len() && pos >= self.rows[row + 1].0 {
-                row += 1;
-                x = 0.0;
+        let mut out = Vec::new();
+        for p in &self.parts {
+            let mut n = 0u32;
+            // (the first call says how many there are)
+            unsafe {
+                let _ = p.layout.GetClusterMetrics(None, &mut n);
             }
-            out.push((pos, x, c.width));
-            pos += c.length as u32;
-            x += c.width;
+            let mut m = vec![DWRITE_CLUSTER_METRICS::default(); n as usize];
+            if n == 0 || unsafe { p.layout.GetClusterMetrics(Some(&mut m), &mut n) }.is_err() {
+                continue;
+            }
+            out.reserve(m.len());
+            let (mut pos, mut x, mut row) = (p.at, p.x, p.row0);
+            for c in &m[..(n as usize).min(m.len())] {
+                // (rows start at the part's x: the text is left-aligned, and only left to right)
+                while row + 1 < self.rows.len() && pos >= self.rows[row + 1].0 {
+                    row += 1;
+                    x = p.x;
+                }
+                out.push((pos, x, c.width));
+                pos += c.length as u32;
+                x += c.width;
+            }
         }
         out
     }
@@ -565,86 +697,23 @@ impl View {
         } else {
             (&cx.style.format_nowrap, 1.0e7)
         };
-        let layout = cx.g.layout(&u, fmt, max_w, 1.0e7);
+        let mut spans = std::mem::take(&mut self.spans);
+        spans.clear();
         if cx.lang != Lang::Plain && !bytes.is_empty() && cx.g.has_target() {
-            let mut spans = std::mem::take(&mut self.spans);
             highlight::lex(cx.lang, bytes, st, Some(&mut spans));
-            let t = cx.theme;
-            for &(s, e, tok) in &spans {
-                let c = match tok {
-                    Tok::Key => t.syn_key,
-                    Tok::Str => t.syn_string,
-                    Tok::Num => t.syn_number,
-                    Tok::Lit => t.syn_literal,
-                    Tok::Punct => t.syn_punct,
-                    Tok::Comment => t.syn_comment,
-                    Tok::Section => t.syn_section,
-                    Tok::Error => t.syn_error,
-                    Tok::Warn => t.syn_warn,
-                    Tok::Info => t.syn_info,
-                    Tok::Dim => t.syn_dim,
-                    Tok::Keyword => t.syn_keyword,
-                    Tok::Control => t.syn_control,
-                    Tok::Type => t.syn_type,
-                    Tok::Func => t.syn_func,
-                    Tok::Tag => t.syn_tag,
-                    Tok::Attr => t.syn_attr,
-                    Tok::Var => t.syn_var,
-                    Tok::Heading => t.syn_heading,
-                    Tok::Link => t.syn_link,
-                    Tok::Added => t.syn_added,
-                    Tok::Removed => t.syn_removed,
-                    Tok::Col(k) => t.syn_cols[k as usize % 8],
-                    Tok::Bold | Tok::Italic => t.text,
-                };
-                let us = map.partition_point(|&m| m < s);
-                let ue = map.partition_point(|&m| m < e);
-                if ue > us {
-                    let range = DWRITE_TEXT_RANGE { startPosition: us as u32, length: (ue - us) as u32 };
-                    unsafe {
-                        // (High contrast: all text in the one text color, which selected text is drawn over in its own.)
-                        if !t.hc {
-                            let _ = layout.SetDrawingEffect(&cx.g.brush(c), range);
-                        }
-                        match tok {
-                            Tok::Bold | Tok::Heading => {
-                                let _ = layout.SetFontWeight(DWRITE_FONT_WEIGHT_BOLD, range);
-                            }
-                            Tok::Italic => {
-                                let _ = layout.SetFontStyle(DWRITE_FONT_STYLE_ITALIC, range);
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            }
-            self.spans = spans;
         }
-        let mut count = 0u32;
-        unsafe {
-            let _ = layout.GetLineMetrics(None, &mut count);
-        }
-        let mut lm = vec![DWRITE_LINE_METRICS::default(); count.max(1) as usize];
-        unsafe {
-            let _ = layout.GetLineMetrics(Some(&mut lm), &mut count);
-        }
-        lm.truncate(count.max(1) as usize);
-        let mut rows = Vec::with_capacity(lm.len());
-        let mut pos = 0u32;
         let total = u.len() as u32;
-        for m in &lm {
-            let end = (pos + m.length).min(total);
-            rows.push((pos, end));
-            pos = end;
-        }
-        if let Some(last) = rows.last_mut() {
-            last.1 = total;
-        }
+        let layout = cx.g.layout(&u, fmt, max_w, 1.0e7);
+        color_layout(cx, &layout, &spans, &map, 0, total);
+        let rows = layout_rows_of(&layout, 0, total);
         let mut tm = DWRITE_TEXT_METRICS::default();
         unsafe {
             let _ = layout.GetMetrics(&mut tm);
         }
-        SegLayout { layout, map, rows, width: tm.widthIncludingTrailingWhitespace }
+        let parts = vec![Part { layout, at: 0, x: 0.0, row0: 0 }];
+        self.spans = spans;
+        let plain = !u.iter().any(|&c| maybe_color(c));
+        SegLayout { parts, map, rows, width: tm.widthIncludingTrailingWhitespace, plain }
     }
 
     // ---- rows ----
@@ -850,13 +919,9 @@ impl View {
         if pos < seg.end && next <= seg.end {
             let lay = self.layout_of(cx, &seg);
             let (u0, u1) = (lay.u16_of(pos - seg.start), lay.u16_of(next - seg.start));
-            let mut count = 0u32;
-            let mut m = [DWRITE_HIT_TEST_METRICS::default(); 2];
-            unsafe {
-                let _ = lay.layout.HitTestTextRange(u0, u1.saturating_sub(u0), 0.0, 0.0, Some(&mut m), &mut count);
-            }
-            if count > 0 && m[0].width > 0.5 {
-                return m[0].width;
+            let w = lay.range_x(lay.row_of_u16(u0), u0, u1.max(u0)).first().map_or(0.0, |r| r.1);
+            if w > 0.5 {
+                return w;
             }
         }
         cx.style.char_w
@@ -899,14 +964,15 @@ impl View {
         let lay = self.layout_of(cx, &seg);
         let ri = lay.row_of_rel(row_start - seg.start);
         let (ra, rb) = lay.rows[ri];
-        let ly = ri as f32 * cx.style.row_h + cx.style.row_h / 2.0;
+        let p = lay.part_of_row(ri);
+        let ly = (ri - p.row0) as f32 * cx.style.row_h + cx.style.row_h / 2.0;
         let mut trailing = BOOL(0);
         let mut inside = BOOL(0);
         let mut m = DWRITE_HIT_TEST_METRICS::default();
         unsafe {
-            let _ = lay.layout.HitTestPoint(lx.max(0.0), ly, &mut trailing, &mut inside, &mut m);
+            let _ = p.layout.HitTestPoint((lx - p.x).max(0.0), ly, &mut trailing, &mut inside, &mut m);
         }
-        let mut u = m.textPosition + if trailing.as_bool() { m.length } else { 0 };
+        let mut u = p.at + m.textPosition + if trailing.as_bool() { m.length } else { 0 };
         u = u.max(ra).min(rb.max(ra));
         let last_row = ri + 1 == lay.rows.len();
         // At the end of a wrapped row the position is the next row's start; keep the caret on this row.
@@ -1110,12 +1176,14 @@ impl View {
             }
         }
 
-        // Text: each segment layout once, positioned by its first visible row.
+        // Text: each segment's layouts once, positioned by its first visible row (and of a long one only what's in view).
         let mut i = 0;
         while i < self.rows.len() {
             let r = &self.rows[i];
             let y0 = r.y - r.row as f32 * row_h;
-            g.draw_layout(&r.lay.layout, ox, y0, t.text);
+            for p in &r.lay.parts {
+                g.draw_layout_in(&p.layout, ox + p.x, y0 + p.row0 as f32 * row_h, t.text, clip, !r.lay.plain);
+            }
             let s = r.seg.start;
             while i < self.rows.len() && self.rows[i].seg.start == s {
                 i += 1;
@@ -1127,8 +1195,10 @@ impl View {
         if t.hc && !sel.is_empty() && (focused || sel_is_match) {
             for (rc, k) in self.range_rects(cx, sel.start(), sel.end(), ox, false) {
                 let r = &self.rows[k];
+                let p = r.lay.part_of_row(r.row);
+                let (x, y) = (ox + p.x, r.y - (r.row - p.row0) as f32 * row_h);
                 g.push_clip(rc);
-                g.draw_layout(&r.lay.layout, ox, r.y - r.row as f32 * row_h, t.selection_text);
+                g.draw_layout_in(&p.layout, x, y, t.selection_text, rc, !r.lay.plain);
                 g.pop_clip();
             }
         }
@@ -1175,17 +1245,11 @@ impl View {
             }
             let s = a.max(r.start);
             let e = b.min(r.end);
-            let y0 = r.y - r.row as f32 * row_h;
             if s < e {
                 let us = r.lay.u16_of(s - r.seg.start);
                 let ue = r.lay.u16_of(e - r.seg.start);
-                let mut count = 0u32;
-                let mut buf = [DWRITE_HIT_TEST_METRICS::default(); 8];
-                unsafe {
-                    let _ = r.lay.layout.HitTestTextRange(us, ue - us, 0.0, 0.0, Some(&mut buf), &mut count);
-                }
-                for m in &buf[..(count as usize).min(8)] {
-                    out.push((Rect::new(ox + m.left, y0 + m.top, m.width.max(1.0), row_h), k));
+                for (x, w) in r.lay.range_x(r.row, us, ue) {
+                    out.push((Rect::new(ox + x, r.y, w.max(1.0), row_h), k));
                 }
             }
             // A line break in the range shows as a small block after the row.
@@ -2539,5 +2603,14 @@ mod tests {
         let s = duplicate(&mut d, Sel::at(end)).unwrap();
         assert!(d.read(0, d.len()).ends_with(b"\nb\r\nb"));
         assert_eq!(s, Sel::at(d.len()));
+    }
+
+    #[test]
+    fn emoji_are_drawn_whole() {
+        let plain = |s: &str| !s.encode_utf16().any(maybe_color);
+        assert!(plain("let x = \"日本語\"; // naïve café ␍"));
+        assert!(!plain("ok 👍"));
+        assert!(!plain("❤️"));
+        assert!(!plain("☀"));
     }
 }
