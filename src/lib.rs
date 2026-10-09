@@ -2,6 +2,7 @@
 //! (`highlight`) are shared; each platform has its own window: `ui` on Windows (Win32 and Direct2D), `gtk` on Linux.
 
 pub mod core;
+pub mod edit;
 pub mod highlight;
 pub mod settings;
 pub mod theme;
