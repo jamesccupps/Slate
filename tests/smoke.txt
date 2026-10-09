@@ -36,7 +36,9 @@ cmd:ToggleComment
 print:text
 shot:smoke-rust.png
 expect:tabs=3
-# What closing keeps comes back: the session, written into the data folder SLATE_DATA_DIR names
+# What closing keeps comes back: the session, written into the data folder SLATE_DATA_DIR names. That folder has to
+# be empty to begin with (a session already there would come back too).
+expect:datadir=empty
 persist
 session:save
 session:restore
