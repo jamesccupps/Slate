@@ -65,9 +65,10 @@ The usual ones work as in Notepad (Ctrl+N, O, S, F, H, G, Z, Y, A, X, C, V), plu
 Get `Slate.exe` from the [latest release](https://github.com/jamesccupps/Slate/releases/latest) and run it from
 any folder. It needs 64-bit Windows 10 or 11.
 
-Slate isn't code-signed yet, so the first time you run it Windows may show "Windows protected your PC"; choose
-*More info* → *Run anyway*. Each release lists the SHA-256 of `Slate.exe` (in `Slate.exe.sha256`) if you want to
-check the download.
+`Slate.exe` is code-signed (publisher: James Cupps, through Microsoft's Artifact Signing) since 0.8.0. While the
+certificate is new, Windows' SmartScreen may still show "Windows protected your PC" the first time; choose *More
+info* → *Run anyway*. Each release lists the SHA-256 of `Slate.exe` (in `Slate.exe.sha256`) if you want to check
+the download.
 
 ### Linux and Raspberry Pi
 

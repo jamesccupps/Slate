@@ -21,5 +21,6 @@ Or download `slate-linux-arm64.deb` (64-bit ARM, like the Pi) or `slate-linux-am
 - Not on Linux yet: the JSON/XML structure panel and path bar, show whitespace, bracket matching and overtype.
 
 ### Windows
-- Nothing changes in how Slate works on Windows; under the hood, the engine, colors and editing are now shared with the Linux version.
+- `Slate.exe` is now code-signed: Windows shows James Cupps as its publisher (Microsoft's Artifact Signing). While the certificate is new, SmartScreen may still ask the first time.
+- Nothing else changes in how Slate works on Windows; under the hood, the engine, colors and editing are now shared with the Linux version.
 - GitHub now builds and tests every release for Windows and for Linux on x86-64 and ARM64; only the step that drafts the release can write to the repository.
