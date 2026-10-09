@@ -68,9 +68,9 @@ Seven more languages: Dart, Scala, Objective-C and Objective-C++, G-code, Inno S
 2. **Release basics (S–M).** Code signing (SignPath Foundation is free for open source; Azure Artifact Signing is
    about $10 a month) so Windows stops warning, then the updater also checks the signature; winget and Scoop
    manifests. (Licensed MIT since October 2026.)
-3. **Big unsaved files, the rest (S–M).** Compact a big document's `.data` while it stays unsaved (it only grows
-   now), keep its newline index in the session so putting it back doesn't count the lines again, and keep big
-   documents that Format or Replace All rewrote (today closing still asks about those).
+3. **Big unsaved files, the rest (S–M).** Keep a big document's newline index in the session so putting it back
+   doesn't count the lines again, and keep big documents that Format or Replace All rewrote (today closing still asks
+   about those). (Its `.data` is already written anew, with only what the text uses, once most of it isn't.)
 
 ## Soon
 
@@ -82,6 +82,12 @@ Seven more languages: Dart, Scala, Objective-C and Objective-C++, G-code, Inno S
 - **A taskbar jump list** with the recent files (S).
 - **JSON structure panel:** keep an open array element open when elements are inserted before it (it's keyed by
   index today); while the panel is updating after an edit, clicks go to the row's old place (S).
+- **The first frame without waiting for the graphics driver (S–M).** Where the driver is slow to load (on an NVIDIA
+  PC `D3D11CreateDevice` takes ~250 ms in a new process; WARP ~20 ms), the first frame waits for it. The device is
+  made on another thread from the start, which hides the rest of starting (~30–50 ms) but not the driver. Next: draw
+  with WARP until the GPU's device is there (made before it: a DLL loaded while the driver loads waits for it), or
+  keep the window cloaked until its first frame. Both need checking on a real screen: a black or white frame at the
+  switch would be worse than the wait.
 
 ## Later
 
@@ -114,16 +120,23 @@ Seven more languages: Dart, Scala, Objective-C and Objective-C++, G-code, Inno S
 - Updates: when closing is cancelled after an update was put in place, the next start should still be watched (and
   undone if it fails), and a setting a newer version wrote that this one can't read should survive this one saving
   (it matters when an update is undone) (S each).
+- Restart after Windows restarts for an update, with the tabs back, as Notepad does (`RegisterApplicationRestart`)
+  (S).
+- Size: of the 3.4 MB, regex's Unicode tables are 380 KB. Without the age, boolean-property and break tables
+  (`\p{Age=…}`, `\p{Alphabetic}`, `\p{Emoji}`, grapheme/word/sentence break classes) it's 155 KB smaller; without
+  general categories and scripts too (`\p{L}`, `\p{Greek}`), 240 KB. Case-insensitive search in every language and
+  `\w`, `\d`, `\s`, `\b` stay either way. To decide (S).
 
 ## Infrastructure
 
 - Reproducible builds: a pinned toolchain, a build cache, no home paths or timestamps in the exe (S).
 - CI: write permission only for the release step (S); automated updater tests against a local stand-in for GitHub,
-  and test-mode commands for the timers (S).
+  and test-mode commands for the timers (S). (The smoke test writes a session and puts it back.)
 - Test on what the development PC doesn't have: a FAT/exFAT drive, a Chinese/Japanese/Korean system locale, the
   "Use UTF-8 worldwide" option, a high-DPI second monitor and a taskbar on the side (S each).
-- Check whether the window shows a white frame before its first paint, and whether switching the theme with the find
-  bar open repaints its boxes (S).
+- Check on a real screen what the window shows before its first frame (nothing is painted until the graphics device
+  is there, a quarter of a second on a PC with a slow driver: see *Soon*), and whether switching the theme with the
+  find bar open repaints its boxes (S).
 - Install: the registry keys, ProgID and data folder are all named just "Slate": decide on final names before many
   people install it, since renaming later needs a migration.
 

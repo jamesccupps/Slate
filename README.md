@@ -3,25 +3,32 @@
 A fast, simple text editor for Windows that opens files of any size: an 800 MB JSON file opens instantly, scrolls
 smoothly, and can be searched, edited, formatted and saved.
 
-- Opens huge files instantly: nothing is loaded up front, only what's on screen is read and drawn.
-- Tabs that come back after a restart, including unsaved changes (like Windows 11 Notepad). Work is never lost
-  silently: anything that can't be kept is asked about, and Windows won't shut down over it without asking.
+- Opens huge files instantly: nothing is loaded up front, only what's on screen is read and drawn. Files open in the
+  background, so a slow network drive never freezes the window.
+- Tabs that come back after a restart, including unsaved changes (like Windows 11 Notepad), for big files too. Work
+  is never lost silently: anything that can't be kept is asked about, and Windows won't shut down over it without
+  asking.
 - Find and replace with match case, whole word and regular expressions; fast on huge files.
-- Syntax colors for about 50 kinds of files: Python, PowerShell, Batch, Shell, VBScript/VBA, AutoHotkey, Perl, R,
-  C, C++, C#, Objective-C, Java, Kotlin, Scala, Swift, Dart, Go, Rust, JavaScript, TypeScript, PHP, Ruby, Lua, SQL,
-  HTML (with its CSS and scripts), CSS, XML, Markdown (code blocks in their language), YAML, JSON, TOML, INI, Java
-  properties, nginx and Apache configuration, Terraform/HCL, CMake, Dockerfiles, Inno Setup and NSIS installer
-  scripts, G-code (3D printers, CNC), PPCL programs (Siemens APOGEE and Desigo), CSV/TSV (each column its own
-  color), logs, diffs, subtitles (SRT, WebVTT), calendars and contacts (iCalendar, vCard) and Visual Studio
-  solutions. Block comments and multi-line strings are followed correctly.
+- Syntax colors for 52 kinds of files: Python, PowerShell, Batch, Shell, VBScript/VBA, AutoHotkey, Perl, R, C, C++,
+  C#, Objective-C and Objective-C++, Java, Kotlin, Scala, Swift, Dart, Go, Rust, JavaScript, TypeScript, PHP, Ruby,
+  Lua, SQL, HTML (with its CSS and scripts), CSS, XML, Markdown (code blocks in their language), YAML, JSON, TOML,
+  INI, Java properties, nginx and Apache configuration, Terraform/HCL, CMake, Dockerfiles, Inno Setup and NSIS
+  installer scripts, G-code (3D printers, CNC), PPCL programs (Siemens APOGEE and Desigo), CSV with commas or
+  semicolons and TSV (each column its own color), logs, diffs, subtitles (SRT, WebVTT), calendars and contacts
+  (iCalendar, vCard) and Visual Studio solutions. Block comments and multi-line strings are followed correctly.
 - Line tools: sort lines (`file2` before `file10`), remove duplicate or blank lines, trim spaces at line ends;
-  UPPERCASE / lowercase / Title Case; comment or uncomment lines with Ctrl+/.
+  UPPERCASE / lowercase / Title Case; comment or uncomment lines with Ctrl+/; duplicate, delete and move lines.
 - JSON and XML: format (pretty-print), minify and check, also for JSON Lines; a path bar showing where the caret
   is (`data › [1203] › name`, `catalog › book[3] › title`; copy it as a JSON path or XPath) and a structure panel to
   browse objects, arrays and elements, fast on huge files.
-- Go to line, word wrap, line numbers, zoom, dark and light themes (follows Windows, or switch with the sun/moon
-  button).
-- Detects and keeps the encoding (UTF-8, UTF-8 BOM, UTF-16, ANSI) and line endings (CRLF / LF).
+- Go to line (`slate notes.txt:120` opens a file at a line), word wrap, line numbers, show whitespace, the matching
+  bracket highlighted, overtype, zoom, dark and light themes (follows Windows, or switch with the sun/moon button).
+  With Windows' high contrast on, Slate uses its colors, and Magnifier follows the text cursor.
+- Reopen closed tabs (Ctrl+Shift+T), close the other, the saved or all tabs, and a list of all tabs when they don't
+  fit. The status bar counts words and characters, and shows the language, line endings, encoding and indentation:
+  click one to change it.
+- Detects and keeps the encoding (UTF-8, UTF-8 with BOM, UTF-16, ANSI) and line endings (CRLF / LF). Saving as ANSI
+  asks first if some characters would turn into "?".
 - Notices when another program changes an open file; reloads it automatically when you have no unsaved changes
   (handy for log files).
 - A single small `Slate.exe` that runs from any folder. *Help → Open files with Slate…* adds it to "Open with",
@@ -30,6 +37,28 @@ smoothly, and can be searched, edited, formatted and saved.
   an *Update* button appears in the status bar. One click downloads it, checks it against the release's checksum
   and restarts Slate with your tabs (and their unsaved text) back where they were. If the new version can't start,
   the old one comes back by itself. *Help → Check for updates* does it on demand.
+
+## Keyboard shortcuts
+
+The usual ones work as in Notepad (Ctrl+N, O, S, F, H, G, Z, Y, A, X, C, V), plus:
+
+| Keys | |
+| --- | --- |
+| Ctrl+W / Ctrl+Shift+T | Close tab / reopen the tab closed last |
+| Ctrl+Tab, Ctrl+1 … Ctrl+9 | Next tab, go to a tab |
+| Ctrl+Alt+S | Save all |
+| Ctrl+D / Ctrl+Shift+K | Duplicate / delete the line |
+| Alt+Up / Alt+Down | Move the line up / down |
+| Ctrl+/ | Comment / uncomment the lines |
+| Ctrl+U / Ctrl+Shift+U | lowercase / UPPERCASE |
+| Shift+Alt+F | Format JSON or XML |
+| F3 / Shift+F3 | Next / previous match |
+| Alt+Z | Word wrap |
+| Ctrl+Plus / Ctrl+Minus / Ctrl+0 | Zoom in / out / reset |
+| Ctrl+Shift+O | JSON and XML structure panel |
+| F5 | Insert the time and date |
+
+*Help → Keyboard shortcuts* lists them all.
 
 ## Download
 
@@ -42,7 +71,9 @@ check the download.
 
 ## Where Slate keeps things
 
-- Settings, the session (open tabs and unsaved text) and `crash.log` are in `%LOCALAPPDATA%\Slate`.
+- Settings, the session (open tabs and unsaved text) and `crash.log` are in `%LOCALAPPDATA%\Slate`
+  (*Help → Open settings folder*). *File → Restore last session* turns the session off: closing then asks about
+  unsaved changes, like Notepad used to.
 - **Portable mode:** put an empty file named `Slate.portable` next to `Slate.exe`, and Slate keeps all of that, and
   its temporary files, in a `data` folder beside it instead (handy on a USB stick or a fast drive).
 - Slate running as administrator keeps its own session, apart from the normal one.
@@ -69,6 +100,7 @@ MIT: see [LICENSE](LICENSE). The libraries built into `Slate.exe` are listed, wi
 ## Building
 
 Needs Rust (the GNU toolchain is enough; no Visual Studio). Run `build.cmd`, which produces `dist\Slate.exe`.
-`cargo test --lib` runs the engine's tests, and `Slate.exe --test tests\smoke.txt` drives the real app offscreen.
+`cargo test --lib` runs the unit tests, and `Slate.exe --test tests\smoke.txt` drives the real app in a hidden
+window (set `SLATE_DATA_DIR` to an empty folder first: the smoke test writes a session there and reads it back).
 GitHub Actions builds and tests every push; a version tag (`v1.2.3`) drafts a release with `Slate.exe` and
 `Slate.exe.sha256` attached. What's planned is in [docs/ROADMAP.md](docs/ROADMAP.md).
