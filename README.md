@@ -81,6 +81,14 @@ wget -O /tmp/slate.deb https://github.com/jamesccupps/Slate/releases/latest/down
 sudo apt install /tmp/slate.deb
 ```
 
+Or add Slate's apt repository yourself and install it by name, like any other package:
+
+```
+sudo wget -O /usr/share/keyrings/slate-archive-keyring.gpg https://jamesccupps.github.io/Slate/apt/slate-archive-keyring.gpg
+echo "deb [signed-by=/usr/share/keyrings/slate-archive-keyring.gpg] https://jamesccupps.github.io/Slate/apt stable main" | sudo tee /etc/apt/sources.list.d/slate.list
+sudo apt update && sudo apt install slate
+```
+
 Slate is then in the menu (Accessories), opens files from the file manager, and `slate notes.txt` opens a file from
 a terminal; **Help → Open files with Slate…** makes it the app that opens text, Markdown, CSV, JSON, XML, YAML, log
 and code files when they're double-clicked. The package also adds Slate's own apt repository (signed; `/etc/apt/sources.list.d/slate.list`), so
