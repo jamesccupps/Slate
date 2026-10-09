@@ -233,7 +233,9 @@ fn tok_color(t: &Theme, tok: Tok) -> u32 {
 fn color_layout(cx: &Ctx, layout: &IDWriteTextLayout, spans: &[Span], map: &[u32], at: u32, end: u32, colors: bool) {
     let t = cx.theme;
     for &(s, e, tok) in spans {
-        if !colors && !matches!(tok, Tok::Bold | Tok::Heading | Tok::Italic) {
+        let bold = matches!(tok, Tok::Bold | Tok::Heading);
+        let italic = matches!(tok, Tok::Italic);
+        if !colors && !bold && !italic {
             continue;
         }
         let us = (map.partition_point(|&m| m < s) as u32).max(at);
@@ -247,14 +249,11 @@ fn color_layout(cx: &Ctx, layout: &IDWriteTextLayout, spans: &[Span], map: &[u32
             if colors && !t.hc {
                 let _ = layout.SetDrawingEffect(&cx.g.brush(tok_color(t, tok)), range);
             }
-            match tok {
-                Tok::Bold | Tok::Heading => {
-                    let _ = layout.SetFontWeight(DWRITE_FONT_WEIGHT_BOLD, range);
-                }
-                Tok::Italic => {
-                    let _ = layout.SetFontStyle(DWRITE_FONT_STYLE_ITALIC, range);
-                }
-                _ => {}
+            if bold {
+                let _ = layout.SetFontWeight(DWRITE_FONT_WEIGHT_BOLD, range);
+            }
+            if italic {
+                let _ = layout.SetFontStyle(DWRITE_FONT_STYLE_ITALIC, range);
             }
         }
     }
