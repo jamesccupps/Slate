@@ -45,7 +45,8 @@
 //! script (frames go through the hidden window's own swap chain, from the paint after the first command on, as in a
 //! real start; `gfx:late` too: its Direct3D device is made then, not from the start), `idle:<ms>` (the real message
 //! loop for that long, with the 2 s disk check: what woke it), `copydata:<path>` (a file handed over the way a second
-//! Slate does it); `session:…` says how long it took.
+//! Slate does it, and whether it was taken); `session:…` says how long it took, and needs `SLATE_DATA_DIR` (as
+//! `persist` does); `print:datadir` is `empty` while that folder has nothing in it.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -607,6 +608,14 @@ fn describe(cell: &Cell, what: &str) -> String {
             super::mark("now");
             super::marks().iter().map(|(w, ms)| format!("{w} {ms:.1}")).collect::<Vec<_>>().join(" | ")
         }
+        // (what's in the data folder SLATE_DATA_DIR names: a test that keeps a session there needs it empty)
+        "datadir" => match std::env::var_os("SLATE_DATA_DIR") {
+            None => "not set".into(),
+            Some(d) => match std::fs::read_dir(&d).map(|r| r.count()) {
+                Ok(0) | Err(_) => "empty".into(),
+                Ok(n) => format!("not empty ({n} files or folders in {})", Path::new(&d).display()),
+            },
+        },
         _ => format!("(unknown: {what})"),
     }
 }
@@ -914,6 +923,11 @@ pub fn run(args: &[String]) -> i32 {
             "crash" => unsafe { std::ptr::null_mut::<u8>().write_volatile(1) },
             // As if another Slate was running but didn't answer: this window keeps nothing for next time.
             "guest" => super::settings::GUEST.store(true, std::sync::atomic::Ordering::Relaxed),
+            // (only with a data folder of the test's own: restoring tidies up the session's folder, and reads it)
+            "session" if std::env::var_os("SLATE_DATA_DIR").is_none() => {
+                out.push_str(&format!("session:{arg} needs SLATE_DATA_DIR\n"));
+                failures += 1;
+            }
             "session" => {
                 let t = Instant::now();
                 let mut a = cell.borrow_mut();
@@ -1032,7 +1046,8 @@ pub fn run(args: &[String]) -> i32 {
                 use windows::Win32::UI::WindowsAndMessaging::{SendMessageW, WM_COPYDATA};
                 let text: Vec<u16> = arg.encode_utf16().collect();
                 let cds = COPYDATASTRUCT { dwData: super::COPYDATA_OPEN, cbData: (text.len() * 2) as u32, lpData: text.as_ptr() as *mut _ };
-                unsafe { SendMessageW(hwnd, WM_COPYDATA, WPARAM(0), LPARAM(&cds as *const _ as isize)) };
+                let took = unsafe { SendMessageW(hwnd, WM_COPYDATA, WPARAM(0), LPARAM(&cds as *const _ as isize)) };
+                out.push_str(&format!("copydata: {}\n", if took.0 != 0 { "taken" } else { "not taken" }));
                 pump(&cell, 0);
             }
             _ => {

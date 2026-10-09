@@ -460,6 +460,9 @@ impl App {
     /// Opens files named on a command line (Slate's own, or another Slate's that handed them over). A name that
     /// isn't there but ends in `:line` or `:line:column` (`notes.txt:120`) opens that file at that line.
     pub fn open_command_line(&mut self, paths: &[PathBuf]) {
+        // (A message from before stays, also when these change the tab shown: what restoring the session said at the
+        // start, or one about another tab while another Slate hands these over.)
+        let said = self.flash.take();
         let mut started = Vec::new();
         for p in paths {
             let p = std::path::absolute(p).unwrap_or_else(|_| p.clone());
@@ -489,6 +492,7 @@ impl App {
         self.settle(&started);
         let a = self.active;
         self.activate(a);
+        super::keep_message(self, said);
     }
 
     /// Opens files in new tabs. Each is read on another thread (a network drive can take long to answer); its tab
@@ -4640,6 +4644,8 @@ pub fn close_tab(cell: &Cell, i: usize) -> bool {
 
 /// Closes the window: unsaved work is kept in the session (or asked about when it can't be).
 pub fn close_window(cell: &Cell) {
+    // (files another Slate hands over meanwhile wait: they'd go down with the window)
+    let _closing = super::Closing::now();
     // Keep what can be kept first; whatever that doesn't cover is asked about.
     let session_ok = cell.borrow_mut().save_session();
     let restore = cell.borrow().settings.restore_session;
