@@ -237,8 +237,12 @@ accent stay Windows-only), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate
   - `app.rs` state, layout and painting; `actions.rs` input, commands, background jobs, saving and closing;
     `editor.rs` the text view; `structure.rs` path bar + structure panel; `findbar.rs`; `session.rs` (tabs and
     unsaved text kept between runs); `settings.rs` (data folder, portable mode); `install.rs` ("Open with" entries
-    in HKCU; `Slate.exe --install` does the same silently for winget and scripts, `--uninstall --quiet` undoes it;
-    CI runs both); `update.rs` (updates from GitHub releases: WinHTTP, SHA-256 check, from 0.8.1 the same
+    in HKCU, never for what Windows runs when it's double-clicked, `NOT_REGISTERED`: .bat, .cmd, .vbs, .js, .reg,
+    .py…, nor .ts — registered, they made Windows ask how to open a .bat with only Slate offered, and 0.8.2 takes
+    that back once at start, a choice of Slate for .bat/.cmd included; `Slate.exe --install` does the setup
+    silently for winget and scripts; Help → Stop opening files with Slate… / `--unassociate` takes back the file
+    part, every UserChoice naming Slate included, and Slate stays installed; `--uninstall --quiet` removes it all;
+    CI runs all three on a runner); `update.rs` (updates from GitHub releases: WinHTTP, SHA-256 check, from 0.8.1 the same
     publisher's signature when the running exe's own signature checks out (`signer_of`: WinVerifyTrust, no online
     revocation lookup), swap the exe, restart with
     `--updated`, undone if the new one doesn't start); `crash.rs` (a minidump next to crash.log on a native crash,

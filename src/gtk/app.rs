@@ -46,6 +46,8 @@ pub enum Ask {
     Shortcuts,
     /// Make Slate the default app for the file types it opens?
     MakeDefault,
+    /// Stop Slate being the default app for them?
+    StopDefault,
 }
 
 /// A menu command or shortcut.
@@ -100,6 +102,7 @@ pub enum Cmd {
     About,
     Shortcuts,
     MakeDefault,
+    StopDefault,
 }
 
 pub struct SaveTask {
@@ -1157,6 +1160,7 @@ impl App {
             Cmd::About => self.asks.push(Ask::About),
             Cmd::Shortcuts => self.asks.push(Ask::Shortcuts),
             Cmd::MakeDefault => self.asks.push(Ask::MakeDefault),
+            Cmd::StopDefault => self.asks.push(Ask::StopDefault),
         }
         self.dirty_title = true;
     }

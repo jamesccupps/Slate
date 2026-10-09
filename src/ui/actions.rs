@@ -3896,7 +3896,11 @@ impl App {
                 };
                 vec![
                     item(Cmd::Shortcuts, "&Keyboard shortcuts", ""),
-                    item(Cmd::MakeDefault, "Open files &with Slate…", ""),
+                    if super::install::associated() {
+                        item(Cmd::StopDefault, "Stop opening files &with Slate…", "")
+                    } else {
+                        item(Cmd::MakeDefault, "Open files &with Slate…", "")
+                    },
                     item(Cmd::OpenDataFolder, "Open settings &folder", ""),
                     item(Cmd::ReportProblem, "&Report a problem…", ""),
                     Item::Sep,
@@ -4528,6 +4532,7 @@ pub fn run_cmd(cell: &Cell, cmd: Cmd) {
             a.invalidate();
         }
         Cmd::MakeDefault => super::install::make_default(cell),
+        Cmd::StopDefault => super::install::stop_default(cell),
         other => {
             let mut a = cell.borrow_mut();
             a.exec(other);

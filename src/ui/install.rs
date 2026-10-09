@@ -36,6 +36,18 @@ const EXTENSIONS: &[&str] = &[
     ".nsi", ".nsh", ".ppcl",
 ];
 
+/// Kinds of files Slate colors but doesn't register for: what Windows runs when it's double-clicked (or merges into
+/// the registry: .reg), and .ts, as often a video as TypeScript. Registered for them, Slate made Windows ask "How do
+/// you want to open this file?" with Slate offered and the way such a file opened before nowhere in the list (0.8.1
+/// and older). "Edit with Slate" on the right-click menu still opens them.
+const NOT_REGISTERED: &[&str] =
+    &[".bat", ".cmd", ".vbs", ".js", ".reg", ".py", ".pyw", ".rb", ".pl", ".ahk", ".ah2", ".sh", ".bash", ".ts"];
+
+/// The kinds of files Slate registers for.
+fn registered() -> impl Iterator<Item = &'static str> {
+    EXTENSIONS.iter().copied().filter(|e| !NOT_REGISTERED.contains(e))
+}
+
 fn set(path: &str, name: Option<&str>, value: &str) -> bool {
     unsafe {
         let mut key = HKEY::default();
@@ -157,7 +169,7 @@ fn register(exe: &Path) -> bool {
     ok &= set(&format!(r"Software\Classes\{PROGID}\shell\open\command"), None, &open);
     ok &= set(r"Software\Classes\Applications\Slate.exe", Some("FriendlyAppName"), "Slate");
     ok &= set(r"Software\Classes\Applications\Slate.exe\shell\open\command", None, &open);
-    for ext in EXTENSIONS {
+    for ext in registered() {
         ok &= set_empty(&format!(r"Software\Classes\{ext}\OpenWithProgids"), PROGID);
         ok &= set(r"Software\Classes\Applications\Slate.exe\SupportedTypes", Some(ext), "");
         ok &= set(r"Software\Slate\Capabilities\FileAssociations", Some(ext), PROGID);
@@ -185,6 +197,8 @@ fn register(exe: &Path) -> bool {
     ok &= set_dword(un, "EstimatedSize", kb);
     // Win+R "slate"
     ok &= set(APP_PATH, None, &e);
+    // (what 0.8.1 and older registered for the kinds of files Slate leaves alone now)
+    forget_unregistered();
     unsafe {
         SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, None, None);
     }
@@ -193,6 +207,152 @@ fn register(exe: &Path) -> bool {
 
 const UNINSTALL: &str = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\Slate";
 const APP_PATH: &str = r"Software\Microsoft\Windows\CurrentVersion\App Paths\Slate.exe";
+
+fn read_str(path: &str, name: &str) -> Option<String> {
+    use windows::Win32::System::Registry::{RRF_RT_REG_SZ, RegGetValueW};
+    let mut buf = [0u16; 1024];
+    let mut len = (buf.len() * 2) as u32;
+    let ok = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            &HSTRING::from(path),
+            &HSTRING::from(name),
+            RRF_RT_REG_SZ,
+            None,
+            Some(buf.as_mut_ptr() as *mut _),
+            Some(&mut len),
+        )
+    }
+    .is_ok();
+    ok.then(|| String::from_utf16_lossy(&buf[..(len as usize / 2).saturating_sub(1)]))
+}
+
+fn read_dword(path: &str, name: &str) -> Option<u32> {
+    use windows::Win32::System::Registry::{RRF_RT_REG_DWORD, RegGetValueW};
+    let mut v = 0u32;
+    let mut len = 4u32;
+    let ok = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            &HSTRING::from(path),
+            &HSTRING::from(name),
+            RRF_RT_REG_DWORD,
+            None,
+            Some(&mut v as *mut u32 as *mut _),
+            Some(&mut len),
+        )
+    }
+    .is_ok();
+    ok.then_some(v)
+}
+
+fn delete_value(path: &str, name: &str) {
+    use windows::Win32::System::Registry::{RegDeleteValueW, RegOpenKeyExW};
+    unsafe {
+        let mut key = HKEY::default();
+        if RegOpenKeyExW(HKEY_CURRENT_USER, &HSTRING::from(path), 0, KEY_WRITE, &mut key).is_ok() {
+            let _ = RegDeleteValueW(key, &HSTRING::from(name));
+            let _ = RegCloseKey(key);
+        }
+    }
+}
+
+/// Deletes a key and what's in it. One Windows guards against changes (a file type's UserChoice) can still be
+/// deleted whole: RegDeleteKey needs no right to change its values, RegDeleteTree (which empties it first) does.
+fn delete_key(path: &str) {
+    use windows::Win32::System::Registry::{RegDeleteKeyW, RegDeleteTreeW};
+    let p = HSTRING::from(path);
+    unsafe {
+        if RegDeleteKeyW(HKEY_CURRENT_USER, &p).is_err() {
+            let _ = RegDeleteTreeW(HKEY_CURRENT_USER, &p);
+        }
+    }
+}
+
+/// Whether "Open files with Slate…" set Slate up for files (Default apps lists it).
+pub fn associated() -> bool {
+    read_str(r"Software\RegisteredApplications", "Slate").is_some()
+}
+
+fn is_slate(progid: &str) -> bool {
+    progid == PROGID || progid.eq_ignore_ascii_case(r"Applications\Slate.exe")
+}
+
+/// Where Slate is the app chosen for `ext`, the choice goes: such files open the way Windows opens them without one
+/// again (a .bat runs), or Windows asks.
+fn forget_choice(ext: &str) {
+    let base = format!(r"Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts\{ext}");
+    let choice = format!(r"{base}\UserChoice");
+    if read_str(&choice, "ProgId").is_some_and(|p| is_slate(&p)) {
+        delete_key(&choice);
+    }
+    // (where newer Windows 11 keeps it)
+    let latest = format!(r"{base}\UserChoiceLatest");
+    if read_str(&latest, "ProgId").or_else(|| read_str(&format!(r"{latest}\ProgId"), "ProgId")).is_some_and(|p| is_slate(&p)) {
+        delete_key(&format!(r"{latest}\ProgId"));
+        delete_key(&latest);
+    }
+}
+
+/// Takes back what 0.8.1 and older registered for the kinds of files in `NOT_REGISTERED`, and a choice of Slate for
+/// .bat and .cmd files (made in the box Windows showed because of it: they opened in Slate instead of running).
+/// Once: `Software\Slate\Registration` notes it.
+fn forget_unregistered() {
+    if read_dword(r"Software\Slate", "Registration").is_some_and(|v| v >= 2) {
+        return;
+    }
+    for ext in NOT_REGISTERED {
+        delete_value(&format!(r"Software\Classes\{ext}\OpenWithProgids"), PROGID);
+        delete_value(r"Software\Classes\Applications\Slate.exe\SupportedTypes", ext);
+        delete_value(r"Software\Slate\Capabilities\FileAssociations", ext);
+    }
+    for ext in [".bat", ".cmd"] {
+        forget_choice(ext);
+    }
+    set_dword(r"Software\Slate", "Registration", 2);
+    unsafe {
+        SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, None, None);
+    }
+}
+
+/// Help → Stop opening files with Slate… (and `Slate.exe --unassociate`): takes back what "Open files with Slate…"
+/// set up for files: Slate in "Open with", "Edit with Slate", its Default apps entry, and every file type set to
+/// open with Slate, which opens the way Windows opens it without a choice again (or Windows asks). Slate stays
+/// installed: its folder, the Start menu, Installed apps.
+pub fn unassociate() {
+    use windows::Win32::System::Registry::RegDeleteTreeW;
+    for ext in EXTENSIONS {
+        delete_value(&format!(r"Software\Classes\{ext}\OpenWithProgids"), PROGID);
+        forget_choice(ext);
+    }
+    unsafe {
+        for k in [
+            format!(r"Software\Classes\{PROGID}"),
+            r"Software\Classes\Applications\Slate.exe".to_string(),
+            r"Software\Classes\*\shell\Slate".to_string(),
+            r"Software\Slate\Capabilities".to_string(),
+        ] {
+            let _ = RegDeleteTreeW(HKEY_CURRENT_USER, &HSTRING::from(k));
+        }
+    }
+    delete_value(r"Software\RegisteredApplications", "Slate");
+    unsafe {
+        SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, None, None);
+    }
+}
+
+/// Help → Stop opening files with Slate…: asks, then `unassociate`.
+pub fn stop_default(cell: &Cell) {
+    let hwnd = cell.borrow().hwnd;
+    let detail = "Slate comes off \"Open with\", the right-click menu and Default apps, and the file types you set to \
+                  open with Slate open the way they did without it (or Windows asks which app to use). Slate stays \
+                  installed, with your settings and tabs; Help → Open files with Slate… sets it up again.";
+    if win::ask(hwnd, "Slate", "Stop opening files with Slate?", detail, &["Stop", "Cancel"]) != Some(0) {
+        return;
+    }
+    unassociate();
+    cell.borrow_mut().flash("Slate no longer opens files by itself. Help → Open files with Slate… sets it up again.", false);
+}
 
 fn set_dword(path: &str, name: &str, value: u32) -> bool {
     use windows::Win32::System::Registry::REG_DWORD;
@@ -212,24 +372,11 @@ fn set_dword(path: &str, name: &str, value: u32) -> bool {
 /// After an update: the version Windows shows under Installed apps is this one's, if this is the Slate that was set
 /// up there.
 pub fn refresh_version() {
-    use windows::Win32::System::Registry::{RRF_RT_REG_SZ, RegGetValueW};
-    let read = |name: &str| -> Option<String> {
-        let mut buf = [0u16; 1024];
-        let mut len = (buf.len() * 2) as u32;
-        let ok = unsafe {
-            RegGetValueW(
-                HKEY_CURRENT_USER,
-                &HSTRING::from(UNINSTALL),
-                &HSTRING::from(name),
-                RRF_RT_REG_SZ,
-                None,
-                Some(buf.as_mut_ptr() as *mut _),
-                Some(&mut len),
-            )
-        }
-        .is_ok();
-        ok.then(|| String::from_utf16_lossy(&buf[..(len as usize / 2).saturating_sub(1)]))
-    };
+    // 0.8.1 and older registered for kinds of files Slate leaves alone now (.bat...): taken back, once.
+    if associated() {
+        forget_unregistered();
+    }
+    let read = |name: &str| read_str(UNINSTALL, name);
     let Some(here) = super::settings::exe_dir() else { return };
     let ours = read("InstallLocation").is_some_and(|l| Path::new(&l) == here);
     if ours && read("DisplayVersion").as_deref() != Some(env!("CARGO_PKG_VERSION")) {
@@ -290,31 +437,11 @@ pub fn install_quiet() -> bool {
 /// and its data folder stay; the message says where they are (`quiet`: no message, for `--uninstall --quiet`).
 pub fn uninstall(quiet: bool) {
     use windows::Win32::System::Registry::RegDeleteTreeW;
+    // (the file types set to open with Slate open the way Windows opens them without a choice again)
+    unassociate();
     unsafe {
-        for k in [
-            format!(r"Software\Classes\{PROGID}"),
-            r"Software\Classes\Applications\Slate.exe".to_string(),
-            r"Software\Classes\*\shell\Slate".to_string(),
-            r"Software\Slate".to_string(),
-            UNINSTALL.to_string(),
-            APP_PATH.to_string(),
-        ] {
+        for k in [r"Software\Slate".to_string(), UNINSTALL.to_string(), APP_PATH.to_string()] {
             let _ = RegDeleteTreeW(HKEY_CURRENT_USER, &HSTRING::from(k));
-        }
-        for ext in EXTENSIONS {
-            let path = HSTRING::from(format!(r"Software\Classes\{ext}\OpenWithProgids"));
-            let mut key = HKEY::default();
-            if windows::Win32::System::Registry::RegOpenKeyExW(HKEY_CURRENT_USER, &path, 0, KEY_WRITE, &mut key).is_ok() {
-                let _ = windows::Win32::System::Registry::RegDeleteValueW(key, &HSTRING::from(PROGID));
-                let _ = RegCloseKey(key);
-            }
-        }
-        let mut key = HKEY::default();
-        if windows::Win32::System::Registry::RegOpenKeyExW(HKEY_CURRENT_USER, w!(r"Software\RegisteredApplications"), 0, KEY_WRITE, &mut key)
-            .is_ok()
-        {
-            let _ = windows::Win32::System::Registry::RegDeleteValueW(key, w!("Slate"));
-            let _ = RegCloseKey(key);
         }
         if let Some(appdata) = std::env::var_os("APPDATA") {
             let _ = std::fs::remove_file(PathBuf::from(appdata).join(r"Microsoft\Windows\Start Menu\Programs\Slate.lnk"));

@@ -60,10 +60,16 @@ jobs:
           if (Test-Path $env:SLATE_TEST_LOG) { Get-Content $env:SLATE_TEST_LOG }
           if ($p.ExitCode -ne 0) { throw "The smoke test failed (exit code $($p.ExitCode))" }
 
-      - name: Install and uninstall (Slate.exe --install, as winget runs it; the runner is thrown away after)
+      - name: Install, stop opening files, uninstall (Slate.exe --install as winget runs it, --unassociate, --uninstall; the runner is thrown away after)
         shell: pwsh
         timeout-minutes: 2
         run: |
+          $classes = 'HKCU:\Software\Classes'
+          $fileExts = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts'
+          function Has($path, $name) { (Get-ItemProperty -LiteralPath $path -ErrorAction SilentlyContinue).PSObject.Properties.Name -contains $name }
+          # What 0.8.1 and older left behind: Slate registered for .bat, and chosen to open it. --install takes both back.
+          reg add 'HKCU\Software\Classes\.bat\OpenWithProgids' /v Slate.TextFile /t REG_NONE /f | Out-Null
+          reg add 'HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts\.bat\UserChoice' /v ProgId /d Slate.TextFile /f | Out-Null
           $p = Start-Process -FilePath target\release\Slate.exe -ArgumentList '--install' -Wait -PassThru -NoNewWindow
           if ($p.ExitCode -ne 0) { throw "--install failed (exit code $($p.ExitCode))" }
           $exe = Join-Path $env:LOCALAPPDATA 'Programs\Slate\Slate.exe'
@@ -73,6 +79,22 @@ jobs:
           if (!(Test-Path $exe) -or !(Test-Path $lnk)) { throw "--install didn't put Slate in place" }
           $v = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
           if ($un.DisplayVersion -ne $v) { throw "Installed apps says $($un.DisplayVersion), not $v" }
+          if (!(Has "$classes\.txt\OpenWithProgids" 'Slate.TextFile')) { throw "Slate isn't in .txt's Open with" }
+          if (Has "$classes\.bat\OpenWithProgids" 'Slate.TextFile') { throw "Slate is still registered for .bat" }
+          if (Has 'HKCU:\Software\Slate\Capabilities\FileAssociations' '.bat') { throw ".bat is in Slate's Default apps list" }
+          if (!(Has 'HKCU:\Software\Slate\Capabilities\FileAssociations' '.txt')) { throw ".txt isn't in Slate's Default apps list" }
+          if (Test-Path -LiteralPath "$fileExts\.bat\UserChoice") { throw "Slate is still chosen to open .bat files" }
+          # Help > Stop opening files with Slate (--unassociate): Open with, Edit with Slate, Default apps and a choice
+          # of Slate go; Slate stays installed.
+          reg add 'HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts\.conf\UserChoice' /v ProgId /d Slate.TextFile /f | Out-Null
+          $p = Start-Process -FilePath $exe -ArgumentList '--unassociate' -Wait -PassThru -NoNewWindow
+          if ($p.ExitCode -ne 0) { throw "--unassociate failed (exit code $($p.ExitCode))" }
+          if (Has "$classes\.txt\OpenWithProgids" 'Slate.TextFile') { throw "--unassociate left Slate in .txt's Open with" }
+          if (Test-Path -LiteralPath "$fileExts\.conf\UserChoice") { throw "--unassociate left the choice of Slate for .conf" }
+          if (Has 'HKCU:\Software\RegisteredApplications' 'Slate') { throw "--unassociate left Slate in Default apps" }
+          if (Test-Path -LiteralPath "$classes\*\shell\Slate") { throw "--unassociate left Edit with Slate" }
+          if (Test-Path -LiteralPath "$classes\Slate.TextFile") { throw "--unassociate left Slate's file type" }
+          if (!(Test-Path $lnk) -or !(Test-Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Slate')) { throw "--unassociate took Slate off the Start menu or Installed apps" }
           $p = Start-Process -FilePath $exe -ArgumentList '--uninstall', '--quiet' -Wait -PassThru -NoNewWindow
           if ($p.ExitCode -ne 0) { throw "--uninstall failed (exit code $($p.ExitCode))" }
           if (Test-Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Slate') { throw "--uninstall left the Installed apps entry" }

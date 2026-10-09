@@ -155,6 +155,23 @@ fn make_default() -> Result<usize, String> {
     Ok(done)
 }
 
+/// Help → Stop opening files with Slate…: the kinds of files Slate is the default for go back to the system's own
+/// choice (GIO forgets what `make_default` wrote to `~/.config/mimeapps.list` for them).
+fn stop_default() -> Result<usize, String> {
+    let id = format!("{APP_ID}.desktop");
+    let Some(info) = gio::AppInfo::all().into_iter().find(|i| i.id().is_some_and(|s| s == id)) else {
+        return Err("Slate isn't installed from its package (the .deb), so it isn't opening any files.".into());
+    };
+    let mut n = 0;
+    for t in info.supported_types() {
+        if gio::AppInfo::default_for_type(&t, false).and_then(|d| d.id()).is_some_and(|d| d == id) {
+            gio::AppInfo::reset_type_associations(&t);
+            n += 1;
+        }
+    }
+    Ok(n)
+}
+
 /// Whether the desktop asks for dark: GNOME's color scheme, GTK's own setting, or a dark GTK theme (Raspberry Pi
 /// OS's PiXnoir).
 fn system_dark() -> bool {
@@ -722,6 +739,7 @@ fn commands() -> Vec<(&'static str, Cmd, &'static [&'static str])> {
         ("shortcuts", Cmd::Shortcuts, &["<Control>question"]),
         ("about", Cmd::About, &[]),
         ("make-default", Cmd::MakeDefault, &[]),
+        ("stop-default", Cmd::StopDefault, &[]),
     ]
 }
 
@@ -822,7 +840,7 @@ fn menu_model() -> gio::Menu {
     format.append_submenu(Some("Language"), &lang_menu());
     bar.append_submenu(Some("F_ormat"), &format);
     let help = gio::Menu::new();
-    help.append_section(None, &section(&[("Keyboard shortcuts", "shortcuts"), ("Open files with Slate…", "make-default"), ("About Slate", "about")]));
+    help.append_section(None, &section(&[("Keyboard shortcuts", "shortcuts"), ("Open files with Slate…", "make-default"), ("Stop opening files with Slate…", "stop-default"), ("About Slate", "about")]));
     bar.append_submenu(Some("_Help"), &help);
     bar
 }
@@ -1596,6 +1614,19 @@ impl Ui {
                     },
                 );
             }
+            Ask::StopDefault => {
+                self.dialog(
+                    "Stop opening files with Slate?",
+                    "The kinds of files Slate opens when they're double-clicked go back to the system's own choice. \
+                     Slate stays installed; Help → Open files with Slate… sets it up again.",
+                    &[("Cancel", "cancel"), ("Stop", "stop")],
+                    |answer| {
+                        if let Some(ui) = get_ui() {
+                            ui.answer(Ask::StopDefault, answer);
+                        }
+                    },
+                );
+            }
             Ask::Shortcuts => {
                 self.with(|a| {
                     let i = a.add_text_tab(SHORTCUTS.as_bytes(), None, Some(Lang::Plain));
@@ -1610,6 +1641,18 @@ impl Ui {
     /// What was answered (by the user, or by a test script).
     fn answer(&self, ask: Ask, answer: &str) {
         match ask {
+            Ask::StopDefault => {
+                if answer != "stop" {
+                    return;
+                }
+                // (A test only says what it would do, like Open files with Slate…)
+                let result = if self.test.is_some() { Ok(0) } else { stop_default() };
+                self.with(|a| match result {
+                    Ok(0) => a.flash("Slate wasn't opening any kind of file by default.", false),
+                    Ok(n) => a.flash(format!("{n} kinds of files open with the system's own choice again."), false),
+                    Err(e) => a.flash(e, true),
+                });
+            }
             Ask::MakeDefault => {
                 if answer != "setup" {
                     return;

@@ -44,7 +44,9 @@ JSON file opens instantly, scrolls smoothly, and can be searched, edited, format
 - Notices when another program changes an open file; reloads it automatically when you have no unsaved changes
   (handy for log files).
 - A single small `Slate.exe` that runs from any folder. *Help → Open files with Slate…* adds it to "Open with",
-  the Start menu and the right-click menu.
+  the Start menu and the right-click menu; *Help → Stop opening files with Slate…* takes that back. Scripts that
+  Windows runs when they're double-clicked (`.bat`, `.cmd`, `.vbs`, `.js`, `.reg`, `.py`…) are left alone: open
+  them with *Edit with Slate* on the right-click menu.
 - Keeps itself up to date: at most once a day it asks GitHub for the latest release, and when there's a newer one
   an *Update* button appears in the status bar. One click downloads it, checks it against the release's checksum
   (and, from 0.8.1, that it's signed by the same publisher) and restarts Slate with your tabs (and their unsaved text) back where they were. If the new version can't start,
@@ -133,7 +135,9 @@ yourself, attaching those files if you like.
 
 ## Uninstalling
 
-If you used *Open files with Slate…*: Windows Settings → Apps → Installed apps → Slate → Uninstall. Then delete
+To keep Slate but stop it opening files when they're double-clicked: *Help → Stop opening files with Slate…*; the
+file types you set to open with Slate go back to Windows' own choice. To remove it: if you used *Open files with
+Slate…*, Windows Settings → Apps → Installed apps → Slate → Uninstall. Then delete
 Slate's folder, and `%LOCALAPPDATA%\Slate` (or the portable `data` folder) if you don't need your settings and
 unsaved text any more. Otherwise just delete `Slate.exe`.
 

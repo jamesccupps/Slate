@@ -93,6 +93,7 @@ pub enum Cmd {
     About,
     Shortcuts,
     MakeDefault,
+    StopDefault,
     OpenDataFolder,
     ReportProblem,
     CheckUpdates,
