@@ -6,8 +6,10 @@
 #   deb [signed-by=/usr/share/keyrings/slate-archive-keyring.gpg] https://jamesccupps.github.io/Slate/apt stable main
 #   packaging/linux/apt-repo.sh <dir with the .debs> <out dir>
 set -eu
-debs=$1
-out=$2
+# (absolute: the script changes folders on the way)
+debs=$(cd "$1" && pwd)
+mkdir -p "$2"
+out=$(cd "$2" && pwd)
 here=$(cd "$(dirname "$0")" && pwd)
 repo="$out/apt"
 mkdir -p "$repo/pool/main"
