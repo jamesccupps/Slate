@@ -75,13 +75,19 @@ Commits use the GitHub no-reply address (repo-local git config); GitHub refuses 
     semantics rename with `\\?\` paths, so it works while we still read the old file; then MoveFileEx, then
     ReplaceFile for a file still open on a share/FAT drive — not atomic, so last, with a backup it restores; never
     writes the target in place). Save refuses text read from a file changed in place (`Changed`) and ANSI that
-    would turn characters into "?" (`Lossy`, unless the user said so). Stale temp files of dead processes are
+    would turn characters into "?" (`Lossy`, unless the user said so); in the app also a damaged UTF-16 document
+    (`Document::bad_units`, which can't be saved back as it was) asks first. Stale temp files of dead processes are
     cleaned up. After a big save the text reads exactly the bytes written, from the file written (found by its file
     ID), never what another program put at that path next.
-  - `search.rs` — byte-regex search in windows of 8 MB, overlapping by 64 KB (at least the query's length) for plain
-    text and by 1 MiB for regexes, so their matches up to 1 MiB are found exactly as in one search of the whole text;
-    find next/prev, count all, streaming replace-all (the text between matches is copied from the window searched).
-    Regex searches of documents over 256 KB (plain text over 32 MB) run on another thread (`Matcher::sync_limit`).
+  - `search.rs` — byte-regex search in windows with an overlap after each (a match running into a window's end is
+    searched again in a bigger one): find next/prev, count all, streaming replace-all (the text between matches is
+    copied from the window searched). Plain text: 8 MB windows, the overlap at least the query's length, always
+    exact. A regex is exact in documents up to 64 MiB (one window; Find previous scans from the start); in bigger
+    ones Count all and Replace all use 64 MiB windows with 16 MiB after (exact while no match is longer than that),
+    Find next/previous 8 MB with 1 MiB. Past that, a match at a seam is missed or cut short and the matches after it
+    can be wrong. Regex searches of documents over 256 KB (plain text over 32 MB) run on another thread
+    (`Matcher::sync_limit`); a background find is dropped if the selection or text changed meanwhile, and Find
+    previous takes its match from a finished count of the same search when there is one.
   - `json.rs` — one streaming tokenizer for pretty-print / minify / validate (JSON Lines OK), errors with offsets;
     comments (JSONC) are refused with a message saying so.
   - `xml.rs` — the same for XML (well-formedness check; markup separated only by whitespace with a line break goes
@@ -101,9 +107,11 @@ Commits use the GitHub no-reply address (repo-local git config); GitHub refuses 
     tag closes the element it names (among the 1024 innermost), a stray one is ignored; in a file cut short, what's
     open ends at its end. An element scanned on its own stops where its parent's list says it ends, and a rescan
     where the list's content ends (`Children::content_end`), so malformed markup reads the same either way.
-  - `text.rs` — encoding/EOL detection (mostly-UTF-8 with a few bad bytes stays UTF-8; UTF-16 without a BOM, like
-    ANSI, only if the text converts back to exactly the file's bytes), UTF-16/ANSI codecs (ANSI = the system code
-    page, Windows-1252 under the UTF-8 code page option; single-byte code pages through tables made once from
+  - `text.rs` — encoding/EOL detection (mostly-UTF-8 with a few bad bytes stays UTF-8; UTF-16 without a BOM when
+    every other byte is mostly zero and the first 8 KiB read as UTF-16 but for at most one unit in 32; the same bytes
+    decide `io::looks_binary`, which for UTF-16 means a zero character), UTF-16/ANSI codecs (UTF-16 halves without
+    their other half and an odd last byte read as U+FFFD and are counted in `Document::bad_units`; ANSI = the system
+    code page, Windows-1252 under the UTF-8 code page option; single-byte code pages through tables made once from
     Windows' own conversions), display decoding (control chars → symbols), char classes.
   - `job.rs` — background jobs with progress/cancel, notify the UI by posting a window message.
 - `src/ui/` — the Win32 app (see the module docs at the top of each file).
