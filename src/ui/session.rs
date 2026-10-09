@@ -330,11 +330,12 @@ fn write(mut p: Plan) -> Outcome {
     }
     let mut ok = true;
     let mut written = Vec::new();
-    // A disk without room for them (and a little more) isn't written to, as for big documents: filling it up again
-    // and again would make other programs' writes fail too. (The backups there stay; closing asks.)
-    let need: u64 = p.backups.iter().map(|b| b.1.len()).sum();
-    let room = need == 0 || !crate::core::io::free_space(&p.dir).is_some_and(|free| free < need + (need / 8).max(1 << 20));
     for (name, snap, id, version) in p.backups {
+        // A copy the disk hasn't room for (and a little more) isn't written, as for big documents: filling the disk
+        // up again and again would make other programs' writes fail too. (The one there stays; closing asks.) Asked
+        // for each, so what was written before counts.
+        let need = snap.len();
+        let room = !crate::core::io::free_space(&p.dir).is_some_and(|free| free < need + (need / 8).max(1 << 20));
         if room && write_backup(&snap, &p.dir.join(&name)) {
             written.push((id, name, version));
         } else {
@@ -1866,15 +1867,22 @@ mod tests {
         let first = b.retry.unwrap().0;
         b.failed(true);
         assert!(b.waiting() && b.retry.unwrap().0 > first);
-        // nor for a copy (as if it were a small one): nothing created, and the session isn't all written
+        // nor for a copy (as if it were a small one): nothing created, and the session isn't all written; a copy
+        // that fits is written all the same
         let (f, path) = crate::core::source::create_temp_file().unwrap();
         let src = Arc::new(Source::session_file(f, huge, path, crate::core::source::IndexBuilder::new().finish()));
         let mut doc = Document::from_buffer(Buffer::from_source(src, 0));
-        let backups = vec![("tab-full.txt".to_string(), doc.snapshot(), 1, doc.version)];
+        let mut small = Document::from_text(b"a few words");
+        let backups = vec![
+            ("tab-full.txt".to_string(), doc.snapshot(), 1, doc.version),
+            ("tab-small.txt".to_string(), small.snapshot(), 2, small.version),
+        ];
         let p = Plan { dir: dir.clone(), session: Session::default(), backups, big: Vec::new(), keep: Vec::new(), pending: false };
         let out = write(p);
-        assert!(!out.ok && out.written.is_empty());
+        assert!(!out.ok);
+        assert_eq!(out.written, [(2, "tab-small.txt".to_string(), small.version)]);
         assert!(!dir.join("tab-full.txt").exists() && !dir.join("tab-full.tmp").exists());
+        assert_eq!(fs::read(dir.join("tab-small.txt")).unwrap(), b"a few words");
         let _ = fs::remove_dir_all(&dir);
     }
 
