@@ -47,6 +47,15 @@ comment puts the `C` after each line's number. Prompts follow dark mode. Details
 Seven more languages: Dart, Scala, Objective-C and Objective-C++, G-code, Inno Setup (with Pascal Script in its
 `[Code]` section) and NSIS, none slower than C. Details in the [0.6.0 release notes](release-notes-0.6.0.md).
 
+## 0.7.0: speed and polish
+
+The second audit, in five parts (the engine; colors; the text view; the window around it; starting, the session and
+updates), weighted to speed and polish. Text is drawn by Slate's own renderer, only what's in view: long lines
+packed with colors draw 10 to 100 times faster, and memory stays low while paging through huge ones. Coloring code is
+about twice as fast, ANSI and UTF-16 files open several times faster. Search finds regex matches across its steps
+exactly, and runs regexes in the background. Crisp lines at 125% and 150%, tooltips, pressed states, a scrollbar in
+the structure panel, a hanging indent with word wrap. Details in the [0.7.0 release notes](release-notes-0.7.0.md).
+
 ## Next
 
 1. **Accessibility: UI Automation (L).** The high-contrast theme (Windows' colors, read again when they change) and a
@@ -105,15 +114,30 @@ Seven more languages: Dart, Scala, Objective-C and Objective-C++, G-code, Inno S
 - More code pages: Shift-JIS, GBK, Windows-125x, ISO-8859-x (M).
 - Save as administrator through an elevated helper (M). An ARM64 build next to the x64 one (M; `Slate.exe` stays
   x64, since every installed Slate downloads that name).
-- Drawing: a long line packed with colors (minified XML, ~2,700 tags per 8 KiB) costs 70–130 ms per caret move, against
-  ~17 ms as plain text: lay out, color and hit-test only the part of a segment that's in view (M).
+- Drawing (what the 0.7.0 audit measured and left): with word wrap off, Page Down in a huge colored line takes
+  ~70 ms, most of it laying out 32 new 8 KiB segments (smaller segments without wrap, or laying out only the columns
+  in view) (M); Ctrl+End in a 30 MB code file takes ~250 ms on the UI thread, as the coloring index lexes the whole
+  file (a faster states-only path in `code.rs`, or catching up over several frames with guessed colors) (S–M); the
+  caret blink presents the whole window (FLIP_SEQUENTIAL with `Present1` dirty rects), up to three frames can queue
+  while scrolling (`SetMaximumFrameLatency(1)`), and ClearType is used even when the user turned it off — each needs
+  checking on a real screen (S each); while a big file's lines are counted, the line numbers' width is a guess, so
+  the text moves once they're counted (S); emoji cost ~0.5 ms each to draw (a glyph cache) (M).
+- The path bar and structure panel scan a big JSON file again after each edit (in the background, ~1.5 s for
+  800 MB): wait for typing to pause, or keep the lists for edits that don't change the structure (S–M). Line tools
+  on a selection run on the UI thread (sorting 16 MB takes ~0.2 s): run them like the whole document's (S).
 - Engine: a piece tree with O(log n) lookups for documents with hundreds of thousands of edits (M); regex matches
-  longer than 64 KiB that cross a search window (M); UTF-16 files with unpaired surrogates kept byte-exact (S);
+  longer than 1 MiB that cross a search window (M); UTF-16 files with unpaired surrogates kept byte-exact (S);
   saving where Slate can't create files, and keeping hard links (S–M); trimming what undo history keeps alive (S);
   Home/End on a big file whose lines are still being counted shouldn't read far (S).
 - Colors: a misdetected heredoc should end sooner than at its end word; exact states for lexers with look-ahead at
   the 8 KiB cuts of very long lines; VB ` _` continued comments, AutoHotkey continuation sections, R raw strings, C#
-  holes inside nested interpolated strings (S each). XML panel rows could show their `[n]` (S).
+  holes inside nested interpolated strings, quotes inside Swift `\(…)` and Kotlin `${…}` holes, CSS
+  `(min-width:768px)` without a space, C# members with capitals taken for types (S each). PHP, Lua, Ruby, Perl, R,
+  Dart, Scala, PowerShell and shell scripts color at 15–25 cycles a byte: a fast path like the C family's (S each).
+  XML panel rows could show their `[n]` (S).
+- Window: the title's text dimmed while the window isn't active; the dark title bar on Windows 10 before 20H1; the
+  structure panel by keyboard; tooltips for cut-short path bar parts and notices; dragging a tab scrolling a full
+  tab strip (S each).
 - Sort lines: `1.10` after `1.9` when the lines look like versions; `ß` as `ss` (S).
 - Line tools keep mixed line endings instead of using the most common one (S). Indenting or commenting a selection
   whose last line ends in a lone CR treats it like the other lines (S).
@@ -121,7 +145,8 @@ Seven more languages: Dart, Scala, Objective-C and Objective-C++, G-code, Inno S
   undone if it fails), and a setting a newer version wrote that this one can't read should survive this one saving
   (it matters when an update is undone) (S each).
 - Restart after Windows restarts for an update, with the tabs back, as Notepad does (`RegisterApplicationRestart`)
-  (S).
+  (S). A new version that hangs while starting should be undone like one that fails (S). A cap on `crash.log`'s size
+  (S). A file handed to a Slate that answers too late (after 10 s) opens in both windows (S).
 - Size: of the 3.4 MB, regex's Unicode tables are 380 KB. Without the age, boolean-property and break tables
   (`\p{Age=…}`, `\p{Alphabetic}`, `\p{Emoji}`, grapheme/word/sentence break classes) it's 155 KB smaller; without
   general categories and scripts too (`\p{L}`, `\p{Greek}`), 240 KB. Case-insensitive search in every language and

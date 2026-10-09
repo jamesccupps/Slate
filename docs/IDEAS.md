@@ -20,3 +20,5 @@ sizes of everything that's coming.
 - PPCL (Siemens APOGEE and Desigo): colored much as Desigo shows it, simple mistakes in red, its exports recognized,
   Toggle comment after the line numbers; prompts in dark mode (0.5.0).
 - Dart, Scala, Objective-C(++), G-code, Inno Setup and NSIS (0.6.0).
+- The speed and polish audit (0.7.0): Slate's own text renderer drawing only what's in view, faster coloring,
+  ANSI/UTF-16 and search, crisp lines, tooltips, a hanging indent with word wrap.
