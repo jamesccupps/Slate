@@ -274,8 +274,10 @@ Commits use the GitHub no-reply address (repo-local git config); GitHub refuses 
 - Panics in message handling are caught, logged to `crash.log` in the data folder, the session is saved and a
   message shown. A panic while painting is only logged (showing a message would paint, and fail, again). A panic in
   a background job comes back as that job's failure (`job::Failure`), never as a job that runs forever.
-- The keyboard focus is read with `GetFocus()` when painting, not tracked from WM_SETFOCUS (which can't reach the
-  App while it is borrowed).
+- The keyboard focus is read with `win::focus()` when painting, not tracked from WM_SETFOCUS (which can't reach the
+  App while it is borrowed). Always `win::set_focus` / `win::focus`, never SetFocus / GetFocus: in test mode the focus
+  is only noted, and nothing activates the hidden window (`SWP_NOACTIVATE`, a CBT hook refusing activation), so a
+  test never takes the keyboard from the user's own windows.
 
 ## Testing
 
