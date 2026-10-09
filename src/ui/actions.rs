@@ -54,6 +54,8 @@ pub const TIMER_UPDATE: usize = 7;
 pub const TIMER_FLASH: usize = 8;
 /// The typing has paused: count the words of a bigger document again (see `App::doc_counts_now`).
 pub const TIMER_COUNT: usize = 9;
+/// The mouse has rested on a part with a tooltip: show it.
+pub const TIMER_TIP: usize = 10;
 
 /// Documents up to this size are searched on the UI thread (fast enough to feel instant).
 const SYNC_SEARCH: u64 = 32 << 20;
@@ -1986,6 +1988,7 @@ impl App {
 
     /// Key presses in the text area. Returns whether the key was used.
     pub fn on_key(&mut self, vk: u16) -> bool {
+        self.hide_tip();
         let m = mods();
         if let Some(used) = self.menu_bar_key(vk, &m) {
             return used;
@@ -2539,6 +2542,7 @@ impl App {
 
     /// Keys typed in the find bar's edit boxes. Returns true if handled (the edit box doesn't see it).
     pub fn bar_key(&mut self, edit: HWND, vk: u16) -> bool {
+        self.hide_tip();
         let m = mods();
         if let Some(used) = self.menu_bar_key(vk, &m) {
             return used;
@@ -2564,14 +2568,21 @@ impl App {
                 true
             }
             VK_TAB if !m.ctrl => {
-                if self.find.mode == BarMode::Replace {
-                    let next = if edit == self.find.find_edit { self.find.replace_edit } else { self.find.find_edit };
-                    FindBar::focus(next);
-                    FindBar::select_all(next);
-                } else {
-                    unsafe {
-                        let _ = SetFocus(self.hwnd);
+                // In order: the find box, the replace box (when it shows), then the text; Shift+Tab goes back.
+                let (find, replace) = (self.find.find_edit, self.find.replace_edit);
+                let next = match (self.find.mode, m.shift) {
+                    (BarMode::Replace, false) if edit == find => Some(replace),
+                    (BarMode::Replace, true) if edit == replace => Some(find),
+                    _ => None,
+                };
+                match next {
+                    Some(h) => {
+                        FindBar::focus(h);
+                        FindBar::select_all(h);
                     }
+                    None => unsafe {
+                        let _ = SetFocus(self.hwnd);
+                    },
                 }
                 self.invalidate();
                 true
@@ -2603,6 +2614,7 @@ impl App {
 
     pub fn on_mouse_down(&mut self, x: f32, y: f32, button: u8) {
         self.disarm_menu_bar();
+        self.hide_tip();
         let hit = self.hit(x, y);
         self.down = hit;
         let capture = |h: HWND| unsafe {
@@ -2788,7 +2800,38 @@ impl App {
         if h != self.hover {
             self.hover = h;
             self.invalidate();
+            self.tip_follow();
         }
+    }
+
+    // ---- tooltips ----
+
+    /// The mouse went onto another part: its tooltip shows after a moment (soon after another one went).
+    fn tip_follow(&mut self) {
+        self.hide_tip();
+        if self.tip_text(self.hover).is_some() {
+            let wait = unsafe { GetDoubleClickTime() }.clamp(100, 2000);
+            let soon = self.tip_gone.is_some_and(|t| t.elapsed() < Duration::from_millis(wait as u64));
+            self.timer(TIMER_TIP, if soon { wait / 5 } else { wait });
+        }
+    }
+
+    pub fn hide_tip(&mut self) {
+        self.kill_timer(TIMER_TIP);
+        if self.tip.text.is_some() {
+            self.tip.hide();
+            self.tip_gone = Some(Instant::now());
+        }
+    }
+
+    /// Shows the tooltip of what the mouse rests on: under it, or over it in the status bar.
+    fn show_tip(&mut self) {
+        self.kill_timer(TIMER_TIP);
+        let (Some(text), Some(r)) = (self.tip_text(self.hover), self.hit_rect(self.hover)) else { return };
+        let tl = client_to_screen(self.hwnd, self.dip_to_px(r.x), self.dip_to_px(r.y));
+        let br = client_to_screen(self.hwnd, self.dip_to_px(r.right()), self.dip_to_px(r.bottom()));
+        let r = windows::Win32::Foundation::RECT { left: tl.x, top: tl.y, right: br.x, bottom: br.y };
+        self.tip.show(&text, r, matches!(self.hover, Hit::Status(_)));
     }
 
     fn drag_to(&mut self, drag: DragMode, x: f32, y: f32) {
@@ -2893,6 +2936,7 @@ impl App {
 
     pub fn on_mouse_leave(&mut self) {
         self.mouse_tracking = false;
+        self.hide_tip();
         if self.hover != Hit::None {
             self.hover = Hit::None;
             self.invalidate();
@@ -2900,6 +2944,7 @@ impl App {
     }
 
     pub fn on_wheel(&mut self, delta: i32, horizontal: bool, x: f32, y: f32) {
+        self.hide_tip();
         let m = mods();
         if m.ctrl && !horizontal {
             // One zoom step per notch (120); a touchpad's pinch sends many small steps, which add up.
@@ -2977,6 +3022,7 @@ impl App {
                 self.kill_timer(id);
                 self.invalidate();
             }
+            TIMER_TIP => self.show_tip(),
             TIMER_JOBS => self.poll_jobs(),
             TIMER_DISK => {
                 self.check_disk();
@@ -3637,7 +3683,7 @@ impl App {
                     recent.push(enabled(Cmd::ClearRecent, "No recent files", "", false));
                 } else {
                     recent.push(Item::Sep);
-                    recent.push(item(Cmd::ClearRecent, "Clear list", ""));
+                    recent.push(item(Cmd::ClearRecent, "&Clear list", ""));
                 }
                 vec![
                     item(Cmd::NewTab, "&New tab", "Ctrl+N"),
@@ -4117,6 +4163,10 @@ fn show_menu_bar(cell: &Cell, mut idx: usize) {
         }
         if let Some(cmd) = chosen {
             run_cmd(cell, cmd);
+        } else if unsafe { GetKeyState(VK_ESCAPE.0 as i32) } < 0 {
+            // Esc closed it: the menu bar keeps the keyboard, as in Windows' own menus (Esc again lets go).
+            cell.borrow_mut().menu_armed = Some(idx);
+            cell.borrow().invalidate();
         }
         break;
     }
@@ -4213,7 +4263,7 @@ pub fn run(cell: &Cell, d: Deferred) {
                 "You have {}. Slate downloads the new version from GitHub and restarts; your tabs and unsaved changes come back.",
                 Version::current()
             );
-            match win::ask(hwnd, "Slate", &q, &detail, &["Update and restart", "What's new", "Not now"]) {
+            match win::ask(hwnd, "Slate", &q, &detail, &["&Update and restart", "&What's new", "&Not now"]) {
                 Some(0) => cell.borrow_mut().start_update(rel),
                 Some(1) => update::show_page(&rel),
                 _ => {}
@@ -4433,7 +4483,7 @@ fn ask_lossy(cell: &Cell, id: u64) {
         "In {} they would become \"?\". UTF-8 keeps every character, and nearly every program reads it.",
         Encoding::Ansi.label()
     );
-    let choice = win::ask(hwnd, "Slate", &q, &detail, &["Save as UTF-8", "Save as ANSI anyway", "Cancel"]);
+    let choice = win::ask(hwnd, "Slate", &q, &detail, &["Save as &UTF-8", "Save as &ANSI anyway", "Cancel"]);
     // The dialog let other things happen (tabs can close or move meanwhile): find the tab again.
     let Some(i) = tab_index(cell, id) else { return };
     match choice {

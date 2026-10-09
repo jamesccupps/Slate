@@ -499,7 +499,7 @@ impl Structure {
     pub fn paint_path(&mut self, g: &Gfx, t: &Theme, ui: &windows::Win32::Graphics::DirectWrite::IDWriteTextFormat, r: Rect, hover: Option<usize>, toggle_hover: bool, panel_open: bool, icons: &windows::Win32::Graphics::DirectWrite::IDWriteTextFormat) {
         self.path_rects.clear();
         g.fill(r, t.surface);
-        g.line(r.x, r.bottom() - 0.5, r.right(), r.bottom() - 0.5, t.border, 1.0);
+        g.hline(r.x, r.right(), r.bottom(), true, t.border);
         let toggle = toggle_rect(r);
         if toggle_hover || panel_open {
             g.fill_round(toggle, 4.0, if panel_open { t.pressed } else { t.hover });
@@ -568,7 +568,7 @@ impl Structure {
         close_hover: bool,
     ) {
         g.fill(r, t.surface);
-        g.line(r.x + 0.5, r.y, r.x + 0.5, r.bottom(), t.border, 1.0);
+        g.vline(r.x, r.y, r.bottom(), false, t.border);
         let head = Rect::new(r.x, r.y, r.w, HEADER_H);
         g.text("Structure", bold, Rect::new(r.x + 14.0, r.y, r.w - 60.0, HEADER_H), t.text, Align::Left);
         if let Some(p) = self.progress().filter(|_| !self.rows.is_empty()) {
@@ -580,7 +580,7 @@ impl Structure {
             g.fill_round(close, 4.0, t.hover);
         }
         g.text("\u{E711}", icons, close, t.text_dim, Align::Center);
-        g.line(r.x, head.bottom() - 0.5, r.right(), head.bottom() - 0.5, t.border, 1.0);
+        g.hline(r.x, r.right(), head.bottom(), true, t.border);
         let body = body_rect(r);
         g.push_clip(body);
         if let Some(p) = self.progress() {
@@ -603,9 +603,9 @@ impl Structure {
             let y = body.y + k as f32 * ROW_H - self.scroll;
             let rr = Rect::new(body.x, y, body.w, ROW_H);
             if self.selected == Some(row.key) {
-                g.fill(rr, t.selection_inactive);
+                g.fill(g.snap_rect(rr), t.selection_inactive);
             } else if hover_row == Some(k) {
-                g.fill(rr, t.hover);
+                g.fill(g.snap_rect(rr), t.hover);
             }
             let x0 = body.x + 8.0 + row.depth as f32 * 14.0;
             if row.expandable {

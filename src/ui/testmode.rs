@@ -5,7 +5,8 @@
 //! With `SLATE_TEST_VISIBLE=1` the window is shown instead (on top, without taking the keyboard focus), it draws
 //! through the real swap chain, and `shot` captures what is actually on screen, native edit boxes included.
 //!
-//! Commands: `size:1200x800`, `theme:dark|light`, `open:<path>`, `type:<text>` (`\n`, `\r` and `\t` allowed),
+//! Commands: `size:1200x800`, `dpi:144` (as if the window moved to a monitor at that DPI: WM_DPICHANGED),
+//! `theme:dark|light`, `open:<path>`, `type:<text>` (`\n`, `\r` and `\t` allowed),
 //! `key:<combo>` (e.g. `ctrl+shift+k`, `enter`, `pagedown`, `apps`), `cmd:<Name>` (a menu command, e.g. `JsonFormat`),
 //! `find:<text>`, `replace:<text>`, `goto:<line>`, `saveas:<path>`, `click:<x>,<y>`, `dblclick:<x>,<y>`,
 //! `wheel:<rows>`, `wait:<ms>`, `jobs` (wait for background work), `checkdisk` (look for files changed on disk,
@@ -25,7 +26,8 @@
 //! (each menu item's access key), `scrollx`, `zoom`, `topline`, `drag`, `wintitle`, `tabnames`, `indent`, `theme`
 //! (light, dark or high contrast), `syscaret` (whether the hidden system caret is where the caret is: `follows`),
 //! `statusbar` (all its texts), `closed` (tabs Reopen closed tab would bring back), `tablist` (the list of all
-//! tabs, or `hidden` while they all fit), `bracket` (the bracket pair at the caret), `overtype`.
+//! tabs, or `hidden` while they all fit), `bracket` (the bracket pair at the caret), `overtype`, `tip` (the tooltip
+//! showing: `hover:` a part, then `timer:10`).
 //! `contrast:on|off|system` pretends Windows' high contrast is on or off (and tells the window it changed).
 //!
 //! Also: `args:<path>` (open it as if named on the command line: a missing file becomes a new one), `lang:<name>`
@@ -34,8 +36,8 @@
 //! `persist` (write settings and the session; only with `SLATE_DATA_DIR` set, never into the real data folder),
 //! `session:save|soon|restore` (write the session now / on another thread as the timer does / restore it), `guest`
 //! (as if another Slate was running but didn't answer: nothing is kept for next time), `crash` (a native crash, to
-//! try the minidump; the run ends there), `prompt:<file.png>|save|update|info` (draws that prompt into a PNG, in the
-//! theme's colors, without showing it).
+//! try the minidump; the run ends there), `prompt:<file.png>|save|update|info|tall` (draws that prompt into a PNG, in
+//! the theme's colors, without showing it; `tall` has more text than a screen holds).
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -279,6 +281,7 @@ fn prompt_shot(owner: HWND, path: &Path, kind: &str) -> Result<(), String> {
         GW_CHILD, GW_HWNDNEXT, GetClientRect, GetWindow, GetWindowRect, PRF_CLIENT, PRF_ERASEBKGND, PRF_NONCLIENT,
         SendMessageW, WM_PRINT,
     };
+    let tall: String = (1..=120).map(|i| format!("Line {i} of a message that doesn't fit on the screen.\n")).collect();
     let (title, main, detail, buttons): (&str, &str, &str, &[&str]) = match kind {
         "info" => ("About Slate", "", "Slate 0.5.0\n\nA fast, simple text editor that opens files of any size. MIT license.", &["OK"]),
         "update" => (
@@ -287,6 +290,8 @@ fn prompt_shot(owner: HWND, path: &Path, kind: &str) -> Result<(), String> {
             "You have 0.4.0. Slate downloads the new version from GitHub and restarts; your tabs and unsaved changes come back.",
             &["Update and restart", "What's new", "Not now"],
         ),
+        // more text than a screen holds
+        "tall" => ("Slate", "A very long message", &tall, &["&Save", "Do&n't save", "Cancel"]),
         _ => ("Slate", "Do you want to save changes to notes.txt?", "", &["&Save", "Do&n't save", "Cancel"]),
     };
     let mut result = Err("the prompt wasn't made".to_string());
@@ -467,6 +472,7 @@ fn describe(cell: &Cell, what: &str) -> String {
             }
         }
         "overtype" => a.overtype.to_string(),
+        "tip" => a.tip.text.clone().unwrap_or_default(),
         k if k.starts_with("keys") => {
             // keys0 … keys4: each item's access key (the letter after '&'; '?' for none), submenus in brackets
             fn keys(items: &[super::commands::Item]) -> String {
@@ -585,6 +591,26 @@ pub fn run(args: &[String]) -> i32 {
                     if !visible {
                         let _ = offscreen(&cell);
                     }
+                }
+            }
+            "dpi" => {
+                // As if the window moved to a monitor at this DPI: WM_DPICHANGED with the rect Windows suggests (the
+                // same size in DIPs).
+                use windows::Win32::Foundation::{LPARAM, RECT, WPARAM};
+                use windows::Win32::UI::WindowsAndMessaging::{GetWindowRect, SendMessageW, WM_DPICHANGED};
+                let new: u32 = arg.parse().unwrap_or(96).clamp(96, 480);
+                let old = cell.borrow().dpi.max(1);
+                super::win::FORCED_DPI.with(|d| d.set(Some(new)));
+                let mut r = RECT::default();
+                unsafe {
+                    let _ = GetWindowRect(hwnd, &mut r);
+                }
+                let scale = |v: i32| (v as i64 * new as i64 / old as i64) as i32;
+                let r = RECT { right: r.left + scale(r.right - r.left), bottom: r.top + scale(r.bottom - r.top), ..r };
+                let (wp, lp) = (WPARAM((new | new << 16) as usize), LPARAM(&r as *const RECT as isize));
+                unsafe { SendMessageW(hwnd, WM_DPICHANGED, wp, lp) };
+                if !visible {
+                    let _ = offscreen(&cell);
                 }
             }
             "theme" => {

@@ -237,9 +237,16 @@ impl FindBar {
         let pad = 8.0;
         let btn = 28.0;
         let box_h = 28.0;
+        // (the window's DPI, which the boxes are styled for: the render target's catches up at the next paint)
+        let dpi = self.font_dpi.max(96) as f32;
+        let snap = |v: f32| super::gfx::snap(v, dpi);
+        // the boxes' edges on device pixels, so their borders are crisp
+        let snap_box = |b: Rect| {
+            let (x, y) = (snap(b.x), snap(b.y));
+            Rect::new(x, y, snap(b.right()) - x, snap(b.bottom()) - y)
+        };
         let y = r.y + (row_h - box_h) / 2.0;
         let mut x = r.x + pad;
-        let dpi = gfx.dpi;
         let place = |h: HWND, b: Rect| unsafe {
             let k = dpi / 96.0;
             let eh = (20.0 * k).round();
@@ -262,7 +269,7 @@ impl FindBar {
             let (lw, _) = gfx.measure("Go to line", ui);
             x += lw + 12.0;
             let box_w = 260f32.min(close.x - 8.0 - 52.0 - 8.0 - x).max(80.0);
-            let b = Rect::new(x, y, box_w, box_h);
+            let b = snap_box(Rect::new(x, y, box_w, box_h));
             self.inputs.push((self.goto_edit, b));
             place(self.goto_edit, Rect::new(b.x + 4.0, b.y, b.w - 8.0, b.h));
             show(self.goto_edit, true);
@@ -280,7 +287,7 @@ impl FindBar {
         let room = (close.x - 8.0 - (2.0 * btn + 2.0) - 14.0 - x).max(0.0);
         self.status_w = 124f32.min(room - 140.0).max(0.0);
         let box_w = (r.w * 0.42).clamp(220.0, 460.0).min(room - self.status_w).max(120.0);
-        let b = Rect::new(x, y, box_w, box_h);
+        let b = snap_box(Rect::new(x, y, box_w, box_h));
         self.inputs.push((self.find_edit, b));
         // Toggles sit inside the box on the right.
         let tw = 26.0;
@@ -297,14 +304,16 @@ impl FindBar {
         self.parts.push((Part::Close, close));
         if self.mode == Mode::Replace {
             let y2 = y + row_h - 6.0;
-            let b2 = Rect::new(b.x, y2, box_w, box_h);
+            let b2 = snap_box(Rect::new(b.x, y2, box_w, box_h));
             self.inputs.push((self.replace_edit, b2));
             place(self.replace_edit, Rect::new(b2.x + 4.0, b2.y, b2.w - 8.0, b2.h));
             show(self.replace_edit, true);
             let (w1, _) = gfx.measure("Replace", ui);
             let (w2, _) = gfx.measure("Replace all", ui);
-            self.parts.push((Part::ReplaceOne, Rect::new(b2.right() + 8.0, y2, w1 + 20.0, box_h)));
-            self.parts.push((Part::ReplaceAll, Rect::new(b2.right() + 8.0 + w1 + 24.0, y2, w2 + 20.0, box_h)));
+            let one = snap_box(Rect::new(b2.right() + 8.0, y2, w1 + 20.0, box_h));
+            self.parts.push((Part::ReplaceOne, one));
+            let all = snap_box(Rect::new(b2.right() + 8.0 + w1 + 24.0, y2, w2 + 20.0, box_h));
+            self.parts.push((Part::ReplaceAll, all));
         } else {
             show(self.replace_edit, false);
         }
@@ -323,17 +332,20 @@ impl FindBar {
         ui: &windows::Win32::Graphics::DirectWrite::IDWriteTextFormat,
         icons: &windows::Win32::Graphics::DirectWrite::IDWriteTextFormat,
         hover: Option<Part>,
+        pressed: bool,
         focused_edit: Option<HWND>,
     ) {
         if !self.open {
             return;
         }
         g.fill(r, t.surface);
-        g.line(r.x, r.bottom() - 0.5, r.right(), r.bottom() - 0.5, t.border, 1.0);
+        g.hline(r.x, r.right(), r.bottom(), true, t.border);
+        // (borders a whole number of pixels thick, on the boxes' pixel edges: crisp at any scale)
+        let hair = g.hair();
         for (h, b) in &self.inputs {
             g.fill_round(*b, 4.0, t.input_bg);
             let focused = focused_edit == Some(*h);
-            g.stroke_round(*b, 4.0, if focused { t.accent } else { t.border }, if focused { 1.5 } else { 1.0 });
+            g.stroke_round(*b, 4.0, if focused { t.accent } else { t.border }, if focused { 2.0 * hair } else { hair });
         }
         if self.mode == Mode::GoTo {
             let (lw, _) = g.measure("Go to line", ui);
@@ -352,9 +364,9 @@ impl FindBar {
             };
             if on {
                 g.fill_round(*b, 4.0, t.pressed);
-                g.stroke_round(*b, 4.0, t.accent, 1.0);
+                g.stroke_round(*b, 4.0, t.accent, hair);
             } else if hover == Some(*p) {
-                g.fill_round(*b, 4.0, t.hover);
+                g.fill_round(*b, 4.0, if pressed { t.pressed } else { t.hover });
             }
             let color = if on { t.text } else { t.text_dim };
             match p {
@@ -366,22 +378,25 @@ impl FindBar {
                 Part::Word => {
                     g.text("ab", ui, *b, color, Align::Center);
                     let cx = b.x + b.w / 2.0;
-                    g.line(cx - 7.0, b.bottom() - 6.0, cx + 7.0, b.bottom() - 6.0, color, 1.0);
+                    g.hline(cx - 7.0, cx + 7.0, b.bottom() - 6.0, true, color);
                 }
                 Part::Regex => g.text(".*", ui, *b, color, Align::Center),
                 Part::Prev => g.text("\u{E70E}", icons, *b, t.text_dim, Align::Center),
                 Part::Next => g.text("\u{E70D}", icons, *b, t.text_dim, Align::Center),
                 Part::Close => g.text("\u{E711}", icons, *b, t.text_dim, Align::Center),
                 Part::ReplaceOne => {
-                    g.stroke_round(*b, 4.0, t.border, 1.0);
+                    g.stroke_round(*b, 4.0, t.border, hair);
                     g.text("Replace", ui, *b, t.text, Align::Center);
                 }
                 Part::ReplaceAll => {
-                    g.stroke_round(*b, 4.0, t.border, 1.0);
+                    g.stroke_round(*b, 4.0, t.border, hair);
                     g.text("Replace all", ui, *b, t.text, Align::Center);
                 }
                 Part::Go => {
                     g.fill_round(*b, 4.0, t.accent);
+                    if hover == Some(*p) {
+                        g.fill_round(*b, 4.0, if pressed { t.pressed } else { t.hover });
+                    }
                     g.text("Go", ui, *b, t.on_accent, Align::Center);
                 }
             }
