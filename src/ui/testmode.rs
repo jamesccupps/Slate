@@ -20,8 +20,8 @@
 //! Lower level: `down:<x>,<y>` / `move:<x>,<y>` / `up:<x>,<y>` (left button, for drags; also where drag scrolling
 //! sees the pointer; `down:<x>,<y>,right` or `,middle` for the others), `leave` (WM_MOUSELEAVE), `wheelraw:<delta>`
 //! or `wheelraw:ctrl,<delta>` (one WM_MOUSEWHEEL; touchpads send small deltas), `char:<hex>[,<hex>…]` (WM_CHAR
-//! through the window procedure, e.g. `char:d83d,de00`), `altkey` (Alt
-//! pressed and released alone: WM_SYSCOMMAND SC_KEYMENU), `altgr:on|off` (pretend Ctrl+Alt+letter types a
+//! through the window procedure, e.g. `char:d83d,de00`), `ime` (WM_IME_COMPOSITION, as typing in an IME), `altkey`
+//! (Alt pressed and released alone: WM_SYSCOMMAND SC_KEYMENU), `altgr:on|off` (pretend Ctrl+Alt+letter types a
 //! character, like AltGr on a Polish keyboard), `activate` / `deactivate` (WM_ACTIVATE), `cancelmode`
 //! (WM_CANCELMODE: something took the mouse capture), `timer:<id>` (run a timer's tick now; 3 = disk check, 4 = drag
 //! scrolling). More `print:` values: `focus` (main, find, replace, goto), `armed` (menu bar title with the
@@ -1021,6 +1021,10 @@ pub fn run(args: &[String]) -> i32 {
                     let v = u16::from_str_radix(c.trim(), 16).unwrap_or(0);
                     unsafe { SendMessageW(hwnd, WM_CHAR, WPARAM(v as usize), LPARAM(0)) };
                 }
+            }
+            "ime" => {
+                use windows::Win32::UI::WindowsAndMessaging::{SendMessageW, WM_IME_COMPOSITION};
+                unsafe { SendMessageW(hwnd, WM_IME_COMPOSITION, WPARAM(0), LPARAM(0)) };
             }
             "altkey" => {
                 use windows::Win32::Foundation::{LPARAM, WPARAM};

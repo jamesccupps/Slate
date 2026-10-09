@@ -428,6 +428,7 @@ fn handle(cell: &Cell, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<L
                 }
                 // (Focus moved by code that has the App borrowed: at least start blinking.)
                 Err(_) => unsafe {
+                    actions::caret_moved();
                     let blink = GetCaretBlinkTime();
                     if blink != 0 && blink != u32::MAX {
                         SetTimer(hwnd, actions::TIMER_CARET, blink.clamp(200, 2000), None);
@@ -603,6 +604,7 @@ fn handle(cell: &Cell, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<L
         }
         WM_IME_STARTCOMPOSITION => {
             if let Ok(mut a) = cell.try_borrow_mut() {
+                a.wake_caret();
                 let p = a.with_view(|v, cx| v.caret_point(cx));
                 if let Some((x, y)) = p {
                     let (px, py) = (a.dip_to_px(x), a.dip_to_px(y));
@@ -619,6 +621,13 @@ fn handle(cell: &Cell, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<L
                         let _ = ImmReleaseContext(hwnd, himc);
                     }
                 }
+            }
+            None
+        }
+        WM_IME_COMPOSITION | WM_IME_ENDCOMPOSITION => {
+            // (typing in the IME: the caret blinks again, as for any key)
+            if let Ok(mut a) = cell.try_borrow_mut() {
+                a.wake_caret();
             }
             None
         }

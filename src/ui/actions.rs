@@ -264,7 +264,7 @@ impl App {
 
     pub fn restart_caret(&mut self) {
         self.caret_on = true;
-        self.caret_since = Instant::now();
+        caret_moved();
         unsafe {
             let blink = GetCaretBlinkTime();
             // Blinking turned off in Windows' settings (INFINITE), or the keyboard is elsewhere: a steady caret and no
@@ -274,6 +274,16 @@ impl App {
             } else {
                 SetTimer(self.hwnd, TIMER_CARET, blink.clamp(200, 2000), None);
             }
+        }
+    }
+
+    /// A key or the IME in the text, also one that moves nothing (Ctrl+C, Ctrl+Up): the caret shows, and blinks again
+    /// if it had stopped.
+    pub fn wake_caret(&mut self) {
+        let shown = self.caret_on;
+        self.restart_caret();
+        if !shown {
+            self.invalidate();
         }
     }
 
@@ -2010,6 +2020,7 @@ impl App {
     /// Key presses in the text area. Returns whether the key was used.
     pub fn on_key(&mut self, vk: u16) -> bool {
         self.hide_tip();
+        self.wake_caret();
         let m = mods();
         if let Some(used) = self.menu_bar_key(vk, &m) {
             return used;
@@ -2626,6 +2637,7 @@ impl App {
                     FindBar::select_all(next);
                 } else {
                     win::set_focus(self.hwnd);
+                    self.restart_caret();
                 }
                 self.invalidate();
                 true
@@ -3100,7 +3112,7 @@ impl App {
             TIMER_CARET => {
                 // Like Windows' own caret, it stops blinking (shown) a while after the last key or click, so a window
                 // left alone doesn't keep repainting for it.
-                if self.caret_since.elapsed() >= caret_timeout() {
+                if CARET_SINCE.with(|c| c.get()).is_some_and(|t| t.elapsed() >= caret_timeout()) {
                     self.kill_timer(TIMER_CARET);
                     if !self.caret_on {
                         self.caret_on = true;
@@ -4028,6 +4040,17 @@ impl App {
 const LINES_MAX: u64 = 512 << 20;
 /// Selections up to this size can have their lines or letter case changed right away.
 const SELECTION_MAX: u64 = 16 << 20;
+
+thread_local! {
+    /// When the caret last moved, or a key or the IME was used in the text: it stops blinking a while after.
+    static CARET_SINCE: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+}
+
+/// The caret moved, or a key or the IME was used in the text, now: it blinks for a while again (also where the App
+/// is borrowed: a focus coming back while it is).
+pub fn caret_moved() {
+    CARET_SINCE.with(|c| c.set(Some(Instant::now())));
+}
 
 /// How long the caret blinks after it last moved: Windows' setting (SPI_GETCARETTIMEOUT), 5 s unless changed.
 fn caret_timeout() -> Duration {
