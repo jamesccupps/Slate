@@ -1004,6 +1004,14 @@ fn find(t: &[u8], from: usize, pat: &[u8]) -> Option<usize> {
 /// (end, closed, escape pending at the end).
 fn scan_str(t: &[u8], mut i: usize, quote: u8, esc: u8, mut esc_pending: bool, one_line: bool) -> (usize, bool, bool) {
     while i < t.len() {
+        if !esc_pending {
+            // (only the quote, the escape character and a line break matter)
+            let next = if esc != 0 { memchr::memchr3(quote, esc, b'\n', &t[i..]) } else { memchr::memchr2(quote, b'\n', &t[i..]) };
+            match next {
+                Some(p) => i += p,
+                None => return (t.len(), false, false),
+            }
+        }
         let b = t[i];
         if esc_pending {
             esc_pending = false;
@@ -1971,6 +1979,96 @@ mod tests {
                     assert_eq!(split, whole, "{lang:?} cut after byte {cut} of {:?}", String::from_utf8_lossy(&t));
                 }
             }
+        }
+    }
+
+    /// The CPU cycles this thread has run.
+    fn thread_cycles() -> u64 {
+        unsafe extern "system" {
+            fn QueryThreadCycleTime(thread: isize, cycles: *mut u64) -> i32;
+            fn GetCurrentThread() -> isize;
+        }
+        let mut c = 0;
+        unsafe { QueryThreadCycleTime(GetCurrentThread(), &mut c) };
+        c
+    }
+
+    /// Lexer speed and detection time, from sample files: `SLATE_HL_SAMPLES=<folder> cargo test --release --lib
+    /// lexer_speed -- --ignored --nocapture`. Each file's language is detected from its name and first 4 KB, and it is
+    /// repeated to 8 MiB; colored = line by line with spans (as painting does), states = 16 KB pieces cut at line
+    /// breaks without spans (as the checkpoints are kept).
+    #[test]
+    #[ignore]
+    fn lexer_speed() {
+        let Ok(dir) = std::env::var("SLATE_HL_SAMPLES") else { return };
+        let mut paths: Vec<_> = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().path()).collect();
+        paths.sort();
+        let mib = |n: usize, s: f64| n as f64 / s / (1 << 20) as f64;
+        for p in paths {
+            let src = std::fs::read(&p).unwrap();
+            let name = p.file_name().unwrap().to_string_lossy().into_owned();
+            let head = &src[..src.len().min(4096)];
+            let t = std::time::Instant::now();
+            let lang = Lang::detect(Some(&name), head);
+            let detect = t.elapsed().as_secs_f64() * 1e6;
+            let text = src.repeat((8 << 20) / src.len().max(1) + 1);
+            // the best of 9 runs: seconds, and CPU cycles per byte (the thread's own, which other programs running
+            // meanwhile don't add to)
+            let best = |f: &dyn Fn()| {
+                (0..9).fold((f64::MAX, f64::MAX), |(s, c), _| {
+                    let (t, c0) = (std::time::Instant::now(), thread_cycles());
+                    f();
+                    (s.min(t.elapsed().as_secs_f64()), c.min((thread_cycles() - c0) as f64 / text.len() as f64))
+                })
+            };
+            // (each line in the state the lines before it end in, worked out first)
+            let mut st = State::START;
+            let lines: Vec<(&[u8], State)> = text
+                .split_inclusive(|&b| b == b'\n')
+                .map(|l| {
+                    let line = (l.strip_suffix(b"\n").unwrap_or(l), st);
+                    st = lex(lang, l, st, None);
+                    line
+                })
+                .collect();
+            let colored = best(&|| {
+                let mut v = Vec::new();
+                for &(l, st) in &lines {
+                    lex(lang, l, st, Some(&mut v));
+                }
+            });
+            let states = best(&|| {
+                let (mut st, mut i) = (State::START, 0);
+                while i < text.len() {
+                    let e = (i + (16 << 10)).min(text.len());
+                    let cut = memchr::memrchr(b'\n', &text[i..e]).map_or(e, |p| i + p + 1);
+                    st = lex(lang, &text[i..cut], st, None);
+                    i = cut;
+                }
+            });
+            println!(
+                "{name:16} {:14} colored {:6.1} MiB/s {:5.1} c/B   states {:6.1} MiB/s {:5.1} c/B   detect {detect:5.1} us",
+                lang.label(),
+                mib(text.len(), colored.0),
+                colored.1,
+                mib(text.len(), states.0),
+                states.1
+            );
+        }
+        // detection's worst cases: 4 KB heads that keep its checks looking
+        for (what, head) in [
+            ("brackets", "[".repeat(4096)),
+            ("json", "{\"a\": [1, 2, {\"b\": null}], ".repeat(160)),
+            ("numbered", "00010     IF(\"A\" .EQ. 1) THEN ON(\"B\")\n".repeat(110)),
+            ("gcode", "G1 X1.5 Y2.5 E0.1\n".repeat(230)),
+            ("one line", "a".repeat(4096)),
+            ("dots", ".".repeat(4096)),
+        ] {
+            let t = std::time::Instant::now();
+            for _ in 0..100 {
+                std::hint::black_box(Lang::detect(Some("x.txt"), &head.as_bytes()[..head.len().min(4096)]));
+            }
+            println!("detect {what:10} {:6.1} us", t.elapsed().as_secs_f64() * 1e4);
         }
     }
 
