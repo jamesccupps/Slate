@@ -20,8 +20,8 @@ use windows::Win32::Graphics::DirectWrite::{
 use crate::core::document::{Document, EditKind, Sel};
 use crate::core::text::{self, is_continuation, utf8_len};
 
-use super::gfx::{Gfx, Rect};
-use super::highlight::{self, CommentStyle, Lang, State as HlState, Tok};
+use super::gfx::{Gfx, Ink, Rect};
+use super::highlight::{self, CommentStyle, Lang, Span, State as HlState, Tok};
 use super::theme::{Theme, metrics};
 
 pub const SEG: u64 = 8192;
@@ -150,6 +150,9 @@ pub struct SegLayout {
     /// No character that may show as a color glyph (emoji), which only Windows 11 draws a run at a time
     /// (`Gfx::draw_layout_in`).
     pub plain: bool,
+    /// Where the colors start (UTF-16 position, color), when they're given at drawing time rather than set on the
+    /// layout (which costs a lot more when the text is packed with them; but a layout drawn whole needs them on it).
+    pub colors: Vec<(u32, u32)>,
 }
 
 /// A UTF-16 unit of a character that may show as a color glyph: emoji (all outside the BMP, the symbols and dingbats
@@ -226,10 +229,13 @@ fn tok_color(t: &Theme, tok: Tok) -> u32 {
 }
 
 /// Colors a layout of the segment's text from UTF-16 position `at` to `end` with the spans (byte ranges of the
-/// segment) that fall in it.
-fn color_layout(cx: &Ctx, layout: &IDWriteTextLayout, spans: &[(u32, u32, Tok)], map: &[u32], at: u32, end: u32) {
+/// segment) that fall in it: bold and italic, and (`colors`) the colors.
+fn color_layout(cx: &Ctx, layout: &IDWriteTextLayout, spans: &[Span], map: &[u32], at: u32, end: u32, colors: bool) {
     let t = cx.theme;
     for &(s, e, tok) in spans {
+        if !colors && !matches!(tok, Tok::Bold | Tok::Heading | Tok::Italic) {
+            continue;
+        }
         let us = (map.partition_point(|&m| m < s) as u32).max(at);
         let ue = (map.partition_point(|&m| m < e) as u32).min(end);
         if ue <= us {
@@ -238,7 +244,7 @@ fn color_layout(cx: &Ctx, layout: &IDWriteTextLayout, spans: &[(u32, u32, Tok)],
         let range = DWRITE_TEXT_RANGE { startPosition: us - at, length: ue - us };
         unsafe {
             // (High contrast: all text in the one text color, which selected text is drawn over in its own.)
-            if !t.hc {
+            if colors && !t.hc {
                 let _ = layout.SetDrawingEffect(&cx.g.brush(tok_color(t, tok)), range);
             }
             match tok {
@@ -252,6 +258,27 @@ fn color_layout(cx: &Ctx, layout: &IDWriteTextLayout, spans: &[(u32, u32, Tok)],
             }
         }
     }
+}
+
+/// Where the colors of the spans start in a text of `total` UTF-16 units (a later span wins where they overlap, as on
+/// a layout); none for text without spans.
+fn colors_of(t: &Theme, spans: &[Span], map: &[u32], total: u32) -> Vec<(u32, u32)> {
+    if spans.is_empty() || t.hc {
+        return Vec::new();
+    }
+    let mut each = vec![t.text; total as usize];
+    for &(s, e, tok) in spans {
+        let us = map.partition_point(|&m| m < s).min(each.len());
+        let ue = map.partition_point(|&m| m < e).min(each.len());
+        each[us..ue.max(us)].fill(tok_color(t, tok));
+    }
+    let mut out: Vec<(u32, u32)> = Vec::new();
+    for (i, &c) in each.iter().enumerate() {
+        if out.last().is_none_or(|&(_, k)| k != c) {
+            out.push((i as u32, c));
+        }
+    }
+    out
 }
 
 impl SegLayout {
@@ -735,7 +762,9 @@ impl View {
         }
         let total = u.len() as u32;
         let layout = cx.g.layout(&u, fmt, max_w, 1.0e7);
-        color_layout(cx, &layout, &spans, &map, 0, total);
+        // (Text that may have emoji can end up drawn whole, which needs its colors on the layout.)
+        let plain = !u.iter().any(|&c| maybe_color(c));
+        color_layout(cx, &layout, &spans, &map, 0, total, !plain);
         let mut rows = layout_rows_of(&layout, 0, total);
         let mut tm = DWRITE_TEXT_METRICS::default();
         unsafe {
@@ -754,8 +783,8 @@ impl View {
                 let rest = cx.g.layout(&u[r1 as usize..], fmt, max_w - ind, 1.0e7);
                 let first_rows = layout_rows_of(&first, 0, r1);
                 if first_rows.len() == 1 {
-                    color_layout(cx, &first, &spans, &map, 0, r1);
-                    color_layout(cx, &rest, &spans, &map, r1, total);
+                    color_layout(cx, &first, &spans, &map, 0, r1, !plain);
+                    color_layout(cx, &rest, &spans, &map, r1, total, !plain);
                     rows = first_rows;
                     rows.extend(layout_rows_of(&rest, r1, total));
                     parts = vec![
@@ -765,9 +794,9 @@ impl View {
                 }
             }
         }
+        let colors = if plain { colors_of(cx.theme, &spans, &map, total) } else { Vec::new() };
         self.spans = spans;
-        let plain = !u.iter().any(|&c| maybe_color(c));
-        SegLayout { parts, map, rows, width: tm.widthIncludingTrailingWhitespace, plain }
+        SegLayout { parts, map, rows, width: tm.widthIncludingTrailingWhitespace, plain, colors }
     }
 
     // ---- rows ----
@@ -1237,7 +1266,8 @@ impl View {
             let r = &self.rows[i];
             let y0 = r.y - r.row as f32 * row_h;
             for p in &r.lay.parts {
-                g.draw_layout_in(&p.layout, ox + p.x, y0 + p.row0 as f32 * row_h, t.text, clip, !r.lay.plain);
+                let ink = Ink { color_glyphs: !r.lay.plain, colors: &r.lay.colors, at: p.at };
+                g.draw_layout_in(&p.layout, ox + p.x, y0 + p.row0 as f32 * row_h, t.text, clip, ink);
             }
             let s = r.seg.start;
             while i < self.rows.len() && self.rows[i].seg.start == s {
@@ -1253,7 +1283,8 @@ impl View {
                 let p = r.lay.part_of_row(r.row);
                 let (x, y) = (ox + p.x, r.y - (r.row - p.row0) as f32 * row_h);
                 g.push_clip(rc);
-                g.draw_layout_in(&p.layout, x, y, t.selection_text, rc, !r.lay.plain);
+                let ink = Ink { color_glyphs: !r.lay.plain, ..Default::default() };
+                g.draw_layout_in(&p.layout, x, y, t.selection_text, rc, ink);
                 g.pop_clip();
             }
         }
