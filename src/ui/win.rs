@@ -67,6 +67,16 @@ fn scripted<R>(f: impl FnOnce(&mut Scripted) -> R) -> Option<R> {
     SCRIPTED.with(|s| s.borrow_mut().as_mut().map(f))
 }
 
+thread_local! {
+    /// Test mode: the DPI windows have (as if on a monitor at that scale; `dpi:` sends WM_DPICHANGED).
+    pub static FORCED_DPI: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// The DPI of the monitor `hwnd` is on (96 = 100%).
+pub fn dpi_of(hwnd: HWND) -> u32 {
+    FORCED_DPI.with(|d| d.get()).unwrap_or_else(|| unsafe { windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd) }).max(96)
+}
+
 // ---- dark mode ----
 
 const DWMWA_USE_IMMERSIVE_DARK_MODE: DWMWINDOWATTRIBUTE = DWMWINDOWATTRIBUTE(20);
@@ -79,14 +89,18 @@ pub fn colorref(argb: u32) -> u32 {
     ((argb & 0xFF) << 16) | (argb & 0xFF00) | ((argb >> 16) & 0xFF)
 }
 
-/// Dark or light title bar, colored like the tab strip under it (Windows 11; ignored on Windows 10).
+/// The color value that gives a DWM color attribute back to Windows.
+const DWMWA_COLOR_DEFAULT: u32 = 0xFFFF_FFFF;
+
+/// Dark or light title bar, colored like the tab strip under it (Windows 11; ignored on Windows 10). The border
+/// stays Windows' own, so the window keeps its edge against others (and the accent color there, if that's set).
 pub fn style_title_bar(hwnd: HWND, dark: bool, caption: u32, text: u32) {
     unsafe {
         let d = BOOL(dark as i32);
         let _ = DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &d as *const _ as _, 4);
         let c = colorref(caption);
         let _ = DwmSetWindowAttribute(hwnd, DWMWA_CAPTION_COLOR, &c as *const _ as _, 4);
-        let _ = DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR, &c as *const _ as _, 4);
+        let _ = DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR, &DWMWA_COLOR_DEFAULT as *const _ as _, 4);
         let t = colorref(text);
         let _ = DwmSetWindowAttribute(hwnd, DWMWA_TEXT_COLOR, &t as *const _ as _, 4);
     }
@@ -94,7 +108,6 @@ pub fn style_title_bar(hwnd: HWND, dark: bool, caption: u32, text: u32) {
 
 /// The title bar Windows draws by itself (in high contrast: its colors, not the tab strip's).
 pub fn system_title_bar(hwnd: HWND) {
-    const DWMWA_COLOR_DEFAULT: u32 = 0xFFFF_FFFF;
     unsafe {
         let d = BOOL(0);
         let _ = DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &d as *const _ as _, 4);
@@ -176,6 +189,126 @@ pub fn set_menu_dark(dark: bool) {
         if let Some(f) = GetProcAddress(lib, PCSTR(136usize as *const u8)) {
             let f: extern "system" fn() = std::mem::transmute(f);
             f();
+        }
+    }
+}
+
+// ---- tooltips ----
+
+/// The tooltip of the window's parts that have a symbol rather than words (and of tabs, which give their file's
+/// path): a tracking tooltip of Windows' own, shown where and when the window says, made the first time it shows.
+/// Test mode never shows it (it would appear on the desktop), only notes what it would say.
+pub struct Tip {
+    hwnd: HWND,
+    owner: HWND,
+    dark: bool,
+    /// What it says while it shows.
+    pub text: Option<String>,
+}
+
+impl Tip {
+    pub fn new(owner: HWND) -> Tip {
+        Tip { hwnd: HWND::default(), owner, dark: false, text: None }
+    }
+
+    /// The tooltip window, made if it isn't yet (None in test mode).
+    fn window(&mut self) -> Option<HWND> {
+        use windows::Win32::UI::Controls::{
+            ICC_BAR_CLASSES, INITCOMMONCONTROLSEX, InitCommonControlsEx, TOOLTIPS_CLASSW, TTF_ABSOLUTE, TTF_TRACK,
+            TTM_ADDTOOLW, TTS_ALWAYSTIP, TTS_NOPREFIX, TTTOOLINFOW,
+        };
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CW_USEDEFAULT, CreateWindowExW, WINDOW_STYLE, WS_EX_TOPMOST, WS_POPUP,
+        };
+        if !self.hwnd.is_invalid() {
+            return Some(self.hwnd);
+        }
+        if scripted(|_| ()).is_some() {
+            return None;
+        }
+        unsafe {
+            let size = std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32;
+            let _ = InitCommonControlsEx(&INITCOMMONCONTROLSEX { dwSize: size, dwICC: ICC_BAR_CLASSES });
+            let style = WS_POPUP | WINDOW_STYLE(TTS_NOPREFIX | TTS_ALWAYSTIP);
+            let d = CW_USEDEFAULT;
+            let owner = self.owner;
+            let hwnd = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, None, style, d, d, d, d, owner, None, None, None).ok()?;
+            let ti = TTTOOLINFOW {
+                cbSize: std::mem::size_of::<TTTOOLINFOW>() as u32,
+                uFlags: TTF_TRACK | TTF_ABSOLUTE,
+                hwnd: owner,
+                uId: 1,
+                ..Default::default()
+            };
+            SendMessageW(hwnd, TTM_ADDTOOLW, WPARAM(0), LPARAM(&ti as *const _ as isize));
+            self.hwnd = hwnd;
+        }
+        self.set_dark(self.dark);
+        Some(self.hwnd)
+    }
+
+    /// Dark when Slate is (high contrast: Windows' own colors).
+    pub fn set_dark(&mut self, dark: bool) {
+        self.dark = dark;
+        if !self.hwnd.is_invalid() {
+            unsafe {
+                let _ = windows::Win32::UI::Controls::SetWindowTheme(
+                    self.hwnd,
+                    if dark { w!("DarkMode_Explorer") } else { PCWSTR::null() },
+                    PCWSTR::null(),
+                );
+            }
+        }
+    }
+
+    /// Shows `text` centered under the screen rect `r` (`above`: over it), within the screen.
+    pub fn show(&mut self, text: &str, r: windows::Win32::Foundation::RECT, above: bool) {
+        use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromRect};
+        use windows::Win32::UI::Controls::{
+            TTM_GETBUBBLESIZE, TTM_SETMAXTIPWIDTH, TTM_TRACKACTIVATE, TTM_TRACKPOSITION, TTM_UPDATETIPTEXTW,
+            TTTOOLINFOW,
+        };
+        self.text = Some(text.to_string());
+        let Some(hwnd) = self.window() else { return };
+        let w: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+        let ti = TTTOOLINFOW {
+            cbSize: std::mem::size_of::<TTTOOLINFOW>() as u32,
+            hwnd: self.owner,
+            uId: 1,
+            lpszText: PWSTR(w.as_ptr() as *mut u16),
+            ..Default::default()
+        };
+        let dpi = dpi_of(self.owner) as i32;
+        unsafe {
+            let tl = LPARAM(&ti as *const _ as isize);
+            // (a long path wraps rather than running off the screen)
+            SendMessageW(hwnd, TTM_SETMAXTIPWIDTH, WPARAM(0), LPARAM((640 * dpi / 96) as isize));
+            SendMessageW(hwnd, TTM_UPDATETIPTEXTW, WPARAM(0), tl);
+            let size = SendMessageW(hwnd, TTM_GETBUBBLESIZE, WPARAM(0), tl).0 as u32;
+            let (tw, th) = ((size & 0xFFFF) as i32, (size >> 16) as i32);
+            let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+            let _ = GetMonitorInfoW(MonitorFromRect(&r, MONITOR_DEFAULTTONEAREST), &mut mi);
+            let work = mi.rcWork;
+            let gap = 4 * dpi / 96;
+            let x = ((r.left + r.right - tw) / 2).min(work.right - tw).max(work.left);
+            let mut y = if above { r.top - gap - th } else { r.bottom + gap };
+            if y + th > work.bottom || y < work.top {
+                y = if above { r.bottom + gap } else { r.top - gap - th };
+            }
+            let pos = (x as u16 as u32) | ((y as u16 as u32) << 16);
+            SendMessageW(hwnd, TTM_TRACKPOSITION, WPARAM(0), LPARAM(pos as isize));
+            SendMessageW(hwnd, TTM_TRACKACTIVATE, WPARAM(1), tl);
+        }
+    }
+
+    pub fn hide(&mut self) {
+        if self.text.take().is_some() && !self.hwnd.is_invalid() {
+            use windows::Win32::UI::Controls::{TTM_TRACKACTIVATE, TTTOOLINFOW};
+            let size = std::mem::size_of::<TTTOOLINFOW>() as u32;
+            let ti = TTTOOLINFOW { cbSize: size, hwnd: self.owner, uId: 1, ..Default::default() };
+            unsafe {
+                SendMessageW(self.hwnd, TTM_TRACKACTIVATE, WPARAM(0), LPARAM(&ti as *const _ as isize));
+            }
         }
     }
 }

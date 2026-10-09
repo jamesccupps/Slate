@@ -499,7 +499,7 @@ impl Structure {
     pub fn paint_path(&mut self, g: &Gfx, t: &Theme, ui: &windows::Win32::Graphics::DirectWrite::IDWriteTextFormat, r: Rect, hover: Option<usize>, toggle_hover: bool, panel_open: bool, icons: &windows::Win32::Graphics::DirectWrite::IDWriteTextFormat) {
         self.path_rects.clear();
         g.fill(r, t.surface);
-        g.line(r.x, r.bottom() - 0.5, r.right(), r.bottom() - 0.5, t.border, 1.0);
+        g.hline(r.x, r.right(), r.bottom(), true, t.border);
         let toggle = toggle_rect(r);
         if toggle_hover || panel_open {
             g.fill_round(toggle, 4.0, if panel_open { t.pressed } else { t.hover });
@@ -566,9 +566,10 @@ impl Structure {
         r: Rect,
         hover_row: Option<usize>,
         close_hover: bool,
+        bar_hot: bool,
     ) {
         g.fill(r, t.surface);
-        g.line(r.x + 0.5, r.y, r.x + 0.5, r.bottom(), t.border, 1.0);
+        g.vline(r.x, r.y, r.bottom(), false, t.border);
         let head = Rect::new(r.x, r.y, r.w, HEADER_H);
         g.text("Structure", bold, Rect::new(r.x + 14.0, r.y, r.w - 60.0, HEADER_H), t.text, Align::Left);
         if let Some(p) = self.progress().filter(|_| !self.rows.is_empty()) {
@@ -580,7 +581,7 @@ impl Structure {
             g.fill_round(close, 4.0, t.hover);
         }
         g.text("\u{E711}", icons, close, t.text_dim, Align::Center);
-        g.line(r.x, head.bottom() - 0.5, r.right(), head.bottom() - 0.5, t.border, 1.0);
+        g.hline(r.x, r.right(), head.bottom(), true, t.border);
         let body = body_rect(r);
         g.push_clip(body);
         if let Some(p) = self.progress() {
@@ -603,9 +604,9 @@ impl Structure {
             let y = body.y + k as f32 * ROW_H - self.scroll;
             let rr = Rect::new(body.x, y, body.w, ROW_H);
             if self.selected == Some(row.key) {
-                g.fill(rr, t.selection_inactive);
+                g.fill(g.snap_rect(rr), t.selection_inactive);
             } else if hover_row == Some(k) {
-                g.fill(rr, t.hover);
+                g.fill(g.snap_rect(rr), t.hover);
             }
             let x0 = body.x + 8.0 + row.depth as f32 * 14.0;
             if row.expandable {
@@ -643,6 +644,28 @@ impl Structure {
             }
         }
         g.pop_clip();
+        // the scrollbar's thumb, as the text's (wider under the mouse)
+        if let Some((_, thumb, _)) = self.scrollbar(r) {
+            let w = if bar_hot { 8.0 } else { 5.0 };
+            let color = if bar_hot { t.scroll_thumb_hover } else { t.scroll_thumb };
+            g.fill_round(Rect::new(thumb.right() - w - 3.0, thumb.y + 2.0, w, thumb.h - 4.0), w / 2.0, color);
+        }
+    }
+
+    /// The panel's scrollbar while its rows don't all fit: the track (down the right edge of the rows), the thumb in
+    /// it, and how far the rows scroll.
+    pub fn scrollbar(&self, panel: Rect) -> Option<(Rect, Rect, f32)> {
+        let body = body_rect(panel);
+        // (as in `paint_panel`: a row's room left after the last one)
+        let max = self.rows.len() as f32 * ROW_H - body.h + ROW_H;
+        if max <= 0.0 || body.h <= 0.0 {
+            return None;
+        }
+        let bar_w = super::theme::metrics::SCROLLBAR_W;
+        let track = Rect::new(body.right() - bar_w, body.y, bar_w, body.h);
+        let h = (body.h * body.h / (body.h + max)).max(28.0).min(body.h);
+        let y = body.y + (body.h - h) * (self.scroll / max).clamp(0.0, 1.0);
+        Some((track, Rect::new(track.x, y, track.w, h), max))
     }
 
     /// Row index at a point in the panel body.
@@ -759,6 +782,25 @@ mod tests {
         let want: HashSet<NodeKey> = [user, NodeKey::Value(node_id(TOP, None, 499)), NodeKey::Bucket(TOP, 400, 500)].into();
         assert_eq!(s.expanded, want);
         assert_eq!(s.selected, Some(NodeKey::Value(node_id(node_id(TOP, None, 499), Some("i"), 0))));
+    }
+
+    #[test]
+    fn the_panels_scrollbar_shows_where_the_rows_are() {
+        let n = notify();
+        let text = format!("[{}]", (0..60).map(|i| i.to_string()).collect::<Vec<_>>().join(","));
+        let mut d = Document::from_text(text.as_bytes());
+        let mut s = Structure::default();
+        s.rows(&mut d, &n);
+        assert_eq!(s.rows.len(), 60);
+        // room for 10 rows: the thumb at the top, then at the bottom
+        let panel = Rect::new(0.0, 0.0, 300.0, HEADER_H + 10.0 * ROW_H);
+        let (track, thumb, max) = s.scrollbar(panel).unwrap();
+        assert_eq!((thumb.y, max), (track.y, 51.0 * ROW_H));
+        s.scroll = max;
+        let (track, thumb, _) = s.scrollbar(panel).unwrap();
+        assert!((thumb.bottom() - track.bottom()).abs() < 0.01);
+        // when they all fit, none
+        assert!(s.scrollbar(Rect::new(0.0, 0.0, 300.0, HEADER_H + 80.0 * ROW_H)).is_none());
     }
 
     #[test]

@@ -407,6 +407,36 @@ impl Gfx {
         unsafe { self.rt().DrawRoundedRectangle(&rr, &self.brush(argb), width, None) };
     }
 
+    /// `v` (DIPs) moved to the nearest edge between device pixels.
+    pub fn snap(&self, v: f32) -> f32 {
+        snap(v, self.dpi)
+    }
+
+    /// `r` with its edges on device pixels.
+    pub fn snap_rect(&self, r: Rect) -> Rect {
+        let (x, y) = (self.snap(r.x), self.snap(r.y));
+        Rect::new(x, y, self.snap(r.right()) - x, self.snap(r.bottom()) - y)
+    }
+
+    /// How thick a hairline is (DIPs): one device pixel, or as many whole ones as a DIP covers (two at 200%).
+    pub fn hair(&self) -> f32 {
+        let k = self.dpi.max(96.0) / 96.0;
+        k.floor() / k
+    }
+
+    /// A crisp hairline across from `x0` to `x1`, on the pixels just below `y` (`above`: just above it). A line
+    /// a DIP thick at a fraction of a pixel would be smeared over two rows at 125% and 150%.
+    pub fn hline(&self, x0: f32, x1: f32, y: f32, above: bool, argb: u32) {
+        let (x0, x1, y, t) = (self.snap(x0), self.snap(x1), self.snap(y), self.hair());
+        self.fill(Rect::new(x0, if above { y - t } else { y }, x1 - x0, t), argb);
+    }
+
+    /// The same down from `y0` to `y1`, on the pixels just right of `x` (`left`: just left of it).
+    pub fn vline(&self, x: f32, y0: f32, y1: f32, left: bool, argb: u32) {
+        let (x, y0, y1, t) = (self.snap(x), self.snap(y0), self.snap(y1), self.hair());
+        self.fill(Rect::new(if left { x - t } else { x }, y0, t, y1 - y0), argb);
+    }
+
     pub fn line(&self, x0: f32, y0: f32, x1: f32, y1: f32, argb: u32, width: f32) {
         unsafe {
             self.rt().DrawLine(
@@ -514,6 +544,12 @@ impl Gfx {
         );
         unsafe { self.rt().DrawTextLayout(D2D_POINT_2F { x, y }, l, &self.brush(argb), opts) };
     }
+}
+
+/// `v` (DIPs) moved to the nearest edge between device pixels at `dpi`.
+pub fn snap(v: f32, dpi: f32) -> f32 {
+    let k = dpi.max(96.0) / 96.0;
+    (v * k).round() / k
 }
 
 /// Facts about a font needed for layout.

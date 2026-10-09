@@ -274,7 +274,7 @@ fn handle(cell: &Cell, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<L
         }
         WM_GETMINMAXINFO => {
             let mm = unsafe { &mut *(lp.0 as *mut MINMAXINFO) };
-            let dpi = unsafe { windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd) }.max(96) as i32;
+            let dpi = win::dpi_of(hwnd) as i32;
             mm.ptMinTrackSize = POINT { x: 420 * dpi / 96, y: 260 * dpi / 96 };
             Some(LRESULT(0))
         }
@@ -544,6 +544,7 @@ fn handle(cell: &Cell, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<L
                 SAVED_FOCUS.with(|s| s.set(f.0 as isize));
                 if let Ok(mut a) = cell.try_borrow_mut() {
                     a.disarm_menu_bar();
+                    a.hide_tip();
                 }
                 return None;
             }

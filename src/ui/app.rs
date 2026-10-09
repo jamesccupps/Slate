@@ -15,7 +15,6 @@ use windows::Win32::Graphics::DirectWrite::{
     IDWriteTextFormat,
 };
 use windows::Win32::Graphics::Gdi::InvalidateRect;
-use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
 
 use crate::core::document::Document;
@@ -361,6 +360,8 @@ pub enum Hit {
     StructRow(usize, bool),
     StructClose,
     StructSplitter,
+    /// The structure panel's scrollbar.
+    StructBar,
     Gutter,
     Text,
     VBar,
@@ -398,6 +399,8 @@ pub struct App {
     pub r_struct: Rect,
     /// Dragging the structure panel's edge: (pointer x at start, width at start).
     pub split_drag: Option<(f32, f32)>,
+    /// Dragging the structure panel's scrollbar thumb: where in the thumb it was taken.
+    pub struct_drag: Option<f32>,
     pub tab_rects: Vec<(Rect, Rect)>,
     pub newtab_rect: Rect,
     pub menu_rects: Vec<Rect>,
@@ -455,6 +458,11 @@ pub struct App {
     pub sel_counts: Option<((u64, u64, u64), Counts)>,
     /// The document version a recount waits to start for, and since when (see `doc_counts_now`).
     pub count_wait: Option<(u64, Instant)>,
+    /// The tooltip of what the mouse rests on, and when one last went away (the next one then comes at once).
+    pub tip: win::Tip,
+    pub tip_gone: Option<Instant>,
+    /// The caret's line and column, as the status bar last worked them out.
+    pub caret_place: CaretPlace,
 }
 
 pub const ZOOM_STEPS: [f32; 15] = [0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0, 4.0, 5.0];
@@ -473,7 +481,7 @@ impl App {
         let g = Gfx::new().expect("Direct2D is not available");
         let settings = Settings::load();
         let theme = make_theme(settings.theme);
-        let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
+        let dpi = win::dpi_of(hwnd);
         let fonts = make_fonts(&g);
         let style = make_style(&g, &settings, 1);
         let mut find = FindBar::new(hwnd);
@@ -500,6 +508,7 @@ impl App {
             r_path: Rect::default(),
             r_struct: Rect::default(),
             split_drag: None,
+            struct_drag: None,
             tab_rects: Vec::new(),
             newtab_rect: Rect::default(),
             menu_rects: Vec::new(),
@@ -541,6 +550,9 @@ impl App {
             count_job: None,
             sel_counts: None,
             count_wait: None,
+            tip: win::Tip::new(hwnd),
+            tip_gone: None,
+            caret_place: CaretPlace::default(),
         };
         app.apply_theme();
         app
@@ -590,6 +602,7 @@ impl App {
             win::style_title_bar(self.hwnd, self.theme.dark, self.theme.frame, self.theme.text);
         }
         win::set_menu_dark(self.theme.dark && !self.theme.hc);
+        self.tip.set_dark(self.theme.dark && !self.theme.hc);
         let t = &self.theme;
         super::prompt::set_colors((!t.hc).then_some(super::prompt::Colors {
             dark: t.dark,
@@ -614,7 +627,7 @@ impl App {
     }
 
     pub fn update_dpi(&mut self) {
-        self.dpi = unsafe { GetDpiForWindow(self.hwnd) }.max(96);
+        self.dpi = win::dpi_of(self.hwnd);
         self.find.style_edits(self.dpi, &self.theme);
         self.rebuild_style();
     }
@@ -641,28 +654,35 @@ impl App {
         let (w, h) = self.client_size();
         let (w, h) = (self.px_to_dip(w as i32), self.px_to_dip(h as i32));
         self.size = (w, h);
+        // Every band starts and ends on a device pixel, so its edges and the hairlines along them stay crisp at 125%
+        // and 150% too.
+        let dpi = self.dpi as f32;
+        let snap = |v: f32| super::gfx::snap(v, dpi);
+        let band = |y: f32, bh: f32| Rect::new(0.0, snap(y), w, snap(y + bh) - snap(y));
         let mut y = 0.0;
-        self.r_tabs = Rect::new(0.0, y, w, metrics::TAB_BAR_H);
+        self.r_tabs = band(y, metrics::TAB_BAR_H);
         y += metrics::TAB_BAR_H;
-        self.r_menu = Rect::new(0.0, y, w, metrics::MENU_BAR_H);
+        self.r_menu = band(y, metrics::MENU_BAR_H);
         y += metrics::MENU_BAR_H;
         let fh = self.find.height();
-        self.r_find = Rect::new(0.0, y, w, fh);
+        self.r_find = band(y, fh);
         y += fh;
         let nh = if self.tabs.get(self.active).is_some_and(|t| t.notice.is_some()) { metrics::NOTICE_H } else { 0.0 };
-        self.r_notice = Rect::new(0.0, y, w, nh);
+        self.r_notice = band(y, nh);
         y += nh;
         let json = self.tabs.get(self.active).is_some_and(|t| t.lang.has_structure());
         let ph = if json && self.settings.path_bar { super::structure::PATH_H } else { 0.0 };
-        self.r_path = Rect::new(0.0, y, w, ph);
-        y += ph;
+        self.r_path = band(y, ph);
+        y = snap(y + ph);
         let sh = metrics::STATUS_H;
-        self.r_status = Rect::new(0.0, (h - sh).max(y), w, sh);
-        let body_h = (h - sh - y).max(0.0);
+        let sy = snap((h - sh).max(y));
+        self.r_status = Rect::new(0.0, sy, w, (h - sy).max(sh));
+        let body_h = (sy - y).max(0.0);
         if json && self.settings.structure_panel {
             let pw = self.settings.structure_width.clamp(200.0, (w * 0.6).max(200.0));
-            self.r_struct = Rect::new((w - pw).max(0.0), y, pw.min(w), body_h);
-            self.r_edit = Rect::new(0.0, y, (w - pw).max(0.0), body_h);
+            let x = snap((w - pw).max(0.0));
+            self.r_struct = Rect::new(x, y, w - x, body_h);
+            self.r_edit = Rect::new(0.0, y, x, body_h);
         } else {
             self.r_struct = Rect::default();
             self.r_edit = Rect::new(0.0, y, w, body_h);
@@ -689,8 +709,8 @@ impl App {
         let total = tw * self.tabs.len() as f32;
         let max_scroll = (total - avail).max(0.0);
         self.tab_scroll = self.tab_scroll.clamp(0.0, max_scroll);
-        let top = bar.y + 6.0;
-        let h = bar.h - 6.0;
+        let top = super::gfx::snap(bar.y + 6.0, self.dpi as f32);
+        let h = bar.bottom() - top;
         for i in 0..self.tabs.len() {
             let x = bar.x + left + i as f32 * tw - self.tab_scroll;
             let r = Rect::new(x, top, tw, h);
@@ -806,6 +826,9 @@ impl App {
             if super::structure::close_rect(self.r_struct).contains(x, y) {
                 return Hit::StructClose;
             }
+            if self.tab().structure.scrollbar(self.r_struct).is_some_and(|(track, _, _)| track.contains(x, y)) {
+                return Hit::StructBar;
+            }
             return match self.tab().structure.row_at(self.r_struct, x, y) {
                 Some((i, chevron)) => Hit::StructRow(i, chevron),
                 None => Hit::None,
@@ -833,6 +856,68 @@ impl App {
             return Hit::Text;
         }
         Hit::None
+    }
+
+    /// What the tooltip of `h` says: what a button with a symbol does (and its key), a tab's file (or its whole name
+    /// when it's cut short). None for parts whose words say it.
+    pub fn tip_text(&self, h: Hit) -> Option<String> {
+        use findbar::{Mode, Part};
+        Some(
+            match h {
+                Hit::Tab(i) => {
+                    let t = self.tabs.get(i)?;
+                    if let Some(p) = t.doc.path.as_ref().filter(|_| t.title_override.is_none()) {
+                        return Some(p.display().to_string());
+                    }
+                    let label = self.tab_label(i);
+                    if self.g.measure(&label, &self.fonts.ui).0 <= self.tab_title_rect(i).w {
+                        return None;
+                    }
+                    return Some(label);
+                }
+                Hit::TabClose(_) => "Close tab (Ctrl+W)",
+                Hit::NewTab => "New tab (Ctrl+T)",
+                Hit::TabList => "All tabs",
+                Hit::ThemeToggle if self.theme.dark => "Light theme",
+                Hit::ThemeToggle => "Dark theme",
+                Hit::PathToggle => "Structure panel (Ctrl+Shift+O)",
+                Hit::StructClose => "Close the structure panel (Ctrl+Shift+O)",
+                Hit::Find(Part::Expand) if self.find.mode == Mode::Replace => "Hide replace",
+                Hit::Find(Part::Expand) => "Replace (Ctrl+H)",
+                Hit::Find(Part::Case) => "Match case (Alt+C)",
+                Hit::Find(Part::Word) => "Whole word (Alt+W)",
+                Hit::Find(Part::Regex) => "Regular expression (Alt+R)",
+                Hit::Find(Part::Prev) => "Previous match (Shift+F3)",
+                Hit::Find(Part::Next) => "Next match (F3)",
+                Hit::Find(Part::Close) => "Close (Esc)",
+                Hit::Find(Part::ReplaceAll) => "Replace all (Ctrl+Alt+Enter)",
+                Hit::Status(StatusItem::Position) => "Go to line (Ctrl+G)",
+                Hit::Status(StatusItem::Zoom) => "Reset zoom (Ctrl+0)",
+                Hit::Status(StatusItem::Eol) => "Line endings",
+                Hit::Status(StatusItem::Encoding) => "Encoding",
+                Hit::Status(StatusItem::Lang) => "Language",
+                Hit::Status(StatusItem::Indent) => "Indentation",
+                Hit::Status(StatusItem::Overtype) => "Typing replaces characters (Insert turns it off)",
+                _ => return None,
+            }
+            .to_string(),
+        )
+    }
+
+    /// Where the part `h` is (client DIPs), for its tooltip.
+    pub fn hit_rect(&self, h: Hit) -> Option<Rect> {
+        Some(match h {
+            Hit::Tab(i) => self.tab_rects.get(i)?.0,
+            Hit::TabClose(i) => self.tab_rects.get(i)?.1,
+            Hit::NewTab => self.newtab_rect,
+            Hit::TabList => self.tablist_rect,
+            Hit::ThemeToggle => self.theme_rect,
+            Hit::PathToggle => super::structure::toggle_rect(self.r_path),
+            Hit::StructClose => super::structure::close_rect(self.r_struct),
+            Hit::Find(p) => self.find.parts.iter().find(|(q, _)| *q == p)?.1,
+            Hit::Status(s) => self.status_rects.iter().find(|(q, _)| *q == s)?.1,
+            _ => return None,
+        })
     }
 
     // ---- painting ----
@@ -869,7 +954,9 @@ impl App {
         }
         let focused_edit = if self.find.is_edit(f) { Some(f) } else { None };
         let hover_part = if let Hit::Find(p) = self.hover { Some(p) } else { None };
-        self.find.paint(&self.g, &self.theme, self.r_find, &self.fonts.ui, &self.fonts.icons_small, hover_part, focused_edit);
+        let pressed = hover_part.is_some() && self.down == self.hover;
+        let (ui, icons) = (&self.fonts.ui, &self.fonts.icons_small);
+        self.find.paint(&self.g, &self.theme, self.r_find, ui, icons, hover_part, pressed, focused_edit);
         self.paint_notice();
         self.paint_editor(focused_edit.is_none());
         self.paint_structure();
@@ -947,30 +1034,31 @@ impl App {
             let tab = &self.tabs[i];
             let active = i == self.active;
             let hovered = matches!(self.hover, Hit::Tab(j) | Hit::TabClose(j) if j == i);
+            let next_hovered = matches!(self.hover, Hit::Tab(j) | Hit::TabClose(j) if j == i + 1);
             if active {
                 // Rounded top corners; the bottom merges into the menu bar.
                 g.fill_round(Rect::new(r.x, r.y, r.w, r.h + 10.0), 7.0, t.surface);
                 if t.hc {
                     // (In high contrast the strip has the tab's color: outline the active tab instead.)
-                    g.stroke_round(Rect::new(r.x + 1.0, r.y + 1.0, r.w - 2.0, r.h - 3.0), 6.0, t.accent, 2.0);
+                    let outline = g.snap_rect(Rect::new(r.x + 1.0, r.y + 1.0, r.w - 2.0, r.h - 3.0));
+                    g.stroke_round(outline, 6.0, t.accent, 2.0 * g.hair());
                 }
             } else if hovered {
                 g.fill_round(Rect::new(r.x + 2.0, r.y + 2.0, r.w - 4.0, r.h - 6.0), 6.0, t.hover);
-            } else if i + 1 != self.active && i + 1 < self.tabs.len() {
-                // separator between inactive tabs
-                g.line(r.right() - 0.5, r.y + 10.0, r.right() - 0.5, r.bottom() - 10.0, t.border, 1.0);
+            } else if i + 1 != self.active && i + 1 < self.tabs.len() && !next_hovered {
+                // separator between inactive tabs (not next to the one under the mouse)
+                g.vline(r.right(), r.y + 10.0, r.bottom() - 10.0, true, t.border);
             }
             let busy = tab.busy() || !tab.doc.is_ready();
             let title = self.tab_label(i);
             let show_close = hovered || active;
-            // (Room for the unsaved-changes dot next to the close button on the active tab.)
-            let dot = active && tab.doc.is_dirty() && show_close && self.hover != Hit::TabClose(i);
-            let text_r = Rect::new(r.x + 14.0, r.y, (c.x - r.x - if dot { 30.0 } else { 18.0 }).max(10.0), r.h - 2.0);
+            // (the unsaved-changes dot next to the close button on the active tab)
+            let dot = active && tab.doc.is_dirty() && self.hover != Hit::TabClose(i);
             let color = if active { t.text } else { t.text_dim };
-            g.text(&title, &self.fonts.ui, text_r, color, Align::Left);
+            g.text(&title, &self.fonts.ui, self.tab_title_rect(i), color, Align::Left);
             if show_close {
-                if self.hover == Hit::TabClose(i) {
-                    g.fill_round(*c, 4.0, t.hover);
+                if let Some(bg) = self.hot(Hit::TabClose(i)) {
+                    g.fill_round(*c, 4.0, bg);
                 }
                 g.text("\u{E711}", &self.fonts.icons_small, *c, t.text_dim, Align::Center);
             } else if tab.doc.is_dirty() {
@@ -985,21 +1073,51 @@ impl App {
             if busy {
                 let pct = tab_progress(tab);
                 let bw = (r.w - 28.0) * pct.unwrap_or(0.35);
-                g.fill(Rect::new(r.x + 14.0, r.bottom() - 4.0, bw.max(4.0), 2.0), t.accent);
+                g.fill(g.snap_rect(Rect::new(r.x + 14.0, r.bottom() - 4.0, bw.max(4.0), 2.0)), t.accent);
             }
         }
         g.pop_clip();
         let nr = self.newtab_rect;
-        if self.hover == Hit::NewTab {
-            g.fill_round(nr, 5.0, t.hover);
+        if let Some(bg) = self.hot(Hit::NewTab) {
+            g.fill_round(nr, 5.0, bg);
         }
         g.text("\u{E710}", &self.fonts.icons_small, nr, t.text_dim, Align::Center);
         let lr = self.tablist_rect;
         if lr.w > 0.0 {
-            if self.hover == Hit::TabList {
-                g.fill_round(lr, 5.0, t.hover);
+            if let Some(bg) = self.hot(Hit::TabList) {
+                g.fill_round(lr, 5.0, bg);
             }
             g.text("\u{E70D}", &self.fonts.icons_small, lr, t.text_dim, Align::Center);
+        }
+    }
+
+    /// Where tab `i`'s title goes: all of the tab but what shows at its end (the close button, the unsaved-changes
+    /// dot), so a narrow tab still shows most of its name.
+    fn tab_title_rect(&self, i: usize) -> Rect {
+        let (r, c) = self.tab_rects[i];
+        let active = i == self.active;
+        let hovered = matches!(self.hover, Hit::Tab(j) | Hit::TabClose(j) if j == i);
+        let dirty = self.tabs[i].doc.is_dirty();
+        let end = if active && dirty && self.hover != Hit::TabClose(i) {
+            c.x - 16.0
+        } else if active || hovered {
+            c.x - 4.0
+        } else if dirty {
+            c.x + 2.0
+        } else {
+            r.right() - 12.0
+        };
+        Rect::new(r.x + 14.0, r.y, (end - r.x - 14.0).max(10.0), r.h - 2.0)
+    }
+
+    /// The background of a button under the mouse: darker while it's held down on it.
+    fn hot(&self, h: Hit) -> Option<u32> {
+        if self.hover != h {
+            None
+        } else if self.down == h {
+            Some(self.theme.pressed)
+        } else {
+            Some(self.theme.hover)
         }
     }
 
@@ -1026,8 +1144,8 @@ impl App {
             }
         }
         // Light/dark switch: a sun in dark mode, a moon in light mode.
-        if self.hover == Hit::ThemeToggle {
-            g.fill_round(self.theme_rect, 5.0, t.hover);
+        if let Some(bg) = self.hot(Hit::ThemeToggle) {
+            g.fill_round(self.theme_rect, 5.0, bg);
         }
         let glyph = if t.dark { "\u{E706}" } else { "\u{E708}" };
         if self.theme_rect.w > 0.0 {
@@ -1036,7 +1154,7 @@ impl App {
         if self.find.open || self.tab().notice.is_some() {
             return;
         }
-        g.line(0.0, self.r_menu.bottom() - 0.5, self.r_menu.right(), self.r_menu.bottom() - 0.5, t.border, 1.0);
+        g.hline(0.0, self.r_menu.right(), self.r_menu.bottom(), true, t.border);
     }
 
     fn paint_notice(&mut self) {
@@ -1049,7 +1167,7 @@ impl App {
         let Some(n) = self.tabs[self.active].notice.as_ref() else { return };
         let g = &self.g;
         g.fill(r, t.notice_bg);
-        g.line(r.x, r.bottom() - 0.5, r.right(), r.bottom() - 0.5, t.border, 1.0);
+        g.hline(r.x, r.right(), r.bottom(), true, t.border);
         let icon = match n.kind {
             NoticeKind::Info => "\u{E946}",
             NoticeKind::Warn => "\u{E7BA}",
@@ -1073,6 +1191,10 @@ impl App {
         for (i, br) in rects.iter().enumerate() {
             let hovered = self.hover == Hit::Notice(i);
             g.fill_round(*br, 4.0, if hovered { t.pressed } else { t.hover });
+            if hovered && self.down == self.hover {
+                // (held down: darker still)
+                g.fill_round(*br, 4.0, t.hover);
+            }
             g.text(&n.actions[i].0, &self.fonts.ui, *br, t.text, Align::Center);
         }
         g.text(&n.text, &self.fonts.ui, Rect::new(r.x + 36.0, r.y, (x - r.x - 40.0).max(20.0), r.h), t.text, Align::Left);
@@ -1095,9 +1217,10 @@ impl App {
         }
         if panel_open {
             let row_hover = if let Hit::StructRow(i, _) = hover { Some(i) } else { None };
-            tab.structure.paint_panel(&self.g, &t, &ui, &bold, &icons, r_struct, row_hover, hover == Hit::StructClose);
+            let (close_hot, bar_hot) = (hover == Hit::StructClose, hover == Hit::StructBar || self.struct_drag.is_some());
+            tab.structure.paint_panel(&self.g, &t, &ui, &bold, &icons, r_struct, row_hover, close_hot, bar_hot);
             if hover == Hit::StructSplitter || self.split_drag.is_some() {
-                self.g.fill(Rect::new(r_struct.x, r_struct.y, 2.0, r_struct.h), t.accent);
+                self.g.fill(self.g.snap_rect(Rect::new(r_struct.x, r_struct.y, 2.0, r_struct.h)), t.accent);
             }
         }
     }
@@ -1216,7 +1339,7 @@ impl App {
         let t = self.theme.clone();
         let r = self.r_status;
         self.g.fill(r, t.frame);
-        self.g.line(r.x, r.y + 0.5, r.right(), r.y + 0.5, t.border, 1.0);
+        self.g.hline(r.x, r.right(), r.y, false, t.border);
         let fonts_ui = self.fonts.ui.clone();
         let StatusTexts { mut pos, pos_short, mut items, counts, size } = self.status_items();
         let w = |s: &str| self.g.measure(s, &fonts_ui).0;
@@ -1255,8 +1378,8 @@ impl App {
         x -= right_w + 12.0;
         for ((item, label), &w) in items.iter().zip(&item_ws).rev() {
             let br = Rect::new(x - w - 16.0, r.y + 2.0, w + 16.0, r.h - 4.0);
-            if self.hover == Hit::Status(*item) {
-                self.g.fill_round(br, 4.0, t.hover);
+            if let Some(bg) = self.hot(Hit::Status(*item)) {
+                self.g.fill_round(br, 4.0, bg);
             }
             let color = match item {
                 StatusItem::Update => t.accent,
@@ -1268,8 +1391,8 @@ impl App {
             x = br.x - 4.0;
         }
         // Left: position, then progress or a message.
-        if self.hover == Hit::Status(StatusItem::Position) {
-            self.g.fill_round(pr, 4.0, t.hover);
+        if let Some(bg) = self.hot(Hit::Status(StatusItem::Position)) {
+            self.g.fill_round(pr, 4.0, bg);
         }
         self.g.text(&pos, &fonts_ui, pr, t.text_dim, Align::Center);
         rects.push((StatusItem::Position, pr));
@@ -1289,6 +1412,10 @@ impl App {
     pub fn status_items(&mut self) -> StatusTexts {
         let counts = self.doc_counts_now();
         let sel_counts = self.selection_counts();
+        let place = {
+            let tab = &self.tabs[self.active];
+            self.caret_place.get(&tab.doc, tab.view.sel.caret)
+        };
         let indent = match self.indent_now() {
             Indent::Spaces(n) => format!("Spaces: {n}"),
             Indent::Tabs => format!("Tab size: {}", self.settings.tab_size),
@@ -1312,7 +1439,7 @@ impl App {
         let counts = counts
             .filter(|c| c.chars > 0)
             .map(|c| format!("{}, {}", plural(c.words, "word", "words"), plural(c.chars, "character", "characters")));
-        let (pos, pos_short) = position_text(tab, sel_counts);
+        let (pos, pos_short) = position_text(tab, sel_counts, place);
         StatusTexts { pos, pos_short, items, counts, size: format_size(doc.len()) }
     }
 
@@ -1511,20 +1638,41 @@ pub fn group(n: u64) -> String {
     out
 }
 
+/// Where the caret is in its line, for the status bar: its line, the line's start and the column (in characters,
+/// from 1; None more than 4 MiB into the line), worked out once per caret place and text, as in a long line the
+/// column means reading megabytes (which every frame would cost a millisecond or two).
+#[derive(Default)]
+pub struct CaretPlace {
+    key: Option<(u64, u64, Option<u64>)>,
+    start: u64,
+    col: Option<u64>,
+}
+
+impl CaretPlace {
+    pub fn get(&mut self, doc: &Document, caret: u64) -> (Option<u64>, u64, Option<u64>) {
+        // (the line is unknown while that part of a big file isn't indexed yet)
+        let line = doc.line_of(caret);
+        let key = (doc.version, caret, line);
+        if self.key != Some(key) {
+            // Unknown line: finding the line start could mean reading hundreds of MB.
+            self.start = if line.is_some() { doc.line_start_of(caret) } else { caret };
+            self.col = (line.is_some() && caret - self.start <= 4 << 20)
+                .then(|| bytecount::num_chars(&doc.read(self.start, caret)) as u64 + 1);
+            self.key = Some(key);
+        }
+        (line, self.start, self.col)
+    }
+}
+
 /// The caret's place ("Ln 3, Col 9") with what's selected, in full and without the selection's words and lines.
-fn position_text(tab: &Tab, sel_counts: Option<Counts>) -> (String, String) {
+fn position_text(
+    tab: &Tab,
+    sel_counts: Option<Counts>,
+    (line, ls, col): (Option<u64>, u64, Option<u64>),
+) -> (String, String) {
     let doc = &tab.doc;
     let sel = tab.view.sel;
     let caret = sel.caret;
-    let line = doc.line_of(caret);
-    // Unknown line (that part isn't indexed yet): finding the line start could mean reading hundreds of MB.
-    let ls = if line.is_some() { doc.line_start_of(caret) } else { caret };
-    let col = if line.is_some() && caret - ls <= 4 << 20 {
-        let b = doc.read(ls, caret);
-        Some(bytecount::num_chars(&b) as u64 + 1)
-    } else {
-        None
-    };
     let s = match (line, col) {
         (Some(l), Some(c)) => format!("Ln {}, Col {}", group(l + 1), group(c)),
         (Some(l), None) => format!("Ln {}, byte {}", group(l + 1), group(caret - ls + 1)),
@@ -1623,4 +1771,25 @@ pub fn make_style(g: &Gfx, s: &Settings, generation: u64) -> Style {
 
 pub fn white() -> u32 {
     rgb(0xFFFFFF)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::document::{EditKind, Sel};
+
+    #[test]
+    fn the_status_bar_column_follows_the_caret_and_the_text() {
+        // (columns count characters: ç and € take 2 and 3 bytes)
+        let mut d = Document::from_text("ab\nçd€x\n".as_bytes());
+        let mut p = CaretPlace::default();
+        assert_eq!(p.get(&d, 9), (Some(1), 3, Some(4)));
+        assert_eq!(p.get(&d, 5), (Some(1), 3, Some(2)));
+        // the same place in a changed text: worked out again
+        d.begin(EditKind::Other, Sel::at(3));
+        d.insert(3, b"12");
+        d.end(Sel::at(5));
+        assert_eq!(p.get(&d, 5), (Some(1), 3, Some(3)));
+        assert_eq!(p.get(&d, 0), (Some(0), 0, Some(1)));
+    }
 }

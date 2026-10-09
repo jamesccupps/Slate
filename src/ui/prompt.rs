@@ -6,7 +6,7 @@
 
 use std::cell::Cell;
 
-use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     CreateFontIndirectW, CreateSolidBrush, DT_CALCRECT, DT_EDITCONTROL, DT_LEFT, DT_NOPREFIX, DT_WORDBREAK,
     DeleteObject, DrawTextW, FillRect, GetDC, GetMonitorInfoW, HBRUSH, HDC, HFONT, InvalidateRect, MONITOR_DEFAULTTONEAREST,
@@ -15,7 +15,7 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::SystemServices::{SS_EDITCONTROL, SS_LEFT, SS_NOPREFIX};
 use windows::Win32::UI::Controls::SetWindowTheme;
-use windows::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForWindow, SystemParametersInfoForDpi};
+use windows::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, SystemParametersInfoForDpi};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL};
 use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -25,7 +25,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowRect, HMENU, IDCANCEL, IsIconic, IsWindowVisible, MoveWindow, NONCLIENTMETRICSW, SPI_GETNONCLIENTMETRICS,
     SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW, SetWindowLongPtrW, SetWindowPos, WINDOW_EX_STYLE, WINDOW_LONG_PTR_INDEX,
     WINDOW_STYLE,
-    WM_COMMAND, WM_CTLCOLORBTN, WM_CTLCOLORDLG, WM_CTLCOLORSTATIC, WM_DPICHANGED, WM_ERASEBKGND, WM_INITDIALOG,
+    WM_COMMAND, WM_CTLCOLORBTN, WM_CTLCOLORDLG, WM_CTLCOLORSTATIC, WM_DPICHANGED, WM_ERASEBKGND, WM_GETDPISCALEDSIZE,
+    WM_INITDIALOG,
     MSG, WM_CHAR, WM_GETDLGCODE, WM_KEYDOWN, WM_NCDESTROY, WM_NEXTDLGCTL, WM_SETFONT, WS_CAPTION, WS_CHILD, WS_GROUP, WS_POPUP, WS_SYSMENU, WS_TABSTOP,
     WS_VISIBLE,
 };
@@ -169,64 +170,97 @@ impl Prompt<'_> {
                 None => super::win::system_title_bar(hwnd),
             }
             SendMessageW(hwnd, DM_SETDEFID, WPARAM(BUTTON as usize), LPARAM(0));
-            Prompt::layout(p, hwnd, GetDpiForWindow(hwnd).max(96), None);
+            Prompt::layout(p, hwnd, super::win::dpi_of(hwnd), None);
             if let Ok(b) = GetDlgItem(hwnd, BUTTON) {
                 SendMessageW(hwnd, WM_NEXTDLGCTL, WPARAM(b.0 as usize), LPARAM(1));
             }
         }
     }
 
+    /// Where the parts go at `dpi` (client pixels), measured in `font` and `big`, for a client area at most `max_h`
+    /// tall: as wide as the longest line, within limits, then as tall as the text wraps to.
+    fn geometry(&self, hdc: HDC, font: HFONT, big: HFONT, dpi: u32, max_h: i32) -> Geometry {
+        let px = |v: i32| v * dpi as i32 / 96;
+        let (margin, gap) = (px(16), px(10));
+        let natural = measure(hdc, big, self.main, None).0.max(measure(hdc, font, self.detail, None).0);
+        let labels: Vec<i32> = self.buttons.iter().map(|b| measure_label(hdc, font, b)).collect();
+        let line_h = measure(hdc, font, "Ag", None).1;
+        let (bh, bgap, bpad) = (px(24).max(line_h + px(8)), px(8), px(12));
+        let widths: Vec<i32> = labels.iter().map(|&w| (w + px(24)).max(px(80))).collect();
+        let gaps = bgap * (widths.len() as i32 - 1).max(0);
+        let text_w = natural.clamp(px(280), px(460)).max(widths.iter().sum::<i32>() + gaps + 2 * bpad - 2 * margin);
+        // (a gap between the main line and the detail when there are both)
+        let between = if self.main.is_empty() || self.detail.is_empty() { 0 } else { gap };
+        let fixed = px(16) + between + px(20) + bh + 2 * px(11);
+        let (main_h, detail_h) = fit(
+            (measure(hdc, big, self.main, Some(text_w)).1, measure(hdc, big, "Ag", None).1),
+            (measure(hdc, font, self.detail, Some(text_w)).1, line_h),
+            fixed,
+            max_h,
+        );
+        let main = (px(16), main_h);
+        let detail = (main.0 + main_h + between, detail_h);
+        let footer = detail.0 + detail_h + px(20);
+        let width = text_w + 2 * margin;
+        let mut x = width - bpad - widths.iter().sum::<i32>() - gaps;
+        let mut buttons = Vec::new();
+        for &w in &widths {
+            buttons.push((x, w));
+            x += w + bgap;
+        }
+        let height = footer + bh + 2 * px(11);
+        Geometry { margin, text_w, main, detail, footer, buttons, button_y: footer + px(11), bh, width, height }
+    }
+
+    /// How much bigger than its client area the dialog's window is at `dpi`.
+    fn frame(hwnd: HWND, dpi: u32) -> (i32, i32) {
+        unsafe {
+            let mut r = RECT::default();
+            let style = WINDOW_STYLE(GetWindowLongW(hwnd, GWL_STYLE) as u32);
+            let ex = WINDOW_EX_STYLE(GetWindowLongW(hwnd, GWL_EXSTYLE) as u32);
+            let _ = AdjustWindowRectExForDpi(&mut r, style, false, ex, dpi);
+            (r.right - r.left, r.bottom - r.top)
+        }
+    }
+
+    /// The work area of the screen `monitor`.
+    fn work_area(monitor: windows::Win32::Graphics::Gdi::HMONITOR) -> RECT {
+        let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        unsafe {
+            let _ = GetMonitorInfoW(monitor, &mut mi);
+        }
+        mi.rcWork
+    }
+
     /// Sizes everything for `dpi` and places the dialog: over the window it belongs to (or at `at`, where Windows
-    /// moved it to another screen), within the screen.
+    /// moved it to another screen), within the screen. Text too tall for the screen is cut short, so the buttons stay
+    /// on it (Ctrl+C still copies all of it).
     fn layout(p: *mut Prompt, hwnd: HWND, dpi: u32, at: Option<RECT>) {
         unsafe {
-            let px = |v: i32| v * dpi as i32 / 96;
-            // Windows' message font, and a bigger one for the main line, as task dialogs have
-            let mut m = NONCLIENTMETRICSW { cbSize: std::mem::size_of::<NONCLIENTMETRICSW>() as u32, ..Default::default() };
-            let _ = SystemParametersInfoForDpi(SPI_GETNONCLIENTMETRICS.0, m.cbSize, Some(&mut m as *mut _ as _), 0, dpi);
-            // (the old ones go once the controls have the new ones)
+            // (the old fonts go once the controls have the new ones)
             let old = [(*p).font, (*p).big];
-            (*p).font = CreateFontIndirectW(&m.lfMessageFont);
-            let mut big = m.lfMessageFont;
-            big.lfHeight = big.lfHeight * 4 / 3;
-            (*p).big = CreateFontIndirectW(&big);
-
+            ((*p).font, (*p).big) = fonts(dpi);
+            let owner = GetWindow(hwnd, GW_OWNER).unwrap_or_default();
+            let work = Prompt::work_area(match &at {
+                Some(a) => MonitorFromRect(a, MONITOR_DEFAULTTONEAREST),
+                None => MonitorFromWindow(if owner.is_invalid() { hwnd } else { owner }, MONITOR_DEFAULTTONEAREST),
+            });
+            let (fw, fh) = Prompt::frame(hwnd, dpi);
             let hdc = GetDC(hwnd);
-            let (margin, gap) = (px(16), px(10));
-            // as wide as the longest line, within limits; then as tall as the text wraps to
-            let natural = measure(hdc, (*p).big, (*p).main, None).0.max(measure(hdc, (*p).font, (*p).detail, None).0);
-            let labels: Vec<i32> = (*p).buttons.iter().map(|b| measure_label(hdc, (*p).font, b)).collect();
-            let (bh, bgap, bpad) = (px(24).max(measure(hdc, (*p).font, "Ag", None).1 + px(8)), px(8), px(12));
-            let widths: Vec<i32> = labels.iter().map(|&w| (w + px(24)).max(px(80))).collect();
-            let row = widths.iter().sum::<i32>() + bgap * (widths.len() as i32 - 1).max(0) + 2 * bpad;
-            let text_w = natural.clamp(px(280), px(460)).max(row - 2 * margin);
-            let main_h = measure(hdc, (*p).big, (*p).main, Some(text_w)).1;
-            let detail_h = measure(hdc, (*p).font, (*p).detail, Some(text_w)).1;
+            let g = (*p).geometry(hdc, (*p).font, (*p).big, dpi, work.bottom - work.top - fh);
             ReleaseDC(hwnd, hdc);
-
-            let mut y = px(16);
-            if let Ok(c) = GetDlgItem(hwnd, MAIN) {
-                let _ = MoveWindow(c, margin, y, text_w, main_h, true);
-                SendMessageW(c, WM_SETFONT, WPARAM((*p).big.0 as usize), LPARAM(1));
-                y += main_h;
+            for (id, (y, h), font) in [(MAIN, g.main, (*p).big), (DETAIL, g.detail, (*p).font)] {
+                if let Ok(c) = GetDlgItem(hwnd, id) {
+                    let _ = MoveWindow(c, g.margin, y, g.text_w, h, true);
+                    SendMessageW(c, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+                }
             }
-            if let Ok(c) = GetDlgItem(hwnd, DETAIL) {
-                let main = (*p).main;
-                y += if main.is_empty() { 0 } else { gap };
-                let _ = MoveWindow(c, margin, y, text_w, detail_h, true);
-                SendMessageW(c, WM_SETFONT, WPARAM((*p).font.0 as usize), LPARAM(1));
-                y += detail_h;
-            }
-            (*p).footer = y + px(20);
-            let width = text_w + 2 * margin;
-            let height = (*p).footer + bh + 2 * px(11);
-            let mut x = width - bpad - widths.iter().sum::<i32>() - bgap * (widths.len() as i32 - 1).max(0);
-            for (i, bw) in widths.iter().enumerate() {
+            (*p).footer = g.footer;
+            for (i, &(x, w)) in g.buttons.iter().enumerate() {
                 if let Ok(b) = GetDlgItem(hwnd, BUTTON + i as i32) {
-                    let _ = MoveWindow(b, x, (*p).footer + px(11), *bw, bh, true);
+                    let _ = MoveWindow(b, x, g.button_y, w, g.bh, true);
                     SendMessageW(b, WM_SETFONT, WPARAM((*p).font.0 as usize), LPARAM(1));
                 }
-                x += bw + bgap;
             }
             for h in old {
                 if !h.is_invalid() {
@@ -235,19 +269,7 @@ impl Prompt<'_> {
             }
 
             // the window around that client area, over its owner and on its screen
-            let mut r = RECT { left: 0, top: 0, right: width, bottom: height };
-            let style = WINDOW_STYLE(GetWindowLongW(hwnd, GWL_STYLE) as u32);
-            let ex = WINDOW_EX_STYLE(GetWindowLongW(hwnd, GWL_EXSTYLE) as u32);
-            let _ = AdjustWindowRectExForDpi(&mut r, style, false, ex, dpi);
-            let (w, h) = (r.right - r.left, r.bottom - r.top);
-            let owner = GetWindow(hwnd, GW_OWNER).unwrap_or_default();
-            let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
-            let monitor = match &at {
-                Some(a) => MonitorFromRect(a, MONITOR_DEFAULTTONEAREST),
-                None => MonitorFromWindow(if owner.is_invalid() { hwnd } else { owner }, MONITOR_DEFAULTTONEAREST),
-            };
-            let _ = GetMonitorInfoW(monitor, &mut mi);
-            let work = mi.rcWork;
+            let (w, h) = (g.width + fw, g.height + fh);
             let (mut x, mut y) = match at {
                 Some(a) => (a.left, a.top),
                 None => {
@@ -264,6 +286,48 @@ impl Prompt<'_> {
             let _ = InvalidateRect(hwnd, None, true);
         }
     }
+}
+
+/// Where a prompt's parts go at one DPI (client pixels).
+struct Geometry {
+    margin: i32,
+    text_w: i32,
+    /// The main line's and the detail's top and height.
+    main: (i32, i32),
+    detail: (i32, i32),
+    /// Where the row of buttons starts, and each button's left edge and width.
+    footer: i32,
+    buttons: Vec<(i32, i32)>,
+    button_y: i32,
+    bh: i32,
+    width: i32,
+    height: i32,
+}
+
+/// Windows' message font at `dpi`, and a bigger one for the main line, as task dialogs have.
+fn fonts(dpi: u32) -> (HFONT, HFONT) {
+    unsafe {
+        let mut m = NONCLIENTMETRICSW { cbSize: std::mem::size_of::<NONCLIENTMETRICSW>() as u32, ..Default::default() };
+        let _ = SystemParametersInfoForDpi(SPI_GETNONCLIENTMETRICS.0, m.cbSize, Some(&mut m as *mut _ as _), 0, dpi);
+        let mut big = m.lfMessageFont;
+        big.lfHeight = big.lfHeight * 4 / 3;
+        (CreateFontIndirectW(&m.lfMessageFont), CreateFontIndirectW(&big))
+    }
+}
+
+/// The heights the main line and the detail get, each given as (its height, a line's height), when the client area
+/// can be `max_h` tall and everything else in it takes `fixed`: what doesn't fit comes off the detail first, then
+/// the main line, in whole lines, so the buttons stay on the screen.
+fn fit((main_h, main_line): (i32, i32), (detail_h, detail_line): (i32, i32), fixed: i32, max_h: i32) -> (i32, i32) {
+    let whole = |h: i32, line: i32| if line > 0 { h / line * line } else { h };
+    let over = fixed + main_h + detail_h - max_h;
+    if over <= 0 {
+        return (main_h, detail_h);
+    }
+    let detail = whole((detail_h - over).max(0), detail_line);
+    let over = over - (detail_h - detail);
+    let main = if over > 0 { whole((main_h - over).max(0), main_line) } else { main_h };
+    (main, detail)
 }
 
 fn instance() -> HINSTANCE {
@@ -417,6 +481,22 @@ extern "system" fn dialog_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                 }
                 1
             }
+            WM_GETDPISCALEDSIZE => {
+                // The size it gets at the new DPI (its text doesn't grow exactly in step), so Windows moves it to the
+                // other screen in one go.
+                let dpi = wp.0 as u32;
+                let (font, big) = fonts(dpi);
+                let work = Prompt::work_area(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST));
+                let (fw, fh) = Prompt::frame(hwnd, dpi);
+                let hdc = GetDC(hwnd);
+                let g = (*p).geometry(hdc, font, big, dpi, work.bottom - work.top - fh);
+                ReleaseDC(hwnd, hdc);
+                let _ = DeleteObject(font);
+                let _ = DeleteObject(big);
+                *(lp.0 as *mut SIZE) = SIZE { cx: g.width + fw, cy: (g.height + fh).min(work.bottom - work.top) };
+                SetWindowLongPtrW(hwnd, WINDOW_LONG_PTR_INDEX(DWLP_MSGRESULT as i32), 1);
+                1
+            }
             WM_DPICHANGED => {
                 let at = *(lp.0 as *const RECT);
                 Prompt::layout(p, hwnd, (wp.0 & 0xFFFF) as u32, Some(at));
@@ -480,5 +560,19 @@ mod tests {
         let words: Vec<u16> = t.iter().flat_map(|d| [*d as u16, (*d >> 16) as u16]).collect();
         assert_eq!(&words[2..11], &[0; 9]);
         assert_eq!(&words[11..14], &[b'H' as u16, b'i' as u16, 0]);
+    }
+
+    #[test]
+    fn text_taller_than_the_screen_leaves_the_buttons_on_it() {
+        // it fits: as it is
+        assert_eq!(fit((30, 30), (200, 20), 100, 1000), (30, 200));
+        // too tall: the detail gives way, in whole lines, and everything fits
+        let (m, d) = fit((30, 30), (2000, 20), 100, 1000);
+        assert_eq!(m, 30);
+        assert!(100 + m + d <= 1000 && d % 20 == 0 && d > 1000 - 100 - 30 - 20, "{d}");
+        // still too tall without the detail: the main line too
+        let (m, d) = fit((900, 30), (300, 20), 100, 500);
+        assert_eq!(d, 0);
+        assert!(100 + m <= 500 && m % 30 == 0 && m > 0, "{m}");
     }
 }
