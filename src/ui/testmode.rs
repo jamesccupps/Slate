@@ -920,6 +920,11 @@ pub fn run(args: &[String]) -> i32 {
                 }
             }
             // A native crash (to try the minidump): the process ends here.
+            // (only with a data folder of the test's own: the crash log and the dump go there)
+            "crash" if std::env::var_os("SLATE_DATA_DIR").is_none() => {
+                out.push_str("crash needs SLATE_DATA_DIR\n");
+                failures += 1;
+            }
             "crash" => unsafe { std::ptr::null_mut::<u8>().write_volatile(1) },
             // As if another Slate was running but didn't answer: this window keeps nothing for next time.
             "guest" => super::settings::GUEST.store(true, std::sync::atomic::Ordering::Relaxed),
