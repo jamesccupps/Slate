@@ -4,27 +4,23 @@
 //! The window is drawn through a Direct3D 11 device and a flip-model swap chain (what modern apps such as Windows
 //! Terminal use). Direct2D's simpler HWND render target is only a fallback: on this developer's PC (a virtual
 //! display adapter next to the GPU) it reported the window as occluded and never showed anything.
-//!
-//! The text view's layouts go through a text renderer of its own (`draw_layout_in`): only the glyph runs in view,
-//! and a row's runs in one font as one run per color, as Direct2D's cost is per run, not per glyph.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::ffi::c_void;
 
-use windows::Win32::Foundation::{BOOL, E_NOINTERFACE, HMODULE, HWND, S_OK};
+use windows::Win32::Foundation::{BOOL, HMODULE, HWND};
 use windows::Win32::Graphics::Direct2D::Common::{
     D2D_POINT_2F, D2D_RECT_F, D2D_SIZE_U, D2D1_ALPHA_MODE_IGNORE, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F,
     D2D1_PIXEL_FORMAT,
 };
 use windows::Win32::Graphics::Direct2D::{
-    D2D1_ANTIALIAS_MODE_ALIASED, D2D1_COLOR_BITMAP_GLYPH_SNAP_OPTION_DEFAULT, D2D1_DRAW_TEXT_OPTIONS,
-    D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT, D2D1_FACTORY_TYPE_SINGLE_THREADED,
-    D2D1_FEATURE_LEVEL_DEFAULT, D2D1_HWND_RENDER_TARGET_PROPERTIES, D2D1_PRESENT_OPTIONS_NONE,
-    D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_RENDER_TARGET_USAGE_NONE, D2D1_ROUNDED_RECT,
-    D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE, D2D1CreateFactory, ID2D1Brush,
-    ID2D1DeviceContext7, ID2D1Factory1, ID2D1HwndRenderTarget, ID2D1RenderTarget, ID2D1SolidColorBrush,
-    ID2D1SvgGlyphStyle, D2D1_BITMAP_OPTIONS_CANNOT_DRAW, D2D1_BITMAP_OPTIONS_TARGET, D2D1_BITMAP_PROPERTIES1,
+    D2D1_ANTIALIAS_MODE_ALIASED, D2D1_DRAW_TEXT_OPTIONS, D2D1_DRAW_TEXT_OPTIONS_CLIP,
+    D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT, D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_FEATURE_LEVEL_DEFAULT,
+    D2D1_HWND_RENDER_TARGET_PROPERTIES, D2D1_PRESENT_OPTIONS_NONE, D2D1_RENDER_TARGET_PROPERTIES,
+    D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_RENDER_TARGET_USAGE_NONE, D2D1_ROUNDED_RECT,
+    D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE, D2D1CreateFactory, ID2D1Factory1,
+    ID2D1HwndRenderTarget, ID2D1RenderTarget, ID2D1SolidColorBrush,
+    D2D1_BITMAP_OPTIONS_CANNOT_DRAW, D2D1_BITMAP_OPTIONS_TARGET, D2D1_BITMAP_PROPERTIES1,
     D2D1_DEVICE_CONTEXT_OPTIONS_NONE, ID2D1Bitmap1, ID2D1DeviceContext,
 };
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE, D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP};
@@ -39,16 +35,14 @@ use windows::Win32::Graphics::Dxgi::{
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_ALPHA_MODE_IGNORE, DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC};
 use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_METRICS, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
-    DWRITE_FONT_WEIGHT, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_GLYPH_OFFSET, DWRITE_GLYPH_RUN,
-    DWRITE_GLYPH_RUN_DESCRIPTION, DWRITE_MATRIX, DWRITE_MEASURING_MODE, DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
-    DWRITE_STRIKETHROUGH, DWRITE_TEXT_ALIGNMENT, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING,
-    DWRITE_TEXT_ALIGNMENT_TRAILING, DWRITE_TEXT_METRICS, DWRITE_TRIMMING, DWRITE_TRIMMING_GRANULARITY_CHARACTER,
-    DWRITE_UNDERLINE, DWRITE_WORD_WRAPPING_NO_WRAP, DWriteCreateFactory, IDWriteFactory, IDWriteFont1,
-    IDWriteFontCollection, IDWriteFontFace, IDWriteFontFace2, IDWritePixelSnapping, IDWritePixelSnapping_Vtbl,
-    IDWriteTextFormat, IDWriteTextLayout, IDWriteTextRenderer, IDWriteTextRenderer_Vtbl,
+    DWRITE_FONT_WEIGHT, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT,
+    DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_TEXT_ALIGNMENT_TRAILING,
+    DWRITE_TEXT_METRICS, DWRITE_TRIMMING, DWRITE_TRIMMING_GRANULARITY_CHARACTER, DWRITE_WORD_WRAPPING_NO_WRAP,
+    DWriteCreateFactory, IDWriteFactory, IDWriteFont1, IDWriteFontCollection, IDWriteTextFormat,
+    IDWriteTextLayout,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
-use windows::core::{GUID, HRESULT, HSTRING, IUnknown, IUnknown_Vtbl, Interface, PCWSTR, w};
+use windows::core::{HSTRING, Interface, PCWSTR, w};
 
 /// A rectangle in DIPs.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -482,307 +476,11 @@ impl Gfx {
     }
 
     /// `draw_layout`, but only the glyph runs that reach into `view`: Direct2D draws every run of a layout, and a long
-    /// row of colored text has thousands, nearly all out of view. `color_glyphs`: the text may have some (emoji),
-    /// which only Windows 11's Direct2D draws run by run (elsewhere the whole layout is drawn).
+    /// row of colored text has thousands, nearly all out of view (see `text_renderer`). `color_glyphs`: the text may
+    /// have some (emoji), which only Windows 11's Direct2D draws run by run (elsewhere the whole layout is drawn).
     pub fn draw_layout_in(&self, l: &IDWriteTextLayout, x: f32, y: f32, argb: u32, view: Rect, color_glyphs: bool) {
-        let rt = self.rt().clone();
-        let color = if color_glyphs {
-            match rt.cast::<ID2D1DeviceContext7>() {
-                Ok(dc) => Some(dc),
-                Err(_) => return self.draw_layout(l, x, y, argb),
-            }
-        } else {
-            None
-        };
-        let (mut dx, mut dy) = (96.0f32, 96.0f32);
-        unsafe { rt.GetDpi(&mut dx, &mut dy) };
-        let mut c = Culler {
-            vtbl: &CULLER_VTBL,
-            rt,
-            brush: self.brush(argb),
-            view: view.d2d(),
-            ppd: dx / 96.0,
-            color,
-            held: RefCell::new(Vec::new()),
-        };
-        unsafe {
-            // (The renderer lives on the stack for this call only: it counts no references.)
-            let r = std::mem::ManuallyDrop::new(IDWriteTextRenderer::from_raw(&mut c as *mut Culler as *mut c_void));
-            let _ = l.Draw(None, &*r, x, y);
-            c.flush();
-        }
+        text_renderer::draw(self, l, x, y, argb, view, color_glyphs);
     }
-}
-
-/// The text renderer behind `Gfx::draw_layout_in`: a COM object by hand (a vtable and the data after it).
-#[repr(C)]
-struct Culler {
-    vtbl: *const IDWriteTextRenderer_Vtbl,
-    rt: ID2D1RenderTarget,
-    brush: ID2D1SolidColorBrush,
-    view: D2D_RECT_F,
-    ppd: f32,
-    /// Draws color glyphs in color.
-    color: Option<ID2D1DeviceContext7>,
-    /// Runs kept back to be drawn together (`flush`).
-    held: RefCell<Vec<Held>>,
-}
-
-/// A glyph run copied out of the layout until its row is done.
-struct Held {
-    x: f32,
-    y: f32,
-    face: IDWriteFontFace,
-    em: f32,
-    mode: DWRITE_MEASURING_MODE,
-    brush: ID2D1Brush,
-    glyphs: Vec<u16>,
-    advances: Vec<f32>,
-    offsets: Vec<DWRITE_GLYPH_OFFSET>,
-}
-
-impl Culler {
-    /// Draws the runs held back: those next to each other on a row in one font go as one run per color, in which the
-    /// other colors' glyphs are blanks. Direct2D's cost is mostly per run, and a row of code has dozens of short
-    /// ones; this way it has as many as it has colors.
-    fn flush(&self) {
-        let held = self.held.take();
-        let width = |h: &Held| h.advances.iter().sum::<f32>();
-        let mut i = 0;
-        while i < held.len() {
-            let a = &held[i];
-            let mut end = a.x + width(a);
-            let mut j = i + 1;
-            while j < held.len() {
-                let b = &held[j];
-                let same = b.y == a.y && b.face.as_raw() == a.face.as_raw() && b.em == a.em && b.mode == a.mode;
-                if !same || b.x < end - 0.01 {
-                    break;
-                }
-                end = b.x + width(b);
-                j += 1;
-            }
-            let group = &held[i..j];
-            i = j;
-            // (the font's space: a glyph with nothing to draw)
-            let mut blank = 0u16;
-            let space = b' ' as u32;
-            let blank_ok = unsafe { a.face.GetGlyphIndices(&space, 1, &mut blank) }.is_ok() && blank != 0;
-            if group.len() == 1 || !blank_ok {
-                for h in group {
-                    self.draw_run(h.x, h.y, h, &h.glyphs, &h.advances, &h.offsets);
-                }
-                continue;
-            }
-            // The row's glyphs, with a blank over any gap between runs, and which run each is of.
-            let (mut glyphs, mut advances, mut offsets, mut owner) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-            let mut x = a.x;
-            for (k, h) in group.iter().enumerate() {
-                if h.x > x + 0.01 {
-                    glyphs.push(blank);
-                    advances.push(h.x - x);
-                    offsets.push(DWRITE_GLYPH_OFFSET::default());
-                    owner.push(usize::MAX);
-                }
-                glyphs.extend_from_slice(&h.glyphs);
-                advances.extend_from_slice(&h.advances);
-                if h.offsets.is_empty() {
-                    offsets.extend(std::iter::repeat_n(DWRITE_GLYPH_OFFSET::default(), h.glyphs.len()));
-                } else {
-                    offsets.extend_from_slice(&h.offsets);
-                }
-                owner.extend(std::iter::repeat_n(k, h.glyphs.len()));
-                x = h.x + width(h);
-            }
-            let mut done = vec![false; group.len()];
-            for k in 0..group.len() {
-                if done[k] {
-                    continue;
-                }
-                let mine: Vec<bool> = group.iter().map(|h| h.brush.as_raw() == group[k].brush.as_raw()).collect();
-                mine.iter().enumerate().filter(|m| *m.1).for_each(|(m, _)| done[m] = true);
-                let ours = |o: &usize| *o != usize::MAX && mine[*o];
-                let (Some(first), Some(last)) = (owner.iter().position(ours), owner.iter().rposition(ours)) else { continue };
-                let ids: Vec<u16> = (first..=last).map(|g| if ours(&owner[g]) { glyphs[g] } else { blank }).collect();
-                let x0 = a.x + advances[..first].iter().sum::<f32>();
-                self.draw_run(x0, a.y, &group[k], &ids, &advances[first..=last], &offsets[first..=last]);
-            }
-        }
-    }
-
-    /// Draws glyphs in the font, size and brush of `h`, starting at (`x`, `y`).
-    fn draw_run(&self, x: f32, y: f32, h: &Held, glyphs: &[u16], advances: &[f32], offsets: &[DWRITE_GLYPH_OFFSET]) {
-        let run = DWRITE_GLYPH_RUN {
-            // (borrowed: no reference of its own)
-            fontFace: std::mem::ManuallyDrop::new(Some(unsafe { std::mem::transmute_copy(&h.face) })),
-            fontEmSize: h.em,
-            glyphCount: glyphs.len() as u32,
-            glyphIndices: glyphs.as_ptr(),
-            glyphAdvances: advances.as_ptr(),
-            glyphOffsets: if offsets.is_empty() { std::ptr::null() } else { offsets.as_ptr() },
-            isSideways: BOOL(0),
-            bidiLevel: 0,
-        };
-        unsafe { self.rt.DrawGlyphRun(D2D_POINT_2F { x, y }, &run, &h.brush, h.mode) };
-    }
-}
-
-static CULLER_VTBL: IDWriteTextRenderer_Vtbl = IDWriteTextRenderer_Vtbl {
-    base__: IDWritePixelSnapping_Vtbl {
-        base__: IUnknown_Vtbl { QueryInterface: culler_qi, AddRef: culler_ref, Release: culler_ref },
-        IsPixelSnappingDisabled: culler_no_snap,
-        GetCurrentTransform: culler_transform,
-        GetPixelsPerDip: culler_ppd,
-    },
-    DrawGlyphRun: culler_glyphs,
-    DrawUnderline: culler_underline,
-    DrawStrikethrough: culler_strikethrough,
-    DrawInlineObject: culler_inline,
-};
-
-unsafe extern "system" fn culler_qi(this: *mut c_void, iid: *const GUID, out: *mut *mut c_void) -> HRESULT {
-    let iid = unsafe { *iid };
-    let ok = iid == IUnknown::IID || iid == IDWritePixelSnapping::IID || iid == IDWriteTextRenderer::IID;
-    unsafe { *out = if ok { this } else { std::ptr::null_mut() } };
-    if ok { S_OK } else { E_NOINTERFACE }
-}
-
-unsafe extern "system" fn culler_ref(_: *mut c_void) -> u32 {
-    1
-}
-
-unsafe extern "system" fn culler_no_snap(_: *mut c_void, _: *const c_void, out: *mut BOOL) -> HRESULT {
-    unsafe { *out = BOOL(0) };
-    S_OK
-}
-
-unsafe extern "system" fn culler_transform(this: *mut c_void, _: *const c_void, out: *mut DWRITE_MATRIX) -> HRESULT {
-    let c = unsafe { &*(this as *const Culler) };
-    let mut m = windows::Foundation::Numerics::Matrix3x2::default();
-    unsafe {
-        c.rt.GetTransform(&mut m);
-        *out = DWRITE_MATRIX { m11: m.M11, m12: m.M12, m21: m.M21, m22: m.M22, dx: m.M31, dy: m.M32 };
-    }
-    S_OK
-}
-
-unsafe extern "system" fn culler_ppd(this: *mut c_void, _: *const c_void, out: *mut f32) -> HRESULT {
-    unsafe { *out = (*(this as *const Culler)).ppd };
-    S_OK
-}
-
-/// The brush a run was given (`SetDrawingEffect`), else the default one.
-unsafe fn culler_brush(c: &Culler, effect: *mut c_void) -> ID2D1Brush {
-    let given = unsafe { IUnknown::from_raw_borrowed(&effect) }.and_then(|e| e.cast::<ID2D1Brush>().ok());
-    given.unwrap_or_else(|| c.brush.clone().into())
-}
-
-unsafe extern "system" fn culler_glyphs(
-    this: *mut c_void,
-    _: *const c_void,
-    x: f32,
-    y: f32,
-    mode: DWRITE_MEASURING_MODE,
-    run: *const DWRITE_GLYPH_RUN,
-    desc: *const DWRITE_GLYPH_RUN_DESCRIPTION,
-    effect: *mut c_void,
-) -> HRESULT {
-    let c = unsafe { &*(this as *const Culler) };
-    let r = unsafe { &*run };
-    let em = r.fontEmSize;
-    let v = c.view;
-    // (with an em to spare for what glyphs reach beyond their advance: accents, italics, tall fallback fonts)
-    if y + em < v.top || y - 2.0 * em > v.bottom {
-        return S_OK;
-    }
-    let w: f32 = if r.glyphAdvances.is_null() || r.glyphCount == 0 {
-        0.0
-    } else {
-        unsafe { std::slice::from_raw_parts(r.glyphAdvances, r.glyphCount as usize) }.iter().sum()
-    };
-    let (x0, x1) = if r.bidiLevel & 1 == 1 { (x - w, x) } else { (x, x + w) };
-    if x1 + em < v.left || x0 - em > v.right {
-        return S_OK;
-    }
-    unsafe {
-        let brush = culler_brush(c, effect);
-        let at = D2D_POINT_2F { x, y };
-        // (only a color font's runs: drawn so, any run costs ten times as much)
-        let colored = |f: &IDWriteFontFace| f.cast::<IDWriteFontFace2>().is_ok_and(|f| f.IsColorFont().as_bool());
-        match (&c.color, r.fontFace.as_ref()) {
-            (Some(dc), Some(f)) if colored(f) => {
-                let snap = D2D1_COLOR_BITMAP_GLYPH_SNAP_OPTION_DEFAULT;
-                dc.DrawGlyphRunWithColorSupport(at, run, Some(desc), &brush, None::<&ID2D1SvgGlyphStyle>, 0, mode, snap);
-            }
-            // left to right: kept to be drawn with the rest of its row
-            (_, Some(f)) if r.bidiLevel & 1 == 0 && !r.isSideways.as_bool() && w > 0.0 => {
-                let n = r.glyphCount as usize;
-                let offsets = if r.glyphOffsets.is_null() { &[] } else { std::slice::from_raw_parts(r.glyphOffsets, n) };
-                c.held.borrow_mut().push(Held {
-                    x,
-                    y,
-                    face: f.clone(),
-                    em,
-                    mode,
-                    brush,
-                    glyphs: std::slice::from_raw_parts(r.glyphIndices, n).to_vec(),
-                    advances: std::slice::from_raw_parts(r.glyphAdvances, n).to_vec(),
-                    offsets: offsets.to_vec(),
-                });
-            }
-            _ => c.rt.DrawGlyphRun(at, run, &brush, mode),
-        }
-    }
-    S_OK
-}
-
-unsafe fn culler_line(c: &Culler, x: f32, y: f32, width: f32, thickness: f32, offset: f32, effect: *mut c_void) {
-    let r = D2D_RECT_F { left: x, top: y + offset, right: x + width, bottom: y + offset + thickness };
-    unsafe { c.rt.FillRectangle(&r, &culler_brush(c, effect)) };
-}
-
-unsafe extern "system" fn culler_underline(
-    this: *mut c_void,
-    _: *const c_void,
-    x: f32,
-    y: f32,
-    u: *const DWRITE_UNDERLINE,
-    effect: *mut c_void,
-) -> HRESULT {
-    unsafe {
-        let u = &*u;
-        culler_line(&*(this as *const Culler), x, y, u.width, u.thickness, u.offset, effect);
-    }
-    S_OK
-}
-
-unsafe extern "system" fn culler_strikethrough(
-    this: *mut c_void,
-    _: *const c_void,
-    x: f32,
-    y: f32,
-    s: *const DWRITE_STRIKETHROUGH,
-    effect: *mut c_void,
-) -> HRESULT {
-    unsafe {
-        let s = &*s;
-        culler_line(&*(this as *const Culler), x, y, s.width, s.thickness, s.offset, effect);
-    }
-    S_OK
-}
-
-unsafe extern "system" fn culler_inline(
-    _: *mut c_void,
-    _: *const c_void,
-    _: f32,
-    _: f32,
-    _: *mut c_void,
-    _: BOOL,
-    _: BOOL,
-    _: *mut c_void,
-) -> HRESULT {
-    // (The text has no inline objects.)
-    S_OK
 }
 
 /// Facts about a font needed for layout.
@@ -865,6 +563,329 @@ pub fn offscreen_pixel_format() -> D2D1_PIXEL_FORMAT {
 
 pub fn pcwstr(v: &[u16]) -> PCWSTR {
     PCWSTR(v.as_ptr())
+}
+
+/// The text renderer behind `Gfx::draw_layout_in`, a COM object made by hand (a vtable and the data after it): only
+/// the glyph runs in view, and a row's runs in one font as one run per color, as Direct2D's cost is per run.
+mod text_renderer {
+    use std::cell::RefCell;
+    use std::ffi::c_void;
+
+    use windows::Win32::Foundation::{BOOL, E_NOINTERFACE, S_OK};
+    use windows::Win32::Graphics::Direct2D::Common::{D2D_POINT_2F, D2D_RECT_F};
+    use windows::Win32::Graphics::Direct2D::{
+        D2D1_COLOR_BITMAP_GLYPH_SNAP_OPTION_DEFAULT, ID2D1Brush, ID2D1DeviceContext7, ID2D1RenderTarget,
+        ID2D1SolidColorBrush, ID2D1SvgGlyphStyle,
+    };
+    use windows::Win32::Graphics::DirectWrite::{
+        DWRITE_GLYPH_OFFSET, DWRITE_GLYPH_RUN, DWRITE_GLYPH_RUN_DESCRIPTION, DWRITE_MATRIX, DWRITE_MEASURING_MODE,
+        DWRITE_STRIKETHROUGH, DWRITE_UNDERLINE, IDWriteFontFace, IDWriteFontFace2, IDWritePixelSnapping,
+        IDWritePixelSnapping_Vtbl, IDWriteTextLayout, IDWriteTextRenderer, IDWriteTextRenderer_Vtbl,
+    };
+    use windows::core::{GUID, HRESULT, IUnknown, IUnknown_Vtbl, Interface};
+
+    use super::{Gfx, Rect};
+
+    pub fn draw(g: &Gfx, l: &IDWriteTextLayout, x: f32, y: f32, argb: u32, view: Rect, color_glyphs: bool) {
+        let rt = g.rt().clone();
+        let color = if color_glyphs {
+            match rt.cast::<ID2D1DeviceContext7>() {
+                Ok(dc) => Some(dc),
+                Err(_) => return g.draw_layout(l, x, y, argb),
+            }
+        } else {
+            None
+        };
+        let (mut dx, mut dy) = (96.0f32, 96.0f32);
+        unsafe { rt.GetDpi(&mut dx, &mut dy) };
+        let mut c = Culler {
+            vtbl: &CULLER_VTBL,
+            rt,
+            brush: g.brush(argb),
+            view: view.d2d(),
+            ppd: dx / 96.0,
+            color,
+            held: RefCell::new(Vec::new()),
+        };
+        unsafe {
+            // (The renderer lives on the stack for this call only: it counts no references.)
+            let r = std::mem::ManuallyDrop::new(IDWriteTextRenderer::from_raw(&mut c as *mut Culler as *mut c_void));
+            let _ = l.Draw(None, &*r, x, y);
+            c.flush();
+        }
+    }
+
+    #[repr(C)]
+    struct Culler {
+        vtbl: *const IDWriteTextRenderer_Vtbl,
+        rt: ID2D1RenderTarget,
+        brush: ID2D1SolidColorBrush,
+        view: D2D_RECT_F,
+        ppd: f32,
+        /// Draws color glyphs in color.
+        color: Option<ID2D1DeviceContext7>,
+        /// Runs kept back to be drawn together (`flush`).
+        held: RefCell<Vec<Held>>,
+    }
+
+    /// A glyph run copied out of the layout until its row is done.
+    struct Held {
+        x: f32,
+        y: f32,
+        face: IDWriteFontFace,
+        em: f32,
+        mode: DWRITE_MEASURING_MODE,
+        brush: ID2D1Brush,
+        glyphs: Vec<u16>,
+        advances: Vec<f32>,
+        offsets: Vec<DWRITE_GLYPH_OFFSET>,
+    }
+
+    impl Culler {
+        /// Draws the runs held back: those next to each other on a row in one font go as one run per color, in which
+        /// the other colors' glyphs are blanks. Direct2D's cost is mostly per run, and a row of code has dozens of
+        /// short ones; this way it has as many as it has colors.
+        fn flush(&self) {
+            let held = self.held.take();
+            let width = |h: &Held| h.advances.iter().sum::<f32>();
+            let mut i = 0;
+            while i < held.len() {
+                let a = &held[i];
+                let mut end = a.x + width(a);
+                let mut j = i + 1;
+                while j < held.len() {
+                    let b = &held[j];
+                    let same = b.y == a.y && b.face.as_raw() == a.face.as_raw() && b.em == a.em && b.mode == a.mode;
+                    if !same || b.x < end - 0.01 {
+                        break;
+                    }
+                    end = b.x + width(b);
+                    j += 1;
+                }
+                let group = &held[i..j];
+                i = j;
+                // (the font's space: a glyph with nothing to draw)
+                let mut blank = 0u16;
+                let space = b' ' as u32;
+                let blank_ok = unsafe { a.face.GetGlyphIndices(&space, 1, &mut blank) }.is_ok() && blank != 0;
+                if group.len() == 1 || !blank_ok {
+                    for h in group {
+                        self.draw_run(h.x, h.y, h, &h.glyphs, &h.advances, &h.offsets);
+                    }
+                    continue;
+                }
+                // The row's glyphs, with a blank over any gap between runs, and which run each is of.
+                let (mut glyphs, mut advances, mut offsets, mut owner) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+                let mut x = a.x;
+                for (k, h) in group.iter().enumerate() {
+                    if h.x > x + 0.01 {
+                        glyphs.push(blank);
+                        advances.push(h.x - x);
+                        offsets.push(DWRITE_GLYPH_OFFSET::default());
+                        owner.push(usize::MAX);
+                    }
+                    glyphs.extend_from_slice(&h.glyphs);
+                    advances.extend_from_slice(&h.advances);
+                    if h.offsets.is_empty() {
+                        offsets.extend(std::iter::repeat_n(DWRITE_GLYPH_OFFSET::default(), h.glyphs.len()));
+                    } else {
+                        offsets.extend_from_slice(&h.offsets);
+                    }
+                    owner.extend(std::iter::repeat_n(k, h.glyphs.len()));
+                    x = h.x + width(h);
+                }
+                let mut done = vec![false; group.len()];
+                for k in 0..group.len() {
+                    if done[k] {
+                        continue;
+                    }
+                    let mine: Vec<bool> = group.iter().map(|h| h.brush.as_raw() == group[k].brush.as_raw()).collect();
+                    mine.iter().enumerate().filter(|m| *m.1).for_each(|(m, _)| done[m] = true);
+                    let ours = |o: &usize| *o != usize::MAX && mine[*o];
+                    let (Some(first), Some(last)) = (owner.iter().position(ours), owner.iter().rposition(ours)) else {
+                        continue;
+                    };
+                    let ids: Vec<u16> = (first..=last).map(|g| if ours(&owner[g]) { glyphs[g] } else { blank }).collect();
+                    let x0 = a.x + advances[..first].iter().sum::<f32>();
+                    self.draw_run(x0, a.y, &group[k], &ids, &advances[first..=last], &offsets[first..=last]);
+                }
+            }
+        }
+
+        /// Draws glyphs in the font, size and brush of `h`, starting at (`x`, `y`).
+        fn draw_run(&self, x: f32, y: f32, h: &Held, glyphs: &[u16], advances: &[f32], offsets: &[DWRITE_GLYPH_OFFSET]) {
+            let run = DWRITE_GLYPH_RUN {
+                // (borrowed: no reference of its own)
+                fontFace: std::mem::ManuallyDrop::new(Some(unsafe { std::mem::transmute_copy(&h.face) })),
+                fontEmSize: h.em,
+                glyphCount: glyphs.len() as u32,
+                glyphIndices: glyphs.as_ptr(),
+                glyphAdvances: advances.as_ptr(),
+                glyphOffsets: if offsets.is_empty() { std::ptr::null() } else { offsets.as_ptr() },
+                isSideways: BOOL(0),
+                bidiLevel: 0,
+            };
+            unsafe { self.rt.DrawGlyphRun(D2D_POINT_2F { x, y }, &run, &h.brush, h.mode) };
+        }
+    }
+
+    static CULLER_VTBL: IDWriteTextRenderer_Vtbl = IDWriteTextRenderer_Vtbl {
+        base__: IDWritePixelSnapping_Vtbl {
+            base__: IUnknown_Vtbl { QueryInterface: query_interface, AddRef: no_count, Release: no_count },
+            IsPixelSnappingDisabled: no_snap,
+            GetCurrentTransform: transform,
+            GetPixelsPerDip: pixels_per_dip,
+        },
+        DrawGlyphRun: glyph_run,
+        DrawUnderline: underline,
+        DrawStrikethrough: strikethrough,
+        DrawInlineObject: inline_object,
+    };
+
+    unsafe extern "system" fn query_interface(this: *mut c_void, iid: *const GUID, out: *mut *mut c_void) -> HRESULT {
+        let iid = unsafe { *iid };
+        let ok = iid == IUnknown::IID || iid == IDWritePixelSnapping::IID || iid == IDWriteTextRenderer::IID;
+        unsafe { *out = if ok { this } else { std::ptr::null_mut() } };
+        if ok { S_OK } else { E_NOINTERFACE }
+    }
+
+    unsafe extern "system" fn no_count(_: *mut c_void) -> u32 {
+        1
+    }
+
+    unsafe extern "system" fn no_snap(_: *mut c_void, _: *const c_void, out: *mut BOOL) -> HRESULT {
+        unsafe { *out = BOOL(0) };
+        S_OK
+    }
+
+    unsafe extern "system" fn transform(this: *mut c_void, _: *const c_void, out: *mut DWRITE_MATRIX) -> HRESULT {
+        let c = unsafe { &*(this as *const Culler) };
+        let mut m = windows::Foundation::Numerics::Matrix3x2::default();
+        unsafe {
+            c.rt.GetTransform(&mut m);
+            *out = DWRITE_MATRIX { m11: m.M11, m12: m.M12, m21: m.M21, m22: m.M22, dx: m.M31, dy: m.M32 };
+        }
+        S_OK
+    }
+
+    unsafe extern "system" fn pixels_per_dip(this: *mut c_void, _: *const c_void, out: *mut f32) -> HRESULT {
+        unsafe { *out = (*(this as *const Culler)).ppd };
+        S_OK
+    }
+
+    /// The brush a run was given (`SetDrawingEffect`), else the default one.
+    unsafe fn brush_of(c: &Culler, effect: *mut c_void) -> ID2D1Brush {
+        let given = unsafe { IUnknown::from_raw_borrowed(&effect) }.and_then(|e| e.cast::<ID2D1Brush>().ok());
+        given.unwrap_or_else(|| c.brush.clone().into())
+    }
+
+    unsafe extern "system" fn glyph_run(
+        this: *mut c_void,
+        _: *const c_void,
+        x: f32,
+        y: f32,
+        mode: DWRITE_MEASURING_MODE,
+        run: *const DWRITE_GLYPH_RUN,
+        desc: *const DWRITE_GLYPH_RUN_DESCRIPTION,
+        effect: *mut c_void,
+    ) -> HRESULT {
+        let c = unsafe { &*(this as *const Culler) };
+        let r = unsafe { &*run };
+        let em = r.fontEmSize;
+        let v = c.view;
+        // (with an em to spare for what glyphs reach beyond their advance: accents, italics, tall fallback fonts)
+        if y + em < v.top || y - 2.0 * em > v.bottom {
+            return S_OK;
+        }
+        let n = r.glyphCount as usize;
+        let advances = match r.glyphAdvances.is_null() || n == 0 {
+            true => &[],
+            false => unsafe { std::slice::from_raw_parts(r.glyphAdvances, n) },
+        };
+        let w: f32 = advances.iter().sum();
+        let (x0, x1) = if r.bidiLevel & 1 == 1 { (x - w, x) } else { (x, x + w) };
+        if x1 + em < v.left || x0 - em > v.right {
+            return S_OK;
+        }
+        unsafe {
+            let brush = brush_of(c, effect);
+            let at = D2D_POINT_2F { x, y };
+            // (only a color font's runs: drawn so, any run costs ten times as much)
+            let colored = |f: &IDWriteFontFace| f.cast::<IDWriteFontFace2>().is_ok_and(|f| f.IsColorFont().as_bool());
+            match (&c.color, r.fontFace.as_ref()) {
+                (Some(dc), Some(f)) if colored(f) => {
+                    let snap = D2D1_COLOR_BITMAP_GLYPH_SNAP_OPTION_DEFAULT;
+                    dc.DrawGlyphRunWithColorSupport(at, run, Some(desc), &brush, None::<&ID2D1SvgGlyphStyle>, 0, mode, snap);
+                }
+                // left to right: kept to be drawn with the rest of its row
+                (_, Some(f)) if r.bidiLevel & 1 == 0 && !r.isSideways.as_bool() && w > 0.0 => {
+                    let offsets = if r.glyphOffsets.is_null() { &[] } else { std::slice::from_raw_parts(r.glyphOffsets, n) };
+                    c.held.borrow_mut().push(Held {
+                        x,
+                        y,
+                        face: f.clone(),
+                        em,
+                        mode,
+                        brush,
+                        glyphs: std::slice::from_raw_parts(r.glyphIndices, n).to_vec(),
+                        advances: advances.to_vec(),
+                        offsets: offsets.to_vec(),
+                    });
+                }
+                _ => c.rt.DrawGlyphRun(at, run, &brush, mode),
+            }
+        }
+        S_OK
+    }
+
+    unsafe fn line(c: &Culler, x: f32, y: f32, width: f32, thickness: f32, offset: f32, effect: *mut c_void) {
+        let r = D2D_RECT_F { left: x, top: y + offset, right: x + width, bottom: y + offset + thickness };
+        unsafe { c.rt.FillRectangle(&r, &brush_of(c, effect)) };
+    }
+
+    unsafe extern "system" fn underline(
+        this: *mut c_void,
+        _: *const c_void,
+        x: f32,
+        y: f32,
+        u: *const DWRITE_UNDERLINE,
+        effect: *mut c_void,
+    ) -> HRESULT {
+        unsafe {
+            let u = &*u;
+            line(&*(this as *const Culler), x, y, u.width, u.thickness, u.offset, effect);
+        }
+        S_OK
+    }
+
+    unsafe extern "system" fn strikethrough(
+        this: *mut c_void,
+        _: *const c_void,
+        x: f32,
+        y: f32,
+        s: *const DWRITE_STRIKETHROUGH,
+        effect: *mut c_void,
+    ) -> HRESULT {
+        unsafe {
+            let s = &*s;
+            line(&*(this as *const Culler), x, y, s.width, s.thickness, s.offset, effect);
+        }
+        S_OK
+    }
+
+    unsafe extern "system" fn inline_object(
+        _: *mut c_void,
+        _: *const c_void,
+        _: f32,
+        _: f32,
+        _: *mut c_void,
+        _: BOOL,
+        _: BOOL,
+        _: *mut c_void,
+    ) -> HRESULT {
+        // (The text has no inline objects.)
+        S_OK
+    }
 }
 
 #[cfg(test)]
