@@ -1158,11 +1158,15 @@ impl View {
         let caret = self.sel.caret;
         let (seg, lay, row, _) = self.caret_place(cx, caret, self.upstream);
         let rs = seg.start + lay.row_bytes(row).0;
-        let ls = cx.doc.line_start_of(caret);
-        if rs > ls && caret != rs {
+        // (A row the line wrapped into starts after the line: no need to look for where that is, which in a huge line
+        // whose lines are still being counted means reading back to it.)
+        let first_row = row == 0 && seg.line_start;
+        if !first_row && caret != rs {
             self.set_caret(rs, extend);
         } else {
-            let head = cx.doc.read(ls, (ls + 4096).min(cx.doc.line_end_of(ls)));
+            let ls = if first_row { rs } else { cx.doc.line_start_of(caret) };
+            // (the indentation ends at the first other character, a line break too)
+            let head = cx.doc.read(ls, (ls + 4096).min(cx.doc.len()));
             let ind = head.iter().take_while(|&&b| b == b' ' || b == b'\t').count() as u64;
             let first = ls + ind;
             self.set_caret(if caret == first { ls } else { first }, extend);
@@ -2772,6 +2776,25 @@ mod tests {
                 }
             });
         }
+    }
+
+    #[test]
+    fn home_goes_to_the_row_then_the_text_then_the_line() {
+        let line = b"    let x = aaaa(bbbb, cccc, dddd, eeee, ffff, gggg, hhhh, iiii, jjjj, kkkk, llll, mmmm, nnnn);";
+        let mut text = b"\n".to_vec();
+        text.extend_from_slice(line);
+        view_on(&text, Lang::Plain, |v, cx| {
+            let end = text.len() as u64;
+            let row = v.row_start(cx, end);
+            assert!(row > 10, "it wraps");
+            v.set_caret(end - 2, false);
+            let mut stops = Vec::new();
+            for _ in 0..4 {
+                v.home(cx, false);
+                stops.push(v.sel.caret);
+            }
+            assert_eq!(stops, [row, 5, 1, 5]);
+        });
     }
 
     #[test]
