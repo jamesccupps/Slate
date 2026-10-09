@@ -102,6 +102,25 @@ fn log_crash(what: &str) {
     }
 }
 
+/// Startup steps and when they were done (FILETIME units), for `print:startup` in test mode.
+static MARKS: std::sync::Mutex<Vec<(&'static str, u64)>> = std::sync::Mutex::new(Vec::new());
+
+pub fn mark(what: &'static str) {
+    let t = unsafe { windows::Win32::System::SystemInformation::GetSystemTimePreciseAsFileTime() };
+    MARKS.lock().unwrap().push((what, ((t.dwHighDateTime as u64) << 32) | t.dwLowDateTime as u64));
+}
+
+/// The startup marks so far, as milliseconds since the process was created.
+pub fn marks() -> Vec<(&'static str, f64)> {
+    use windows::Win32::Foundation::FILETIME;
+    let (mut created, mut x) = (FILETIME::default(), FILETIME::default());
+    let (mut y, mut z) = (FILETIME::default(), FILETIME::default());
+    let process = unsafe { windows::Win32::System::Threading::GetCurrentProcess() };
+    let _ = unsafe { windows::Win32::System::Threading::GetProcessTimes(process, &mut created, &mut x, &mut y, &mut z) };
+    let created = ((created.dwHighDateTime as u64) << 32) | created.dwLowDateTime as u64;
+    MARKS.lock().unwrap().iter().map(|&(w, t)| (w, t.saturating_sub(created) as f64 / 10_000.0)).collect()
+}
+
 /// Runs queued actions (menus, dialogs, commands) once the App isn't borrowed.
 pub fn drain_pending(cell: &Cell) {
     thread_local! {
@@ -1026,11 +1045,13 @@ pub fn place_tab(tab: &mut app::Tab, st: &session::SessionTab) {
 }
 
 pub fn run(args: Vec<String>) -> i32 {
+    mark("run");
     std::panic::set_hook(Box::new(|info| log_crash(&info.to_string())));
     crash::install();
     unsafe {
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
     }
+    mark("init");
     if args.first().map(String::as_str) == Some("--uninstall") {
         install::uninstall(args.iter().any(|a| a == "--quiet"));
         return 0;
@@ -1066,9 +1087,11 @@ pub fn run(args: Vec<String>) -> i32 {
         Running::No => {}
         Running::Busy => settings::GUEST.store(true, std::sync::atomic::Ordering::Relaxed),
     }
+    let _device = gfx::make_device_early();
     if !updated && update_failed.is_none() {
         // (Right after an update the copy before it stays: it goes back in place if the new one fails to start.)
-        install::clean_old_copies();
+        // On another thread: a big Downloads folder can take a while to list.
+        std::thread::spawn(install::clean_old_copies);
     }
     install::refresh_version();
     crate::core::source::set_temp_dir(settings::temp_dir());

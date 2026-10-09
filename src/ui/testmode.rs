@@ -36,6 +36,12 @@
 //! (as if another Slate was running but didn't answer: nothing is kept for next time), `crash` (a native crash, to
 //! try the minidump; the run ends there), `prompt:<file.png>|save|update|info` (draws that prompt into a PNG, in the
 //! theme's colors, without showing it).
+//!
+//! Measuring: `print:startup` (the start's steps in ms since the process was created), `gfx:window` anywhere in the
+//! script (frames go through the hidden window's own swap chain, from the paint after the first command on, as in a
+//! real start; `gfx:late` too: its Direct3D device is made then, not from the start), `idle:<ms>` (the real message
+//! loop for that long, with the 2 s disk check: what woke it), `copydata:<path>` (a file handed over the way a second
+//! Slate does it); `session:…` says how long it took.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -81,6 +87,31 @@ fn pump(cell: &Cell, ms: u64) {
         }
         std::thread::sleep(Duration::from_millis(5));
     }
+}
+
+/// Runs the message loop for `ms` the way the real one does (GetMessage), counting what woke it.
+fn idle(ms: u32) -> String {
+    use windows::Win32::UI::WindowsAndMessaging::{GetMessageW, KillTimer, SetTimer, WM_TIMER};
+    let mut seen = std::collections::BTreeMap::<String, u32>::new();
+    unsafe {
+        let stop = SetTimer(None, 0, ms, None);
+        let mut msg = MSG::default();
+        while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+            if msg.hwnd.is_invalid() && msg.message == WM_TIMER && msg.wParam.0 == stop {
+                break;
+            }
+            let what = match msg.message {
+                WM_TIMER => format!("timer {}", msg.wParam.0),
+                super::actions::WM_APP_JOB => "job".into(),
+                m => format!("{m:#06x}"),
+            };
+            *seen.entry(what).or_default() += 1;
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        let _ = KillTimer(None, stop);
+    }
+    seen.iter().map(|(k, n)| format!("{k} x{n}")).collect::<Vec<_>>().join(", ")
 }
 
 fn busy(cell: &Cell) -> bool {
@@ -519,6 +550,11 @@ fn describe(cell: &Cell, what: &str) -> String {
             a.update_find_status();
             a.find.status.clone()
         }
+        // (milliseconds since the process was created: the start's steps, then this command)
+        "startup" => {
+            super::mark("now");
+            super::marks().iter().map(|(w, ms)| format!("{w} {ms:.1}")).collect::<Vec<_>>().join(" | ")
+        }
         _ => format!("(unknown: {what})"),
     }
 }
@@ -548,10 +584,17 @@ pub fn run(args: &[String]) -> i32 {
     } else {
         args.to_vec()
     };
+    // A script that draws through the window's own target starts the way Slate does: the device made early (unless
+    // `gfx:late`: then at the first paint, to compare), and the first frame after the first command.
+    let has = |what: &str| lines.iter().any(|l| l.trim() == what);
+    let real = has("gfx:window");
+    let _device = (real && !has("gfx:late")).then(super::gfx::make_device_early);
     let hinst = register_class();
     let s = Settings { restore_session: false, ..Default::default() };
     let hwnd = create_window(hinst, &s);
+    super::mark("window");
     let cell = make_app(hwnd);
+    super::mark("app");
     {
         let mut a = cell.borrow_mut();
         a.settings = s;
@@ -568,9 +611,10 @@ pub fn run(args: &[String]) -> i32 {
         }
     };
     set_size(hwnd, 1200, 800);
-    if !visible {
+    if !visible && !real {
         let _ = offscreen(&cell);
     }
+    super::mark("ready");
     let started = Instant::now();
     let mut mark = started;
     let mut failures = 0;
@@ -796,6 +840,7 @@ pub fn run(args: &[String]) -> i32 {
             // As if another Slate was running but didn't answer: this window keeps nothing for next time.
             "guest" => super::settings::GUEST.store(true, std::sync::atomic::Ordering::Relaxed),
             "session" => {
+                let t = Instant::now();
                 let mut a = cell.borrow_mut();
                 match arg {
                     "save" => {
@@ -813,6 +858,7 @@ pub fn run(args: &[String]) -> i32 {
                         super::restore(&mut a, &[]);
                     }
                 }
+                out.push_str(&format!("session {arg}: {:.1} ms\n", t.elapsed().as_secs_f64() * 1000.0));
             }
             "down" | "move" | "up" => {
                 let (x, y) = arg.split_once(',').map(|(x, y)| (x.parse().unwrap_or(0.0), y.parse().unwrap_or(0.0))).unwrap_or((0.0, 0.0));
@@ -890,6 +936,29 @@ pub fn run(args: &[String]) -> i32 {
                 let f: f32 = arg.parse().unwrap_or(0.5);
                 let mut a = cell.borrow_mut();
                 a.with_view(|v, cx| v.set_scroll_fraction(cx, f));
+            }
+            // (see `real` above) Back to the window's own target after a `shot`.
+            "gfx" => {
+                let mut a = cell.borrow_mut();
+                if a.g.offscreen {
+                    a.g.offscreen = false;
+                    a.g.discard_target();
+                }
+            }
+            // The real message loop for <ms>, as an idle window runs it (with its 2 s disk check): what woke it.
+            "idle" => {
+                cell.borrow().timer(super::actions::TIMER_DISK, 2000);
+                out.push_str(&format!("idle: {}\n", idle(arg.parse().unwrap_or(10_000))));
+            }
+            // What another Slate sends to hand its files over.
+            "copydata" => {
+                use windows::Win32::Foundation::{LPARAM, WPARAM};
+                use windows::Win32::System::DataExchange::COPYDATASTRUCT;
+                use windows::Win32::UI::WindowsAndMessaging::{SendMessageW, WM_COPYDATA};
+                let text: Vec<u16> = arg.encode_utf16().collect();
+                let cds = COPYDATASTRUCT { dwData: super::COPYDATA_OPEN, cbData: (text.len() * 2) as u32, lpData: text.as_ptr() as *mut _ };
+                unsafe { SendMessageW(hwnd, WM_COPYDATA, WPARAM(0), LPARAM(&cds as *const _ as isize)) };
+                pump(&cell, 0);
             }
             _ => {
                 out.push_str(&format!("unknown op {op}\n"));

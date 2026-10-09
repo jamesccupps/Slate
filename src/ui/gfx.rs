@@ -149,6 +149,58 @@ fn user_locale() -> HSTRING {
     if n > 1 { HSTRING::from_wide(&buf[..n as usize - 1]).unwrap_or_else(|_| HSTRING::from("en-us")) } else { HSTRING::from("en-us") }
 }
 
+fn device(kind: D3D_DRIVER_TYPE) -> windows::core::Result<ID3D11Device> {
+    let mut dev = None;
+    unsafe {
+        D3D11CreateDevice(
+            None,
+            kind,
+            HMODULE::default(),
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+            None,
+            D3D11_SDK_VERSION,
+            Some(&mut dev),
+            None,
+            None,
+        )?;
+    }
+    dev.ok_or_else(|| windows::core::Error::from(windows::Win32::Foundation::E_FAIL))
+}
+
+/// (A Direct3D 11 device can be used from any thread.)
+struct Device(ID3D11Device);
+unsafe impl Send for Device {}
+
+/// The hardware device `make_device_early` is making.
+static EARLY: std::sync::Mutex<Option<std::thread::JoinHandle<Option<Device>>>> = std::sync::Mutex::new(None);
+
+/// Starts making the hardware Direct3D device on another thread while Slate starts: the graphics driver can take a
+/// quarter of a second to load, which the first frame would otherwise wait for on its own. Dropping what this returns
+/// waits for that thread (Slate never ends while the driver loads on it).
+pub fn make_device_early() -> EarlyDevice {
+    let made = std::thread::Builder::new().name("slate-d3d".into()).spawn(|| {
+        let made = device(D3D_DRIVER_TYPE_HARDWARE).ok().map(Device);
+        super::mark("device");
+        made
+    });
+    *EARLY.lock().unwrap() = made.ok();
+    EarlyDevice
+}
+
+pub struct EarlyDevice;
+
+impl Drop for EarlyDevice {
+    fn drop(&mut self) {
+        drop(early_device());
+    }
+}
+
+/// The device `make_device_early` made, once (waiting for it if it isn't done yet).
+fn early_device() -> Option<ID3D11Device> {
+    let made = EARLY.lock().unwrap().take()?;
+    made.join().ok().flatten().map(|d| d.0)
+}
+
 impl Gfx {
     pub fn new() -> windows::core::Result<Gfx> {
         unsafe {
@@ -171,22 +223,10 @@ impl Gfx {
     /// The normal window target: a flip-model swap chain on a Direct3D 11 device (hardware, else WARP).
     fn create_flip(&self, hwnd: HWND, w: u32, h: u32, dpi: f32) -> windows::core::Result<WinTarget> {
         unsafe {
-            let make = |kind: D3D_DRIVER_TYPE| -> windows::core::Result<ID3D11Device> {
-                let mut dev = None;
-                D3D11CreateDevice(
-                    None,
-                    kind,
-                    HMODULE::default(),
-                    D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-                    None,
-                    D3D11_SDK_VERSION,
-                    Some(&mut dev),
-                    None,
-                    None,
-                )?;
-                dev.ok_or_else(|| windows::core::Error::from(windows::Win32::Foundation::E_FAIL))
+            let dev = match early_device() {
+                Some(dev) => dev,
+                None => device(D3D_DRIVER_TYPE_HARDWARE).or_else(|_| device(D3D_DRIVER_TYPE_WARP))?,
             };
-            let dev = make(D3D_DRIVER_TYPE_HARDWARE).or_else(|_| make(D3D_DRIVER_TYPE_WARP))?;
             let dxgi_dev: IDXGIDevice = dev.cast()?;
             let d2d_dev = self.d2d.CreateDevice(&dxgi_dev)?;
             let dc = d2d_dev.CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE)?;
