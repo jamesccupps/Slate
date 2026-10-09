@@ -82,9 +82,10 @@ open as fast as on Windows; colors are drawn with the glyphs, only what's in vie
    - Why it's L: COM classes through the windows crate's `implement` feature; the provider is called while the App
      may be borrowed (`try_borrow`, else `UIA_E_ELEMENTNOTAVAILABLE`, and never a panic across COM); offsets to
      UTF-16 over huge documents and ones whose lines are still being counted; testing with Narrator and NVDA.
-2. **Release basics (S–M).** Slate.exe is signed since 0.8.0 (Azure Artifact Signing, in CI). Next: the updater
-   also checks the signature of what it downloads; winget (a silent `--install` that does what "Open files with
-   Slate…" does, then a manifest in microsoft/winget-pkgs) and Scoop. (Licensed MIT since October 2026.)
+2. **Release basics (S–M).** Slate.exe is signed since 0.8.0 (Azure Artifact Signing, in CI); since 0.8.1 the
+   updater checks that an update is signed by the same publisher, and `Slate.exe --install` installs silently for
+   winget (`JamesCupps.Slate`, submitted with 0.8.1). Next: a winget manifest PR made by CI for each release (needs
+   a GitHub token of the user's as a secret), Scoop. (Licensed MIT since October 2026.)
 3. **Big unsaved files, the rest (S–M).** Keep a big document's newline index in the session so putting it back
    doesn't count the lines again, and keep big documents that Format or Replace All rewrote (today closing still asks
    about those). (Its `.data` is already written anew, with only what the text uses, once most of it isn't.)

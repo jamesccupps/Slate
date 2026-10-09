@@ -74,6 +74,14 @@ icons) and a tarball, each with a `.sha256`.
    reads them: with another key, apt refuses the repository until a `.deb` bringing the new key is installed by
    hand.
 
+5. winget: the package is `JamesCupps.Slate` in microsoft/winget-pkgs (first submitted with 0.8.1:
+   microsoft/winget-pkgs#449740, from the user's fork `jamesccupps/winget-pkgs`). Its installer is the release's
+   `Slate.exe`, `InstallerType: exe`, `Scope: user`, silent switch `--install`, `ProductCode: Slate` (the Installed
+   apps key), `UpgradeBehavior: install`. Each new version needs its own manifest PR (three files under
+   `manifests/j/JamesCupps/Slate/<version>/`, with the new `InstallerUrl` and `InstallerSha256`; `winget validate
+   --manifest <folder>` first); Microsoft's pipeline installs it in a sandbox and merges it. Slate updates itself
+   anyway, so a winget PR per release only matters for new installs and `winget upgrade`.
+
 What the updater reads from a release can never change, as every version out there reads it: the tag `vX.Y.Z` (no
 pre-release suffix), assets named exactly `Slate.exe` and `Slate.exe.sha256` (`<64 hex digits>  Slate.exe`), this
 repository, `/releases/latest`. Slate.exe stays the x64 build. The updater never goes back to a lower version, so a
