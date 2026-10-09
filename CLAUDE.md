@@ -76,9 +76,12 @@ Commits use the GitHub no-reply address (repo-local git config); GitHub refuses 
     ReplaceFile for a file still open on a share/FAT drive — not atomic, so last, with a backup it restores; never
     writes the target in place). Save refuses text read from a file changed in place (`Changed`) and ANSI that
     would turn characters into "?" (`Lossy`, unless the user said so). Stale temp files of dead processes are
-    cleaned up.
-  - `search.rs` — byte-regex search in windows (8 MB, 64 KB overlap, grows for long matches), find next/prev,
-    count all, streaming replace-all.
+    cleaned up. After a big save the text reads exactly the bytes written, from the file written (found by its file
+    ID), never what another program put at that path next.
+  - `search.rs` — byte-regex search in windows of 8 MB, overlapping by 64 KB (at least the query's length) for plain
+    text and by 1 MiB for regexes, so their matches up to 1 MiB are found exactly as in one search of the whole text;
+    find next/prev, count all, streaming replace-all (the text between matches is copied from the window searched).
+    Regex searches of documents over 256 KB (plain text over 32 MB) run on another thread (`Matcher::sync_limit`).
   - `json.rs` — one streaming tokenizer for pretty-print / minify / validate (JSON Lines OK), errors with offsets;
     comments (JSONC) are refused with a message saying so.
   - `xml.rs` — the same for XML (well-formedness check; markup separated only by whitespace with a line break goes
@@ -98,12 +101,13 @@ Commits use the GitHub no-reply address (repo-local git config); GitHub refuses 
     tag closes the element it names (among the 1024 innermost), a stray one is ignored; in a file cut short, what's
     open ends at its end. An element scanned on its own stops where its parent's list says it ends, and a rescan
     where the list's content ends (`Children::content_end`), so malformed markup reads the same either way.
-  - `text.rs` — encoding/EOL detection (mostly-UTF-8 with a few bad bytes stays UTF-8), UTF-16/ANSI codecs (ANSI
-    = the system code page, Windows-1252 under the UTF-8 code page option), display decoding (control chars →
-    symbols), char classes.
+  - `text.rs` — encoding/EOL detection (mostly-UTF-8 with a few bad bytes stays UTF-8; UTF-16 without a BOM, like
+    ANSI, only if the text converts back to exactly the file's bytes), UTF-16/ANSI codecs (ANSI = the system code
+    page, Windows-1252 under the UTF-8 code page option; single-byte code pages through tables made once from
+    Windows' own conversions), display decoding (control chars → symbols), char classes.
   - `job.rs` — background jobs with progress/cancel, notify the UI by posting a window message.
 - `src/ui/` — the Win32 app (see the module docs at the top of each file).
-  - `highlight.rs` (+ `highlight/code.rs`, `highlight/markup.rs`, `highlight/config.rs`) — syntax coloring for ~50
+  - `highlight.rs` (+ `highlight/code.rs`, `highlight/markup.rs`, `highlight/config.rs`) — syntax coloring for 52
     languages: hand-written lexers that color one segment and return the `State` they end in (inside a block
     comment, a multi-line string, an XML tag, a Markdown code block...). `code.rs` is one configurable lexer for
     programming/scripting languages (keyword tables + per-language extras: Rust and C++ raw strings, PowerShell
@@ -117,17 +121,25 @@ Commits use the GitHub no-reply address (repo-local git config); GitHub refuses 
     can't be right (a line number out of order, which the state's `b` carries; a string left open, a `GOTO` without
     a line number, `.NOT.` and other operators PPCL hasn't got, a name over 6 characters without quotes), only on
     numbered lines. Only the eleven dotted operators split a word (`ROOM.MIN.TEMP` is one name); Toggle comment puts
-    the `C` after each line's number); PHP files are HTML with PHP inside. A Markdown
+    the `C` after each line's number); PHP files are HTML with PHP inside. Backtick names (Kotlin, Scala, Swift) are
+    plain names and Scala's `'sym` a literal; a `;` ending a G-code line is Fanuc's end of block; Markdown's inline
+    spans never cross (`uncross`); errors are drawn bold. A Markdown
     ``` block is colored as the language it names, that lexer's state kept in the Markdown state (`mode` holds the
     language; where its state doesn't fit, each line is colored from its line start). Where a quote is easily a
     stray one (shell, SQL, PHP...), a string left open gives up at a blank line or after 40 lines. Language is
     picked by file name (templates like `x.yaml.j2` by the name inside; nginx/Apache configuration also by its
     folder, so detection gets the whole path; `.m`/`.h` are Objective-C only with `#import`/`@interface`-style lines,
-    `.m` is MATLAB too), then by content (`#!` lines, `<?xml`, `server {`, `<VirtualHost`, `WEBVTT`, JSON that reads
+    `.m` is MATLAB too, and `.h` is C++ with `class`, `namespace`, `template`, `std::`, `public:` or `<vector>`-style
+    includes in its first 4 KB), then by content (`#!` lines, `<?xml`, `server {`, `<VirtualHost`, `WEBVTT`, JSON that reads
     as JSON, PPCL's numbered lines, log timestamps — not IP addresses —, G-code by a slicer's header or lines of
     G-code words). A test checks that lexing a text in two pieces ends in the same state as lexing it whole (cut
     after a line break for every language, mid-line too for those listed in it — not Inno Setup, whose `[Section]`
-    needs its line to itself); for deeper runs raise its counts for a while.
+    needs its line to itself); for deeper runs raise its counts for a while. Another checks that spans never cross
+    and that coloring ends in the state lexing does. For speed, names and punctuation skip the checks that can't
+    apply (`letter_starts_more`, `plain_punct`): a new extra for the C family, Rust, C# or SQL that starts with
+    punctuation must be left out of `plain_punct` (the `plain_punctuation_starts_nothing` test only catches what the
+    syntax tables say). `SLATE_HL_SAMPLES=<folder> cargo test --release --lib lexer_speed -- --ignored --nocapture`
+    measures each lexer on the files in a folder.
   - `app.rs` state, layout and painting; `actions.rs` input, commands, background jobs, saving and closing;
     `editor.rs` the text view; `structure.rs` path bar + structure panel; `findbar.rs`; `session.rs` (tabs and
     unsaved text kept between runs); `settings.rs` (data folder, portable mode); `install.rs` ("Open with" entries
@@ -137,10 +149,21 @@ Commits use the GitHub no-reply address (repo-local git config); GitHub refuses 
     the user sends themselves; the version string with the commit, which build.rs passes in); `prompt.rs` (prompts
     in the theme's colors, as Windows' task dialogs and message boxes stay light: a real dialog of Windows' own
     controls, push buttons themed `DarkMode_Explorer` when dark, so the keyboard, screen readers and Ctrl+C work as in
-    any dialog; `win::ask` falls back to a task dialog if it can't be made); `testmode.rs`.
+    any dialog; `win::ask` falls back to a task dialog if it can't be made; text taller than the screen is cut to whole lines,
+    Ctrl+C still copies all of it; WM_GETDPISCALEDSIZE sizes it for another monitor); `testmode.rs`. Symbol-only
+    buttons, status bar items and tabs (their file's path) have tooltips: `win::Tip`, Windows' own tracking tooltip,
+    made the first time one shows (never in test mode), its texts from `App::tip_text`.
   - `gfx.rs` — Direct2D drawing into a D3D11 **flip-model swap chain** (FLIP_DISCARD, then FLIP_SEQUENTIAL), with
     `ID2D1HwndRenderTarget` only as a fallback: on a PC with a Parsec virtual display adapter the HWND target reported
     "occluded" and drew nothing. Device loss → `discard_target()` and paint again.
+    The hardware device is made on another thread from the start (`make_device_early`; the first paint takes it,
+    and Slate doesn't end before that thread does): the driver can take a quarter of a second to load. The text view
+    draws through its own `IDWriteTextRenderer` (`mod text_renderer`): only the glyph runs in view (and of a long run,
+    only its glyphs in view), a row's runs in one font as one Direct2D run per color, the colors given at drawing
+    time through each run's cluster map rather than set on the layout (emoji through
+    `ID2D1DeviceContext7::DrawGlyphRunWithColorSupport` on Windows 11; on older Windows a layout that may hold emoji
+    keeps its colors on the layout and is drawn whole); a pixel test checks it draws what `DrawTextLayout` does. Bars
+    and hairlines sit on device pixels (`snap`, `hline`/`vline`, `hair`), so they stay crisp at 125% and 150%.
 
 ## Design decisions
 
@@ -157,7 +180,9 @@ Commits use the GitHub no-reply address (repo-local git config); GitHub refuses 
   never from another segment start); an edit drops only what comes after it (the
   index applies the document's pending changes itself, as layout can run before `View::sync`). Measuring the scroll
   limit uses guessed states, so it never reads the whole file. Bigger files color each line on its own. Layouts are
-  cached by (bytes, state).
+  cached by (bytes, state): at most 4000 of them and 1 MB of text, never dropping one that's on screen.
+- With word wrap, a line's later rows start under its indentation (after a PPCL line's number), as in VS Code,
+  unless it's indented more than half the width or is over ~4 KiB (cut into segments).
 - A general editor first: JSON and XML extras (format/minify/check, the path bar and structure panel) only appear in
   menus for those files; everything else gets the general tools (line tools, toggle comment, change case).
 - Indentation is per document (`Tab::indent`): detected from the text (tabs, or spaces and their step), always tabs
@@ -170,12 +195,14 @@ Commits use the GitHub no-reply address (repo-local git config); GitHub refuses 
 - Accessibility: while Windows' high contrast is on, the theme is built from `GetSysColor` (`Theme::high_contrast`):
   everything on the window color with borders, no syntax colors, selected text drawn again in the highlight's text
   color, no light/dark switch; it's read again on WM_SETTINGCHANGE (SPI_SETHIGHCONTRAST), WM_SYSCOLORCHANGE and
-  WM_THEMECHANGED. A hidden system caret (`win::follow_caret`, never shown) is moved to the drawn caret after each
+  WM_THEMECHANGED. The caret stops blinking (shown) after Windows' caret timeout (`SPI_GETCARETTIMEOUT`), as in
+  other apps, until the next key or click. A hidden system caret (`win::follow_caret`, never shown) is moved to the drawn caret after each
   paint while the text has the keyboard, with EVENT_OBJECT_LOCATIONCHANGE for OBJID_CARET; WM_KILLFOCUS destroys it
   (the find box's edit control makes its own), and so does the caret scrolling out of view. UI Automation is designed in the roadmap, not built.
 - Dark mode reaches everything Slate draws, its menus (uxtheme's dark menus) and its prompts (`prompt.rs`). The Open
   and Save As dialogs are Windows' own: they follow Windows' light/dark setting, not Slate's switch.
-- Status bar counts: a selection up to 4 MiB is counted at once; a document up to 1 MiB at once, up to 64 MiB on
+- Status bar counts: the caret's column is worked out once per caret place (`CaretPlace`), not each frame. A
+  selection up to 4 MiB is counted at once; a document up to 1 MiB at once, up to 64 MiB on
   another thread (after an edit only once the typing pauses: the count's snapshot ends the piece typing goes into),
   a bigger one not at all. Words are runs of non-space characters, like `wc -w`.
 - `Tab::goto` is where a tab goes once its document is ready and it's the tab shown: `slate file.txt:120:5` (only
@@ -225,7 +252,11 @@ Commits use the GitHub no-reply address (repo-local git config); GitHub refuses 
   found" in a folder that is means gone) waits too and looks again, less often each time, as long as it's one of
   those; until a tab is back, the session keeps its entry as read.
 - One Slate per user session: a second start hands its files to the running one. A Slate running as administrator
-  is separate (its own lock, window class and session), as Windows doesn't let the two talk.
+  is separate (its own lock, window class and session), as Windows doesn't let the two talk. A second start tries
+  for up to ~10 s while the running one is starting (its window not there yet, or not ready for files) or closing
+  (then it becomes the Slate once the old one has ended); files count as handed over only when the window answers 1
+  (every version does once it has queued them). Guest and test-mode windows have classes of their own, so a Slate
+  starting later never hands its files to them.
 - Updates: the version being replaced starts the new one with `--updated` and waits ~15 s; if it can't start or ends
   with an error, it puts itself back and starts again with `--update-failed <version>` (that version isn't offered
   by the daily check again). Old copies are deleted by the next normal start. 0.2.0 starts the new one with
@@ -238,7 +269,7 @@ Commits use the GitHub no-reply address (repo-local git config); GitHub refuses 
 
 ## Testing
 
-- `cargo test --lib` — core tests (~4 s).
+- `cargo test --lib` — all unit tests, the UI's included (~210, ~5 s).
 - `Slate.exe --test script.txt` drives the real app in a hidden window and renders frames offscreen into PNGs; the
   commands are listed at the top of `src/ui/testmode.rs` (`open:`, `type:`, `key:`, `cmd:`, `jobs`, `shot:`,
   `print:`, `expect:`, `answer:`, `lang:<name>` …; `print:menu0`…`menu4` lists a menu's items). In this mode
@@ -252,7 +283,15 @@ Commits use the GitHub no-reply address (repo-local git config); GitHub refuses 
   session now, writes it the way the timer does, or restores it. `SLATE_UPDATE_TEST_VERSION=0.1.0` makes Slate
   believe it's that version (to try the updater against the real latest release, in a scratch folder);
   `SLATE_TEST_SLOW_OPEN=<ms>` makes reading each file take that much longer (a slow network drive).
-- `tests/smoke.txt` is the smoke test CI runs on the built exe (paths in it are relative to the working folder).
+- `tests/smoke.txt` is the smoke test CI runs on the built exe (paths in it are relative to the working folder). It
+  writes a session and puts it back, so it needs `SLATE_DATA_DIR` set to an empty folder.
+- Measuring: `t:<label>` marks; `print:startup` (each startup step in ms since the process was created), `gfx:window`
+  in a script or `SLATE_TEST_GPU=1` (draw through the hidden window's own swap chain on the GPU, as the real window
+  does; `gfx:late` makes the device at the first paint, to compare), `idle:<ms>` (run the real message loop and count
+  what wakes it), `print:busy` (what `jobs` waits for), `print:mem` (private bytes, working set). `copydata:<path>`
+  hands a file over the way a second Slate does; `dpi:<n>` acts as if the window moved to a monitor at that DPI
+  (WM_DPICHANGED); `prompt:<png>|tall` draws a prompt with more text than a screen holds; `print:tip` (after
+  `hover:` and `timer:10`) the tooltip; `print:caret` whether the caret is blinked on.
 - `SLATE_TEST_VISIBLE=1` runs the same scripts in the real window (on top, without taking the focus), drawing
   through the real swap chain; `shot:` then captures the screen.
 - Don't drive the user's desktop with real mouse/keyboard input.
