@@ -34,8 +34,7 @@
 //!
 //! Also: `args:<path>` (open it as if named on the command line: a missing file becomes a new one), `lang:<name>`
 //! (pick the language), `hit:<x>,<y>` / `hover:<x>,<y>` (what's at a point / move the mouse
-//! there), `scrollto:<0..1>`, `dpi:<n>` (draw as on a screen at that DPI, 144 = 150%, in the same pixels),
-//! `endsession` (what a Windows shutdown asks), `t:<label>` (a timing mark), `temp:<dir>`,
+//! there), `scrollto:<0..1>`, `endsession` (what a Windows shutdown asks), `t:<label>` (a timing mark), `temp:<dir>`,
 //! `persist` (write settings and the session; only with `SLATE_DATA_DIR` set, never into the real data folder),
 //! `session:save|soon|restore` (write the session now / on another thread as the timer does / restore it), `guest`
 //! (as if another Slate was running but didn't answer: nothing is kept for next time), `crash` (a native crash, to
@@ -711,14 +710,6 @@ pub fn run(args: &[String]) -> i32 {
                 let mut a = cell.borrow_mut();
                 a.settings.theme = if arg == "dark" { ThemeMode::Dark } else { ThemeMode::Light };
                 a.apply_theme();
-            }
-            // as if the window were on a screen at that DPI (144: 150%), in the same number of pixels
-            "dpi" => {
-                cell.borrow_mut().dpi = arg.parse().unwrap_or(96);
-                if !visible && !gpu {
-                    let _ = offscreen(&cell);
-                }
-                cell.borrow_mut().layout();
             }
             "set" => {
                 let mut a = cell.borrow_mut();
