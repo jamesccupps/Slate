@@ -5,8 +5,14 @@
 //! that color what spans lines (`HlIndex`).
 
 use std::collections::BTreeMap;
+use std::fs::File;
+use std::io::{self, BufWriter, Write};
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::core::document::{Document, EditKind, Sel};
+use crate::core::io::MEM_LIMIT;
+use crate::core::source::{IndexBuilder, Source, create_temp_file};
 use crate::core::text::{self, is_continuation, utf8_len};
 use crate::highlight::{self, CommentStyle, Lang, State as HlState};
 
@@ -188,6 +194,62 @@ impl HlIndex {
         }
         self.memo.insert(off, st);
         st
+    }
+}
+
+/// Output for a background transform: memory for small results, a self-deleting temp file for big ones.
+pub enum Sink {
+    Mem(Vec<u8>),
+    File(BufWriter<File>, PathBuf),
+}
+
+impl Sink {
+    pub fn new(len_hint: u64) -> io::Result<Sink> {
+        if len_hint <= MEM_LIMIT {
+            Ok(Sink::Mem(Vec::with_capacity(len_hint as usize)))
+        } else {
+            let (f, p) = create_temp_file()?;
+            Ok(Sink::File(BufWriter::with_capacity(1 << 20, f), p))
+        }
+    }
+
+    pub fn finish(self, idx: IndexBuilder) -> io::Result<(Arc<Source>, u64)> {
+        let nl = idx.newlines();
+        match self {
+            Sink::Mem(v) => Ok((Arc::new(Source::from_vec(v)), nl)),
+            Sink::File(w, p) => {
+                let f = w.into_inner().map_err(|e| e.into_error())?;
+                let len = f.metadata()?.len();
+                Ok((Arc::new(Source::from_file(f, len, p, true, Some(idx.finish()))), nl))
+            }
+        }
+    }
+}
+
+impl Write for Sink {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Sink::Mem(v) => {
+                v.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            Sink::File(w, _) => w.write(buf),
+        }
+    }
+    fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        match self {
+            Sink::Mem(v) => {
+                v.extend_from_slice(buf);
+                Ok(())
+            }
+            Sink::File(w, _) => w.write_all(buf),
+        }
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Sink::Mem(_) => Ok(()),
+            Sink::File(w, _) => w.flush(),
+        }
     }
 }
 
@@ -1246,35 +1308,42 @@ mod tests {
         assert!(last.line_start);
     }
 
+    /// A document whose new line breaks are CRLF (the tests' expectations are written for them).
+    fn crlf(text: &[u8]) -> Document {
+        let mut d = Document::from_text(text);
+        d.eol = crate::core::text::Eol::Crlf;
+        d
+    }
+
     #[test]
     fn edits() {
-        let mut d = Document::from_text(b"{}\n  [1, 2]\n");
+        let mut d = crlf(b"{}\n  [1, 2]\n");
         let s = newline(&mut d, Sel::at(1), b"  ");
         assert_eq!(d.read(0, d.len()), b"{\r\n  \r\n}\n  [1, 2]\n");
         assert_eq!(s, Sel::at(5));
-        let mut d = Document::from_text(b"a\nb\nc");
+        let mut d = crlf(b"a\nb\nc");
         let s = move_lines(&mut d, Sel::at(0), true).unwrap();
         assert_eq!(d.read(0, d.len()), b"b\r\na\nc");
         assert_eq!(s, Sel::at(3));
-        let mut d = Document::from_text(b"a\nb\nc");
+        let mut d = crlf(b"a\nb\nc");
         delete_lines(&mut d, Sel::at(2)).unwrap();
         assert_eq!(d.read(0, d.len()), b"a\nc");
-        let mut d = Document::from_text(b"a\nb\nc");
+        let mut d = crlf(b"a\nb\nc");
         delete_lines(&mut d, Sel::at(4)).unwrap();
         assert_eq!(d.read(0, d.len()), b"a\nb");
-        let mut d = Document::from_text(b"x\ny");
+        let mut d = crlf(b"x\ny");
         let s = indent_lines(&mut d, Sel::new(0, 3), Indent::Tabs, 4, false).unwrap();
         assert_eq!(d.read(0, d.len()), b"\tx\n\ty");
         assert_eq!(s, Sel::new(0, 5));
         indent_lines(&mut d, s, Indent::Tabs, 4, true).unwrap();
         assert_eq!(d.read(0, d.len()), b"x\ny");
         assert_eq!(normalize_eols(b"a\nb\r\nc\rd", b"\r\n"), b"a\r\nb\r\nc\r\nd");
-        let mut d = Document::from_text(b"ab");
+        let mut d = crlf(b"ab");
         let s = duplicate(&mut d, Sel::at(1)).unwrap();
         assert_eq!(d.read(0, d.len()), b"ab\r\nab");
         assert_eq!(s, Sel::at(5));
         // Enter on a line of nothing but indentation takes the indentation along instead of leaving it behind.
-        let mut d = Document::from_text(b"  x\n    \ny");
+        let mut d = crlf(b"  x\n    \ny");
         let s = newline(&mut d, Sel::at(8), b"  ");
         assert_eq!(d.read(0, d.len()), b"  x\n\r\n    \ny");
         assert_eq!(s, Sel::at(10));
@@ -1464,7 +1533,7 @@ mod tests {
     fn huge_lines_are_not_copied() {
         let mut big = vec![b'a'; (COPY_MAX + 10) as usize];
         big.extend_from_slice(b"\nb");
-        let mut d = Document::from_text(&big);
+        let mut d = crlf(&big);
         assert_eq!(duplicate(&mut d, Sel::at(5)), Err(TOO_MUCH_TEXT));
         assert_eq!(move_lines(&mut d, Sel::at(5), true), Err(TOO_MUCH_TEXT));
         let end = d.len();

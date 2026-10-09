@@ -83,6 +83,9 @@ pub enum Eol {
 }
 
 impl Eol {
+    /// The system's: what new documents, and text without any line break, get.
+    pub const NATIVE: Eol = if cfg!(windows) { Eol::Crlf } else { Eol::Lf };
+
     pub fn as_bytes(self) -> &'static [u8] {
         match self {
             Eol::Crlf => b"\r\n",
@@ -296,11 +299,11 @@ impl AnsiCheck {
     }
 }
 
-/// The line ending most used in `sample`; CRLF if there are none (the Windows default).
+/// The line ending most used in `sample`; the system's if there are none (CRLF on Windows, LF on Linux).
 pub fn detect_eol(sample: &[u8]) -> Eol {
     let lf = bytecount::count(sample, b'\n');
     if lf == 0 {
-        return Eol::Crlf;
+        return Eol::NATIVE;
     }
     let crlf = memchr::memmem::find_iter(sample, b"\r\n").count();
     if crlf * 2 >= lf { Eol::Crlf } else { Eol::Lf }
@@ -1057,7 +1060,7 @@ mod tests {
         assert_eq!(detect_encoding(&be, false), (Encoding::Utf16Be, 0));
         assert_eq!(detect_eol(b"a\r\nb\r\nc\n"), Eol::Crlf);
         assert_eq!(detect_eol(b"a\nb\nc\r\n"), Eol::Lf);
-        assert_eq!(detect_eol(b"abc"), Eol::Crlf);
+        assert_eq!(detect_eol(b"abc"), Eol::NATIVE);
     }
 
     #[test]

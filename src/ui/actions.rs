@@ -3,8 +3,8 @@
 //! App methods never open modal UI (menus, dialogs) because they run while the App is borrowed; they queue a
 //! `Deferred` instead, which `run` performs after the borrow ends.
 
-use std::fs::File;
-use std::io::{self, BufWriter, Write};
+use crate::edit::Sink;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -22,13 +22,13 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::{HSTRING, PCWSTR, w};
 
 use crate::core::document::{Document, EditKind, Sel};
-use crate::core::io::{self as fileio, Loading, MEM_LIMIT, SaveError};
+use crate::core::io::{self as fileio, Loading, SaveError};
 use crate::core::job::{Ctx as JobCtx, Job, Notify};
 use crate::core::json::{self, Mode as JsonMode};
 use crate::core::lines::{self, CaseOp, LineOp};
 use crate::core::xml;
 use crate::core::search::{self, Matcher};
-use crate::core::source::{IndexBuilder, Source, create_temp_file};
+use crate::core::source::{IndexBuilder, Source};
 use crate::core::text::{Encoding, Eol, is_continuation};
 
 use super::app::*;
@@ -65,62 +65,6 @@ const BIG_CLIPBOARD: u64 = 64 << 20;
 thread_local! {
     /// Test mode: where the mouse pointer is (client DIPs), for scrolling while dragging.
     pub static TEST_POINTER: std::cell::Cell<Option<(f32, f32)>> = const { std::cell::Cell::new(None) };
-}
-
-/// Output for a background transform: memory for small results, a self-deleting temp file for big ones.
-enum Sink {
-    Mem(Vec<u8>),
-    File(BufWriter<File>, PathBuf),
-}
-
-impl Sink {
-    fn new(len_hint: u64) -> io::Result<Sink> {
-        if len_hint <= MEM_LIMIT {
-            Ok(Sink::Mem(Vec::with_capacity(len_hint as usize)))
-        } else {
-            let (f, p) = create_temp_file()?;
-            Ok(Sink::File(BufWriter::with_capacity(1 << 20, f), p))
-        }
-    }
-
-    fn finish(self, idx: IndexBuilder) -> io::Result<(Arc<Source>, u64)> {
-        let nl = idx.newlines();
-        match self {
-            Sink::Mem(v) => Ok((Arc::new(Source::from_vec(v)), nl)),
-            Sink::File(w, p) => {
-                let f = w.into_inner().map_err(|e| e.into_error())?;
-                let len = f.metadata()?.len();
-                Ok((Arc::new(Source::from_file(f, len, p, true, Some(idx.finish()))), nl))
-            }
-        }
-    }
-}
-
-impl Write for Sink {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        match self {
-            Sink::Mem(v) => {
-                v.extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            Sink::File(w, _) => w.write(buf),
-        }
-    }
-    fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
-        match self {
-            Sink::Mem(v) => {
-                v.extend_from_slice(buf);
-                Ok(())
-            }
-            Sink::File(w, _) => w.write_all(buf),
-        }
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        match self {
-            Sink::Mem(_) => Ok(()),
-            Sink::File(w, _) => w.flush(),
-        }
-    }
 }
 
 fn convert_eol(snap: &crate::core::buffer::Snapshot, to_crlf: bool, w: &mut dyn Write, idx: &mut IndexBuilder, ctx: &JobCtx) -> io::Result<u64> {

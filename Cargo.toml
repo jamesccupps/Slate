@@ -25,6 +25,11 @@ serde_json = "1.0.151"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# GTK 4.8 is what Debian 12 and Raspberry Pi OS 12 have.
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk4 = { version = "0.11", features = ["v4_8"] }
+pangocairo = "0.22"
+
 # 0.58 is the newest version that links with the GNU toolchain's bundled linker (later versions use raw-dylib,
 # which needs an assembler that isn't bundled). See CLAUDE.md "Build".
 [target.'cfg(windows)'.dependencies.windows]

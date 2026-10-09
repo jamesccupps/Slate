@@ -175,7 +175,7 @@ impl Document {
             path: None,
             encoding: Encoding::Utf8,
             bom: false,
-            eol: Eol::Crlf,
+            eol: Eol::NATIVE,
             disk: None,
             bad_units: 0,
         }

@@ -6,5 +6,7 @@ pub mod edit;
 pub mod highlight;
 pub mod settings;
 pub mod theme;
+#[cfg(target_os = "linux")]
+pub mod gtk;
 #[cfg(windows)]
 pub mod ui;
