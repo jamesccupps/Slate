@@ -1166,6 +1166,9 @@ pub fn run(args: Vec<String>) -> i32 {
         install::uninstall(args.iter().any(|a| a == "--quiet"));
         return 0;
     }
+    if args.first().map(String::as_str) == Some("--install") {
+        return if install::install_quiet() { 0 } else { 1 };
+    }
     if args.first().map(String::as_str) == Some("--test") {
         return testmode::run(&args[1..]);
     }

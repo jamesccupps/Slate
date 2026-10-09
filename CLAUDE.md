@@ -35,7 +35,9 @@ cargo test --lib
 Linux: GTK 4.8 or newer (`gtk4` crate 0.11 with `v4_8`, as Debian 12 and Raspberry Pi OS 12 have it) and `libc`;
 `cargo build --release` gives `target/release/Slate` (installed as `slate`). On the Windows development PC it's built
 and tested in Docker (Docker Desktop): an image from `rust:1-bookworm` with `libgtk-4-dev xvfb xauth
-fonts-dejavu-core fonts-noto-color-emoji dbus-x11`, the source mounted, `CARGO_TARGET_DIR` in a volume, and the
+fonts-dejavu-core fonts-noto-color-emoji dbus-x11`, the source copied into a volume first (a `tar` of the folder
+piped into `docker run -i -v slate-src:/src`: building from the Windows folder through WSL is slow and makes WSL show
+the user "Performance Tip" notifications), `CARGO_TARGET_DIR` in a volume, and the
 program run under `xvfb-run` with `GTK_A11Y=none GSK_RENDERER=cairo` (`--test` scripts; for the real window's
 dialogs and menus, `Xvfb` + `dbus-run-session` + `xdotool` and ImageMagick's `import` for pictures, as test mode
 never shows a dialog). `cargo check --target x86_64-unknown-linux-gnu` on Windows doesn't work any more (GTK's
@@ -214,7 +216,10 @@ accent stay Windows-only), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate
   - `app.rs` state, layout and painting; `actions.rs` input, commands, background jobs, saving and closing;
     `editor.rs` the text view; `structure.rs` path bar + structure panel; `findbar.rs`; `session.rs` (tabs and
     unsaved text kept between runs); `settings.rs` (data folder, portable mode); `install.rs` ("Open with" entries
-    in HKCU); `update.rs` (updates from GitHub releases: WinHTTP, SHA-256 check, swap the exe, restart with
+    in HKCU; `Slate.exe --install` does the same silently for winget and scripts, `--uninstall --quiet` undoes it;
+    CI runs both); `update.rs` (updates from GitHub releases: WinHTTP, SHA-256 check, from 0.8.1 the same
+    publisher's signature when the running exe's own signature checks out (`signer_of`: WinVerifyTrust, no online
+    revocation lookup), swap the exe, restart with
     `--updated`, undone if the new one doesn't start); `crash.rs` (a minidump next to crash.log on a native crash,
     written by a thread waiting for it from the start; Help → Report a problem opens a filled-in GitHub issue form
     the user sends themselves; the version string with the commit, which build.rs passes in); `prompt.rs` (prompts

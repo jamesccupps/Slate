@@ -175,7 +175,8 @@ fn register(exe: &Path) -> bool {
     ok &= set(un, Some("DisplayName"), "Slate");
     ok &= set(un, Some("DisplayIcon"), &icon);
     ok &= set(un, Some("DisplayVersion"), env!("CARGO_PKG_VERSION"));
-    ok &= set(un, Some("Publisher"), "Slate");
+    // (the name Slate.exe is signed with)
+    ok &= set(un, Some("Publisher"), "James Cupps");
     let loc = exe.parent().map(|p| p.display().to_string()).unwrap_or_default();
     ok &= set(un, Some("InstallLocation"), &loc);
     ok &= set(un, Some("UninstallString"), &format!("\"{e}\" --uninstall"));
@@ -234,6 +235,10 @@ pub fn refresh_version() {
     if ours && read("DisplayVersion").as_deref() != Some(env!("CARGO_PKG_VERSION")) {
         set(UNINSTALL, Some("DisplayVersion"), env!("CARGO_PKG_VERSION"));
     }
+    // (0.7.0 and older wrote "Slate")
+    if ours && read("Publisher").as_deref() != Some("James Cupps") {
+        set(UNINSTALL, Some("Publisher"), "James Cupps");
+    }
 }
 
 pub fn make_default(cell: &Cell) {
@@ -266,6 +271,19 @@ pub fn make_default(cell: &Cell) {
         ShellExecuteW(hwnd, w!("open"), w!("ms-settings:defaultapps?registeredAppUser=Slate"), None, None, SW_SHOWNORMAL);
     }
     cell.borrow_mut().flash("Slate is set up. Pick it in Default apps for the file types you want.", false);
+}
+
+/// `Slate.exe --install` (winget, scripts): installs Slate for the current user the way "Open files with Slate…"
+/// does (its folder, the Start menu, "Open with", Installed apps), with nothing shown and Default apps not opened.
+/// True when all of it worked (the exit code says so).
+pub fn install_quiet() -> bool {
+    match install_exe() {
+        Ok(exe) => {
+            start_menu_shortcut(&exe);
+            register(&exe)
+        }
+        Err(_) => false,
+    }
 }
 
 /// `Slate.exe --uninstall` (Settings → Apps → Slate → Uninstall): removes what `make_default` added. Slate's folder

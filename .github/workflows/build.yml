@@ -60,6 +60,24 @@ jobs:
           if (Test-Path $env:SLATE_TEST_LOG) { Get-Content $env:SLATE_TEST_LOG }
           if ($p.ExitCode -ne 0) { throw "The smoke test failed (exit code $($p.ExitCode))" }
 
+      - name: Install and uninstall (Slate.exe --install, as winget runs it; the runner is thrown away after)
+        shell: pwsh
+        timeout-minutes: 2
+        run: |
+          $p = Start-Process -FilePath target\release\Slate.exe -ArgumentList '--install' -Wait -PassThru -NoNewWindow
+          if ($p.ExitCode -ne 0) { throw "--install failed (exit code $($p.ExitCode))" }
+          $exe = Join-Path $env:LOCALAPPDATA 'Programs\Slate\Slate.exe'
+          $lnk = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Slate.lnk'
+          $un = Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Slate'
+          "$($un.DisplayName) $($un.DisplayVersion) by $($un.Publisher): $($un.QuietUninstallString)"
+          if (!(Test-Path $exe) -or !(Test-Path $lnk)) { throw "--install didn't put Slate in place" }
+          $v = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          if ($un.DisplayVersion -ne $v) { throw "Installed apps says $($un.DisplayVersion), not $v" }
+          $p = Start-Process -FilePath $exe -ArgumentList '--uninstall', '--quiet' -Wait -PassThru -NoNewWindow
+          if ($p.ExitCode -ne 0) { throw "--uninstall failed (exit code $($p.ExitCode))" }
+          if (Test-Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Slate') { throw "--uninstall left the Installed apps entry" }
+          if (Test-Path $lnk) { throw "--uninstall left the Start menu entry" }
+
       - name: Package
         shell: pwsh
         run: |

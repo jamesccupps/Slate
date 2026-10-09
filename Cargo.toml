@@ -1,8 +1,8 @@
 [package]
 name = "slate"
-version = "0.8.0"
+version = "0.8.1"
 edition = "2024"
-description = "A fast, simple text editor for Windows that handles huge files"
+description = "A fast, simple text editor for Windows and Linux that handles huge files"
 license = "MIT"
 repository = "https://github.com/jamesccupps/Slate"
 build = "build.rs"
@@ -60,6 +60,9 @@ features = [
     "Win32_System_Ole",
     "Win32_Networking_WinHttp",
     "Win32_Security_Cryptography",
+    "Win32_Security_Cryptography_Catalog",
+    "Win32_Security_Cryptography_Sip",
+    "Win32_Security_WinTrust",
     "Win32_System_Registry",
     "Win32_System_Shutdown",
     "Win32_System_SystemInformation",

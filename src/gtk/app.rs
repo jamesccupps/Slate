@@ -408,7 +408,11 @@ impl App {
 
     /// Goes to the line asked for (`Tab::goto`) in tab `i` now, and shows it.
     pub fn goto_now(&mut self, i: usize) {
+        // The view stays where it is when the line is in it (as on Windows); revealing scrolls it there otherwise.
+        let (top, row) = (self.tabs[i].view.top, self.tabs[i].view.top_row);
         self.apply_goto(i);
+        self.tabs[i].view.top = top;
+        self.tabs[i].view.top_row = row;
         self.reveal_pending = true;
         self.reveal_center = true;
     }

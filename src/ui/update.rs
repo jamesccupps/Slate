@@ -226,7 +226,66 @@ pub fn download(rel: &Release, ctx: &Ctx) -> Result<PathBuf, String> {
         let _ = fs::remove_file(&tmp);
         return Err(format!("Can't write to {} ({e})", dir.display()));
     }
+    if let Err(e) = same_publisher(signer_of(&me).as_deref(), signer_of(&tmp).as_deref()) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
     Ok(tmp)
+}
+
+/// An update has to come from the publisher this Slate came from: when the running exe's signature checks out on
+/// this PC, the download's must as well, by the same name. A Slate that isn't signed (0.7.0 and older, a local
+/// build) has nothing to compare with and goes by the checksum alone.
+pub fn same_publisher(current: Option<&str>, new: Option<&str>) -> Result<(), String> {
+    match (current, new) {
+        (None, _) => Ok(()),
+        (Some(a), Some(b)) if a == b => Ok(()),
+        (Some(a), _) => Err(format!("The download isn't signed by {a} like this Slate is, so it wasn't installed")),
+    }
+}
+
+/// Who a file is signed by (the signing certificate's name: "James Cupps"), when its Authenticode signature
+/// checks out on this PC; None for a file that isn't signed or whose signature doesn't. Revocation isn't looked up
+/// online (the certificates last days; the signature's timestamp keeps it valid after).
+pub fn signer_of(path: &Path) -> Option<String> {
+    use windows::Win32::Foundation::{HWND, INVALID_HANDLE_VALUE};
+    use windows::Win32::Security::Cryptography::{CERT_NAME_SIMPLE_DISPLAY_TYPE, CertGetNameStringW};
+    use windows::Win32::Security::WinTrust::*;
+    let wide = HSTRING::from(path.as_os_str());
+    let mut file = WINTRUST_FILE_INFO {
+        cbStruct: std::mem::size_of::<WINTRUST_FILE_INFO>() as u32,
+        pcwszFilePath: PCWSTR(wide.as_ptr()),
+        ..Default::default()
+    };
+    let mut data = WINTRUST_DATA {
+        cbStruct: std::mem::size_of::<WINTRUST_DATA>() as u32,
+        dwUIChoice: WTD_UI_NONE,
+        fdwRevocationChecks: WTD_REVOKE_NONE,
+        dwUnionChoice: WTD_CHOICE_FILE,
+        Anonymous: WINTRUST_DATA_0 { pFile: &mut file },
+        dwStateAction: WTD_STATEACTION_VERIFY,
+        dwProvFlags: WTD_CACHE_ONLY_URL_RETRIEVAL,
+        ..Default::default()
+    };
+    let mut action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+    let no_ui = HWND(INVALID_HANDLE_VALUE.0);
+    let mut name = None;
+    unsafe {
+        if WinVerifyTrust(no_ui, &mut action, &mut data as *mut _ as *mut _) == 0 {
+            let prov = WTHelperProvDataFromStateData(data.hWVTStateData);
+            let signer = if prov.is_null() { std::ptr::null_mut() } else { WTHelperGetProvSignerFromChain(prov, 0, false, 0) };
+            if !signer.is_null() && !(*signer).pasCertChain.is_null() {
+                let mut buf = [0u16; 256];
+                let n = CertGetNameStringW((*(*signer).pasCertChain).pCert, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0, None, Some(&mut buf)) as usize;
+                if n > 1 {
+                    name = Some(String::from_utf16_lossy(&buf[..n - 1]));
+                }
+            }
+        }
+        data.dwStateAction = WTD_STATEACTION_CLOSE;
+        WinVerifyTrust(no_ui, &mut action, &mut data as *mut _ as *mut _);
+    }
+    name
 }
 
 /// Whether Slate can replace itself where it is (not, say, in Program Files without administrator rights).
@@ -447,5 +506,24 @@ mod tests {
         assert_eq!(parse_sha(format!("{hex}  Slate.exe\n").as_bytes()), Some(digest));
         assert_eq!(parse_sha(hex.to_uppercase().as_bytes()), Some(digest));
         assert_eq!(parse_sha(b"not a hash"), None);
+    }
+
+    #[test]
+    fn updates_come_from_the_same_publisher() {
+        assert!(same_publisher(None, None).is_ok());
+        assert!(same_publisher(None, Some("Someone")).is_ok());
+        assert!(same_publisher(Some("James Cupps"), Some("James Cupps")).is_ok());
+        assert!(same_publisher(Some("James Cupps"), None).is_err());
+        assert!(same_publisher(Some("James Cupps"), Some("Someone else")).is_err());
+    }
+
+    #[test]
+    fn signers() {
+        // The test program isn't signed. A signed Slate.exe is tried when there's one:
+        // SLATE_SIGNED_EXE=<path> cargo test --lib signers
+        assert_eq!(signer_of(&std::env::current_exe().unwrap()), None);
+        if let Some(p) = std::env::var_os("SLATE_SIGNED_EXE") {
+            assert_eq!(signer_of(Path::new(&p)).as_deref(), Some("James Cupps"));
+        }
     }
 }

@@ -725,9 +725,16 @@ fn commands() -> Vec<(&'static str, Cmd, &'static [&'static str])> {
     ]
 }
 
+/// Menu items that show a check mark: their actions have a true/false state (`Ui::sync_menu`).
+const CHECKED: &[&str] = &["wrap", "line-numbers", "theme-system", "theme-light", "theme-dark", "eol-lf", "eol-crlf"];
+
 fn actions(ui: &Rc<Ui>) {
     for (name, cmd, accels) in commands() {
-        let a = gio::SimpleAction::new(name, None);
+        let a = if CHECKED.contains(&name) {
+            gio::SimpleAction::new_stateful(name, None, &false.to_variant())
+        } else {
+            gio::SimpleAction::new(name, None)
+        };
         a.connect_activate(move |_, _| {
             if let Some(ui) = get_ui() {
                 ui.command(cmd);
@@ -749,7 +756,8 @@ fn actions(ui: &Rc<Ui>) {
         ui.window.add_action(&a);
         ui.gtk_app.set_accels_for_action(&format!("win.{name}"), &[&format!("<Alt>{k}")]);
     }
-    let lang = gio::SimpleAction::new("set-lang", Some(glib::VariantTy::STRING));
+    // (its state is the tab's language: the menu shows a dot at that one)
+    let lang = gio::SimpleAction::new_stateful("set-lang", Some(glib::VariantTy::STRING), &"".to_variant());
     lang.connect_activate(|_, v| {
         let Some(label) = v.and_then(|v| v.get::<String>()) else { return };
         if let (Some(ui), Some(&l)) = (get_ui(), Lang::ALL.iter().find(|l| l.label() == label)) {
@@ -1276,6 +1284,7 @@ impl Ui {
         if theme_changed {
             a.apply_theme();
         }
+        self.sync_menu(&a);
         if std::mem::take(&mut a.reveal_pending) {
             let center = std::mem::take(&mut a.reveal_center);
             drop(a);
@@ -1339,6 +1348,34 @@ impl Ui {
             self.text.grab_focus();
         }
         self.queue_all();
+    }
+
+    /// The menus' check marks and dots follow the app: Word wrap, Line numbers, the theme, the tab's line breaks and
+    /// language.
+    fn sync_menu(&self, a: &App) {
+        let tab = a.tab();
+        let theme = a.settings.theme;
+        let checks = [
+            ("wrap", a.style.wrap),
+            ("line-numbers", a.style.line_numbers),
+            ("theme-system", theme == ThemeMode::System),
+            ("theme-light", theme == ThemeMode::Light),
+            ("theme-dark", theme == ThemeMode::Dark),
+            ("eol-lf", tab.doc.eol == Eol::Lf),
+            ("eol-crlf", tab.doc.eol == Eol::Crlf),
+        ];
+        for (name, on) in checks {
+            self.set_action_state(name, on.to_variant());
+        }
+        self.set_action_state("set-lang", tab.lang.label().to_variant());
+    }
+
+    fn set_action_state(&self, name: &str, state: glib::Variant) {
+        if let Some(action) = self.window.lookup_action(name).and_downcast::<gio::SimpleAction>() {
+            if action.state().as_ref() != Some(&state) {
+                action.set_state(&state);
+            }
+        }
     }
 
     /// After painting: the scrollbars show where the view is.

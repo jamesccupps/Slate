@@ -1,7 +1,17 @@
 # Slate
 
+[![Latest release](https://img.shields.io/github/v/release/jamesccupps/Slate?label=release)](https://github.com/jamesccupps/Slate/releases/latest)
+[![Build](https://github.com/jamesccupps/Slate/actions/workflows/build.yml/badge.svg)](https://github.com/jamesccupps/Slate/actions/workflows/build.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+
 A fast, simple text editor for Windows and Linux (Raspberry Pi included) that opens files of any size: an 800 MB
 JSON file opens instantly, scrolls smoothly, and can be searched, edited, formatted and saved.
+
+**[⬇ Download for Windows](https://github.com/jamesccupps/Slate/releases/latest/download/Slate.exe)** (one signed
+`Slate.exe`, 64-bit Windows 10 or 11) · **[Linux and Raspberry Pi](#linux-and-raspberry-pi)** (apt) ·
+[All releases](https://github.com/jamesccupps/Slate/releases)
+
+![Slate on Windows, dark theme: a JSON file, the path bar above it showing where the cursor is, and the structure panel](docs/images/slate-windows-dark.png)
 
 - Opens huge files instantly: nothing is loaded up front, only what's on screen is read and drawn. Files open in the
   background, so a slow network drive never freezes the window.
@@ -35,7 +45,7 @@ JSON file opens instantly, scrolls smoothly, and can be searched, edited, format
   the Start menu and the right-click menu.
 - Keeps itself up to date: at most once a day it asks GitHub for the latest release, and when there's a newer one
   an *Update* button appears in the status bar. One click downloads it, checks it against the release's checksum
-  and restarts Slate with your tabs (and their unsaved text) back where they were. If the new version can't start,
+  (and, from 0.8.1, that it's signed by the same publisher) and restarts Slate with your tabs (and their unsaved text) back where they were. If the new version can't start,
   the old one comes back by itself. *Help → Check for updates* does it on demand.
 
 ## Keyboard shortcuts
@@ -63,7 +73,8 @@ The usual ones work as in Notepad (Ctrl+N, O, S, F, H, G, Z, Y, A, X, C, V), plu
 ## Download
 
 Get `Slate.exe` from the [latest release](https://github.com/jamesccupps/Slate/releases/latest) and run it from
-any folder. It needs 64-bit Windows 10 or 11.
+any folder. It needs 64-bit Windows 10 or 11. `Slate.exe --install` sets it up for your account without asking
+anything (what *Help → Open files with Slate…* does, for scripts and package managers).
 
 `Slate.exe` is code-signed (publisher: James Cupps, through Microsoft's Artifact Signing) since 0.8.0. While the
 certificate is new, Windows' SmartScreen may still show "Windows protected your PC" the first time; choose *More
@@ -88,6 +99,8 @@ sudo wget -O /usr/share/keyrings/slate-archive-keyring.gpg https://jamesccupps.g
 echo "deb [signed-by=/usr/share/keyrings/slate-archive-keyring.gpg] https://jamesccupps.github.io/Slate/apt stable main" | sudo tee /etc/apt/sources.list.d/slate.list
 sudo apt update && sudo apt install slate
 ```
+
+![Slate on Linux (GTK 4): a Python file, light theme](docs/images/slate-linux.png)
 
 Slate is then in the menu (Accessories), opens files from the file manager, and `slate notes.txt` opens a file from
 a terminal; **Help → Open files with Slate…** makes it the app that opens text, Markdown, CSV, JSON, XML, YAML, log
