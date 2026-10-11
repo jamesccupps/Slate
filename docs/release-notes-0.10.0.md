@@ -15,7 +15,7 @@
 - Find no longer risks holding the window up for a moment on an unusual search in an unusual file (a query like `,000…0` in a file of zeros) while it works out the fastest way to search.
 
 ### Windows
-- The path bar and the structure panel work out a pretty-printed JSON file's structure about 40% faster (0.22 s instead of 0.36 s for 103 MB).
+- The path bar and the structure panel work out a pretty-printed JSON file's structure about a third faster (0.22 s instead of 0.33 s for 103 MB).
 - The scrollbar's marks follow a new search that has as many matches as the one before.
 - While you type in a big JSON or XML file, its structure isn't read again in the background until you pause.
 - Slate started minimized and closed without being shown no longer sets the last session's tabs aside at the next start, as if it had crashed.
