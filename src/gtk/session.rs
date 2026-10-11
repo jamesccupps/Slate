@@ -59,6 +59,12 @@ struct SessionTab {
     bom: bool,
     #[serde(default, deserialize_with = "lenient")]
     eol: Option<Eol>,
+    /// File → Read only.
+    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    read_only: Option<bool>,
+    /// The starts of the lines bookmarked.
+    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    bookmarks: Option<Vec<u64>>,
 }
 
 impl SessionTab {
@@ -258,6 +264,11 @@ fn plan(app: &mut App) -> Option<Plan> {
     let mut copies = Vec::new();
     let mut keep = Vec::new();
     for (i, tab) in app.tabs.iter_mut().enumerate() {
+        // (a tab of matching lines isn't kept: it's made again from its file in a moment)
+        if tab.filter.is_some() {
+            continue;
+        }
+        let marks = tab.restore_marks.clone().unwrap_or_else(|| tab.view.bookmarks.clone());
         let mut st = SessionTab {
             caret: tab.view.sel.caret,
             anchor: tab.view.sel.anchor,
@@ -267,6 +278,8 @@ fn plan(app: &mut App) -> Option<Plan> {
             encoding: Some(tab.doc.encoding),
             bom: tab.doc.bom,
             eol: Some(tab.doc.eol),
+            read_only: tab.read_only.then_some(true),
+            bookmarks: (!marks.is_empty()).then_some(marks),
             ..Default::default()
         };
         st.set_path(tab.doc.path.as_deref());
@@ -494,6 +507,10 @@ pub fn restore(app: &mut App, watch: bool) {
                 let len = tab.doc.len();
                 tab.view.sel = Sel::new(st.anchor.min(len), st.caret.min(len));
                 tab.view.top = st.top.min(len);
+                tab.read_only = st.read_only.unwrap_or(false);
+                let mut marks = st.bookmarks.clone().unwrap_or_default();
+                crate::edit::tidy_marks(&mut marks, &tab.doc);
+                tab.view.bookmarks = marks;
                 continue;
             }
             if path.is_none() {
@@ -513,6 +530,8 @@ pub fn restore(app: &mut App, watch: bool) {
             }
         }
         tab.restore_at = Some((st.anchor, st.caret, st.top));
+        tab.read_only |= st.read_only.unwrap_or(false);
+        tab.restore_marks = st.bookmarks.clone();
         if name.is_some() {
             missing.push(format!("the unsaved changes to {}", p.display()));
         }

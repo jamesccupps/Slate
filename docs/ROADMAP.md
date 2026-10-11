@@ -93,6 +93,13 @@ longer ends in an ANSI save, a line-ending change keeps the caret on its line, S
 marks, uninstalling right before a reinstall, and the apt repository checked as apt checks it before it's published;
 a pretty-printed JSON's structure a third faster. Details in the [0.10.0 release notes](release-notes-0.10.0.md).
 
+## 0.11.0: the lines that matter
+
+Show only matching lines (Alt+L, or the lines that don't match): a tab of their own, read only, numbered as in the
+file, Enter or a double-click going to the line there; filtering such a tab again keeps the file's numbers. 809,820
+lines out of a 400 MB log in 0.3 s. Bookmarks (Ctrl+F2, F2, Shift+F2), kept with the tabs. Read-only tabs, on by
+themselves for files that can't be written. Details in the [0.11.0 release notes](release-notes-0.11.0.md).
+
 ## Next
 
 1. **Accessibility: UI Automation (L).** The high-contrast theme (Windows' colors, read again when they change) and a
@@ -122,13 +129,10 @@ a pretty-printed JSON's structure a third faster. Details in the [0.10.0 release
 
 ## Soon
 
-- **Show only the lines that match** (M): a search's matching lines in a view of their own (or the lines that don't
-  match, to hide noise), a click going to the line. What big-log tools (klogg, glogg, LogExpert) are used for, built
-  on Count all, which already finds every match of an 800 MB file in a fraction of a second.
-- **Bookmarks** (S): Ctrl+F2 marks a line, F2 and Shift+F2 go from one to the next; kept in the session, shown on the
-  scrollbar like search matches.
-- **Read-only tabs** (S): `slate --read-only`, a lock on the tab; offered by itself for a file that's read-only on
-  disk, instead of a failed save.
+- **Matching lines, more** (S each): a button in the find bar; the tab of lines following a log as it grows (filtering
+  what's added); several searches at once (lines with any of them, highlighted each in a color).
+- `slate --read-only` from a command line (S: the files handed to a Slate that's running already would need it
+  too).
 - **The character at the caret** (S): its code point and bytes (`U+00E9 é · C3 A9`) from the status bar's encoding.
 - **Invisible and look-alike characters shown** (S): zero-width and non-breaking spaces, a byte order mark inside the
   text, and the bidirectional controls of the "Trojan Source" trick, as symbols, as control characters are already.

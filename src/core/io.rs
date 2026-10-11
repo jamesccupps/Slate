@@ -105,12 +105,14 @@ pub struct Opened {
     pub binary: bool,
     /// It isn't there, but its folder is: a new file, which saving creates (if `open` was asked to look).
     pub creatable: bool,
+    /// It can't be written (read-only on disk, or another's): its tab opens read only.
+    pub read_only: bool,
 }
 
 impl Failure for Opened {
     fn failure(msg: &str) -> Opened {
         let loading = Err(io::Error::other(msg.to_string()));
-        Opened { path: PathBuf::new(), loading, canon: None, binary: false, creatable: false }
+        Opened { path: PathBuf::new(), loading, canon: None, binary: false, creatable: false, read_only: false }
     }
 }
 
@@ -126,6 +128,7 @@ pub fn open(path: &Path, notify: Notify, create: bool, ctx: &Ctx) -> Opened {
         canon: if there { fs::canonicalize(path).ok() } else { None },
         binary: there && looks_binary(path),
         creatable: create && missing && path.parent().is_some_and(Path::is_dir),
+        read_only: there && !os::can_write(path),
     }
 }
 
@@ -143,7 +146,7 @@ pub fn open_either(path: &Path, or: &Path, notify: Notify, create: bool, ctx: &C
 /// Reads `path` again (see `open_with`), on another thread like `open`.
 pub fn reload(path: &Path, notify: Notify, prev: Option<Arc<Source>>, force: Option<Encoding>, ctx: &Ctx) -> Opened {
     let loading = open_with(path, notify, prev, force, ctx);
-    Opened { path: path.to_path_buf(), loading, canon: None, binary: false, creatable: false }
+    Opened { path: path.to_path_buf(), loading, canon: None, binary: false, creatable: false, read_only: false }
 }
 
 /// Opens `path`. `prev` is the source of the same file opened earlier (a reload): if the file only grew, its

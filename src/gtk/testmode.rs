@@ -372,6 +372,14 @@ fn value(what: &str, test: &Test) -> String {
             v.join(" ")
         }
         "notice" => tab.notice.clone().unwrap_or_default(),
+        "readonly" => (tab.read_only || tab.filter.is_some()).to_string(),
+        // (the lines bookmarked, 1-based)
+        "bookmarks" => tab.view.bookmarks.iter().filter_map(|&b| tab.doc.line_of(b)).map(|l| (l + 1).to_string()).collect::<Vec<_>>().join(","),
+        // (a tab of matching lines: the line in its file of each of its lines, 1-based)
+        "filter" => match &tab.filter {
+            Some(f) => (0..f.map.lines.min(50)).filter_map(|l| f.map.source(l)).map(|l| (l + 1).to_string()).collect::<Vec<_>>().join(","),
+            None => "none".into(),
+        },
         other => format!("(unknown: {other})"),
     }
 }

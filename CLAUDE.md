@@ -188,7 +188,11 @@ accent stay Windows-only), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate
     Find next/previous 8 MB with 1 MiB. Past that, a match at a seam is missed or cut short and the matches after it
     can be wrong. Regex searches of documents over 256 KB (plain text over 32 MB) run on another thread
     (`Matcher::sync_limit`); a background find is dropped if the selection or text changed meanwhile, and Find
-    previous takes its match from a finished count of the same search when there is one.
+    previous takes its match from a finished count of the same search when there is one. `filter_lines_to` (View →
+    Show only matching lines, Alt+L) streams the lines a match starts in (or, inverted, the others) into a `Sink`,
+    with a `LineMap` (runs of lines that follow each other in both: one entry per kept stretch, at most `RUNS_MAX`)
+    saying which line of the source each one is; `LineMap::through` maps a filter of a filter to the first text.
+    400 MB, 809,820 lines kept: 0.3 s.
   - `json.rs` — one streaming tokenizer for pretty-print / minify / validate (JSON Lines OK), errors with offsets;
     comments (JSONC) are refused with a message saying so.
   - `xml.rs` — the same for XML (well-formedness check; markup separated only by whitespace with a line break goes
@@ -446,6 +450,13 @@ accent stay Windows-only), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate
 - The JSON/XML path bar and structure panel are worked out again after an edit only once the typing pauses
   (`structure::PAUSE`, 200 ms; documents up to 256 KiB at once): a rescan per key took a frame's time on a few MB, and
   a whole background read of a big file per key. Meanwhile they show the old places (not current: clicks are ignored).
+- A tab of matching lines (`Tab::filter`: its source tab's id and the `LineMap`) is read only, isn't kept in the
+  session, shows the source's line numbers in its gutter and status bar, and Enter or a double-click goes to the line
+  in the source tab (`go_to_source`). Filtering it again maps through to the first tab. Read only (`Tab::read_only`,
+  File → Read only, on by itself when `os::can_write` says the file can't be written, kept in the session) is checked
+  in `editable()`, which every edit goes through. Bookmarks are line starts in each view (`View::bookmarks`), mapped
+  through the change log in `View::sync` (`edit::map_marks`, then `tidy_marks` back to line starts), kept in the
+  session; Format, Minify and line tools drop them, line endings and Replace all keep them by line number.
 - Transforms (Format, Minify, line tools, Replace all, line endings) write into a `Sink`: memory until it passes
   64 MiB, then a temp file; Format refuses a result over 64 times the text plus 64 MiB (absurd nesting; when the
   text isn't valid JSON or XML, that's what it says instead: `edit::format_stopped`).

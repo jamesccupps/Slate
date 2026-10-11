@@ -21,6 +21,10 @@ JSON file opens instantly, scrolls smoothly, and can be searched, edited, format
   Linux, up to 64 MB). Work is never lost silently: anything that can't be kept is asked about, and Windows won't
   shut down over it without asking.
 - Find and replace with match case, whole word and regular expressions; fast on huge files.
+- Show only the lines that match a search (or the ones that don't), in a tab of their own with each line's number in
+  the file; Enter or a double-click goes to that line in the file. 809,820 lines out of a 400 MB log in 0.3 s.
+- Bookmarks (Ctrl+F2, then F2 / Shift+F2 to go from one to the next), kept with the tabs; read-only tabs (File → Read
+  only; a file you can't write opens that way).
 - Syntax colors for 52 kinds of files: Python, PowerShell, Batch, Shell, VBScript/VBA, AutoHotkey, Perl, R, C, C++,
   C#, Objective-C and Objective-C++, Java, Kotlin, Scala, Swift, Dart, Go, Rust, JavaScript, TypeScript, PHP, Ruby,
   Lua, SQL, HTML (with its CSS and scripts), CSS, XML, Markdown (code blocks in their language), YAML, JSON, TOML,
@@ -73,6 +77,8 @@ The usual ones work as in Notepad (Ctrl+N, O, S, F, H, G, Z, Y, A, X, C, V), plu
 | Ctrl+U / Ctrl+Shift+U | lowercase / UPPERCASE |
 | Shift+Alt+F | Format JSON or XML |
 | F3 / Shift+F3 | Next / previous match |
+| Alt+L | Show only the lines with a match |
+| Ctrl+F2 / F2 / Shift+F2 | Bookmark the line / next / previous bookmark |
 | Alt+Z | Word wrap |
 | Ctrl+Plus / Ctrl+Minus / Ctrl+0 | Zoom in / out / reset |
 | Ctrl+Shift+O | JSON and XML structure panel (Windows) |

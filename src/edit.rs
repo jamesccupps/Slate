@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::core::buffer::Snapshot;
-use crate::core::document::{Document, EditKind, Sel};
+use crate::core::document::{Change, Document, EditKind, Sel};
 use crate::core::io::MEM_LIMIT;
 use crate::core::job::Ctx;
 use crate::core::lines::LineOp;
@@ -305,6 +305,90 @@ impl Write for Sink {
             SinkOut::File(w, _) => w.flush(),
         }
     }
+}
+
+// ---- bookmarks ----
+
+/// Bookmarks are the starts of the lines marked, in order (each view keeps its own). They follow edits: `map_marks`
+/// with each change, then `tidy_marks`.
+pub fn map_marks(marks: &mut [u64], c: &Change) {
+    for m in marks.iter_mut() {
+        *m = c.map(*m);
+    }
+}
+
+/// After edits: each bookmark at the start of its line again (deleting a line break leaves one inside the line it
+/// joined), in order, once.
+pub fn tidy_marks(marks: &mut Vec<u64>, doc: &Document) {
+    for m in marks.iter_mut() {
+        *m = (*m).min(doc.len());
+        if *m > 0 && doc.byte_at(*m - 1) != Some(b'\n') {
+            *m = doc.line_start_of(*m);
+        }
+    }
+    marks.sort_unstable();
+    marks.dedup();
+}
+
+/// Ctrl+F2: marks the caret's line, or unmarks it. Returns whether it's marked now.
+pub fn toggle_mark(marks: &mut Vec<u64>, doc: &Document, caret: u64) -> bool {
+    let at = doc.line_start_of(caret);
+    match marks.binary_search(&at) {
+        Ok(i) => {
+            marks.remove(i);
+            false
+        }
+        Err(i) => {
+            marks.insert(i, at);
+            true
+        }
+    }
+}
+
+/// F2 / Shift+F2: the first bookmark after the caret's line (before it), else round to the first (last).
+pub fn next_mark(marks: &[u64], doc: &Document, caret: u64, forward: bool) -> Option<u64> {
+    let line = doc.line_start_of(caret);
+    if forward {
+        marks.iter().copied().find(|&m| m > line).or(marks.first().copied())
+    } else {
+        marks.iter().rev().copied().find(|&m| m < line).or(marks.last().copied())
+    }
+}
+
+/// The lines of a text as people count them: not the empty one after a last line break. None while they're counted.
+pub fn text_lines(doc: &Document) -> Option<u64> {
+    let n = doc.line_count()?;
+    let len = doc.len();
+    Some(if len > 0 && doc.byte_at(len - 1) == Some(b'\n') { n - 1 } else { n })
+}
+
+/// What a tab of matching lines says about itself: `lines` of the `total` lines of `name` have the search `q` (or don't).
+pub fn filtered_note(lines: u64, total: Option<u64>, name: &str, q: &str, invert: bool, cut: bool) -> String {
+    let verb = match (invert, lines == 1) {
+        (false, true) => "has",
+        (false, false) => "have",
+        (true, true) => "doesn't have",
+        (true, false) => "don't have",
+    };
+    let which = match total {
+        Some(t) => format!("{} of the {} lines of {name}", group(lines), group(t)),
+        None => format!("{} of {name}", plural(lines, "line", "lines")),
+    };
+    let cut = if cut { " (the first ones: there are too many to list)" } else { "" };
+    format!("{which} {verb} “{q}”{cut}. Enter or a double-click goes to one there.")
+}
+
+/// Bookmarks as line numbers, to put back on the same lines with `marks_at_lines` after the whole text was replaced
+/// by one whose lines are the same (line endings converted).
+pub fn marks_as_lines(marks: &[u64], doc: &Document) -> Vec<u64> {
+    marks.iter().filter_map(|&m| doc.line_of(m)).collect()
+}
+
+pub fn marks_at_lines(lines: &[u64], doc: &Document) -> Vec<u64> {
+    let mut v: Vec<u64> = lines.iter().filter_map(|&l| doc.line_start(l)).collect();
+    v.sort_unstable();
+    v.dedup();
+    v
 }
 
 /// Text to insert for a newline in `doc`.
@@ -1400,6 +1484,46 @@ pub fn nothing_to_clean(op: LineOp) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bookmarks_follow_edits_and_stay_at_line_starts() {
+        let mut doc = Document::from_text(b"one\ntwo\nthree\nfour\n");
+        let mut marks = Vec::new();
+        assert!(toggle_mark(&mut marks, &doc, 5)); // "two"
+        assert!(toggle_mark(&mut marks, &doc, 14)); // "four"
+        assert_eq!(marks, [4, 14]);
+        assert_eq!(next_mark(&marks, &doc, 0, true), Some(4));
+        assert_eq!(next_mark(&marks, &doc, 4, true), Some(14));
+        assert_eq!(next_mark(&marks, &doc, 15, true), Some(4));
+        assert_eq!(next_mark(&marks, &doc, 15, false), Some(4));
+        assert_eq!(next_mark(&marks, &doc, 0, false), Some(14));
+        // a line typed before them moves them down
+        doc.begin(EditKind::Other, Sel::at(0));
+        doc.insert(0, b"zero\n");
+        doc.end(Sel::at(5));
+        for c in doc.take_changes() {
+            map_marks(&mut marks, &c);
+        }
+        tidy_marks(&mut marks, &doc);
+        assert_eq!(marks, [9, 19]);
+        // the line break before "two" deleted: the mark goes to the start of the line it joined
+        doc.begin(EditKind::Other, Sel::at(8));
+        doc.delete(8, 9);
+        doc.end(Sel::at(8));
+        for c in doc.take_changes() {
+            map_marks(&mut marks, &c);
+        }
+        tidy_marks(&mut marks, &doc);
+        assert_eq!(marks, [5, 18]);
+        assert_eq!(doc.read(5, 11), b"onetwo");
+        // the same lines after the line endings changed
+        let lines = marks_as_lines(&marks, &doc);
+        assert_eq!(lines, [1, 3]);
+        let crlf = Document::from_text(b"zero\r\nonetwo\r\nthree\r\nfour\r\n");
+        assert_eq!(marks_at_lines(&lines, &crlf), [6, 21]);
+        assert!(!toggle_mark(&mut marks, &doc, 7));
+        assert_eq!(marks, [18]);
+    }
 
     #[test]
     fn a_result_bigger_than_thought_goes_to_disk_and_an_absurd_one_is_refused() {

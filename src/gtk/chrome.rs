@@ -40,9 +40,10 @@ pub fn tab_strip(app: &App, width: f64, first: &mut usize) -> TabStrip {
     let arrows_w = 2.0 * 28.0;
     let avail = (width - PLUS_W - 8.0).max(TAB_MIN_W);
     let w = (avail / n as f64).clamp(TAB_MIN_W, TAB_MAX_W);
-    let fit = ((avail / w).floor() as usize).max(1);
     let mut strip = TabStrip { width, ..Default::default() };
-    if fit >= n {
+    // (whether they all fit, not by dividing back: avail / (avail / 7) can come out as 6.999…, and then as many tabs
+    // as fit with the arrows could be more than there are)
+    if n as f64 * TAB_MIN_W <= avail {
         *first = 0;
         for i in 0..n {
             strip.tabs.push((i, i as f64 * w, w));
@@ -51,7 +52,7 @@ pub fn tab_strip(app: &App, width: f64, first: &mut usize) -> TabStrip {
         return strip;
     }
     // more than fit: arrows at the right, and the active tab always among those shown
-    let fit = (((avail - arrows_w) / TAB_MIN_W).floor() as usize).max(1);
+    let fit = (((avail - arrows_w) / TAB_MIN_W).floor() as usize).clamp(1, n);
     let w = ((avail - arrows_w) / fit as f64).min(TAB_MAX_W);
     if app.active < *first {
         *first = app.active;
@@ -116,6 +117,28 @@ fn rounded(cr: &cairo::Context, x: f64, y: f64, w: f64, h: f64, r: f64) {
     cr.close_path();
 }
 
+/// A small padlock, 9 pixels wide, from `x` and centered on `y` (in the color set).
+fn lock(cr: &cairo::Context, x: f64, y: f64) {
+    cr.set_line_width(1.5);
+    cr.new_sub_path();
+    cr.arc(x + 4.5, y - 1.5, 2.6, std::f64::consts::PI, 0.0);
+    let _ = cr.stroke();
+    cr.rectangle(x + 0.5, y - 1.0, 8.0, 6.0);
+    let _ = cr.fill();
+}
+
+/// A small funnel (a filter), 9 pixels wide, from `x` and centered on `y`.
+fn funnel(cr: &cairo::Context, x: f64, y: f64) {
+    cr.move_to(x, y - 4.0);
+    cr.line_to(x + 9.0, y - 4.0);
+    cr.line_to(x + 5.5, y + 0.5);
+    cr.line_to(x + 5.5, y + 4.5);
+    cr.line_to(x + 3.5, y + 3.5);
+    cr.line_to(x + 3.5, y + 0.5);
+    cr.close_path();
+    let _ = cr.fill();
+}
+
 /// Draws the tab strip.
 pub fn paint_tabs(cr: &cairo::Context, ctx: &pango::Context, app: &App, strip: &TabStrip, height: f64, hover: Option<TabPart>) {
     let t = &app.theme;
@@ -147,10 +170,23 @@ pub fn paint_tabs(cr: &cairo::Context, ctx: &pango::Context, app: &App, strip: &
         if tab.doc.is_dirty() {
             title = format!("• {title}");
         }
-        let text_w = w - 14.0 - CLOSE_W - 10.0;
+        // a funnel (matching lines) or a lock (read only) before the title
+        let mid = top + (height - top) / 2.0;
+        let lead = if tab.filter.is_some() || tab.read_only {
+            set_color(cr, t.text_dim);
+            if tab.filter.is_some() {
+                funnel(cr, x + 14.0, mid);
+            } else {
+                lock(cr, x + 14.0, mid);
+            }
+            14.0
+        } else {
+            0.0
+        };
+        let text_w = w - 14.0 - CLOSE_W - 10.0 - lead;
         let l = text_layout(ctx, &font, &title, text_w);
         let color = if active { t.text } else { t.text_dim };
-        draw_text(cr, &l, x + 14.0, top + (height - top) / 2.0, color);
+        draw_text(cr, &l, x + 14.0 + lead, mid, color);
         // close button: on the active tab and the one under the pointer
         let cx = x + w - CLOSE_W - 6.0;
         let cy = top + (height - top - CLOSE_W) / 2.0;
@@ -217,7 +253,8 @@ pub fn status_texts(app: &App) -> (String, Vec<String>, bool) {
     } else {
         let sel = tab.view.sel;
         let pos = sel.caret;
-        let line = doc.line_of(pos).map(|l| l + 1);
+        // (a tab of matching lines: the line in the file they came from)
+        let line = doc.line_of(pos).map(|l| tab.filter.as_ref().and_then(|f| f.map.source(l)).unwrap_or(l) + 1);
         let ls = doc.line_start_of(pos);
         // Characters, counted once per caret place and text (the status bar is drawn after every key, and the caret
         // can be megabytes into a line).
@@ -263,7 +300,11 @@ pub fn status_texts(app: &App) -> (String, Vec<String>, bool) {
         crate::edit::Indent::Tabs => "Tabs".to_string(),
         crate::edit::Indent::Spaces(n) => format!("Spaces: {n}"),
     };
-    let right = vec![indent, tab.lang.label().to_string(), doc.eol.short().to_string(), doc.encoding.label(), size_text(doc.len())];
+    let mut right = vec![indent, tab.lang.label().to_string(), doc.eol.short().to_string(), doc.encoding.label(), size_text(doc.len())];
+    // (item 5: a click makes it editable)
+    if tab.read_only || tab.filter.is_some() {
+        right.push("Read only".into());
+    }
     (left, right, bad)
 }
 

@@ -528,6 +528,250 @@ impl Matcher {
         copy(&[], 0, copied, snap.len(), w, idx)?;
         Ok(count)
     }
+
+    /// Writes the lines of `snap` that a match starts in (all the lines a match spans), or with `invert` the other
+    /// lines, as they are (line breaks included). Returns which line of `snap` each written line is. Stops after
+    /// `RUNS_MAX` stretches of lines that follow each other (`Filtered::cut`).
+    pub fn filter_lines_to(
+        &self,
+        snap: &Snapshot,
+        invert: bool,
+        w: &mut dyn Write,
+        idx: &mut IndexBuilder,
+        ctx: &Ctx,
+    ) -> io::Result<Filtered> {
+        let len = snap.len();
+        let ends_with_nl = len > 0 && snap.slice(len - 1, len, &mut Vec::new()) == b"\n";
+        let mut lines = Lines::default();
+        // The text before `done` is dealt with (written, or left out); `done_line` is the line it starts.
+        let (mut done, mut done_line) = (0u64, 0u64);
+        let mut out = Filtered::default();
+        let mut err: Option<io::Error> = None;
+        // Writes the whole lines `[a, b)`, the first of them line `line`.
+        let mut write = |hay: &[u8], hs: u64, a: u64, b: u64, line: u64, out: &mut Filtered| -> io::Result<u64> {
+            let nl = put_lines(snap, hay, hs, a, b, &mut *w, &mut *idx)?;
+            // (only the very last line can end without a line break)
+            out.map.push(line, nl + u64::from(b == len && !ends_with_nl));
+            Ok(nl)
+        };
+        self.windows(snap, 0, len, Some(ctx), self.sizes(len, true), &mut |hay, hs, hit| {
+            let r = match hit {
+                Hit::Done(upto) => {
+                    lines.advance(snap, hay, hs, upto);
+                    // (with `invert`, the lines before the one `upto` is in have no match: written while they're in
+                    // this window)
+                    if invert && lines.start > done {
+                        write(hay, hs, done, lines.start, done_line, &mut out).map(|nl| {
+                            done_line += nl;
+                            done = lines.start;
+                        })
+                    } else {
+                        Ok(())
+                    }
+                }
+                Hit::Match(s, e) => {
+                    out.matches += 1;
+                    // the lines from the one the match starts in to the one its last byte is in
+                    let (ls, ls_line) = if s >= done {
+                        lines.advance(snap, hay, hs, s);
+                        (lines.start, lines.line)
+                    } else {
+                        (done, done_line)
+                    };
+                    let last = if e > s { e - 1 } else { s };
+                    let le = next_nl(snap, hay, hs, last).map_or(len, |p| p + 1);
+                    let mut r = Ok(());
+                    if le > done {
+                        if invert && ls > done {
+                            r = write(hay, hs, done, ls, done_line, &mut out).map(|_| ());
+                        } else if !invert && le > ls {
+                            r = write(hay, hs, ls, le, ls_line, &mut out).map(|_| ());
+                        }
+                        if r.is_ok() {
+                            // the line `le` starts: the matched lines counted (on to `le`)
+                            lines.advance(snap, hay, hs, le);
+                            done = le;
+                            done_line = lines.line;
+                        }
+                    }
+                    r
+                }
+            };
+            if let Err(x) = r {
+                err = Some(x);
+                return false;
+            }
+            if out.map.runs.len() >= RUNS_MAX {
+                out.cut = true;
+                return false;
+            }
+            true
+        });
+        if let Some(e) = err {
+            return Err(e);
+        }
+        if ctx.cancelled() {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
+        }
+        if invert && !out.cut && done < len {
+            write(&[], 0, done, len, done_line, &mut out)?;
+        }
+        Ok(out)
+    }
+}
+
+/// How far line breaks are counted: those before `at` (`line` of them), and where the line `at` is in starts.
+#[derive(Default)]
+struct Lines {
+    at: u64,
+    line: u64,
+    start: u64,
+}
+
+impl Lines {
+    /// Counts on to `to`, from `hay` (the text from `hs`) where it holds the bytes.
+    fn advance(&mut self, snap: &Snapshot, hay: &[u8], hs: u64, to: u64) {
+        if to <= self.at {
+            return;
+        }
+        let he = hs + hay.len() as u64;
+        let (mut line, mut start) = (self.line, self.start);
+        let mut eat = |c: &[u8], base: u64| {
+            let n = bytecount::count(c, b'\n') as u64;
+            if n > 0 {
+                line += n;
+                start = base + memchr::memrchr(b'\n', c).map_or(0, |i| i as u64 + 1);
+            }
+        };
+        if self.at >= hs && to <= he {
+            eat(&hay[(self.at - hs) as usize..(to - hs) as usize], self.at);
+        } else {
+            let mut base = self.at;
+            snap.chunks(self.at, to, &mut |c| {
+                eat(c, base);
+                base += c.len() as u64;
+                true
+            });
+        }
+        (self.at, self.line, self.start) = (to, line, start);
+    }
+}
+
+/// The first line break at or after `p` (looked for in `hay`, the text from `hs`, first).
+fn next_nl(snap: &Snapshot, hay: &[u8], hs: u64, p: u64) -> Option<u64> {
+    let he = hs + hay.len() as u64;
+    let mut from = p;
+    if p >= hs && p < he {
+        if let Some(i) = memchr::memchr(b'\n', &hay[(p - hs) as usize..]) {
+            return Some(p + i as u64);
+        }
+        from = he;
+    }
+    let mut at = from;
+    let mut found = None;
+    snap.chunks(from, snap.len(), &mut |c| match memchr::memchr(b'\n', c) {
+        Some(i) => {
+            found = Some(at + i as u64);
+            false
+        }
+        None => {
+            at += c.len() as u64;
+            true
+        }
+    });
+    found
+}
+
+/// Writes `[a, b)` of the text (from `hay`, the text from `hs`, where it holds it). Returns its line breaks.
+fn put_lines(snap: &Snapshot, hay: &[u8], hs: u64, a: u64, b: u64, w: &mut dyn Write, idx: &mut IndexBuilder) -> io::Result<u64> {
+    let he = hs + hay.len() as u64;
+    if a >= hs && b <= he {
+        let c = &hay[(a - hs) as usize..(b - hs) as usize];
+        idx.push(c);
+        w.write_all(c)?;
+        return Ok(bytecount::count(c, b'\n') as u64);
+    }
+    let (mut nl, mut e) = (0u64, None);
+    snap.chunks(a, b, &mut |c| {
+        nl += bytecount::count(c, b'\n') as u64;
+        idx.push(c);
+        e = w.write_all(c).err();
+        e.is_none()
+    });
+    e.map_or(Ok(nl), Err)
+}
+
+/// Stretches of lines that follow each other a filter keeps at most (each costs a `LineMap` entry: 64 MB in all).
+pub const RUNS_MAX: usize = 4_000_000;
+
+/// What `Matcher::filter_lines_to` found.
+#[derive(Clone, Debug, Default)]
+pub struct Filtered {
+    pub map: LineMap,
+    pub matches: u64,
+    /// Stopped at `RUNS_MAX`: the rest isn't there.
+    pub cut: bool,
+}
+
+/// Which line of another text each line of a text filtered out of it is: stretches of lines that follow each other in
+/// both (`Matcher::filter_lines_to`).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct LineMap {
+    /// (first line here, its line there), in order.
+    runs: Vec<(u64, u64)>,
+    /// How many lines there are here.
+    pub lines: u64,
+}
+
+impl LineMap {
+    /// The line there (0-based) that line `line` here is; None past the last.
+    pub fn source(&self, line: u64) -> Option<u64> {
+        if line >= self.lines {
+            return None;
+        }
+        let k = self.runs.partition_point(|r| r.0 <= line);
+        let (o, s) = self.runs[k - 1];
+        Some(s + (line - o))
+    }
+
+    /// The last line there (for the width of line numbers).
+    pub fn last_source(&self) -> u64 {
+        self.lines.checked_sub(1).and_then(|l| self.source(l)).unwrap_or(0)
+    }
+
+    /// This map's lines as lines of the text `outer` maps to: the lines of a tab of lines filtered again.
+    pub fn through(&self, outer: &LineMap) -> LineMap {
+        let mut out = LineMap::default();
+        for (k, &(o, s)) in self.runs.iter().enumerate() {
+            let end = s + (self.runs.get(k + 1).map_or(self.lines, |r| r.0) - o);
+            let mut line = s;
+            while line < end {
+                // the stretch of `outer` this line is in, and how much of this one it holds
+                let j = outer.runs.partition_point(|r| r.0 <= line);
+                let run_end = outer.runs.get(j).map_or(outer.lines, |r| r.0);
+                if j == 0 || line >= run_end {
+                    break;
+                }
+                let (oo, os) = outer.runs[j - 1];
+                let take = end.min(run_end) - line;
+                out.push(os + (line - oo), take);
+                line += take;
+            }
+        }
+        out
+    }
+
+    /// Adds `count` lines from line `line` there.
+    fn push(&mut self, line: u64, count: u64) {
+        if count == 0 {
+            return;
+        }
+        match self.runs.last() {
+            Some(&(o, s)) if s + (self.lines - o) == line => {}
+            _ => self.runs.push((self.lines, line)),
+        }
+        self.lines += count;
+    }
 }
 
 /// What `Matcher::windows` reports: a match, or that the window it searched is done up to an offset.
@@ -589,6 +833,87 @@ mod tests {
             b.insert(0, chunk);
         }
         b.snapshot()
+    }
+
+    /// The lines with a match (or without), and their line numbers, worked out the simple way from the matches.
+    fn filtered_simply(text: &[u8], matches: &[(u64, u64)], invert: bool) -> (Vec<u8>, Vec<u64>) {
+        let mut starts = vec![0u64];
+        starts.extend(text.iter().enumerate().filter(|(_, b)| **b == b'\n').map(|(i, _)| i as u64 + 1));
+        if starts.last() == Some(&(text.len() as u64)) {
+            starts.pop();
+        }
+        let line_of = |p: u64| (starts.partition_point(|&s| s <= p) - 1) as u64;
+        let mut hit = vec![false; starts.len()];
+        for &(s, e) in matches {
+            // (one at the very end is in the last line, unless a line break ends the text)
+            if starts.is_empty() || (s >= text.len() as u64 && text.ends_with(b"\n")) {
+                continue;
+            }
+            let last = if e > s { e - 1 } else { s };
+            for l in line_of(s)..=line_of(last) {
+                hit[l as usize] = true;
+            }
+        }
+        let (mut out, mut lines) = (Vec::new(), Vec::new());
+        for (l, &s) in starts.iter().enumerate() {
+            if hit[l] != invert {
+                let e = starts.get(l + 1).map_or(text.len(), |&e| e as usize);
+                out.extend_from_slice(&text[s as usize..e]);
+                lines.push(l as u64);
+            }
+        }
+        (out, lines)
+    }
+
+    #[test]
+    fn lines_of_lines_map_to_the_first_text() {
+        // lines 2-4, 10, 20-21 of a text; then lines 1-3 and 5 of those
+        let mut outer = LineMap::default();
+        outer.push(2, 3);
+        outer.push(10, 1);
+        outer.push(20, 2);
+        let mut inner = LineMap::default();
+        inner.push(1, 3);
+        inner.push(5, 1);
+        let both = inner.through(&outer);
+        let got: Vec<u64> = (0..both.lines).map(|l| both.source(l).unwrap()).collect();
+        assert_eq!(got, [3, 4, 10, 21]);
+        assert_eq!(both.last_source(), 21);
+    }
+
+    #[test]
+    fn filtering_keeps_the_lines_with_a_match_or_the_others() {
+        let mut r = 0x2545_F491_4F6C_DD1Du64;
+        let words = ["ab", "x", "AB", "a", "b", " ", "\n", "\r\n", "\n\n", "abab", "é", "line"];
+        for round in 0..40 {
+            let mut text = String::new();
+            for _ in 0..(200 + round * 37) {
+                r ^= r << 13;
+                r ^= r >> 7;
+                r ^= r << 17;
+                text.push_str(words[(r % words.len() as u64) as usize]);
+            }
+            // a last line without a line break, or with one
+            if round % 2 == 0 {
+                text.push('\n');
+            }
+            let snap = fragmented(text.as_bytes());
+            for (query, regex, case) in [("ab", false, false), ("ab", false, true), ("b\na", true, false), ("^x", true, true), ("$", true, true), ("é", false, false)] {
+                let m = Matcher::new(&Query { text: query.into(), regex, match_case: case, ..Default::default() }).unwrap();
+                let found = count_all(&m, &snap, &ctx());
+                for invert in [false, true] {
+                    let mut out = Vec::new();
+                    let mut idx = IndexBuilder::new();
+                    let f = m.filter_lines_to(&snap, invert, &mut out, &mut idx, &ctx()).unwrap();
+                    let (want, want_lines) = filtered_simply(text.as_bytes(), &found.positions, invert);
+                    assert_eq!(out, want, "{query:?} invert {invert} round {round}");
+                    let got: Vec<u64> = (0..f.map.lines).map(|l| f.map.source(l).unwrap()).collect();
+                    assert_eq!(got, want_lines, "{query:?} invert {invert} round {round}");
+                    assert_eq!(f.map.source(f.map.lines), None);
+                    assert_eq!(f.matches, found.count);
+                }
+            }
+        }
     }
 
     #[test]

@@ -82,6 +82,8 @@ pub enum TaskKind {
     Eol(Eol),
     Lines(LineOp),
     Print,
+    /// Show only matching lines (false), or the lines without a match (true).
+    Filter(bool),
 }
 
 /// The structured formats Slate can format and check.
@@ -109,6 +111,8 @@ pub enum TaskResult {
     FormatError { offset: u64, msg: String },
     /// Done (printed): what to say.
     Done(String),
+    /// The lines kept by a filter, for a tab of their own.
+    Filtered { src: Arc<Source>, nl: u64, found: crate::core::search::Filtered, query: String },
     Failed(String),
     Cancelled,
 }
@@ -222,6 +226,16 @@ pub struct Tab {
     pub big: Option<super::session::BigBackup>,
     /// A tab from the session that isn't back yet (being put back, or its file doesn't answer): see session.rs.
     pub restore: Option<super::session::Restoring>,
+    /// File → Read only (on by itself for a file that's read-only on disk): the text can't be changed here.
+    pub read_only: bool,
+    /// A tab of matching lines (View → Show only matching lines): read only, not kept for next time.
+    pub filter: Option<FilterOf>,
+}
+
+/// What a tab of matching lines shows: lines of the tab `source`, `map` saying which line there each line here is.
+pub struct FilterOf {
+    pub source: u64,
+    pub map: Arc<crate::core::search::LineMap>,
 }
 
 /// A tab's file being read on another thread (`Tab::load_job`).
@@ -289,6 +303,8 @@ impl Tab {
             goto: None,
             big: None,
             restore: None,
+            read_only: false,
+            filter: None,
         }
     }
 
@@ -353,6 +369,8 @@ pub enum StatusItem {
     Indent,
     /// "OVR" while typing replaces characters (Insert); a click turns it off.
     Overtype,
+    /// "Read only" for a tab that is; a click makes it editable.
+    ReadOnly,
 }
 
 /// Where updating Slate is at (see `update.rs`).
@@ -795,7 +813,8 @@ impl App {
     }
 
     pub fn editor_geom(&self) -> Geom {
-        View::geometry(&self.tab().doc, &self.style, self.r_edit)
+        let tab = self.tab();
+        View::geometry(&tab.doc, &self.style, self.r_edit, tab.filter.as_ref().map(|f| f.map.last_source() + 1))
     }
 
     // ---- hit testing ----
@@ -931,6 +950,10 @@ impl App {
                 Hit::Status(StatusItem::Lang) => "Language",
                 Hit::Status(StatusItem::Indent) => "Indentation",
                 Hit::Status(StatusItem::Overtype) => "Typing replaces characters (Insert turns it off)",
+                Hit::Status(StatusItem::ReadOnly) if self.tab().filter.is_some() => {
+                    "Lines of another tab: Enter or a double-click goes to one there"
+                }
+                Hit::Status(StatusItem::ReadOnly) => "Read only (click to edit)",
                 _ => return None,
             }
             .to_string(),
@@ -1094,6 +1117,11 @@ impl App {
             // (the unsaved-changes dot next to the close button on the active tab)
             let dot = active && tab.doc.is_dirty() && self.hover != Hit::TabClose(i);
             let color = if active { t.text } else { t.text_dim };
+            // (a funnel: matching lines; a lock: read only)
+            let mark = if tab.filter.is_some() { Some("\u{E71C}") } else { tab.read_only.then_some("\u{E72E}") };
+            if let Some(m) = mark {
+                g.text(m, &self.fonts.icons_small, Rect::new(r.x + 10.0, r.y, 16.0, r.h - 2.0), t.text_dim, Align::Center);
+            }
             g.text(&title, &self.fonts.ui, self.tab_title_rect(i), color, Align::Left);
             if show_close {
                 if let Some(bg) = self.hot(Hit::TabClose(i)) {
@@ -1146,7 +1174,9 @@ impl App {
         } else {
             r.right() - 12.0
         };
-        Rect::new(r.x + 14.0, r.y, (end - r.x - 14.0).max(10.0), r.h - 2.0)
+        let tab = &self.tabs[i];
+        let lead = if tab.read_only || tab.filter.is_some() { 30.0 } else { 14.0 };
+        Rect::new(r.x + lead, r.y, (end - r.x - lead).max(10.0), r.h - 2.0)
     }
 
     /// The background of a button under the mouse: darker while it's held down on it.
@@ -1310,7 +1340,8 @@ impl App {
         let matcher = if self.find.open && self.find.mode != findbar::Mode::GoTo { self.find.matcher.clone() } else { None };
         let tab = &mut self.tabs[self.active];
         tab.view.sync(&mut tab.doc);
-        let cx = Ctx { doc: &tab.doc, g: &self.g, style: &self.style, theme: &self.theme, lang: tab.lang, geom };
+        let line_map = tab.filter.as_ref().map(|f| &*f.map);
+        let cx = Ctx { doc: &tab.doc, g: &self.g, style: &self.style, theme: &self.theme, lang: tab.lang, geom, line_map };
         tab.view.layout_rows(&cx);
         // Matches on screen (searched directly; cheap for a screenful of text).
         let mut matches = Vec::new();
@@ -1371,6 +1402,12 @@ impl App {
                         self.g.fill(Rect::new(vb.right() - 4.0, my, 3.0, 2.0), t.scroll_mark);
                     }
                 }
+            }
+            // bookmarks (on the bar's other side)
+            let len = tab.doc.len().max(1) as f64;
+            for &b in &tab.view.bookmarks {
+                let my = vb.y + (vb.h as f64 * b as f64 / len) as f32;
+                self.g.fill(Rect::new(vb.x + 1.0, my, 4.0, 2.0), t.accent);
             }
             self.g.fill_round(
                 Rect::new(vb.right() - w - 3.0, y + 2.0, w, thumb_h - 4.0),
@@ -1442,7 +1479,7 @@ impl App {
             }
             let color = match item {
                 StatusItem::Update => t.accent,
-                StatusItem::Overtype => t.text,
+                StatusItem::Overtype | StatusItem::ReadOnly => t.text,
                 _ => t.text_dim,
             };
             self.g.text(label, &fonts_ui, br, color, Align::Center);
@@ -1484,6 +1521,9 @@ impl App {
         let doc = &tab.doc;
         if self.overtype {
             items.push((StatusItem::Overtype, "OVR".into()));
+        }
+        if tab.read_only || tab.filter.is_some() {
+            items.push((StatusItem::ReadOnly, "Read only".into()));
         }
         if self.settings.zoom != 1.0 {
             items.push((StatusItem::Zoom, format!("{:.0}%", self.settings.zoom * 100.0)));
@@ -1612,6 +1652,7 @@ impl App {
                 TaskKind::Lines(LineOp::SortAsc | LineOp::SortDesc) => "Sorting lines".into(),
                 TaskKind::Lines(_) => "Cleaning up lines".into(),
                 TaskKind::Print => "Printing".into(),
+                TaskKind::Filter(_) => "Finding the lines".into(),
             };
             return Some((format!("{what}… {:.0}%  (Esc to cancel)", task.job.fraction() * 100.0), false));
         }
@@ -1721,6 +1762,11 @@ fn position_text(
     let doc = &tab.doc;
     let sel = tab.view.sel;
     let caret = sel.caret;
+    // (a tab of matching lines: the line in the file they came from)
+    let line = match &tab.filter {
+        Some(f) => line.map(|l| f.map.source(l).unwrap_or(l)),
+        None => line,
+    };
     let s = match (line, col) {
         (Some(l), Some(c)) => format!("Ln {}, Col {}", group(l + 1), group(c)),
         (Some(l), None) => format!("Ln {}, byte {}", group(l + 1), group(caret - ls + 1)),

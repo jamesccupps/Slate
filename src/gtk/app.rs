@@ -110,6 +110,16 @@ pub enum Cmd {
     Shortcuts,
     MakeDefault,
     StopDefault,
+    /// File → Read only: the tab's text can't be changed.
+    ToggleReadOnly,
+    /// View → Show only matching lines (false) / lines not matching (true): the find bar's search, the lines in a tab
+    /// of their own.
+    FilterLines(bool),
+    /// Bookmarks: the caret's line marked or not (Ctrl+F2), the next and previous (F2, Shift+F2), none.
+    ToggleBookmark,
+    NextBookmark,
+    PrevBookmark,
+    ClearBookmarks,
 }
 
 pub struct SaveTask {
@@ -124,6 +134,8 @@ pub struct SaveTask {
 
 enum TaskResult {
     Content { src: Arc<crate::core::source::Source>, nl: u64, count: u64 },
+    /// The lines kept by a filter, for a tab of their own.
+    Filtered { src: Arc<crate::core::source::Source>, nl: u64, found: crate::core::search::Filtered, query: String },
     Valid(String),
     FormatError { offset: u64, msg: String },
     Failed(String),
@@ -144,6 +156,8 @@ enum TaskKind {
     ReplaceAll,
     /// Every line break to this kind.
     Eol(Eol),
+    /// Show only matching lines (false), or the lines without a match (true).
+    Filter(bool),
 }
 
 struct Task {
@@ -186,6 +200,18 @@ pub struct Tab {
     /// Being read again after another program changed the file: whether the caret was at the end (it stays there,
     /// following a log as it grows).
     reload: Option<bool>,
+    /// File → Read only (on by itself for a file this user can't write): the text can't be changed here.
+    pub read_only: bool,
+    /// A tab of matching lines (View → Show only matching lines): read only, not kept for next time.
+    pub filter: Option<FilterOf>,
+    /// The bookmarks to put back once its file is read (a tab from the session).
+    pub restore_marks: Option<Vec<u64>>,
+}
+
+/// What a tab of matching lines shows: lines of the tab `source`, `map` saying which line there each line here is.
+pub struct FilterOf {
+    pub source: u64,
+    pub map: Arc<crate::core::search::LineMap>,
 }
 
 impl Tab {
@@ -378,6 +404,9 @@ impl App {
             canon: None,
             title_override: None,
             reload: None,
+            read_only: false,
+            filter: None,
+            restore_marks: None,
         }
     }
 
@@ -450,6 +479,85 @@ impl App {
         }
         self.dirty_title = true;
         self.dirty_view = true;
+    }
+
+    /// View → Show only matching lines: the find bar's search (opened to type one), the lines in a tab of their own.
+    fn filter_lines(&mut self, invert: bool) {
+        if self.find.matcher.is_none() {
+            match self.find.error.clone() {
+                Some(e) => self.flash(e, true),
+                None => {
+                    self.exec(Cmd::Find);
+                    self.flash("Type what the lines should have, then Alt+L.", false);
+                }
+            }
+            return;
+        }
+        if !self.tab().doc.is_ready() {
+            self.flash("Still reading the file's lines — try again in a moment.", true);
+            return;
+        }
+        self.start_task(TaskKind::Filter(invert));
+    }
+
+    /// The lines a filter of tab `i` kept, in a tab of their own after it (or what it found when no line is kept).
+    fn show_filtered(
+        &mut self,
+        i: usize,
+        invert: bool,
+        src: Arc<crate::core::source::Source>,
+        nl: u64,
+        found: crate::core::search::Filtered,
+        query: &str,
+    ) {
+        let q: String = if query.chars().count() > 40 { query.chars().take(39).collect::<String>() + "…" } else { query.to_string() };
+        if found.map.lines == 0 {
+            self.flash(if invert { format!("Every line has “{q}”") } else { format!("No line has “{q}”") }, false);
+            return;
+        }
+        // (lines of a tab of lines: of the tab those came from)
+        let source = &self.tabs[i];
+        let (origin, map) = match &source.filter {
+            Some(f) => (f.source, found.map.through(&f.map)),
+            None => (source.id, found.map),
+        };
+        let (lang, encoding, eol) = (source.lang, source.doc.encoding, source.doc.eol);
+        let from = self.tabs.iter().find(|t| t.id == origin);
+        let name = from.map_or_else(|| "the file".to_string(), |t| t.title());
+        let total = from.and_then(|t| edit::text_lines(&t.doc));
+        let mut doc = Document::from_buffer(crate::core::buffer::Buffer::from_source(src, nl));
+        doc.encoding = encoding;
+        doc.eol = eol;
+        let lines = map.lines;
+        let mut tab = self.make_tab(doc);
+        tab.lang = lang;
+        tab.lang_picked = true;
+        tab.filter = Some(FilterOf { source: origin, map: Arc::new(map) });
+        tab.title_override = Some(if invert { format!("not “{q}” in {name}") } else { format!("“{q}” in {name}") });
+        tab.notice = Some(edit::filtered_note(lines, total, &name, &q, invert, found.cut));
+        let at = (i + 1).min(self.tabs.len());
+        self.tabs.insert(at, tab);
+        self.active = at;
+        self.find.found = None;
+        self.dirty_title = true;
+        self.dirty_view = true;
+    }
+
+    /// Enter or a double-click in a tab of matching lines: the caret's line, in the tab the lines came from.
+    pub fn go_to_source(&mut self) {
+        let tab = self.tab();
+        let Some(f) = &tab.filter else { return };
+        let Some(line) = tab.doc.line_of(tab.view.sel.caret).and_then(|l| f.map.source(l)) else { return };
+        let source = f.source;
+        let Some(i) = self.tabs.iter().position(|t| t.id == source) else {
+            self.flash("The tab these lines came from is closed.", true);
+            return;
+        };
+        self.active = i;
+        self.find.found = None;
+        self.tabs[i].goto = Some((line + 1, 1));
+        self.goto_now(i);
+        self.dirty_title = true;
     }
 
     /// File → Print: GTK's print dialog for the tab (`Ask::Print`), unless it's far too long.
@@ -616,6 +724,9 @@ impl App {
             if opened.canon.is_some() {
                 tab.canon = opened.canon.clone();
             }
+            if opened.read_only && !reading_again {
+                tab.read_only = true;
+            }
             if tab.doc.path.as_deref() == Some(opened.path.as_path()) {
                 // (a file of that very name, colons and all: no line to go to)
                 tab.goto = None;
@@ -679,6 +790,10 @@ impl App {
         tab.doc = doc;
         tab.index = index;
         let old = std::mem::take(&mut tab.view);
+        // (the bookmarks stay: on line starts of the text as it is now)
+        let mut marks = tab.restore_marks.take().unwrap_or(old.bookmarks.clone());
+        edit::tidy_marks(&mut marks, &tab.doc);
+        tab.view.bookmarks = marks;
         tab.seen_disk = None;
         let len = tab.doc.len();
         if let Some(follow_end) = tab.reload.take() {
@@ -867,6 +982,14 @@ impl App {
 
     pub fn editable(&mut self) -> bool {
         let tab = &self.tabs[self.active];
+        if tab.filter.is_some() {
+            self.flash("These are lines of another tab, to look through: Enter or a double-click goes to one there.", false);
+            return false;
+        }
+        if tab.read_only {
+            self.flash("This tab is read only (File → Read only to edit it).", false);
+            return false;
+        }
         if tab.loading() {
             self.flash("Still opening the file…", false);
             return false;
@@ -1053,6 +1176,7 @@ impl App {
                     self.after_edit(true);
                 }
             }
+            Key::Return | Key::KP_Enter if !ctrl && !alt && self.tab().filter.is_some() => self.go_to_source(),
             Key::Return | Key::KP_Enter if !ctrl && !alt => {
                 if self.editable() {
                     let unit = self.tabs[self.active].indent.unit();
@@ -1317,6 +1441,40 @@ impl App {
             Cmd::Shortcuts => self.asks.push(Ask::Shortcuts),
             Cmd::MakeDefault => self.asks.push(Ask::MakeDefault),
             Cmd::StopDefault => self.asks.push(Ask::StopDefault),
+            Cmd::ToggleReadOnly => {
+                let tab = &mut self.tabs[self.active];
+                if tab.filter.is_some() {
+                    self.flash("A tab of matching lines stays read only.", false);
+                } else {
+                    tab.read_only = !tab.read_only;
+                    let on = tab.read_only;
+                    self.session_dirty = true;
+                    self.flash(if on { "Read only: the text can't be changed (File → Read only)" } else { "Editable" }, false);
+                }
+            }
+            Cmd::FilterLines(invert) => self.filter_lines(invert),
+            Cmd::ToggleBookmark => {
+                let tab = &mut self.tabs[self.active];
+                let caret = tab.view.sel.caret;
+                edit::toggle_mark(&mut tab.view.bookmarks, &tab.doc, caret);
+                self.session_dirty = true;
+            }
+            Cmd::NextBookmark | Cmd::PrevBookmark => {
+                let tab = &mut self.tabs[self.active];
+                match edit::next_mark(&tab.view.bookmarks, &tab.doc, tab.view.sel.caret, cmd == Cmd::NextBookmark) {
+                    Some(p) => {
+                        tab.view.sel = Sel::at(p);
+                        tab.view.want_x = None;
+                        self.reveal_pending = true;
+                        self.reveal_center = true;
+                    }
+                    None => self.flash("No bookmarks in this tab: Ctrl+F2 bookmarks the caret's line.", false),
+                }
+            }
+            Cmd::ClearBookmarks => {
+                self.tabs[self.active].view.bookmarks.clear();
+                self.session_dirty = true;
+            }
         }
         self.dirty_title = true;
     }
@@ -1376,13 +1534,15 @@ impl App {
 
     fn start_task(&mut self, kind: TaskKind) {
         let notify = self.notify.clone();
-        let changes = !matches!(kind, TaskKind::Json(json::Mode::Validate) | TaskKind::Xml(json::Mode::Validate));
+        let changes =
+            !matches!(kind, TaskKind::Json(json::Mode::Validate) | TaskKind::Xml(json::Mode::Validate) | TaskKind::Filter(_));
         if changes && !self.editable() {
             return;
         }
         let indent = vec![b' '; self.settings.json_indent as usize];
+        let query = self.find.query.text.clone();
         let matcher = match kind {
-            TaskKind::ReplaceAll => match self.find.matcher.clone() {
+            TaskKind::ReplaceAll | TaskKind::Filter(_) => match self.find.matcher.clone() {
                 Some(m) => Some(m),
                 None => {
                     self.flash("Type something to find first", true);
@@ -1483,6 +1643,22 @@ impl App {
                         Err(e) => TaskResult::Failed(format!("Couldn't replace: {e}")),
                     }
                 }
+                TaskKind::Filter(invert) => {
+                    let m = matcher.unwrap();
+                    let mut sink = match Sink::new(len) {
+                        Ok(s) => s,
+                        Err(e) => return TaskResult::Failed(format!("Couldn't create a temporary file: {e}")),
+                    };
+                    let mut idx = IndexBuilder::new();
+                    match m.filter_lines_to(&snap, invert, &mut sink, &mut idx, ctx) {
+                        Ok(found) => match sink.finish(idx) {
+                            Ok((src, nl)) => TaskResult::Filtered { src, nl, found, query },
+                            Err(e) => TaskResult::Failed(format!("Couldn't write the lines: {e}")),
+                        },
+                        Err(_) if ctx.cancelled() => TaskResult::Cancelled,
+                        Err(e) => TaskResult::Failed(format!("Couldn't go through the lines: {e}")),
+                    }
+                }
                 TaskKind::Eol(e) => {
                     let mut sink = match Sink::new(len + len / 16) {
                         Ok(s) => s,
@@ -1536,6 +1712,9 @@ impl App {
                 let sel = tab.view.sel;
                 let new_len = src.len();
                 let places = matches!(kind, TaskKind::Eol(_)).then(|| (tab.doc.place_of(sel.caret), tab.doc.place_of(tab.view.top)));
+                // (bookmarks stay on their lines where the lines stay what they were; elsewhere they go)
+                let marks =
+                    matches!(kind, TaskKind::Eol(_) | TaskKind::ReplaceAll).then(|| edit::marks_as_lines(&tab.view.bookmarks, &tab.doc));
                 tab.doc.begin(EditKind::Other, sel);
                 tab.doc.replace_all_with(src, nl);
                 let keep = matches!(kind, TaskKind::ReplaceAll | TaskKind::Lines(_) | TaskKind::Eol(_));
@@ -1547,6 +1726,8 @@ impl App {
                 tab.doc.end(new_sel);
                 tab.doc.seal();
                 tab.view.sel = new_sel;
+                tab.view.sync(&mut tab.doc);
+                tab.view.bookmarks = marks.map_or_else(Vec::new, |l| edit::marks_at_lines(&l, &tab.doc));
                 if let Some((_, top)) = places {
                     tab.view.top = top.and_then(|p| tab.doc.offset_of_place(p)).unwrap_or(0);
                 }
@@ -1565,6 +1746,10 @@ impl App {
                     self.after_edit(false);
                 }
                 self.flash(msg, false);
+            }
+            TaskResult::Filtered { src, nl, found, query } => {
+                let TaskKind::Filter(invert) = kind else { return };
+                self.show_filtered(i, invert, src, nl, found, &query);
             }
             TaskResult::Valid(msg) => self.flash(msg, false),
             TaskResult::FormatError { offset, msg } => {

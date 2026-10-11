@@ -70,6 +70,12 @@ pub struct SessionTab {
     pub disk_len: Option<u64>,
     #[serde(default)]
     pub disk_modified_ms: Option<u64>,
+    /// File → Read only.
+    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "std::ops::Not::not")]
+    pub read_only: bool,
+    /// The starts of the lines bookmarked.
+    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Vec::is_empty")]
+    pub bookmarks: Vec<u64>,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -104,6 +110,18 @@ impl Fallback for Eol {
 impl Fallback for Lang {
     fn fallback() -> Self {
         Lang::Plain
+    }
+}
+
+impl Fallback for bool {
+    fn fallback() -> Self {
+        false
+    }
+}
+
+impl Fallback for Vec<u64> {
+    fn fallback() -> Self {
+        Vec::new()
     }
 }
 
@@ -217,6 +235,10 @@ fn plan_in(d: PathBuf, tabs: &mut [Tab], active: usize, closing: bool) -> Plan {
         if tab.load_job.is_some() && tab.doc.path.is_none() {
             continue;
         }
+        // (a tab of matching lines isn't kept: it's made again from its file in a moment)
+        if tab.filter.is_some() {
+            continue;
+        }
         // Not back yet: as it was (its files are still needed). Its file still being read: as the session had it.
         if let Some(st) = tab.restore.as_ref().map(|r| &r.st).or(tab.place.as_ref()) {
             keep.extend(files_of(st));
@@ -293,6 +315,8 @@ fn plan_in(d: PathBuf, tabs: &mut [Tab], active: usize, closing: bool) -> Plan {
             top: tab.view.top,
             disk_len: doc.disk.map(|x| x.len),
             disk_modified_ms: doc.disk.map(|x| ms(x.modified)),
+            read_only: tab.read_only,
+            bookmarks: tab.view.bookmarks.clone(),
         };
         if let Some(name) = &pieces {
             let b = tab.big.as_ref().unwrap();
@@ -1612,6 +1636,8 @@ impl SessionTab {
             top: 0,
             disk_len: None,
             disk_modified_ms: None,
+            read_only: false,
+            bookmarks: Vec::new(),
         }
     }
 }

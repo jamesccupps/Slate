@@ -208,6 +208,8 @@ pub struct View {
     pub max_w: f64,
     pub rows: Vec<VisRow>,
     pub drag: Option<Drag>,
+    /// The starts of the lines bookmarked, in order (`edit::toggle_mark`); they follow edits (`sync`).
+    pub bookmarks: Vec<u64>,
     cache: HashMap<u64, CacheEntry>,
     cache_bytes: usize,
     tick: u64,
@@ -298,16 +300,24 @@ impl View {
             spans: Vec::new(),
             keys: HashMap::new(),
             keys_version: u64::MAX,
+            bookmarks: Vec::new(),
         }
     }
 
-    /// Takes the document's changes (after edits, undo, a reload): coloring states after them are worked out again.
+    /// Takes the document's changes (after edits, undo, a reload): coloring states after them are worked out again,
+    /// and the bookmarks follow them.
     pub fn sync(&mut self, doc: &mut Document) {
         // (the coloring index applies pending changes itself as it's asked; those it hasn't seen yet, here)
+        let mut moved = false;
         for (k, c) in doc.take_changes().iter().enumerate() {
+            crate::edit::map_marks(&mut self.bookmarks, c);
+            moved = true;
             if k >= self.hl.seen {
                 self.hl.edited(c.at);
             }
+        }
+        if moved && !self.bookmarks.is_empty() {
+            crate::edit::tidy_marks(&mut self.bookmarks, doc);
         }
         self.hl.seen = 0;
         self.hl.len = doc.len();

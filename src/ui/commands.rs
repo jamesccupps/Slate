@@ -40,6 +40,8 @@ pub enum Cmd {
     ShowTab(u64),
     /// Keep the tabs and unsaved text for next time (settings.json's `restore_session`).
     ToggleRestoreSession,
+    /// File → Read only: the tab's text can't be changed.
+    ToggleReadOnly,
     Exit,
     Undo,
     Redo,
@@ -53,6 +55,14 @@ pub enum Cmd {
     FindPrev,
     Replace,
     GoToLine,
+    /// View → Show only matching lines (false) / lines not matching (true): the find bar's search, the lines in a tab
+    /// of their own.
+    FilterLines(bool),
+    /// Bookmarks: the caret's line marked or not (Ctrl+F2), the next and previous (F2, Shift+F2), none.
+    ToggleBookmark,
+    NextBookmark,
+    PrevBookmark,
+    ClearBookmarks,
     DuplicateLine,
     DeleteLine,
     MoveLineUp,
@@ -184,6 +194,9 @@ pub fn global_key(vk: u16, m: &Mods) -> Option<Cmd> {
         (VK_O, true, true) => Cmd::ToggleStructure,
         (VK_F3, false, false) => Cmd::FindNext,
         (VK_F3, false, true) => Cmd::FindPrev,
+        (VK_F2, true, false) => Cmd::ToggleBookmark,
+        (VK_F2, false, false) => Cmd::NextBookmark,
+        (VK_F2, false, true) => Cmd::PrevBookmark,
         (VK_TAB, true, false) | (VK_NEXT, true, false) => Cmd::NextTab,
         (VK_TAB, true, true) | (VK_PRIOR, true, false) => Cmd::PrevTab,
         (VK_OEM_PLUS, true, _) | (VK_ADD, true, _) => Cmd::ZoomIn,
@@ -195,6 +208,9 @@ pub fn global_key(vk: u16, m: &Mods) -> Option<Cmd> {
             }
             if m.alt && !m.ctrl && k == VK_Z {
                 return Some(Cmd::ToggleWrap);
+            }
+            if m.alt && !m.ctrl && !m.shift && k == VK_L {
+                return Some(Cmd::FilterLines(false));
             }
             if m.alt && m.shift && !m.ctrl && k == VK_F {
                 return Some(Cmd::Format);
@@ -359,6 +375,8 @@ Moving around
   PgUp / PgDn                   Page up / down
   Ctrl+Up / Ctrl+Down           Scroll without moving the caret
   Ctrl+G                        Go to line (line:column works too)
+  Ctrl+F2                       Bookmark the line (or take the bookmark off)
+  F2 / Shift+F2                 Next / previous bookmark
 
 Find and replace
   Ctrl+F / Ctrl+H               Find / Replace
@@ -368,6 +386,8 @@ Find and replace
   Enter                         Replace this match (in the replace box)
   Ctrl+Alt+Enter                Replace all (in the replace box)
   Tab                           Switch between the find and replace boxes
+  Alt+L                         Show only the lines with a match, in a tab of their own
+                                (Enter or a double-click there goes to a line in the file)
   Esc                           Close the find bar
 
 View

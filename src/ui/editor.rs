@@ -297,6 +297,8 @@ pub struct Ctx<'a> {
     pub theme: &'a Theme,
     pub lang: Lang,
     pub geom: Geom,
+    /// A tab of matching lines: the line numbers shown are those of the file they came from.
+    pub line_map: Option<&'a crate::core::search::LineMap>,
 }
 
 impl Ctx<'_> {
@@ -368,6 +370,8 @@ pub struct View {
     bracket: Option<((u64, u64), Option<(u64, u64)>)>,
     /// The clusters (`SegLayout::clusters`) of the layouts last shown with whitespace marks.
     ws_clusters: Vec<(Rc<SegLayout>, Rc<Vec<(u32, f32, f32)>>)>,
+    /// The starts of the lines bookmarked, in order (`edit::toggle_mark`); they follow edits (`sync`).
+    pub bookmarks: Vec<u64>,
 }
 
 impl Default for View {
@@ -398,12 +402,14 @@ impl View {
             hl_guess: false,
             bracket: None,
             ws_clusters: Vec::new(),
+            bookmarks: Vec::new(),
         }
     }
 
-    pub fn geometry(doc: &Document, style: &Style, rect: Rect) -> Geom {
+    /// `lines`: the highest line number shown, when it isn't the document's line count (a tab of matching lines).
+    pub fn geometry(doc: &Document, style: &Style, rect: Rect, lines: Option<u64>) -> Geom {
         let gutter_w = if style.line_numbers {
-            let lines = doc.line_count().unwrap_or_else(|| (doc.len() / 40).max(1));
+            let lines = lines.or(doc.line_count()).unwrap_or_else(|| (doc.len() / 40).max(1));
             let digits = (lines.max(1) as f64).log10().floor() as u32 + 1;
             (digits.max(3) as f32) * style.digit_w + style.digit_w * 2.5
         } else {
@@ -428,13 +434,19 @@ impl View {
         self.hl.reset();
     }
 
-    /// Applies the document's change log to the scroll position.
+    /// Applies the document's change log to the scroll position and the bookmarks.
     pub fn sync(&mut self, doc: &mut Document) {
+        let mut moved = false;
         for (k, c) in doc.take_changes().iter().enumerate() {
             self.top = c.map(self.top);
+            crate::edit::map_marks(&mut self.bookmarks, c);
+            moved = true;
             if k >= self.hl.seen {
                 self.hl.edited(c.at);
             }
+        }
+        if moved && !self.bookmarks.is_empty() {
+            crate::edit::tidy_marks(&mut self.bookmarks, doc);
         }
         self.hl.seen = 0;
         self.hl.len = doc.len();
@@ -1009,7 +1021,15 @@ impl View {
                 if let Some(n) = r.line_no {
                     current_line = Some(n);
                     let active = caret_line_no.is_some_and(|c| c + 1 == n);
-                    let s = n.to_string();
+                    // (a tab of matching lines: the number in the file they came from)
+                    let shown = match cx.line_map {
+                        Some(m) => match m.source(n - 1) {
+                            Some(s) => s + 1,
+                            None => continue,
+                        },
+                        None => n,
+                    };
+                    let s = shown.to_string();
                     let w = s.len() as f32 * cx.style.digit_w;
                     let x = geom.rect.x + geom.gutter_w - cx.style.digit_w * 1.25 - w;
                     let l = g.layout(&super::gfx::wide(&s), fmt, 1000.0, row_h);
@@ -1018,6 +1038,14 @@ impl View {
             }
             let _ = current_line;
             g.pop_clip();
+        }
+        // Bookmarks: a bar at the gutter's edge, on the first row of each line marked.
+        if !self.bookmarks.is_empty() {
+            for r in &self.rows {
+                if r.row == 0 && r.seg.line_start && self.bookmarks.binary_search(&r.start).is_ok() {
+                    g.fill_round(Rect::new(geom.rect.x + 1.0, r.y + 2.0, 3.0, row_h - 4.0), 1.5, t.accent);
+                }
+            }
         }
 
         let text = geom.text_rect();
@@ -1225,8 +1253,8 @@ mod tests {
         let style = crate::ui::app::make_style(&g, &settings, 1);
         let theme = Theme::light(0xFF0078D4);
         let doc = Document::from_text(text);
-        let geom = View::geometry(&doc, &style, Rect::new(0.0, 0.0, 300.0, 400.0));
-        let cx = Ctx { doc: &doc, g: &g, style: &style, theme: &theme, lang, geom };
+        let geom = View::geometry(&doc, &style, Rect::new(0.0, 0.0, 300.0, 400.0), None);
+        let cx = Ctx { doc: &doc, g: &g, style: &style, theme: &theme, lang, geom, line_map: None };
         f(&mut View::new(), &cx);
     }
 

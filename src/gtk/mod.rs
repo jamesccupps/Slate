@@ -918,11 +918,18 @@ fn commands() -> Vec<(&'static str, Cmd, &'static [&'static str])> {
         ("about", Cmd::About, &[]),
         ("make-default", Cmd::MakeDefault, &[]),
         ("stop-default", Cmd::StopDefault, &[]),
+        ("read-only", Cmd::ToggleReadOnly, &[]),
+        ("filter-lines", Cmd::FilterLines(false), &["<Alt>l"]),
+        ("filter-lines-not", Cmd::FilterLines(true), &[]),
+        ("toggle-bookmark", Cmd::ToggleBookmark, &["<Control>F2"]),
+        ("next-bookmark", Cmd::NextBookmark, &["F2"]),
+        ("prev-bookmark", Cmd::PrevBookmark, &["<Shift>F2"]),
+        ("clear-bookmarks", Cmd::ClearBookmarks, &[]),
     ]
 }
 
 /// Menu items that show a check mark: their actions have a true/false state (`Ui::sync_menu`).
-const CHECKED: &[&str] = &["wrap", "line-numbers", "theme-system", "theme-light", "theme-dark", "eol-lf", "eol-crlf"];
+const CHECKED: &[&str] = &["wrap", "line-numbers", "theme-system", "theme-light", "theme-dark", "eol-lf", "eol-crlf", "read-only"];
 
 fn actions(ui: &Rc<Ui>) {
     // (in place of the window's own "win" group: menus and shortcuts find these the same way)
@@ -1008,12 +1015,16 @@ fn menu_model(recent: &gio::Menu) -> gio::Menu {
     file.append_section(None, &open);
     file.append_section(None, &section(&[("Save", "save"), ("Save as…", "save-as"), ("Save all", "save-all")]));
     file.append_section(None, &section(&[("Print…", "print")]));
+    file.append_section(None, &section(&[("Read only", "read-only")]));
     file.append_section(None, &section(&[("Close tab", "close-tab"), ("Reopen closed tab", "reopen-closed"), ("Quit", "quit")]));
     bar.append_submenu(Some("_File"), &file);
     let edit = gio::Menu::new();
     edit.append_section(None, &section(&[("Undo", "undo"), ("Redo", "redo")]));
     edit.append_section(None, &section(&[("Cut", "cut"), ("Copy", "copy"), ("Paste", "paste"), ("Select all", "select-all")]));
     edit.append_section(None, &section(&[("Find…", "find"), ("Replace…", "replace"), ("Find next", "find-next"), ("Find previous", "find-prev"), ("Go to line…", "goto-line")]));
+    let marks = section(&[("Toggle bookmark", "toggle-bookmark"), ("Next bookmark", "next-bookmark"), ("Previous bookmark", "prev-bookmark")]);
+    marks.append_section(None, &section(&[("Clear bookmarks", "clear-bookmarks")]));
+    edit.append_submenu(Some("Bookmarks"), &marks);
     edit.append_section(None, &section(&[("Toggle comment", "toggle-comment"), ("Duplicate line", "duplicate-line"), ("Delete line", "delete-line")]));
     let lines = section(&[("Sort A to Z", "sort-asc"), ("Sort Z to A", "sort-desc"), ("Remove duplicate lines", "dedupe"), ("Remove blank lines", "remove-blank"), ("Trim spaces at line ends", "trim")]);
     edit.append_submenu(Some("Lines"), &lines);
@@ -1023,6 +1034,7 @@ fn menu_model(recent: &gio::Menu) -> gio::Menu {
     bar.append_submenu(Some("_Edit"), &edit);
     let view = gio::Menu::new();
     view.append_section(None, &section(&[("Word wrap", "wrap"), ("Line numbers", "line-numbers")]));
+    view.append_section(None, &section(&[("Show only matching lines", "filter-lines"), ("Show lines not matching", "filter-lines-not")]));
     view.append_section(None, &section(&[("Zoom in", "zoom-in"), ("Zoom out", "zoom-out"), ("Reset zoom", "zoom-reset")]));
     let theme = section(&[("Use system setting", "theme-system"), ("Light", "theme-light"), ("Dark", "theme-dark")]);
     view.append_submenu(Some("Theme"), &theme);
@@ -1096,7 +1108,11 @@ const SHORTCUTS: &str = "Slate keyboard shortcuts
   F3 / Shift+F3            Next / previous match (in the find box: Enter / Shift+Enter)
   Ctrl+Alt+Enter           Replace all
   Esc                      Close the find bar
+  Alt+L                    Show only the lines with a match, in a tab of their own
+                           (Enter or a double-click there goes to the line in the file)
   Ctrl+G                   Go to line
+  Ctrl+F2                  Bookmark the line (or take the bookmark off)
+  F2 / Shift+F2            Next / previous bookmark
   Ctrl+/                   Toggle comment
   Ctrl+D / Ctrl+Shift+K    Duplicate / delete the line
   Alt+Up / Alt+Down        Move the line up / down
@@ -1250,8 +1266,14 @@ impl Ui {
         if !app.style.line_numbers {
             return 0.0;
         }
-        let doc = &app.tab().doc;
-        let lines = doc.line_count().unwrap_or(doc.len() / 40 + 1).max(1);
+        let tab = app.tab();
+        let doc = &tab.doc;
+        // (a tab of matching lines: the numbers of the file they came from)
+        let lines = match &tab.filter {
+            Some(f) => f.map.last_source() + 1,
+            None => doc.line_count().unwrap_or(doc.len() / 40 + 1),
+        }
+        .max(1);
         let digits = (lines as f64).log10().floor() as usize + 1;
         digits.max(3) as f64 * app.style.char_w + 2.0 * PAD
     }
@@ -1303,6 +1325,15 @@ impl Ui {
             if button == 3 {
                 self.context_menu(x + gw + PAD, y);
             }
+            return;
+        }
+        // a double-click in a tab of matching lines: that line, in the file
+        if n == 2 && self.app.try_borrow().is_ok_and(|a| a.tab().filter.is_some()) {
+            self.with(|a| {
+                let pos = a.with_view(&g, |v, cx| v.pos_at(cx, x, y));
+                a.tab_mut().view.sel = Sel::at(pos);
+                a.go_to_source();
+            });
             return;
         }
         self.with(|a| {
@@ -1448,6 +1479,10 @@ impl Ui {
         let menu = match k {
             1 => lang_menu(),
             2 => eol_menu(),
+            5 => {
+                self.command(Cmd::ToggleReadOnly);
+                return;
+            }
             _ => return,
         };
         self.status_menu.set_menu_model(Some(&menu));
@@ -1678,6 +1713,7 @@ impl Ui {
             ("theme-dark", theme == ThemeMode::Dark),
             ("eol-lf", tab.doc.eol == Eol::Lf),
             ("eol-crlf", tab.doc.eol == Eol::Crlf),
+            ("read-only", tab.read_only || tab.filter.is_some()),
         ];
         for (name, on) in checks {
             self.set_action_state(name, on.to_variant());
@@ -1772,11 +1808,20 @@ impl Ui {
             let font = a.style.font.clone();
             let baseline = a.style.baseline;
             let rows = a.tab().view.rows.clone();
+            let map = a.tab().filter.as_ref().map(|f| f.map.clone());
             for r in rows.iter() {
                 let Some(n) = r.line_no else { continue };
+                // (a tab of matching lines: the number in the file they came from)
+                let shown = match &map {
+                    Some(m) => match m.source(n - 1) {
+                        Some(s) => s + 1,
+                        None => continue,
+                    },
+                    None => n,
+                };
                 let l = pango::Layout::new(&area.pango_context());
                 l.set_font_description(Some(&font));
-                l.set_text(&n.to_string());
+                l.set_text(&shown.to_string());
                 let lw = l.pixel_size().0 as f64;
                 let line = l.line_readonly(0);
                 set_color(cr, if Some(n - 1) == caret_line { t.gutter_active } else { t.gutter });
@@ -1784,6 +1829,19 @@ impl Ui {
                 if let Some(line) = line {
                     pangocairo::functions::show_layout_line(cr, &line);
                 }
+            }
+        }
+        // bookmarks: a bar at the left edge, on the first row of each line marked
+        {
+            let tab = a.tab();
+            if !tab.view.bookmarks.is_empty() {
+                set_color(cr, a.theme.accent);
+                for r in &tab.view.rows {
+                    if r.line == 0 && r.seg.line_start && tab.view.bookmarks.binary_search(&r.seg.start).is_ok() {
+                        cr.rectangle(1.0, r.y + 2.0, 3.0, a.style.row_h - 4.0);
+                    }
+                }
+                let _ = cr.fill();
             }
         }
         // where the input method shows its candidates

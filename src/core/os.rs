@@ -31,6 +31,11 @@ mod imp {
     const FILE_ATTRIBUTE_TEMPORARY: u32 = 0x100;
     const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
 
+    /// Whether the file at `path` may be written (not read-only).
+    pub fn can_write(path: &Path) -> bool {
+        !std::fs::metadata(path).is_ok_and(|m| m.permissions().readonly())
+    }
+
     /// Options for opening a file without blocking anyone else from reading, writing, renaming or deleting it.
     pub fn shared() -> OpenOptions {
         let mut o = OpenOptions::new();
@@ -158,6 +163,13 @@ mod imp {
 mod imp {
     use super::*;
     use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
+
+    /// Whether this user may write the file at `path`.
+    pub fn can_write(path: &Path) -> bool {
+        use std::os::unix::ffi::OsStrExt;
+        let Ok(c) = std::ffi::CString::new(path.as_os_str().as_bytes()) else { return true };
+        unsafe { libc::access(c.as_ptr(), libc::W_OK) == 0 }
+    }
 
     /// Options for opening a file (on Unix nobody is ever blocked by an open file).
     pub fn shared() -> OpenOptions {

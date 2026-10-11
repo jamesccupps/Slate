@@ -66,3 +66,22 @@ cmd:EolLf
 jobs
 type:X
 expect:text=abc\nXdef\n
+# Show only matching lines (a tab of their own, read only), and back to the line in the file; bookmarks; read only
+cmd:NewTab
+type:one apple\ntwo\nthree apple\nfour
+find:apple
+jobs
+cmd:FilterLines
+jobs
+expect:filter=1,3
+expect:readonly=true
+expect:text=one apple\nthree apple\n
+key:esc
+key:down
+key:enter
+expect:sel=14..14
+cmd:ToggleBookmark
+expect:bookmarks=3
+cmd:ToggleReadOnly
+type:x
+expect:text=one apple\ntwo\nthree apple\nfour

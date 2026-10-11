@@ -219,6 +219,13 @@ fn cmd_of(name: &str) -> Option<Cmd> {
         "Title" => Cmd::Case(crate::core::lines::CaseOp::Title),
         "EolLf" => Cmd::SetEol(crate::core::text::Eol::Lf),
         "EolCrlf" => Cmd::SetEol(crate::core::text::Eol::Crlf),
+        "ToggleReadOnly" => Cmd::ToggleReadOnly,
+        "FilterLines" => Cmd::FilterLines(false),
+        "FilterLinesNot" => Cmd::FilterLines(true),
+        "ToggleBookmark" => Cmd::ToggleBookmark,
+        "NextBookmark" => Cmd::NextBookmark,
+        "PrevBookmark" => Cmd::PrevBookmark,
+        "ClearBookmarks" => Cmd::ClearBookmarks,
         "SaveUtf8" => Cmd::SaveEncoding(crate::core::text::Encoding::Utf8),
         "SaveUtf16Le" => Cmd::SaveEncoding(crate::core::text::Encoding::Utf16Le),
         "SaveAnsi" => Cmd::SaveEncoding(crate::core::text::Encoding::Ansi),
@@ -617,6 +624,18 @@ fn describe(cell: &Cell, what: &str) -> String {
             a.update_find_status();
             a.find.status.clone()
         }
+        "readonly" => (a.tab().read_only || a.tab().filter.is_some()).to_string(),
+        // (the lines bookmarked, 1-based)
+        "bookmarks" => {
+            let tab = a.tab();
+            let lines: Vec<String> = tab.view.bookmarks.iter().filter_map(|&b| tab.doc.line_of(b)).map(|l| (l + 1).to_string()).collect();
+            lines.join(",")
+        }
+        // (a tab of matching lines: the line in its file of each of its lines, 1-based)
+        "filter" => match &a.tab().filter {
+            Some(f) => (0..f.map.lines.min(50)).filter_map(|l| f.map.source(l)).map(|l| (l + 1).to_string()).collect::<Vec<_>>().join(","),
+            None => "none".into(),
+        },
         // (the JSON or XML path bar, as last worked out)
         "path" => {
             let s = &a.tab().structure;

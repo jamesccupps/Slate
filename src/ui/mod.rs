@@ -1180,6 +1180,11 @@ pub fn place_tab(tab: &mut app::Tab, st: &session::SessionTab) {
     }
     tab.view.sel = Sel::new(editor::char_start(doc, st.anchor), editor::char_start(doc, st.caret));
     tab.view.top = top;
+    // (read only on disk counts too)
+    tab.read_only |= st.read_only;
+    let mut marks = st.bookmarks.clone();
+    crate::edit::tidy_marks(&mut marks, doc);
+    tab.view.bookmarks = marks;
 }
 
 pub fn run(args: Vec<String>) -> i32 {
