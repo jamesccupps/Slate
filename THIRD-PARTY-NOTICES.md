@@ -26,14 +26,19 @@ or MIT or Apache-2.0):
 | Component | Version | Copyright | Source |
 |---|---|---|---|
 | gtk4, gdk4, gsk4 (and their -sys crates) | 0.11.5 | The gtk-rs Project Developers | https://github.com/gtk-rs/gtk4-rs |
-| glib, gio, pango, pangocairo, cairo-rs, gdk-pixbuf, graphene-rs (and their -sys crates), gobject-sys | 0.22 | The gtk-rs Project Developers | https://github.com/gtk-rs/gtk-rs-core |
+| glib, gio | 0.22.10 | The gtk-rs Project Developers | https://github.com/gtk-rs/gtk-rs-core |
+| pango, pangocairo, cairo-rs | 0.22.9 | The gtk-rs Project Developers | https://github.com/gtk-rs/gtk-rs-core |
+| graphene-rs | 0.22.8 | The gtk-rs Project Developers | https://github.com/gtk-rs/gtk-rs-core |
+| gdk-pixbuf | 0.22.0 | The gtk-rs Project Developers | https://github.com/gtk-rs/gtk-rs-core |
+| glib-sys, gio-sys, gobject-sys, pango-sys, pangocairo-sys, cairo-sys-rs, gdk-pixbuf-sys, graphene-sys | 0.22.9 | The gtk-rs Project Developers | https://github.com/gtk-rs/gtk-rs-core |
 | libc | 0.2.190 | The Rust Project Developers | https://github.com/rust-lang/libc |
 | bitflags | 2.13.2 | The Rust Project Developers | https://github.com/bitflags/bitflags |
 | futures-channel, futures-core, futures-executor, futures-io, futures-task, futures-util | 0.3.34 | The futures-rs authors | https://github.com/rust-lang/futures-rs |
 | pin-project-lite | 0.2.17 | Taiki Endo | https://github.com/taiki-e/pin-project-lite |
 | slab | 0.4.12 | Carl Lerche | https://github.com/tokio-rs/slab |
 | smallvec | 1.16.2 | The Servo Project Developers | https://github.com/servo/rust-smallvec |
-| field-offset, memoffset | 0.3.6, 0.9.1 | Diggory Blake; Gilad Naaman | https://github.com/Diggsey/rust-field-offset |
+| field-offset | 0.3.6 | Diggory Blake | https://github.com/Diggsey/rust-field-offset |
+| memoffset | 0.9.1 | Gilad Naaman | https://github.com/Gilad-Naaman/rust-memoffset |
 
 GTK, GLib, Pango, cairo and the libraries under them aren't part of it: it uses the system's (under their own
 licenses, mostly the LGPL).

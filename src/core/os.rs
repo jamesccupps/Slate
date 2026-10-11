@@ -109,17 +109,27 @@ mod imp {
         Some(free)
     }
 
-    /// Whether the process `pid` is still running.
+    /// Whether the process `pid` is still running. One Windows won't let us look at (another user's) is.
     pub fn process_running(pid: u32) -> bool {
         use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
-        unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }
-            .map(|h| unsafe { windows::Win32::Foundation::CloseHandle(h) })
-            .is_ok()
+        match unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) } {
+            Ok(h) => {
+                let _ = unsafe { windows::Win32::Foundation::CloseHandle(h) };
+                true
+            }
+            // (ERROR_ACCESS_DENIED)
+            Err(e) => e.code().0 as u32 == 0x8007_0005,
+        }
     }
 
     /// Whether `e` says the file or folder isn't found.
     pub fn is_not_found(e: &io::Error) -> bool {
         e.raw_os_error() == Some(2)
+    }
+
+    /// Whether `e` says the name isn't one a file can have (ERROR_INVALID_NAME).
+    pub fn is_bad_name(e: &io::Error) -> bool {
+        e.raw_os_error() == Some(123)
     }
 
     /// Whether `e` is one that may pass by itself, other than "not found": another program has the file, a network
@@ -221,6 +231,11 @@ mod imp {
     /// Whether `e` says the file or folder isn't found.
     pub fn is_not_found(e: &io::Error) -> bool {
         e.raw_os_error() == Some(libc::ENOENT)
+    }
+
+    /// Whether `e` says the name isn't one a file can have (on Unix any name is).
+    pub fn is_bad_name(_: &io::Error) -> bool {
+        false
     }
 
     /// Whether `e` is one that may pass by itself, other than "not found": a network file system that doesn't

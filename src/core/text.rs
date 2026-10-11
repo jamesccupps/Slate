@@ -387,11 +387,13 @@ impl Utf16Decoder {
 pub struct Utf16Encoder {
     big_endian: bool,
     pending: Vec<u8>,
+    /// Bytes that weren't UTF-8 (a mostly-UTF-8 file's stray bytes) became U+FFFD: they're not kept.
+    pub lossy: bool,
 }
 
 impl Utf16Encoder {
     pub fn new(big_endian: bool) -> Self {
-        Utf16Encoder { big_endian, pending: Vec::new() }
+        Utf16Encoder { big_endian, pending: Vec::new(), lossy: false }
     }
 
     pub fn push(&mut self, input: &[u8], out: &mut Vec<u8>) {
@@ -417,6 +419,7 @@ impl Utf16Encoder {
                     match e.error_len() {
                         Some(n) => {
                             self.put("\u{FFFD}", out);
+                            self.lossy = true;
                             i += n;
                         }
                         None => {
@@ -440,6 +443,7 @@ impl Utf16Encoder {
         if !self.pending.is_empty() {
             self.pending.clear();
             self.put("\u{FFFD}", out);
+            self.lossy = true;
         }
     }
 }

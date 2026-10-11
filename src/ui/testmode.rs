@@ -136,6 +136,7 @@ fn busy(cell: &Cell) -> bool {
             || t.search.job.is_some()
             || t.find_job.is_some()
             || t.structure.busy()
+            || t.structure.pausing()
     }) || a.disk_job.is_some()
         || a.count_job.is_some()
         || matches!(a.update, super::app::UpdateState::Checking { .. } | super::app::UpdateState::Downloading { .. })

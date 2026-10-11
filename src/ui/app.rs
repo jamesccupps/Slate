@@ -24,6 +24,7 @@ use crate::core::lines::LineOp;
 use crate::core::search::Found;
 use crate::core::source::Source;
 use crate::core::text::{Encoding, Eol};
+pub use crate::edit::{group, plural};
 
 use super::commands::{Cmd, MENU_KEYS, MENU_TITLES};
 use super::update::Release;
@@ -127,6 +128,9 @@ pub struct Search {
     pub key: Option<(String, bool, bool, bool, u64)>,
     pub job: Option<Job<Found>>,
     pub found: Option<Found>,
+    /// Where the scrollbar's match marks go, worked out once for a count and a bar (document version, matches, bar
+    /// top and height): there can be a million matches, and the caret's blink repaints.
+    pub marks: Option<((u64, usize, u32, u32), Vec<f32>)>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -447,6 +451,8 @@ pub struct App {
     pub last_session_save: Instant,
     /// The session being written on another thread (while editing).
     pub session_job: Option<Job<super::session::Outcome>>,
+    /// The window was drawn once (the tabs from the session are shown: `session::restored`).
+    pub painted: bool,
     pub mouse_tracking: bool,
     /// `g.generation` the cached layouts were made for.
     pub gfx_generation: u64,
@@ -483,7 +489,7 @@ pub struct App {
     pub caret_place: CaretPlace,
 }
 
-pub const ZOOM_STEPS: [f32; 15] = [0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0, 4.0, 5.0];
+pub use crate::settings::ZOOM_STEPS;
 
 fn pick_family(dw: &windows::Win32::Graphics::DirectWrite::IDWriteFactory, wanted: &[&str]) -> String {
     for f in wanted {
@@ -554,6 +560,7 @@ impl App {
             session_dirty: false,
             last_session_save: Instant::now(),
             session_job: None,
+            painted: false,
             mouse_tracking: false,
             gfx_generation: 0,
             menu_armed: None,
@@ -987,6 +994,12 @@ impl App {
             self.g.discard_target();
             self.invalidate();
         }
+        if !self.painted {
+            self.painted = true;
+            if !self.g.offscreen {
+                super::session::restored();
+            }
+        }
     }
 
     /// What tab `i` is called on the tab strip: its title, plus as much of its folder as tells it apart from other
@@ -1256,6 +1269,18 @@ impl App {
         let tab = &mut self.tabs[self.active];
         let caret = tab.view.sel.caret;
         tab.structure.set_lang(tab.lang);
+        if tab.structure.waiting(&tab.doc) {
+            // (typing: worked out once it pauses)
+            unsafe {
+                windows::Win32::UI::WindowsAndMessaging::SetTimer(
+                    self.hwnd,
+                    super::actions::TIMER_STRUCTURE,
+                    super::structure::PAUSE.as_millis() as u32 + 10,
+                    None,
+                );
+            }
+            return;
+        }
         tab.structure.follow = panel;
         let before = tab.structure.selected;
         tab.structure.update_path(&mut tab.doc, caret, &notify);
@@ -1322,14 +1347,22 @@ impl App {
             // match marks
             if let Some(f) = &tab.search.found {
                 if self.find.open && !f.positions.is_empty() {
-                    let len = tab.doc.len().max(1) as f64;
-                    let mut last_y = -10.0f32;
-                    for &(s, _) in &f.positions {
-                        let my = vb.y + (vb.h as f64 * s as f64 / len) as f32;
-                        if my - last_y >= 2.0 {
-                            self.g.fill(Rect::new(vb.right() - 4.0, my, 3.0, 2.0), t.scroll_mark);
-                            last_y = my;
+                    let key = (tab.doc.version, f.positions.len(), vb.y.to_bits(), vb.h.to_bits());
+                    if tab.search.marks.as_ref().is_none_or(|m| m.0 != key) {
+                        let len = tab.doc.len().max(1) as f64;
+                        let mut last_y = -10.0f32;
+                        let mut ys = Vec::new();
+                        for &(s, _) in &f.positions {
+                            let my = vb.y + (vb.h as f64 * s as f64 / len) as f32;
+                            if my - last_y >= 2.0 {
+                                ys.push(my);
+                                last_y = my;
+                            }
                         }
+                        tab.search.marks = Some((key, ys));
+                    }
+                    for &my in tab.search.marks.as_ref().map_or(&[][..], |m| &m.1[..]) {
+                        self.g.fill(Rect::new(vb.right() - 4.0, my, 3.0, 2.0), t.scroll_mark);
                     }
                 }
             }
@@ -1646,18 +1679,6 @@ pub fn format_size(n: u64) -> String {
     }
 }
 
-pub fn group(n: u64) -> String {
-    let s = n.to_string();
-    let mut out = String::new();
-    for (i, c) in s.chars().enumerate() {
-        if i > 0 && (s.len() - i) % 3 == 0 {
-            out.push(',');
-        }
-        out.push(c);
-    }
-    out
-}
-
 /// Where the caret is in its line, for the status bar: its line, the line's start and the column (in characters,
 /// from 1; None more than 4 MiB into the line), worked out once per caret place and text, as in a long line the
 /// column means reading megabytes (which every frame would cost a millisecond or two).
@@ -1722,10 +1743,6 @@ fn position_text(
             (s.clone(), s)
         }
     }
-}
-
-fn plural(n: u64, one: &str, many: &str) -> String {
-    if n == 1 { format!("1 {one}") } else { format!("{} {many}", group(n)) }
 }
 
 pub fn make_theme(mode: ThemeMode) -> Theme {

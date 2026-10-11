@@ -219,21 +219,40 @@ pub fn status_texts(app: &App) -> (String, Vec<String>, bool) {
         let pos = sel.caret;
         let line = doc.line_of(pos).map(|l| l + 1);
         let ls = doc.line_start_of(pos);
-        let col = if pos - ls <= 4 << 20 {
-            let bytes = doc.read(ls, pos);
-            String::from_utf8_lossy(&bytes).chars().count() as u64 + 1
-        } else {
-            pos - ls + 1
+        // Characters, counted once per caret place and text (the status bar is drawn after every key, and the caret
+        // can be megabytes into a line).
+        let chars = |a: u64, b: u64| {
+            let mut n = 0u64;
+            doc.chunks(a, b, &mut |c| {
+                n += bytecount::num_chars(c) as u64;
+                true
+            });
+            n
+        };
+        let col = match app.col_cache.get() {
+            Some((v, p, c)) if (v, p) == (doc.version, pos) => c,
+            _ => {
+                let c = if pos - ls <= 4 << 20 { chars(ls, pos) + 1 } else { pos - ls + 1 };
+                app.col_cache.set(Some((doc.version, pos, c)));
+                c
+            }
         };
         let mut s = match line {
-            Some(l) => format!("Ln {l}, Col {col}"),
-            None => format!("Col {col}"),
+            Some(l) => format!("Ln {}, Col {}", crate::edit::group(l), crate::edit::group(col)),
+            None => format!("Col {}", crate::edit::group(col)),
         };
         if !sel.is_empty() {
             let n = sel.end() - sel.start();
             if n <= 4 << 20 {
-                let chars = String::from_utf8_lossy(&doc.read(sel.start(), sel.end())).chars().count();
-                s.push_str(&format!("  ({chars} selected)"));
+                let k = match app.sel_cache.get() {
+                    Some((v, a, b, k)) if (v, a, b) == (doc.version, sel.start(), sel.end()) => k,
+                    _ => {
+                        let k = chars(sel.start(), sel.end());
+                        app.sel_cache.set(Some((doc.version, sel.start(), sel.end(), k)));
+                        k
+                    }
+                };
+                s.push_str(&format!("  ({} selected)", crate::edit::group(k)));
             } else {
                 s.push_str(&format!("  ({} selected)", size_text(n)));
             }

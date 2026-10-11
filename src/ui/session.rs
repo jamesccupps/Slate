@@ -228,6 +228,7 @@ fn plan_in(d: PathBuf, tabs: &mut [Tab], active: usize, closing: bool) -> Plan {
         if tab.doc.is_dirty() && !tab.discard && tab.doc.is_ready() {
             if tab.doc.len() <= BACKUP_LIMIT {
                 tab.big = None;
+                // (small again: the copy is what's written; a list of pieces from when it was big goes with the prune)
                 let name = tab.backup_name.get_or_insert_with(new_backup_name).clone();
                 if tab.backup_version != tab.doc.version || !d.join(&name).exists() {
                     own(&name);
@@ -252,6 +253,15 @@ fn plan_in(d: PathBuf, tabs: &mut [Tab], active: usize, closing: bool) -> Plan {
                         // (waiting, nothing written yet: kept, with its tries, for the next one)
                         Some(_) if keepable => {}
                         _ => tab.big = None,
+                    }
+                    if pieces.is_none() {
+                        // Grown past the copy limit, no list of its pieces written yet: the copy written before (if
+                        // any) stays the tab's, so a crash before the list is there still brings back the text as it
+                        // was then.
+                        if let Some(name) = tab.backup_name.clone().filter(|n| d.join(n).exists()) {
+                            keep.push(name.clone());
+                            backup = Some(name);
+                        }
                     }
                 }
             }
@@ -499,11 +509,23 @@ pub fn load() -> Option<Session> {
     serde_json::from_slice(&fs::read(d.join("session.json.bak")).ok()?).ok()
 }
 
+/// Whether `name` (from session.json) is one Slate gives a tab's files: `tab-…` and, for a copy, `.txt` (never a
+/// path, a drive-relative name like `D:x`, or anything else that would reach outside the session folder).
+fn slates_name(name: &str, copy: bool) -> bool {
+    let core = name.strip_prefix("tab-").and_then(|n| if copy { n.strip_suffix(".txt") } else { Some(n) });
+    core.is_some_and(|c| !c.is_empty() && c.len() < 64 && c.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'))
+}
+
 pub fn read_backup(name: &str) -> Option<Vec<u8>> {
-    if name.contains(['/', '\\']) || name.contains("..") {
+    if !slates_name(name, true) {
         return None;
     }
-    let bytes = fs::read(dir().join(name)).ok()?;
+    let path = dir().join(name);
+    // (never more than a copy holds)
+    if fs::metadata(&path).ok()?.len() > BACKUP_LIMIT + (1 << 20) {
+        return None;
+    }
+    let bytes = fs::read(path).ok()?;
     own(name);
     Some(bytes)
 }
@@ -580,6 +602,27 @@ pub fn orphans(claimed: &[String]) -> Vec<(String, Vec<u8>)> {
         }
     }
     out
+}
+
+/// Notes that the tabs are being put back; `restored` takes the note away once they're shown. Returns whether the
+/// note was there already: the last start stopped on the way (Slate crashed in a way a caught panic doesn't tell,
+/// out of memory say), and would again (the caller sets the session aside then).
+pub fn mark_restoring() -> bool {
+    let d = dir();
+    let marker = d.join("restoring");
+    if marker.exists() {
+        let _ = fs::remove_file(&marker);
+        return true;
+    }
+    let _ = fs::create_dir_all(&d).and_then(|_| fs::write(&marker, b""));
+    false
+}
+
+/// The tabs from the session are shown: the next start puts them back as usual (see `mark_restoring`).
+pub fn restored() {
+    if super::settings::persist() && !super::settings::guest() {
+        let _ = fs::remove_file(dir().join("restoring"));
+    }
 }
 
 /// Restoring the session crashed Slate: moves it (session.json and the backups) into `crashed-<time>\`, so the next
@@ -1176,7 +1219,7 @@ pub fn read_big(name: &str) -> Result<BigList, ListErr> {
 }
 
 fn read_big_in(dir: &Path, name: &str) -> Result<BigList, ListErr> {
-    if name.contains(['/', '\\']) || name.contains("..") {
+    if !slates_name(name, false) {
         return Err(ListErr::Damaged("its name isn't one Slate gives".into()));
     }
     own(&pieces_file(name));
@@ -1697,6 +1740,16 @@ mod tests {
 
     fn name(big: &Option<BigBackup>) -> String {
         big.as_ref().unwrap().name.clone()
+    }
+
+    #[test]
+    fn only_slates_own_names_are_read() {
+        assert!(slates_name(&new_backup_name(), true) && slates_name("tab-1.txt", true));
+        assert!(slates_name(BigBackup::new().name.as_str(), false));
+        for bad in ["D:x", "tab-D:x.txt", "..\\tab-1.txt", "tab-1\\..\\x.txt", "C:\\tab-1.txt", "tab-.txt", "tab-1.pieces", "x.txt"] {
+            assert!(!slates_name(bad, true), "{bad}");
+        }
+        assert!(!slates_name("tab-1:2", false) && !slates_name("tab-1/2", false));
     }
 
     fn restore_in(dir: &Path, name: &str) -> Restored {

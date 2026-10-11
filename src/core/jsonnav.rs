@@ -110,6 +110,11 @@ pub const STRIDE: u64 = 64;
 /// The same for the lists of the containers a scan passes through (kept when they are big): a coordinate-heavy
 /// GeoJSON is thousands of such lists, which would otherwise cost about as much memory as the file.
 pub const NESTED_MAX: u64 = 1024;
+/// A scan stops at a container nested deeper than this inside the one scanned (the list is partial from there, as for
+/// broken JSON), and paths go no deeper. Every level costs a few hundred bytes, and a file of nothing but `[` would
+/// otherwise take that for every byte (gigabytes, then an abort); this deep, at most about 25 MB. (Stopping costs the
+/// scan nothing; reading on past the deep part made every scan slower.)
+pub const DEPTH_MAX: usize = 50_000;
 
 const LINE_COMMENT: u8 = 1;
 const BLOCK_COMMENT: u8 = 2;
@@ -495,6 +500,11 @@ fn scan_core(
                 }
                 C_OPEN => {
                     lv.val_start = Some(p);
+                    if stack.len() > DEPTH_MAX {
+                        broken = true;
+                        end = Some(p);
+                        return false;
+                    }
                     let from = items.len();
                     stack.push(Level::new(Some(p), b == b'{', from, true));
                 }
@@ -892,7 +902,7 @@ pub fn path_at(
         // (a step the last walk went into is a container)
         let container = (again.is_some() && prev.get(k + 1).is_some_and(|n| n.parent == Some(c.start)))
             || src.bytes(c.start, c.start + 1).first().is_some_and(|&b| Kind::of(b).is_container());
-        if container && offset > c.start && offset < c.end {
+        if container && offset > c.start && offset < c.end && path.len() < DEPTH_MAX {
             (open, end) = (Some(c.start), c.end);
             continue;
         }
@@ -1252,6 +1262,27 @@ mod tests {
     }
 
     #[test]
+    fn nesting_too_deep_to_follow_stops_the_scan_and_costs_little() {
+        // a file of nothing but `[`, and one that closes with something after it
+        let deep = DEPTH_MAX + 1000;
+        for s in ["[".repeat(deep * 3), format!("[{}1{}, \"after\"]", "[".repeat(deep), "]".repeat(deep))] {
+            let d = doc(&s);
+            let lists = scan(&d, None, u64::MAX, Some(d.len() / 2), None);
+            // (the lists of the containers followed, and no more; partial from where it stopped)
+            assert!(lists.len() <= DEPTH_MAX + 2, "{} lists", lists.len());
+            assert!(lists.last().unwrap().1.partial);
+            let cache: HashMap<Option<u64>, Arc<Children>> = lists.into_iter().map(|(o, c)| (o, Arc::new(c))).collect();
+            let path = path_at(&d, d.len() / 2, &[], &mut |o| cache.get(&o).cloned()).unwrap();
+            assert!(path.len() <= DEPTH_MAX + 1);
+        }
+        // up to the limit, as deep as it goes
+        let s = format!("{}1{}", "[".repeat(DEPTH_MAX), "]".repeat(DEPTH_MAX));
+        let d = doc(&s);
+        let lists = scan(&d, None, u64::MAX, Some(DEPTH_MAX as u64), None);
+        assert!(!lists.last().unwrap().1.partial);
+    }
+
+    #[test]
     fn huge_lists_are_thinned_but_complete() {
         // 300,000 numbers in an array and an object with 150,000 keys.
         let n = 300_000u64;
@@ -1315,5 +1346,18 @@ mod tests {
         let c = top.get(&d, 199_999).unwrap();
         assert_eq!(d.read(c.start, c.end), b"{\"i\":199999}");
     }
-}
 
+    /// `SLATE_SCAN_FILE=<file> cargo test --release --lib scan_speed -- --ignored --nocapture`: how long the outline
+    /// scan of a big file takes (in memory).
+    #[test]
+    #[ignore]
+    fn scan_speed() {
+        let Some(p) = std::env::var_os("SLATE_SCAN_FILE") else { return };
+        let d = Document::from_text(&std::fs::read(p).unwrap());
+        for _ in 0..3 {
+            let t = std::time::Instant::now();
+            let lists = scan(&d, None, 1 << 20, None, None);
+            println!("scan: {} lists in {:.1} ms", lists.len(), t.elapsed().as_secs_f64() * 1000.0);
+        }
+    }
+}

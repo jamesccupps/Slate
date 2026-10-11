@@ -10,8 +10,11 @@ use std::io::{self, BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::core::buffer::Snapshot;
 use crate::core::document::{Document, EditKind, Sel};
 use crate::core::io::MEM_LIMIT;
+use crate::core::job::Ctx;
+use crate::core::lines::LineOp;
 use crate::core::source::{IndexBuilder, Source, create_temp_file};
 use crate::core::text::{self, is_continuation, utf8_len};
 use crate::highlight::{self, CommentStyle, Lang, State as HlState};
@@ -197,27 +200,50 @@ impl HlIndex {
     }
 }
 
-/// Output for a background transform: memory for small results, a self-deleting temp file for big ones.
-pub enum Sink {
+/// Output for a background transform: memory for small results, a self-deleting temp file for big ones. A result
+/// that turns out bigger than it was thought to be (Format can make much more text than it's given) moves from
+/// memory to a temp file once it passes `MEM_LIMIT`; one bigger than its limit (`limited`) is refused.
+pub struct Sink {
+    out: SinkOut,
+    written: u64,
+    max: u64,
+}
+
+enum SinkOut {
     Mem(Vec<u8>),
     File(BufWriter<File>, PathBuf),
 }
 
+/// What a limited `Sink` says when the result would be bigger than its limit.
+pub const TOO_BIG: &str = "the result would be far bigger than the file (absurdly deep nesting?)";
+
+/// The most a transform of `len` bytes may make (Format makes a few times as much; 64 times is absurd nesting, and
+/// the disk would fill up next).
+pub fn transform_max(len: u64) -> u64 {
+    len.saturating_mul(64).saturating_add(64 << 20)
+}
+
 impl Sink {
     pub fn new(len_hint: u64) -> io::Result<Sink> {
-        if len_hint <= MEM_LIMIT {
-            Ok(Sink::Mem(Vec::with_capacity(len_hint as usize)))
+        Sink::limited(len_hint, u64::MAX)
+    }
+
+    /// A sink that refuses more than `max` bytes (an error saying `TOO_BIG`).
+    pub fn limited(len_hint: u64, max: u64) -> io::Result<Sink> {
+        let out = if len_hint <= MEM_LIMIT {
+            SinkOut::Mem(Vec::with_capacity(len_hint as usize))
         } else {
             let (f, p) = create_temp_file()?;
-            Ok(Sink::File(BufWriter::with_capacity(1 << 20, f), p))
-        }
+            SinkOut::File(BufWriter::with_capacity(1 << 20, f), p)
+        };
+        Ok(Sink { out, written: 0, max })
     }
 
     pub fn finish(self, idx: IndexBuilder) -> io::Result<(Arc<Source>, u64)> {
         let nl = idx.newlines();
-        match self {
-            Sink::Mem(v) => Ok((Arc::new(Source::from_vec(v)), nl)),
-            Sink::File(w, p) => {
+        match self.out {
+            SinkOut::Mem(v) => Ok((Arc::new(Source::from_vec(v)), nl)),
+            SinkOut::File(w, p) => {
                 let f = w.into_inner().map_err(|e| e.into_error())?;
                 let len = f.metadata()?.len();
                 Ok((Arc::new(Source::from_file(f, len, p, true, Some(idx.finish()))), nl))
@@ -228,27 +254,35 @@ impl Sink {
 
 impl Write for Sink {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        match self {
-            Sink::Mem(v) => {
-                v.extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            Sink::File(w, _) => w.write(buf),
-        }
+        self.write_all(buf)?;
+        Ok(buf.len())
     }
     fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
-        match self {
-            Sink::Mem(v) => {
+        self.written += buf.len() as u64;
+        if self.written > self.max {
+            return Err(io::Error::other(TOO_BIG));
+        }
+        if let SinkOut::Mem(v) = &mut self.out {
+            if (v.len() + buf.len()) as u64 > MEM_LIMIT {
+                // (bigger than thought: on to a temp file, with what's there so far)
+                let (f, p) = create_temp_file()?;
+                let mut w = BufWriter::with_capacity(1 << 20, f);
+                w.write_all(v)?;
+                self.out = SinkOut::File(w, p);
+            }
+        }
+        match &mut self.out {
+            SinkOut::Mem(v) => {
                 v.extend_from_slice(buf);
                 Ok(())
             }
-            Sink::File(w, _) => w.write_all(buf),
+            SinkOut::File(w, _) => w.write_all(buf),
         }
     }
     fn flush(&mut self) -> io::Result<()> {
-        match self {
-            Sink::Mem(_) => Ok(()),
-            Sink::File(w, _) => w.flush(),
+        match &mut self.out {
+            SinkOut::Mem(_) => Ok(()),
+            SinkOut::File(w, _) => w.flush(),
         }
     }
 }
@@ -1222,9 +1256,146 @@ pub fn move_lines(doc: &mut Document, sel: Sel, down: bool) -> Result<Sel, &'sta
     }
 }
 
+// ---- the same on both windows: rules that depend on the file, and what commands say ----
+
+/// What Toggle comment uses at the line holding `at`: the language's comments, but `;` in a .ini, .inf or .reg file,
+/// and `//` in Inno Setup's [Code] section (Pascal, where a `;` would only be an empty statement).
+pub fn comment_style(doc: &Document, lang: Lang, at: u64) -> Option<CommentStyle> {
+    let mut style = lang.comment()?;
+    let ext = doc.path.as_ref().and_then(|p| p.extension()).map(|e| e.to_ascii_lowercase());
+    if lang == Lang::Ini && ext.as_ref().is_some_and(|e| e == "ini" || e == "inf" || e == "reg") {
+        style = CommentStyle::Line(";");
+    }
+    if lang == Lang::InnoSetup {
+        let a = doc.line_start_of(at);
+        let before = doc.read(a.saturating_sub(4 << 20), a);
+        if highlight::inno_code_line(&before, &doc.read(a, doc.line_end_of(a))) {
+            style = CommentStyle::Line("//");
+        }
+    }
+    Some(style)
+}
+
+/// Changes every line break in `snap` to CRLF (`to_crlf`) or LF, writing the text to `w` and its line breaks to
+/// `idx`. Returns how many changed.
+pub fn convert_eol(snap: &Snapshot, to_crlf: bool, w: &mut dyn Write, idx: &mut IndexBuilder, ctx: &Ctx) -> io::Result<u64> {
+    let mut out = Vec::with_capacity(1 << 20);
+    let mut changed = 0u64;
+    let mut prev_cr = false;
+    let mut pending_cr = false;
+    let mut pos = 0u64;
+    let mut err = None;
+    while pos < snap.len() {
+        if ctx.cancelled() {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
+        }
+        let end = (pos + (8 << 20)).min(snap.len());
+        snap.chunks(pos, end, &mut |c| {
+            for &b in c {
+                if to_crlf {
+                    if b == b'\n' && !prev_cr {
+                        out.push(b'\r');
+                        changed += 1;
+                    }
+                    out.push(b);
+                    prev_cr = b == b'\r';
+                } else {
+                    if pending_cr {
+                        pending_cr = false;
+                        if b == b'\n' {
+                            changed += 1;
+                        } else {
+                            out.push(b'\r');
+                        }
+                    }
+                    if b == b'\r' {
+                        pending_cr = true;
+                    } else {
+                        out.push(b);
+                    }
+                }
+            }
+            if out.len() >= 1 << 20 {
+                idx.push(&out);
+                if let Err(e) = w.write_all(&out) {
+                    err = Some(e);
+                    return false;
+                }
+                out.clear();
+            }
+            true
+        });
+        if let Some(e) = err.take() {
+            return Err(e);
+        }
+        pos = end;
+        ctx.set(pos);
+    }
+    if pending_cr {
+        out.push(b'\r');
+    }
+    idx.push(&out);
+    w.write_all(&out)?;
+    Ok(changed)
+}
+
+/// `n` with thousands separators: 4,851,721.
+pub fn group(n: u64) -> String {
+    let s = n.to_string();
+    let mut out = String::new();
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// "1 line", "4,851,721 lines".
+pub fn plural(n: u64, one: &str, many: &str) -> String {
+    if n == 1 { format!("1 {one}") } else { format!("{} {many}", group(n)) }
+}
+
+/// What a line tool did, for the status bar.
+pub fn lines_done(op: LineOp, n: u64) -> String {
+    match op {
+        LineOp::SortAsc | LineOp::SortDesc => format!("Sorted {}", plural(n, "line", "lines")),
+        LineOp::Dedupe => format!("Removed {}", plural(n, "duplicate line", "duplicate lines")),
+        LineOp::RemoveBlank => format!("Removed {}", plural(n, "blank line", "blank lines")),
+        LineOp::TrimTrailing => format!("Trimmed spaces from {}", plural(n, "line", "lines")),
+    }
+}
+
+/// What a line tool says when it finds nothing to do.
+pub fn nothing_to_clean(op: LineOp) -> &'static str {
+    match op {
+        LineOp::SortAsc | LineOp::SortDesc => "The lines are already in that order",
+        LineOp::Dedupe => "No duplicate lines",
+        LineOp::RemoveBlank => "No blank lines",
+        LineOp::TrimTrailing => "No spaces at line ends",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_result_bigger_than_thought_goes_to_disk_and_an_absurd_one_is_refused() {
+        let mut s = Sink::new(10).unwrap();
+        let chunk = vec![b'x'; 1 << 20];
+        for _ in 0..(MEM_LIMIT >> 20) + 2 {
+            s.write_all(&chunk).unwrap();
+        }
+        assert!(matches!(s.out, SinkOut::File(..)));
+        let (src, _) = s.finish(IndexBuilder::new()).unwrap();
+        assert_eq!(src.len(), MEM_LIMIT + (2 << 20));
+        let mut s = Sink::limited(10, 100).unwrap();
+        s.write_all(&[0; 100]).unwrap();
+        assert!(s.write_all(&[0]).is_err_and(|e| e.to_string() == TOO_BIG));
+        assert!(transform_max(1 << 20) > 32 << 20);
+    }
 
     #[test]
     fn places_from_another_text_never_split_a_character_or_a_line_break() {

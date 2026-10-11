@@ -932,7 +932,27 @@ mod text_renderer {
         to(k.a) << 24 | to(k.r) << 16 | to(k.g) << 8 | to(k.b)
     }
 
+    /// Runs a callback's body: a panic can't leave a callback DirectWrite calls (it would end Slate there and then),
+    /// so it's caught (the panic hook logged it) and the run isn't drawn.
+    fn caught(f: impl FnOnce() -> HRESULT) -> HRESULT {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or(windows::Win32::Foundation::E_FAIL)
+    }
+
     unsafe extern "system" fn glyph_run(
+        this: *mut c_void,
+        ctx: *const c_void,
+        x: f32,
+        y: f32,
+        mode: DWRITE_MEASURING_MODE,
+        run: *const DWRITE_GLYPH_RUN,
+        desc: *const DWRITE_GLYPH_RUN_DESCRIPTION,
+        effect: *mut c_void,
+    ) -> HRESULT {
+        caught(|| unsafe { draw_run(this, ctx, x, y, mode, run, desc, effect) })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn draw_run(
         this: *mut c_void,
         _: *const c_void,
         x: f32,
@@ -1026,11 +1046,13 @@ mod text_renderer {
         u: *const DWRITE_UNDERLINE,
         effect: *mut c_void,
     ) -> HRESULT {
-        unsafe {
-            let u = &*u;
-            line(&*(this as *const Culler), x, y, u.width, u.thickness, u.offset, effect);
-        }
-        S_OK
+        caught(|| {
+            unsafe {
+                let u = &*u;
+                line(&*(this as *const Culler), x, y, u.width, u.thickness, u.offset, effect);
+            }
+            S_OK
+        })
     }
 
     unsafe extern "system" fn strikethrough(
@@ -1041,11 +1063,13 @@ mod text_renderer {
         s: *const DWRITE_STRIKETHROUGH,
         effect: *mut c_void,
     ) -> HRESULT {
-        unsafe {
-            let s = &*s;
-            line(&*(this as *const Culler), x, y, s.width, s.thickness, s.offset, effect);
-        }
-        S_OK
+        caught(|| {
+            unsafe {
+                let s = &*s;
+                line(&*(this as *const Culler), x, y, s.width, s.thickness, s.offset, effect);
+            }
+            S_OK
+        })
     }
 
     unsafe extern "system" fn inline_object(

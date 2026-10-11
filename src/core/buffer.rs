@@ -736,11 +736,24 @@ impl Snapshot {
         true
     }
 
+    /// Appends `[a, b)` to `out`, a big range of a file read straight into it (not through a buffer of its own).
     pub fn read_into(&self, a: u64, b: u64, out: &mut Vec<u8>) {
-        self.chunks(a, b, &mut |c| {
-            out.extend_from_slice(c);
-            true
-        });
+        let b = b.min(self.len);
+        if a >= b {
+            return;
+        }
+        out.reserve((b - a) as usize);
+        let mut i = self.pieces.partition_point(|(off, p)| off + p.len <= a);
+        while i < self.pieces.len() {
+            let (off, p) = self.pieces[i];
+            if off >= b {
+                break;
+            }
+            let s = a.max(off) - off;
+            let e = (b - off).min(p.len);
+            self.sources[p.src as usize].read_into(p.start + s, p.start + e, out);
+            i += 1;
+        }
     }
 
     /// The bytes of `[a, b)` without copying when they sit in one in-memory piece.

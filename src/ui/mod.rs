@@ -874,7 +874,13 @@ pub fn make_app(hwnd: HWND) -> Cell {
 /// Puts back the tabs from last time, then opens `paths`.
 pub fn restore(app: &mut App, paths: &[PathBuf]) {
     let mut active_id = None;
-    if app.settings.restore_session && !settings::guest() {
+    // (not in a test: its windows draw offscreen)
+    let watch = !app.g.offscreen && settings::persist();
+    if app.settings.restore_session && !settings::guest() && watch && session::mark_restoring() {
+        // The last start stopped while putting the tabs back, in a way no panic told: it would again. Set aside.
+        let kept = session::put_aside();
+        app.flash(format!("Slate stopped while reopening last time's tabs. Their unsaved text is kept in {}.", kept.display()), true);
+    } else if app.settings.restore_session && !settings::guest() {
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| restore_session(app))) {
             Ok(id) => active_id = id,
             Err(_) => {

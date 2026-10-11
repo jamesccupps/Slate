@@ -115,7 +115,9 @@ accent stay Windows-only), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate
   (Windows and Unix sides: shared opens, reads at an offset, a second handle, stamps and file IDs — on Unix dev/inode
   and times in 100 ns units like Windows', as the session keeps them —, self-deleting temp files, free space,
   whether a process runs, which errors pass by themselves). Saving on Linux is a rename (atomic; open files keep the
-  old one), the directory synced, the old file's permissions and owner kept; ANSI there is Windows-1252 from a
+  old one), the directory synced; the temp file is readable by its owner only while it's written (when it replaces a
+  file), then gets the old file's owner, then its permissions (in that order: a chown clears setuid), then its
+  extended attributes (ACLs, SELinux labels; a hard link is split, as by any rename); ANSI there is Windows-1252 from a
   built-in table (checked against Windows' own by a test on Windows). New documents get `Eol::NATIVE`.
   - `source.rs` — immutable byte sources: memory, or a file read on demand via a 64 KiB block cache (opened with
     full sharing, never locked). Newline index = cumulative count per 64 KiB block, built in the background; a file
@@ -124,7 +126,9 @@ accent stay Windows-only), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate
     are tried again; one that keeps failing stops the index (`index_error`: the doc stays pending), never a guessed
     count. Each file source keeps its file's stamp through its own handle (size, write/change times):
     `changed_in_place` tells another program writing into that file (the text read from it isn't the user's any
-    more) from a file that only grew or was replaced by a new one (the handle keeps reading the old one). Bulk
+    more) from a file that only grew or was replaced by a new one (the handle keeps reading the old one). The same
+    size with a new last-write time counts as written into (a value changed to one of the same length can be
+    anywhere: samples can't rule it out), as for the session's `same_as`; a new change time alone doesn't. Bulk
     reads (index, hashing, big ranges for search and save, the stamp checks) go through a second handle on the same
     file (`ReOpenFile`), so the window's block reads don't queue behind them on a slow share. A source whose file
     isn't at its path any more (a save put a new one there, or the disk check found another file or none) is `gone`:
@@ -144,10 +148,21 @@ accent stay Windows-only), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate
     would turn characters into "?" (`Lossy`, unless the user said so); in the app also a damaged UTF-16 document
     (`Document::bad_units`, which can't be saved back as it was) asks first. Stale temp files of dead processes are
     cleaned up. After a big save the text reads exactly the bytes written, from the file written (found by its file
-    ID), never what another program put at that path next.
+    ID), never what another program put at that path next. On Windows a file with what a renamed new one wouldn't
+    have (permissions of its own rather than its folder's, EFS, compression, alternate streams such as the
+    downloaded-from-the-internet mark: `place::special`) is put in place with ReplaceFile first, which keeps those;
+    a set-aside original ReplaceFile couldn't put back is never hidden+temporary, which is what marks a deletable
+    leftover. Saving as UTF-16 asks first (`Lossy`) when a mostly-UTF-8 document's stray bytes would become U+FFFD.
+    `open_either` (`name.txt:120:5`) falls back to the name without the suffix on "not found" and on Windows'
+    "invalid name" (a stream `120` of type `5`).
   - `search.rs` — byte-regex search in windows with an overlap after each (a match running into a window's end is
     searched again in a bigger one): find next/prev, count all, streaming replace-all (the text between matches is
-    copied from the window searched). Plain text: 8 MB windows, the overlap at least the query's length, always
+    copied from the window searched). Plain text without Whole word skips the regex where that's faster, finding
+    exactly what it would (`Literal`, a test compares them, `ſ` and the Kelvin sign included): Match case by
+    `memmem`; ignoring case, an ASCII query whose longest run of letters and digits isn't at its start
+    (`"status":"refunded"`) by that run first, then the query in a window around each place (5x faster in a JSON
+    file, where the start is every record's key). `SLATE_SEARCH_FILE=<file> cargo test --release --lib search_speed
+    -- --ignored --nocapture` times them. Plain text: 8 MB windows, the overlap at least the query's length, always
     exact. A regex is exact in documents up to 64 MiB (one window; Find previous scans from the start); in bigger
     ones Count all and Replace all use 64 MiB windows with 16 MiB after (exact while no match is longer than that),
     Find next/previous 8 MB with 1 MiB. Past that, a match at a seam is missed or cut short and the matches after it
@@ -160,12 +175,19 @@ accent stay Windows-only), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate
     on its own line, text is kept exactly, and nothing is added inside an element once it has text, so mixed content
     keeps its meaning; whitespace-only elements, spaces between elements on one line and `xml:space="preserve"` stay).
   - `lines.rs` — sort (natural: numbers with signs and decimals, case and accents ignored), remove duplicate / blank
-    lines, trim line ends, change case.
+    lines, trim line ends, change case. Lines are (start, length) pairs into the text (8 bytes each); a big sort runs
+    on up to 8 threads (runs sorted side by side, then merged); whole documents up to 512 MB and `COUNT_MAX` (32 M)
+    lines. A `\r` is part of a line break only before a `\n` (a lone one at the very end is text).
   - `jsonnav.rs` — lazy JSON structure: the children of one container (lists over 100,000 keep every 64th child
     and rescan between them; lists of containers inside a scanned one already over 1024), the path at an offset
     (`data[1203].name`), previews. Comments are skipped; in a file cut short, open containers end at its end. A scan
     can also keep the lists of every container holding an offset (`path_to`): the path to the caret, however deep,
-    then needs one scan, and a walk takes the last path's steps as they are where it goes the same way.
+    then needs one scan, and a walk takes the last path's steps as they are where it goes the same way. A scan stops
+    at a container deeper than `DEPTH_MAX` (50,000) inside the one scanned (partial from there; stopping costs the
+    scan nothing, reading on past it made every scan 5% slower), xmlnav reads past such an element as one child, and
+    paths go no deeper: a file of nothing but `[` took ~200 bytes a byte (gigabytes, then an abort).
+    `SLATE_SCAN_FILE=<file> cargo test --release --lib scan_speed -- --ignored --nocapture` (`xml_scan_speed`) times
+    an outline scan.
   - `xmlnav.rs` — the same for XML, filling in jsonnav's lists: the elements inside one element (names hashed as
     they're read, ~270 MB/s), the path (`catalog › book[3] › title`, the index among siblings of that name; XPath
     to copy), previews (attributes, and the text of an element without elements inside). Comments, CDATA, PIs and
@@ -182,20 +204,37 @@ accent stay Windows-only), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate
   - `job.rs` — background jobs with progress/cancel, notify the UI by posting a window message (on Linux: an idle
     callback on GLib's main loop).
 - `src/gtk/` — the Linux app (GTK 4): `mod.rs` the window (menu bar from a `gio::Menu`, actions with accelerators,
-    the find bar's GtkEntry boxes, a notice line, native scrollbars mapping bytes, dialogs: `FileChooserNative` and
-    `MessageDialog` as GTK 4.8 has them, the session written every 5 s when it changed and on closing; one Slate per
-    session through GApplication/D-Bus, `HANDLES_OPEN`), `app.rs` the state and commands (`App`, `Tab`, `Cmd`; what
-    needs a dialog is queued in `asks`), `view.rs` the text view on Pango and cairo (segments laid out plain and cached,
+    the find bar's GtkEntry boxes, a notice line (with Save as… after a save that failed), native scrollbars mapping
+    bytes, dialogs: `FileChooserNative` and `MessageDialog` as GTK 4.8 has them; one Slate per session through
+    GApplication/D-Bus, `HANDLES_OPEN`: `run` hands it absolute paths, as GIO reads a relative `notes.txt:120` as a
+    link and drops it, and a name that isn't UTF-8 as a `file://` link; menus as on Windows: JSON's and XML's items only
+    for those files and Help's Open files with Slate… or Stop opening files with Slate…, whichever applies (actions
+    turned off, `hidden-when`), File → Open recent; Ctrl+1–9 and Alt+1–9 for tabs, Shift+Alt+F formats JSON or XML;
+    a panic in a callback would abort (GTK can't pass it on): `Ui::guarded` catches it around the app's work (logged in
+    crash.log by the panic hook, the session written, the window says so), drawing only logs; SIGTERM, SIGHUP and SIGINT
+    (an atomic flag the caret's timer looks at) and the session manager's `query-end` write the session first
+    (`ending`), and logging out waits while unsaved work the session can't keep is open), `app.rs` the state and
+    commands (`App`, `Tab`, `Cmd`; what needs a dialog is queued in `asks`, `Ask::Quit` only after a save that closing
+    waited for, so dialogs never pile up; a tab another program changed is read again keeping its view, following the
+    end of a log; "Open already?" by name, then by the canonical path once read, never asking the file system on the
+    UI thread), `view.rs` the text view on Pango and cairo (segments laid out plain and cached,
     rows of one height, colors drawn with the glyphs by `draw_row`: only those in view, each in its byte's color —
     color attributes made Pango shape minified JSON in thousands of pieces; wrapped rows hang under the indentation
-    with a negative Pango indent), `chrome.rs` the tab strip and status bar (drawn like Windows'), `session.rs`
-    (`session.json` and a copy per unsaved tab up to 64 MiB; bigger ones are asked about), `testmode.rs`
-    (`slate --test script` under Xvfb: commands at the top of the file; shots through `WidgetPaintable`). Not on Linux
-    yet: the structure panel and path bar, show whitespace, bracket matching, overtype, high contrast. Help → Open
-    files with Slate… (`make_default`) makes Slate the default for the desktop file's MimeType list through GIO
-    (`~/.config/mimeapps.list`; Linux lets an app do that itself). File dialogs (`FileChooserNative`) must be kept
-    alive until answered (`keep_until_answered`): GTK drops them otherwise. The menu bar's items don't take the
-    keyboard, and commands leave it in the text.
+    with a negative Pango indent), `chrome.rs` the tab strip and status bar (drawn like Windows'; the column and the
+    selection's size counted once per caret place and text), `session.rs` (`session.json` and a copy per unsaved tab
+    up to 64 MiB; bigger ones are asked about; Windows' rules: lenient reading per tab and value, session.json.bak,
+    only copies this Slate wrote or read are deleted, copies no tab names come back as tabs, names `tab-<time>-<pid>-<n>`
+    and only `tab-…txt` read, written every 5 s on another thread when it changed and in place on closing (a write
+    that fails leaves the tab's last copy listed, and closing then asks about every unsaved tab), a `restoring` mark
+    while the tabs are put back: still there at the next start, the session goes into `crashed-<time>/`),
+    `testmode.rs` (`slate --test script` under Xvfb: commands at the top of the file; shots through
+    `WidgetPaintable`). Not on Linux yet: the structure panel and path bar, show whitespace, bracket matching,
+    overtype, high contrast, word counts, the Encoding / Indentation / Font menus, big unsaved documents in the
+    session (README lists it all). Help → Open files with Slate… (`make_default`) makes Slate the default for the
+    desktop file's MimeType list through GIO (`~/.config/mimeapps.list`; Linux lets an app do that itself); Stop
+    opening files with Slate… takes only Slate's entries out of that file (GIO's reset would forget other apps' too).
+    File dialogs (`FileChooserNative`) must be kept alive until answered (`keep_until_answered`): GTK drops them
+    otherwise. The menu bar's items don't take the keyboard, and commands leave it in the text.
     `SLATE_TIMING=1` prints how long painting and keys take.
 - `src/ui/` — the Win32 app (see the module docs at the top of each file).
   - `src/highlight.rs` (+ `highlight/code.rs`, `highlight/markup.rs`, `highlight/config.rs`; shared, `ui` reaches it
@@ -241,8 +280,9 @@ accent stay Windows-only), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate
     .py…, nor .ts — registered, they made Windows ask how to open a .bat with only Slate offered, and 0.8.2 takes
     that back once at start, a choice of Slate for .bat/.cmd included; `Slate.exe --install` does the setup
     silently for winget and scripts; Help → Stop opening files with Slate… / `--unassociate` takes back the file
-    part, every UserChoice naming Slate included, and Slate stays installed; `--uninstall --quiet` removes it all;
-    CI runs all three on a runner); `update.rs` (updates from GitHub releases: WinHTTP, SHA-256 check, from 0.8.1 the same
+    part, every UserChoice naming Slate included, and Slate stays installed; `--uninstall --quiet` removes it all, the
+    installed copy too when it's the one running, by a hidden `cmd` once it has ended; CI runs all three on a
+    runner); `update.rs` (updates from GitHub releases: WinHTTP, SHA-256 check, from 0.8.1 the same
     publisher's signature when the running exe's own signature checks out (`signer_of`: WinVerifyTrust, no online
     revocation lookup), swap the exe, restart with
     `--updated`, undone if the new one doesn't start); `crash.rs` (a minidump next to crash.log on a native crash,
@@ -307,8 +347,9 @@ accent stay Windows-only), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate
   another thread (after an edit only once the typing pauses: the count's snapshot ends the piece typing goes into),
   a bigger one not at all. Words are runs of non-space characters, like `wc -w`.
 - `Tab::goto` is where a tab goes once its document is ready and it's the tab shown: `slate file.txt:120:5` (only
-  when the path as given doesn't exist; a name with any other colon never becomes a new file, as it would be an
-  alternate data stream) and Reopen closed tab (the last 20 tabs closed that had a file, back at their place).
+  when the path as given isn't a file: not found, or on Windows no name at all; a name with any other colon never
+  becomes a new file, as it would be an alternate data stream) and Reopen closed tab (the last 20 tabs closed that had
+  a file, back at their place).
 - The App lives in `Rc<RefCell<App>>`. Anything that shows a dialog or menu runs from the `Deferred` queue outside
   the borrow. Dialogs run a modal loop in which timers and job messages still arrive (tabs can close, open or move),
   so code that shows one finds its tab again **by id** afterwards, never by an index taken before. The queue isn't
@@ -332,8 +373,10 @@ accent stay Windows-only), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate
   A tab from the session keeps its entry as read (`Tab::place`) until its file is read.
 - The session (session.rs) holds that unsaved text, so: files are flushed to disk before they replace the old ones;
   reading is lenient (one bad tab or a value from a newer version loses nothing else; settings too); Slate deletes
-  only backups it wrote or read itself, and backups no tab refers to come back as new tabs; restoring that crashes is
-  caught and the session set aside. While editing it's written on another thread; closing writes it in place.
+  only backups it wrote or read itself (names it gives only: `slates_name`), and backups no tab refers to come back as
+  new tabs; restoring that crashes is caught and the session set aside, also a crash a panic doesn't tell (a
+  `restoring` mark, taken away at the first paint). While editing it's written on another thread; closing writes it
+  in place. A document that grew past 64 MiB keeps its last copy listed until its first list of pieces is written.
   Documents up to 64 MiB are backed up as a copy. Bigger ones as their pieces: `<name>.pieces` (the piece list, with
   the `Identity` of each file of the user's it reads: stamp, file id, sample hashes; rewritten when the text
   changed, or when a file it names is `gone` or not read any more: after a save, or another file found in its place)
@@ -363,8 +406,14 @@ accent stay Windows-only), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate
   by the daily check again). Old copies are deleted by the next normal start. 0.2.0 starts the new one with
   `--wait-for <pid>` instead (still understood).
 - Panics in message handling are caught, logged to `crash.log` in the data folder, the session is saved and a
-  message shown. A panic while painting is only logged (showing a message would paint, and fail, again). A panic in
-  a background job comes back as that job's failure (`job::Failure`), never as a job that runs forever.
+  message shown. A panic while painting is only logged (showing a message would paint, and fail, again), also one in
+  the text renderer's callbacks (`caught`: DirectWrite's callbacks can't pass a panic on). A panic in a background job
+  comes back as that job's failure (`job::Failure`), never as a job that runs forever.
+- The JSON/XML path bar and structure panel are worked out again after an edit only once the typing pauses
+  (`structure::PAUSE`, 200 ms; documents up to 256 KiB at once): a rescan per key took a frame's time on a few MB, and
+  a whole background read of a big file per key. Meanwhile they show the old places (not current: clicks are ignored).
+- Transforms (Format, Minify, line tools, Replace all, line endings) write into a `Sink`: memory until it passes
+  64 MiB, then a temp file; Format refuses a result over 64 times the text plus 64 MiB (absurd nesting).
 - The keyboard focus is read with `win::focus()` when painting, not tracked from WM_SETFOCUS (which can't reach the
   App while it is borrowed). Always `win::set_focus` / `win::focus`, never SetFocus / GetFocus: in test mode the focus
   is only noted, and nothing activates the hidden window (`SWP_NOACTIVATE`, a CBT hook refusing activation), so a
@@ -387,7 +436,9 @@ accent stay Windows-only), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate
   believe it's that version (to try the updater against the real latest release, in a scratch folder);
   `SLATE_TEST_SLOW_OPEN=<ms>` makes reading each file take that much longer (a slow network drive).
 - `tests/smoke.txt` is the smoke test CI runs on the built exe (paths in it are relative to the working folder). It
-  writes a session and puts it back, so it needs `SLATE_DATA_DIR` set to an empty folder.
+  checks Format XML, Toggle comment and `name:line:col`, writes a session and puts it back, so it needs
+  `SLATE_DATA_DIR` set to an empty folder. Linux's test mode also has `session:soon` (written on another thread),
+  `print:session` (the session folder's files) and `print:notice`.
 - Measuring: `t:<label>` marks; `print:startup` (each startup step in ms since the process was created), `gfx:window`
   in a script or `SLATE_TEST_GPU=1` (draw through the hidden window's own swap chain on the GPU, as the real window
   does; `gfx:late` makes the device at the first paint, to compare), `idle:<ms>` (run the real message loop and count

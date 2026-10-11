@@ -18,9 +18,10 @@ use crate::core::text::{Encoding, Eol};
 use crate::core::{json, lines, xml};
 use crate::edit::{self, Indent, Sink};
 use crate::highlight::Lang;
-use crate::settings::{Settings, ThemeMode};
+use crate::settings::{Settings, ThemeMode, ZOOM_STEPS};
 use crate::theme::Theme;
 
+use super::session;
 use super::view::{Ctx, Geom, Style, View};
 
 /// Documents up to this size are kept in the session as a copy; bigger unsaved ones are asked about on closing.
@@ -82,10 +83,13 @@ pub enum Cmd {
     MoveLineDown,
     Lines(lines::LineOp),
     Case(lines::CaseOp),
+    /// Format JSON or XML, whichever the document is (Shift+Alt+F).
+    Format,
     JsonFormat,
     JsonMinify,
     JsonCheck,
     XmlFormat,
+    XmlMinify,
     XmlCheck,
     Wrap,
     LineNumbers,
@@ -135,6 +139,8 @@ enum TaskKind {
     Xml(json::Mode),
     Lines(lines::LineOp),
     ReplaceAll,
+    /// Every line break to this kind.
+    Eol(Eol),
 }
 
 struct Task {
@@ -158,6 +164,8 @@ pub struct Tab {
     task: Option<Task>,
     /// Shown above the text: why it can't be edited, that its file changed...
     pub notice: Option<String>,
+    /// The notice is about a save that failed: it offers Save as….
+    pub notice_save_as: bool,
     /// Line (and column) to go to once the document is there (`slate file.txt:120`).
     pub goto: Option<(u64, u64)>,
     /// What was last seen on disk (a change already told about isn't told again).
@@ -168,10 +176,20 @@ pub struct Tab {
     pub restore_at: Option<(u64, u64, u64)>,
     /// The document version the session's copy of its text is of (it isn't written again while that's so).
     pub session_version: u64,
+    /// The canonical path found when its file was read (another open of the same file comes to this tab).
+    pub canon: Option<PathBuf>,
+    /// What the tab is called when it isn't a file's (Keyboard shortcuts).
+    pub title_override: Option<String>,
+    /// Being read again after another program changed the file: whether the caret was at the end (it stays there,
+    /// following a log as it grows).
+    reload: Option<bool>,
 }
 
 impl Tab {
     pub fn title(&self) -> String {
+        if let Some(t) = &self.title_override {
+            return t.clone();
+        }
         match &self.doc.path {
             Some(p) => p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| p.display().to_string()),
             None => "Untitled".into(),
@@ -233,6 +251,10 @@ pub struct App {
     copied_line: Option<String>,
     pub quitting: bool,
     pub session_dirty: bool,
+    /// The session being written on another thread (`session::start`).
+    pub session_job: Option<Job<session::Outcome>>,
+    /// Closing couldn't write the session: every unsaved tab is asked about.
+    pub session_failed: bool,
     /// The caret should be shown (scrolled to) once the text is laid out; `reveal_center`: in the middle.
     pub reveal_pending: bool,
     pub reveal_center: bool,
@@ -240,6 +262,10 @@ pub struct App {
     pub restyle: bool,
     next_id: u64,
     disk_job: Option<Job<Vec<(u64, Option<crate::core::document::DiskInfo>)>>>,
+    /// The status bar's column (document version, caret, column) and selection size (version, start, end,
+    /// characters), counted once for each.
+    pub col_cache: std::cell::Cell<Option<(u64, u64, u64)>>,
+    pub sel_cache: std::cell::Cell<Option<(u64, u64, u64, u64)>>,
 }
 
 fn now_text() -> String {
@@ -275,11 +301,15 @@ impl App {
             copied_line: None,
             quitting: false,
             session_dirty: false,
+            session_job: None,
+            session_failed: false,
             reveal_pending: false,
             reveal_center: false,
             restyle: false,
             next_id: 1,
             disk_job: None,
+            col_cache: Default::default(),
+            sel_cache: Default::default(),
         };
         app.apply_theme();
         app
@@ -336,11 +366,15 @@ impl App {
             save: None,
             task: None,
             notice: None,
+            notice_save_as: false,
             goto: None,
             seen_disk: None,
             backup: None,
             restore_at: None,
             session_version: 0,
+            canon: None,
+            title_override: None,
+            reload: None,
         }
     }
 
@@ -371,12 +405,18 @@ impl App {
     /// first.
     pub fn open_paths(&mut self, paths: &[PathBuf]) {
         for p in paths {
-            let (path, goto) = split_line_suffix(p);
-            if let Some(i) = self.tabs.iter().position(|t| t.doc.path.as_deref().is_some_and(|q| fileio::same_file(q, &path))) {
+            // `notes.txt:120:5`: that file at line 120, when there's no file of that very name. The open finds out,
+            // on another thread, as the file system isn't asked here: a network drive that doesn't answer would
+            // freeze the window. (Another name for a file open already is found once it's read: `opened`.)
+            let suffix = line_suffix(p);
+            let names = [Some(p.as_path()), suffix.as_ref().map(|s| s.0.as_path())];
+            if let Some(i) = self.tabs.iter().position(|t| t.doc.path.as_deref().is_some_and(|q| names.contains(&Some(q)))) {
                 self.active = i;
-                if let Some(g) = goto {
-                    self.tabs[i].goto = Some(g);
-                    self.apply_goto(i);
+                if let Some((base, line, col)) = &suffix {
+                    if self.tabs[i].doc.path.as_deref() == Some(base.as_path()) {
+                        self.tabs[i].goto = Some((*line, *col));
+                        self.apply_goto(i);
+                    }
                 }
                 continue;
             }
@@ -385,12 +425,18 @@ impl App {
                 t.doc.path.is_none() && t.doc.is_empty() && !t.doc.is_dirty() && !t.busy()
             };
             let mut doc = Document::new();
-            doc.path = Some(path.clone());
+            doc.path = Some(p.clone());
             let mut tab = self.make_tab(doc);
-            tab.goto = goto;
             let notify = self.notify.clone();
-            let p2 = path.clone();
-            tab.load = Some(Job::spawn(fileio::OPEN_STEPS, notify.clone(), move |ctx| fileio::open(&p2, notify, true, ctx)));
+            let full = p.clone();
+            tab.load = Some(match suffix {
+                Some((base, line, col)) => {
+                    // (the line applies if `base` is what's read: `opened`)
+                    tab.goto = Some((line, col));
+                    Job::spawn(fileio::OPEN_STEPS, notify.clone(), move |ctx| fileio::open_either(&full, &base, notify, true, ctx))
+                }
+                None => Job::spawn(fileio::OPEN_STEPS, notify.clone(), move |ctx| fileio::open(&full, notify, true, ctx)),
+            });
             if reuse {
                 self.tabs[0] = tab;
                 self.active = 0;
@@ -398,7 +444,6 @@ impl App {
                 self.tabs.push(tab);
                 self.active = self.tabs.len() - 1;
             }
-            self.settings.add_recent(&path);
         }
         self.dirty_title = true;
         self.dirty_view = true;
@@ -406,7 +451,10 @@ impl App {
 
     /// Whether anything runs in the background (test mode waits for it).
     pub fn busy(&self) -> bool {
-        self.tabs.iter().any(|t| t.busy() || t.index.is_some()) || self.find_running() || self.disk_job.is_some()
+        self.tabs.iter().any(|t| t.busy() || t.index.is_some())
+            || self.find_running()
+            || self.disk_job.is_some()
+            || self.session_job.is_some()
     }
 
     /// Goes to the line asked for (`Tab::goto`) in tab `i` now, and shows it.
@@ -450,9 +498,7 @@ impl App {
         }
         running |= self.poll_find();
         running |= self.poll_disk();
-        if self.quitting && self.tabs.iter().all(|t| t.save.is_none()) {
-            self.asks.push(Ask::Quit);
-        }
+        running |= session::poll(self);
         running
     }
 
@@ -462,7 +508,10 @@ impl App {
             match job.take() {
                 Some(opened) => {
                     self.tabs[i].load = None;
-                    self.opened(i, opened);
+                    if !self.opened(i, opened) {
+                        // (the tab is gone: the rest isn't its own any more)
+                        return false;
+                    }
                 }
                 None => running = true,
             }
@@ -519,42 +568,81 @@ impl App {
         running
     }
 
-    fn opened(&mut self, i: usize, opened: Opened) {
+    /// Tab `i`'s file was read, or couldn't be. Returns false if the tab is gone: its file couldn't be opened, or
+    /// another tab has that file open already (under another name: a link, `..`), which is shown instead.
+    fn opened(&mut self, i: usize, opened: Opened) -> bool {
+        self.dirty_title = true;
+        self.dirty_view = true;
+        let id = self.tabs[i].id;
+        let reading_again = self.tabs[i].reload.is_some();
+        if opened.loading.is_ok() {
+            let dup = opened.canon.as_ref().and_then(|c| self.tabs.iter().position(|t| t.id != id && t.canon.as_ref() == Some(c)));
+            if let Some(k) = dup {
+                let goto = self.tabs[i].goto.take().filter(|_| self.tabs[i].doc.path.as_deref() != Some(opened.path.as_path()));
+                self.tabs.remove(i);
+                let k = if k > i { k - 1 } else { k };
+                self.active = k;
+                if let Some(g) = goto {
+                    self.tabs[k].goto = Some(g);
+                    self.goto_now(k);
+                }
+                return false;
+            }
+            let tab = &mut self.tabs[i];
+            if opened.canon.is_some() {
+                tab.canon = opened.canon.clone();
+            }
+            if tab.doc.path.as_deref() == Some(opened.path.as_path()) {
+                // (a file of that very name, colons and all: no line to go to)
+                tab.goto = None;
+            } else {
+                // `notes.txt:120` was `notes.txt`
+                tab.doc.path = Some(opened.path.clone());
+            }
+            if !reading_again {
+                self.settings.add_recent(&opened.path);
+            }
+        }
         match opened.loading {
             Ok(Loading::Ready(doc)) => self.loaded(i, doc, None),
             Ok(Loading::Indexing(doc, job)) => self.loaded(i, doc, Some(job)),
             Ok(Loading::Converting(job)) => self.tabs[i].convert = Some(job),
-            Err(e) if opened.creatable => {
+            Err(_) if opened.creatable => {
                 // a new file: saving creates it
-                let _ = e;
                 let tab = &mut self.tabs[i];
+                tab.doc.path = Some(opened.path.clone());
                 tab.lang = detect(Some(&opened.path), &tab.doc);
                 let name = tab.title();
                 self.flash(format!("{name} is a new file: saving creates it."), false);
             }
             Err(e) => {
-                let name = opened.path.display().to_string();
+                let name = self.tabs[i].doc.path.as_deref().unwrap_or(&opened.path).display().to_string();
+                if reading_again {
+                    // (the text as it was stays)
+                    self.tabs[i].reload = None;
+                    self.flash(format!("Couldn't read {name} again: {}", fileio::friendly_io(&e)), true);
+                    return true;
+                }
                 self.flash(format!("Couldn't open {name}: {}", fileio::friendly_io(&e)), true);
                 // the tab goes (unless it's the only one)
                 if self.tabs.len() > 1 {
                     self.tabs.remove(i);
                     self.active = self.active.min(self.tabs.len() - 1);
-                } else {
-                    let tab = &mut self.tabs[i];
-                    tab.doc = Document::new();
+                    return false;
                 }
+                let tab = &mut self.tabs[i];
+                tab.doc = Document::new();
+                tab.goto = None;
             }
         }
-        if let Some(t) = self.tabs.get_mut(i) {
-            if opened.binary && t.doc.path.as_deref() == Some(opened.path.as_path()) {
-                t.notice = Some("This looks like a binary file (a program, an image...): shown as text.".into());
-            }
+        if opened.binary {
+            self.tabs[i].notice = Some("This looks like a binary file (a program, an image...): shown as text.".into());
         }
-        self.dirty_title = true;
-        self.dirty_view = true;
+        true
     }
 
     fn loaded(&mut self, i: usize, mut doc: Document, index: Option<Job<bool>>) {
+        let active = i == self.active;
         let tab = &mut self.tabs[i];
         if doc.path.is_none() {
             doc.path = tab.doc.path.clone();
@@ -566,10 +654,20 @@ impl App {
         }
         tab.doc = doc;
         tab.index = index;
-        tab.view = View::new();
+        let old = std::mem::take(&mut tab.view);
         tab.seen_disk = None;
-        if let Some((anchor, caret, top)) = tab.restore_at.take() {
-            let len = tab.doc.len();
+        let len = tab.doc.len();
+        if let Some(follow_end) = tab.reload.take() {
+            // read again after another program changed it: the view stays where it was (at the end, if the caret was:
+            // a log that grows is followed)
+            let v = &mut tab.view;
+            v.sel = if follow_end { Sel::at(len) } else { Sel::new(old.sel.anchor.min(len), old.sel.caret.min(len)) };
+            v.top = old.top.min(len);
+            v.scroll_x = old.scroll_x;
+            if follow_end && active {
+                self.reveal_pending = true;
+            }
+        } else if let Some((anchor, caret, top)) = tab.restore_at.take() {
             tab.view.sel = Sel::new(anchor.min(len), caret.min(len));
             tab.view.top = top.min(len);
         }
@@ -628,6 +726,9 @@ impl App {
                 let tab = &mut self.tabs[i];
                 if tab.doc.id() != st.doc {
                     self.flash("Saved", false);
+                    if self.quitting && self.tabs.iter().all(|t| t.save.is_none()) {
+                        self.asks.push(Ask::Quit);
+                    }
                     return;
                 }
                 let ext = |p: &Path| p.extension().map(|e| e.to_ascii_lowercase());
@@ -648,6 +749,7 @@ impl App {
                     tab.view.clear_cache();
                 }
                 tab.notice = None;
+                tab.notice_save_as = false;
                 let name = tab.title();
                 self.settings.add_recent(&st.path);
                 self.session_dirty = true;
@@ -659,14 +761,24 @@ impl App {
                 if st.close_after && !self.tabs[i].doc.is_dirty() {
                     self.remove_tab(i);
                 }
+                // (closing waited for this save: it carries on)
+                if self.quitting && self.tabs.iter().all(|t| t.save.is_none()) {
+                    self.asks.push(Ask::Quit);
+                }
             }
             Err(SaveError::Lossy) => {
                 let tab = self.tabs[i].id;
                 self.asks.push(Ask::Lossy { tab, path: st.path, encoding: st.encoding, close_after: st.close_after });
             }
-            Err(SaveError::Cancelled) => self.flash("Saving was cancelled.", false),
+            Err(SaveError::Cancelled) => {
+                self.flash("Saving was cancelled.", false);
+                self.quitting = false;
+            }
             Err(e) => {
-                self.flash(format!("Couldn't save: {e}"), true);
+                let tab = &mut self.tabs[i];
+                tab.notice = Some(format!("Couldn't save {}: {e}", st.path.display()));
+                tab.notice_save_as = true;
+                self.flash("Couldn't save (see above the text)", true);
                 self.quitting = false;
             }
         }
@@ -1056,9 +1168,9 @@ impl App {
             Cmd::ReplaceAll => self.start_task(TaskKind::ReplaceAll),
             Cmd::GotoLine => self.asks.push(Ask::GotoLine),
             Cmd::ToggleComment => {
-                let lang = self.tab().lang;
-                let Some(style) = lang.comment() else {
-                    self.flash("This kind of file has no comments.", false);
+                let tab = self.tab();
+                let Some(style) = edit::comment_style(&tab.doc, tab.lang, tab.view.sel.start()) else {
+                    self.flash(format!("{} has no comments", self.tab().lang.label()), true);
                     return;
                 };
                 if !self.editable() {
@@ -1106,6 +1218,12 @@ impl App {
             Cmd::JsonMinify => self.start_task(TaskKind::Json(json::Mode::Minify)),
             Cmd::JsonCheck => self.start_task(TaskKind::Json(json::Mode::Validate)),
             Cmd::XmlFormat => self.start_task(TaskKind::Xml(json::Mode::Pretty)),
+            Cmd::XmlMinify => self.start_task(TaskKind::Xml(json::Mode::Minify)),
+            Cmd::Format => match self.tab().lang {
+                Lang::Json => self.start_task(TaskKind::Json(json::Mode::Pretty)),
+                Lang::Xml => self.start_task(TaskKind::Xml(json::Mode::Pretty)),
+                _ => self.flash("Formatting works for JSON and XML files (the language is in the status bar).", true),
+            },
             Cmd::XmlCheck => self.start_task(TaskKind::Xml(json::Mode::Validate)),
             Cmd::Wrap => {
                 self.settings.wrap = !self.settings.wrap;
@@ -1120,9 +1238,10 @@ impl App {
                 self.style.line_numbers = self.settings.line_numbers;
             }
             Cmd::ZoomIn | Cmd::ZoomOut | Cmd::ZoomReset => {
+                let z = self.settings.zoom;
                 let z = match cmd {
-                    Cmd::ZoomIn => (self.settings.zoom * 1.1).min(4.0),
-                    Cmd::ZoomOut => (self.settings.zoom / 1.1).max(0.4),
+                    Cmd::ZoomIn => ZOOM_STEPS.iter().copied().find(|&s| s > z + 0.001).unwrap_or(5.0),
+                    Cmd::ZoomOut => ZOOM_STEPS.iter().rev().copied().find(|&s| s < z - 0.001).unwrap_or(0.5),
                     _ => 1.0,
                 };
                 self.settings.zoom = z;
@@ -1143,11 +1262,12 @@ impl App {
                 self.activate(i.min(self.tabs.len() - 1));
             }
             Cmd::SetEol(e) => {
+                // every line break in the text (as on Windows), and the ones typed from now on
                 let tab = &mut self.tabs[self.active];
-                if tab.doc.eol != e {
+                if tab.doc.is_empty() {
                     tab.doc.eol = e;
-                    tab.doc.mark_dirty();
-                    self.flash(format!("New line breaks are {} (the ones in the text stay as they are)", e.label()), false);
+                } else {
+                    self.start_task(TaskKind::Eol(e));
                 }
             }
             Cmd::SetLang(l) => {
@@ -1185,12 +1305,12 @@ impl App {
         let text = tab.doc.read(a, b);
         let (out, count) = lines::apply(op, &text);
         if count == 0 {
-            self.flash("Nothing to change", false);
+            self.flash(edit::nothing_to_clean(op), false);
             return;
         }
         tab.view.sel = edit::replace_range(&mut tab.doc, sel, a, b, &out);
         self.after_edit(true);
-        self.flash(format!("{count} line(s) changed"), false);
+        self.flash(edit::lines_done(op, count), false);
     }
 
     fn case_op(&mut self, op: lines::CaseOp) {
@@ -1226,12 +1346,8 @@ impl App {
         }
         let indent = vec![b' '; self.settings.json_indent as usize];
         let matcher = match kind {
-            TaskKind::ReplaceAll => match self.find.matcher.take() {
-                Some(m) => {
-                    let again = Matcher::new(&self.find.query).ok();
-                    self.find.matcher = again;
-                    Some(m)
-                }
+            TaskKind::ReplaceAll => match self.find.matcher.clone() {
+                Some(m) => Some(m),
                 None => {
                     self.flash("Type something to find first", true);
                     return;
@@ -1250,8 +1366,8 @@ impl App {
         let eol = tab.doc.eol.as_bytes().to_vec();
         let len = snap.len();
         if let TaskKind::Lines(_) = kind {
-            if len > LINES_MAX {
-                self.flash("Sorting and cleaning up lines works for files up to 512 MB.", true);
+            if len > LINES_MAX || tab.doc.line_count().unwrap_or(0) > lines::COUNT_MAX {
+                self.flash("Sorting and cleaning up lines works for files up to 512 MB and 32 million lines.", true);
                 return;
             }
         }
@@ -1259,7 +1375,7 @@ impl App {
             guarded(&snap, || match kind {
                 TaskKind::Json(mode) | TaskKind::Xml(mode) if mode != json::Mode::Validate => {
                     let hint = if mode == json::Mode::Pretty { len.saturating_mul(3) } else { len };
-                    let mut sink = match Sink::new(hint) {
+                    let mut sink = match Sink::limited(hint, edit::transform_max(len)) {
                         Ok(s) => s,
                         Err(e) => return TaskResult::Failed(format!("Couldn't create a temporary file: {e}")),
                     };
@@ -1276,6 +1392,8 @@ impl App {
                             Err(e) => TaskResult::Failed(format!("Couldn't write the result: {e}")),
                         },
                         Err(_) if ctx.cancelled() => TaskResult::Cancelled,
+                        // (the result, not the text: a full disk, or far too big)
+                        Err((_, msg)) if msg.starts_with(json::WRITE_FAILED) => TaskResult::Failed(msg),
                         Err((offset, msg)) => TaskResult::FormatError { offset, msg },
                     }
                 }
@@ -1324,6 +1442,21 @@ impl App {
                         Err(e) => TaskResult::Failed(format!("Couldn't replace: {e}")),
                     }
                 }
+                TaskKind::Eol(e) => {
+                    let mut sink = match Sink::new(len + len / 16) {
+                        Ok(s) => s,
+                        Err(e) => return TaskResult::Failed(format!("Couldn't create a temporary file: {e}")),
+                    };
+                    let mut idx = IndexBuilder::new();
+                    match edit::convert_eol(&snap, e == Eol::Crlf, &mut sink, &mut idx, ctx) {
+                        Ok(count) => match sink.finish(idx) {
+                            Ok((src, nl)) => TaskResult::Content { src, nl, count },
+                            Err(e) => TaskResult::Failed(format!("Couldn't write the result: {e}")),
+                        },
+                        Err(_) if ctx.cancelled() => TaskResult::Cancelled,
+                        Err(e) => TaskResult::Failed(format!("Couldn't convert: {e}")),
+                    }
+                }
             })
         });
         tab.task = Some(Task { kind, job, version });
@@ -1342,15 +1475,26 @@ impl App {
                     self.flash("No matches to replace", true);
                     return;
                 }
-                if matches!(kind, TaskKind::Lines(_)) && count == 0 {
-                    self.flash("Nothing to change", false);
-                    return;
+                if let TaskKind::Lines(op) = kind {
+                    if count == 0 {
+                        self.flash(edit::nothing_to_clean(op), false);
+                        return;
+                    }
+                }
+                if let TaskKind::Eol(e) = kind {
+                    tab.doc.eol = e;
+                    if count == 0 {
+                        // (only the kind typed from now on changed)
+                        tab.doc.mark_dirty();
+                        self.flash(format!("Line endings are {}", e.short()), false);
+                        return;
+                    }
                 }
                 let sel = tab.view.sel;
                 let new_len = src.len();
                 tab.doc.begin(EditKind::Other, sel);
                 tab.doc.replace_all_with(src, nl);
-                let keep = matches!(kind, TaskKind::ReplaceAll | TaskKind::Lines(_));
+                let keep = matches!(kind, TaskKind::ReplaceAll | TaskKind::Lines(_) | TaskKind::Eol(_));
                 let new_sel = if keep { Sel::at(sel.caret.min(new_len)) } else { Sel::at(0) };
                 tab.doc.end(new_sel);
                 tab.doc.seal();
@@ -1360,8 +1504,9 @@ impl App {
                     tab.view.top_row = 0;
                 }
                 let msg = match kind {
-                    TaskKind::ReplaceAll => format!("Replaced {count}"),
-                    TaskKind::Lines(_) => format!("{count} line(s) changed"),
+                    TaskKind::ReplaceAll => format!("Replaced {}", edit::plural(count, "match", "matches")),
+                    TaskKind::Lines(op) => edit::lines_done(op, count),
+                    TaskKind::Eol(e) => format!("Line endings changed to {} ({} lines)", e.short(), edit::group(count)),
                     TaskKind::Json(json::Mode::Minify) | TaskKind::Xml(json::Mode::Minify) => "Minified".into(),
                     _ => "Formatted".into(),
                 };
@@ -1374,11 +1519,14 @@ impl App {
             TaskResult::FormatError { offset, msg } => {
                 let tab = &mut self.tabs[i];
                 let line = tab.doc.line_of(offset).map(|l| l + 1);
-                let col = offset - tab.doc.line_start_of(offset) + 1;
+                // in characters, like the status bar (bytes for a line too long to count)
+                let off = offset.min(tab.doc.len());
+                let ls = tab.doc.line_start_of(off);
+                let col = if off - ls <= 4 << 20 { bytecount::num_chars(&tab.doc.read(ls, off)) as u64 + 1 } else { off - ls + 1 };
                 tab.view.sel = Sel::at(offset.min(tab.doc.len()));
                 self.reveal_pending = true;
                 self.reveal_center = true;
-                let at = line.map_or(format!("byte {offset}"), |l| format!("line {l}, column {col}"));
+                let at = line.map_or(format!("byte {}", edit::group(offset + 1)), |l| format!("line {}, column {}", edit::group(l), edit::group(col)));
                 self.flash(format!("{msg} ({at})"), true);
             }
             TaskResult::Failed(msg) => self.flash(msg, true),
@@ -1408,7 +1556,7 @@ impl App {
     }
 
     fn start_count(&mut self) {
-        let Ok(m) = Matcher::new(&self.find.query) else { return };
+        let Some(m) = self.find.matcher.clone() else { return };
         let notify = self.notify.clone();
         let tab = &mut self.tabs[self.active];
         let snap: Snapshot = tab.doc.snapshot();
@@ -1560,10 +1708,11 @@ impl App {
         if self.disk_job.is_some() {
             return;
         }
+        // (a tab whose lines are still being read is looked at once they are: reading it again now would start over)
         let asks: Vec<(u64, PathBuf)> = self
             .tabs
             .iter()
-            .filter(|t| !t.busy() && t.doc.disk.is_some())
+            .filter(|t| !t.busy() && t.index.is_none() && t.doc.disk.is_some())
             .filter_map(|t| t.doc.path.clone().map(|p| (t.id, p)))
             .collect();
         if asks.is_empty() {
@@ -1582,7 +1731,7 @@ impl App {
         for (id, now) in found {
             let Some(i) = self.index_of(id) else { continue };
             let tab = &mut self.tabs[i];
-            if tab.busy() || now == tab.doc.disk || tab.seen_disk == Some(now) {
+            if tab.busy() || tab.index.is_some() || now == tab.doc.disk || tab.seen_disk == Some(now) {
                 continue;
             }
             let name = tab.title();
@@ -1593,13 +1742,14 @@ impl App {
                 continue;
             }
             if !tab.doc.is_dirty() {
-                // reload: the same tab, the caret where it was
+                // read again: the same tab, the view where it was (`loaded`); a file that only grew (a log) keeps the
+                // lines counted so far
                 let path = tab.doc.path.clone().unwrap();
                 let notify = self.notify.clone();
-                let keep = tab.view.sel.caret;
                 tab.goto = None;
-                tab.load = Some(Job::spawn(fileio::OPEN_STEPS, notify.clone(), move |ctx| fileio::open(&path, notify, false, ctx)));
-                tab.view.sel = Sel::at(keep);
+                tab.reload = Some(tab.view.sel.caret >= tab.doc.len() && !tab.doc.is_empty());
+                let prev = tab.doc.buffer().sources().iter().find(|s| s.file_path() == Some(path.as_path())).cloned();
+                tab.load = Some(Job::spawn(fileio::OPEN_STEPS, notify.clone(), move |ctx| fileio::reload(&path, notify, prev, None, ctx)));
                 self.flash(format!("{name} changed on disk and was reloaded."), false);
             } else {
                 tab.seen_disk = Some(now);
@@ -1622,27 +1772,22 @@ pub fn default_indent(s: &Settings) -> Indent {
     if s.use_spaces { Indent::Spaces(s.tab_size) } else { Indent::Tabs }
 }
 
-/// `notes.txt:120:5` from a command line: the file, and the line and column, when the name as given isn't a file
-/// (a name with other colons is just a name).
-pub fn split_line_suffix(p: &Path) -> (PathBuf, Option<(u64, u64)>) {
-    if p.exists() {
-        return (p.to_path_buf(), None);
+/// `notes.txt:120:5` from a command line: the file without the suffix, and the line and column (1 when there's
+/// none). Only the name says so; whether a file of the full name is there is for the open to find out (it's that
+/// file then). A name with other colons is just a name.
+pub fn line_suffix(p: &Path) -> Option<(PathBuf, u64, u64)> {
+    let name = p.file_name()?.to_str()?;
+    let number = |s: &str| (!s.is_empty() && s.len() <= 18 && s.bytes().all(|b| b.is_ascii_digit())).then(|| s.parse::<u64>().ok()).flatten();
+    let (rest, last) = name.rsplit_once(':')?;
+    let last = number(last)?;
+    let (base, line, col) = match rest.rsplit_once(':').and_then(|(b, l)| Some((b, number(l)?))) {
+        Some((base, line)) => (base, line, last),
+        None => (rest, last, 1),
+    };
+    if base.is_empty() {
+        return None;
     }
-    let s = p.to_string_lossy();
-    let mut parts = s.rsplitn(3, ':');
-    let last = parts.next().and_then(|x| x.parse::<u64>().ok());
-    let mid = parts.next();
-    match (last, mid) {
-        (Some(col), Some(m)) if m.parse::<u64>().is_ok() => {
-            let rest = parts.next().unwrap_or_default();
-            if !rest.is_empty() {
-                return (PathBuf::from(rest), Some((m.parse().unwrap(), col)));
-            }
-            (PathBuf::from(m), Some((col, 1)))
-        }
-        (Some(line), Some(m)) => (PathBuf::from(m), Some((line, 1))),
-        _ => (p.to_path_buf(), None),
-    }
+    Some((p.with_file_name(base), line.max(1), col.max(1)))
 }
 
 fn guarded(snap: &Snapshot, f: impl FnOnce() -> TaskResult) -> TaskResult {
@@ -1665,12 +1810,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_line_and_column_after_a_name_that_isnt_there() {
-        let (p, g) = split_line_suffix(Path::new("/no/such/notes.txt:120"));
-        assert_eq!((p, g), (PathBuf::from("/no/such/notes.txt"), Some((120, 1))));
-        let (p, g) = split_line_suffix(Path::new("/no/such/notes.txt:120:5"));
-        assert_eq!((p, g), (PathBuf::from("/no/such/notes.txt"), Some((120, 5))));
-        let (p, g) = split_line_suffix(Path::new("/no/such/a:b"));
-        assert_eq!((p, g), (PathBuf::from("/no/such/a:b"), None));
+    fn a_line_and_column_after_a_name() {
+        let s = |p: &str| line_suffix(Path::new(p));
+        assert_eq!(s("/no/such/notes.txt:120"), Some((PathBuf::from("/no/such/notes.txt"), 120, 1)));
+        assert_eq!(s("/no/such/notes.txt:120:5"), Some((PathBuf::from("/no/such/notes.txt"), 120, 5)));
+        assert_eq!(s("main.rs:7"), Some((PathBuf::from("main.rs"), 7, 1)));
+        assert_eq!(s("/a/b:x:3"), Some((PathBuf::from("/a/b:x"), 3, 1)));
+        for none in ["/no/such/a:b", "/a/b.txt", "/a/:12", "/a/b.txt:"] {
+            assert_eq!(s(none), None, "{none}");
+        }
     }
 }

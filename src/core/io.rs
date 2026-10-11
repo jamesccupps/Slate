@@ -134,7 +134,8 @@ pub fn open(path: &Path, notify: Notify, create: bool, ctx: &Ctx) -> Opened {
 pub fn open_either(path: &Path, or: &Path, notify: Notify, create: bool, ctx: &Ctx) -> Opened {
     let o = open(path, notify.clone(), false, ctx);
     match &o.loading {
-        Err(e) if e.kind() == io::ErrorKind::NotFound => open(or, notify, create, ctx),
+        // (on Windows `notes.txt:120:5` is no name at all: an alternate stream `120` of a type `5`)
+        Err(e) if e.kind() == io::ErrorKind::NotFound || os::is_bad_name(e) => open(or, notify, create, ctx),
         _ => o,
     }
 }
@@ -439,9 +440,11 @@ mod place {
 
     use windows::Win32::Foundation::HANDLE;
     use windows::Win32::Storage::FileSystem::{
-        FILE_ATTRIBUTE_HIDDEN as HIDDEN, FILE_BASIC_INFO, FILE_RENAME_INFO, FileBasicInfo, FileRenameInfoEx,
+        FILE_ATTRIBUTE_HIDDEN as HIDDEN, FILE_BASIC_INFO, FILE_FLAGS_AND_ATTRIBUTES, FILE_RENAME_INFO, FileBasicInfo,
+        FileRenameInfoEx, FindClose, FindFirstStreamW, FindNextStreamW, FindStreamInfoStandard, GetFileAttributesW,
         MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW, REPLACEFILE_IGNORE_ACL_ERRORS,
         REPLACEFILE_IGNORE_MERGE_ERRORS, ReplaceFileW, SetFileAttributesW, SetFileInformationByHandle,
+        WIN32_FIND_STREAM_DATA,
     };
     use windows::core::PCWSTR;
 
@@ -451,6 +454,9 @@ mod place {
     const SHARE_READ_DELETE: u32 = 0x1 | 0x4;
     const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
     const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
+    const TEMPORARY: u32 = 0x100;
+    const ENCRYPTED: u32 = 0x4000;
+    const COMPRESSED: u32 = 0x800;
     const KEEP_ATTRIBUTES: u32 = 0x2 | 0x4 | 0x20 | 0x2000; // hidden, system, archive, not content indexed
     const FILE_RENAME_FLAG_REPLACE_IF_EXISTS: u32 = 0x1;
     const FILE_RENAME_FLAG_POSIX_SEMANTICS: u32 = 0x2;
@@ -459,17 +465,22 @@ mod place {
         p.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
     }
 
-    /// The `\\?\` form of an absolute path, which isn't limited to 260 characters.
+    /// The `\\?\` form of an absolute path, which isn't limited to 260 characters. Built from the path's own UTF-16:
+    /// a name with a lone surrogate (NTFS allows one) mustn't turn into another name.
     fn verbatim(p: &Path) -> PathBuf {
+        use std::os::windows::ffi::OsStringExt;
         let abs = std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
-        let s = abs.as_os_str().to_string_lossy();
-        if s.starts_with(r"\\?\") {
-            abs
-        } else if let Some(unc) = s.strip_prefix(r"\\") {
-            PathBuf::from(format!(r"\\?\UNC\{unc}"))
+        let w: Vec<u16> = abs.as_os_str().encode_wide().collect();
+        let prefix: Vec<u16> = r"\\?\".encode_utf16().collect();
+        let unc: Vec<u16> = r"\\".encode_utf16().collect();
+        let out: Vec<u16> = if w.starts_with(&prefix) {
+            return abs;
+        } else if w.starts_with(&unc) {
+            r"\\?\UNC\".encode_utf16().chain(w[2..].iter().copied()).collect()
         } else {
-            PathBuf::from(format!(r"\\?\{s}"))
-        }
+            prefix.into_iter().chain(w).collect()
+        };
+        PathBuf::from(std::ffi::OsString::from_wide(&out))
     }
 
     /// Renames the open file `file` to `target`, replacing it even if it is open elsewhere (NTFS, Windows 10 1809+).
@@ -481,7 +492,7 @@ mod place {
         unsafe {
             (*info).Anonymous.Flags = FILE_RENAME_FLAG_REPLACE_IF_EXISTS | FILE_RENAME_FLAG_POSIX_SEMANTICS;
             (*info).FileNameLength = (name.len() * 2) as u32;
-            std::ptr::copy_nonoverlapping(name.as_ptr(), (*info).FileName.as_mut_ptr(), name.len());
+            std::ptr::copy_nonoverlapping(name.as_ptr(), std::ptr::addr_of_mut!((*info).FileName).cast::<u16>(), name.len());
             SetFileInformationByHandle(
                 HANDLE(file.as_raw_handle()),
                 FileRenameInfoEx,
@@ -515,15 +526,23 @@ mod place {
         let ok = unsafe { ReplaceFileW(PCWSTR(t.as_ptr()), PCWSTR(r.as_ptr()), PCWSTR(b.as_ptr()), flags, None, None) }
             .is_ok();
         if ok {
-            // (it may stay in the folder until Slate lets go of it, on a network share: hidden)
+            // (it may stay in the folder until Slate lets go of it, on a network share: hidden and temporary, which
+            // is what `leftover` looks for)
             unsafe {
-                let _ = SetFileAttributesW(PCWSTR(b.as_ptr()), HIDDEN);
+                let _ = SetFileAttributesW(PCWSTR(b.as_ptr()), FILE_FLAGS_AND_ATTRIBUTES(HIDDEN.0 | TEMPORARY));
             }
             let _ = fs::remove_file(&backup);
         } else if !target.exists() && backup.exists() {
             let back = unsafe { MoveFileExW(PCWSTR(b.as_ptr()), PCWSTR(t.as_ptr()), MOVEFILE_WRITE_THROUGH) }.is_ok();
             if !back {
-                // (Not hidden, so `clean_stale_temps` never takes it for a leftover.)
+                // It keeps the original's attributes (hidden, maybe): not temporary, so `leftover` never takes it for
+                // one; and visible, if that can be done, so the user finds it.
+                let attrs = unsafe { GetFileAttributesW(PCWSTR(b.as_ptr())) };
+                if attrs != u32::MAX {
+                    unsafe {
+                        let _ = SetFileAttributesW(PCWSTR(b.as_ptr()), FILE_FLAGS_AND_ATTRIBUTES(attrs & !(HIDDEN.0 | TEMPORARY)));
+                    }
+                }
                 return Err(backup);
             }
         }
@@ -531,7 +550,7 @@ mod place {
     }
 
     /// Gives the new file the old one's creation time and attributes (and clears our temp "hidden" flag).
-    pub fn copy_identity(file: &File, old: Option<&fs::Metadata>) {
+    pub fn copy_identity(file: &File, old: Option<&fs::Metadata>, _old_path: &Path) {
         let mut info = FILE_BASIC_INFO::default();
         let attrs = old.map_or(0, |m| m.file_attributes() & KEEP_ATTRIBUTES);
         info.FileAttributes = if attrs == 0 { FILE_ATTRIBUTE_NORMAL } else { attrs };
@@ -548,8 +567,9 @@ mod place {
         }
     }
 
-    /// Creates the hidden temp file a save writes (`p` mustn't exist).
-    pub fn create_temp(p: &Path) -> io::Result<File> {
+    /// Creates the hidden temp file a save writes (`p` mustn't exist), encrypted if the file it replaces (`old`) is.
+    pub fn create_temp(p: &Path, old: Option<&fs::Metadata>) -> io::Result<File> {
+        let encrypted = old.map_or(0, |m| m.file_attributes() & ENCRYPTED);
         // (std refuses create_new without write(true), even with an explicit access mode)
         OpenOptions::new()
             .read(true)
@@ -557,8 +577,81 @@ mod place {
             .access_mode(GENERIC_READ | GENERIC_WRITE | DELETE)
             .share_mode(SHARE_READ_DELETE)
             .create_new(true)
-            .attributes(FILE_ATTRIBUTE_HIDDEN)
+            .attributes(FILE_ATTRIBUTE_HIDDEN | encrypted)
             .open(p)
+    }
+
+    /// Whether the file at `target` (its metadata `m`) has what a new file renamed into its place wouldn't: permissions
+    /// of its own (not only the folder's), encryption, compression, or alternate data streams (the "downloaded from
+    /// the internet" mark among them). ReplaceFile keeps all of those.
+    pub fn special(target: &Path, m: &fs::Metadata) -> bool {
+        m.file_attributes() & (ENCRYPTED | COMPRESSED) != 0 || has_streams(target) || own_permissions(target)
+    }
+
+    pub fn has_streams(target: &Path) -> bool {
+        let w = wide(&verbatim(target));
+        let mut data = WIN32_FIND_STREAM_DATA::default();
+        let Ok(h) = (unsafe { FindFirstStreamW(PCWSTR(w.as_ptr()), FindStreamInfoStandard, &mut data as *mut _ as *mut _, 0) })
+        else {
+            return false;
+        };
+        let main: Vec<u16> = "::$DATA".encode_utf16().collect();
+        let mut more = false;
+        loop {
+            let n = data.cStreamName.iter().position(|&c| c == 0).unwrap_or(data.cStreamName.len());
+            if data.cStreamName[..n] != main[..] {
+                more = true;
+                break;
+            }
+            if unsafe { FindNextStreamW(h, &mut data as *mut _ as *mut _) }.is_err() {
+                break;
+            }
+        }
+        unsafe {
+            let _ = FindClose(h);
+        }
+        more
+    }
+
+    /// Whether the file's permissions are its own: not inherited from its folder, or with entries of its own.
+    pub fn own_permissions(target: &Path) -> bool {
+        use windows::Win32::Security::{
+            ACE_HEADER, ACL, DACL_SECURITY_INFORMATION, GetAce, GetFileSecurityW, GetSecurityDescriptorControl,
+            GetSecurityDescriptorDacl, PSECURITY_DESCRIPTOR,
+        };
+        const SE_DACL_PROTECTED: u16 = 0x1000;
+        const INHERITED_ACE: u8 = 0x10;
+        let w = wide(&verbatim(target));
+        let mut need = 0u32;
+        unsafe {
+            let _ = GetFileSecurityW(PCWSTR(w.as_ptr()), DACL_SECURITY_INFORMATION.0, PSECURITY_DESCRIPTOR::default(), 0, &mut need);
+        }
+        if need == 0 || need > 1 << 20 {
+            return false;
+        }
+        let mut buf = vec![0u64; (need as usize).div_ceil(8)];
+        let sd = PSECURITY_DESCRIPTOR(buf.as_mut_ptr() as *mut _);
+        unsafe {
+            if !GetFileSecurityW(PCWSTR(w.as_ptr()), DACL_SECURITY_INFORMATION.0, sd, need, &mut need).as_bool() {
+                return false;
+            }
+            let (mut control, mut rev) = (0u16, 0u32);
+            if GetSecurityDescriptorControl(sd, &mut control, &mut rev).is_ok() && control & SE_DACL_PROTECTED != 0 {
+                return true;
+            }
+            let (mut present, mut defaulted) = (Default::default(), Default::default());
+            let mut dacl: *mut ACL = std::ptr::null_mut();
+            if GetSecurityDescriptorDacl(sd, &mut present, &mut dacl, &mut defaulted).is_err() || !present.as_bool() || dacl.is_null() {
+                return false;
+            }
+            for k in 0..(*dacl).AceCount as u32 {
+                let mut ace = std::ptr::null_mut();
+                if GetAce(dacl, k, &mut ace).is_ok() && !ace.is_null() && (*(ace as *const ACE_HEADER)).AceFlags & INHERITED_ACE == 0 {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// Puts the written temp file (`file`, at `temp_path`) in place of `target` (see the module docs). Returns
@@ -569,12 +662,26 @@ mod place {
         temp_path: &Path,
         target: &Path,
         replacing: bool,
+        special: bool,
         dir: &Path,
     ) -> (bool, Option<FileId>, Option<PathBuf>) {
+        let mut set_aside = None;
+        if special {
+            // ReplaceFile first: it keeps what the original has that a new file wouldn't (`special`)
+            drop(file);
+            let replaced = replace_file(temp_path, target, dir).unwrap_or_else(|backup| {
+                set_aside = Some(backup);
+                false
+            });
+            if replaced || set_aside.is_some() {
+                return (replaced, None, set_aside);
+            }
+            // (it can't, there: saved all the same, as a new file)
+            return (move_file(temp_path, target), None, None);
+        }
         let posix = posix_rename(&file, &verbatim(target)).is_ok();
         let written = posix.then(|| stamp_of(&file).map(|s| s.1)).flatten();
         drop(file);
-        let mut set_aside = None;
         let renamed = posix
             || move_file(temp_path, target)
             || (replacing
@@ -586,10 +693,12 @@ mod place {
     }
 
     /// Whether the save leftover `name` (`.slate-save-…` or `.slate-bak-…`, its metadata `m`) may be deleted once
-    /// the Slate that made it is gone. A .slate-bak is a leftover only when it's hidden (ReplaceFile worked and the
-    /// share still held the old file); one that isn't is an original that couldn't be put back: never deleted.
+    /// the Slate that made it is gone. A .slate-bak is a leftover only when it's hidden and temporary (ReplaceFile
+    /// worked and the share still held the old file); one that isn't is an original that couldn't be put back:
+    /// never deleted.
     pub fn leftover(name: &str, m: Option<&fs::Metadata>) -> bool {
-        !name.starts_with(".slate-bak-") || m.is_some_and(|m| m.file_attributes() & FILE_ATTRIBUTE_HIDDEN != 0)
+        let both = FILE_ATTRIBUTE_HIDDEN | TEMPORARY;
+        !name.starts_with(".slate-bak-") || m.is_some_and(|m| m.file_attributes() & both == both)
     }
 }
 
@@ -598,18 +707,50 @@ mod place {
     use super::*;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
-    /// Creates the temp file a save writes (`p` mustn't exist; its name starts with a dot, so it's hidden).
-    pub fn create_temp(p: &Path) -> io::Result<File> {
-        std::fs::OpenOptions::new().read(true).write(true).create_new(true).mode(0o666).open(p)
+    /// Creates the temp file a save writes (`p` mustn't exist; its name starts with a dot, so it's hidden). Readable
+    /// by this user only while it's written when it replaces a file (that may be a secret one; `copy_identity` gives
+    /// it the old file's permissions once it's all there); a new file gets the usual ones (`0666` less the umask).
+    pub fn create_temp(p: &Path, old: Option<&fs::Metadata>) -> io::Result<File> {
+        let mode = if old.is_some() { 0o600 } else { 0o666 };
+        std::fs::OpenOptions::new().read(true).write(true).create_new(true).mode(mode).open(p)
     }
 
-    /// Gives the new file the old one's permissions, and its owner and group where that's allowed.
-    pub fn copy_identity(file: &File, old: Option<&fs::Metadata>) {
-        if let Some(m) = old {
-            let _ = file.set_permissions(m.permissions());
-            let _ = std::os::unix::fs::fchown(file, Some(m.uid()), Some(m.gid()));
-            // (not allowed to give it away: keep the group at least, which may be)
-            let _ = std::os::unix::fs::fchown(file, None, Some(m.gid()));
+    /// Never on Unix (see the Windows side).
+    pub fn special(_: &Path, _: &fs::Metadata) -> bool {
+        false
+    }
+
+    /// Gives the new file the old one's owner and group where that's allowed, then its permissions (in that order: a
+    /// change of owner clears setuid and setgid), then its extended attributes (ACLs, an SELinux label…) where
+    /// allowed.
+    pub fn copy_identity(file: &File, old: Option<&fs::Metadata>, old_path: &Path) {
+        let Some(m) = old else { return };
+        let _ = std::os::unix::fs::fchown(file, Some(m.uid()), Some(m.gid()));
+        // (not allowed to give it away: keep the group at least, which may be)
+        let _ = std::os::unix::fs::fchown(file, None, Some(m.gid()));
+        let _ = file.set_permissions(m.permissions());
+        copy_xattrs(file, old_path);
+    }
+
+    /// The old file's extended attributes onto the new one (best effort: some can't be set by this user).
+    fn copy_xattrs(file: &File, from: &Path) {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::ffi::OsStrExt;
+        let Ok(c) = std::ffi::CString::new(from.as_os_str().as_bytes()) else { return };
+        let mut names = vec![0u8; 4096];
+        let n = unsafe { libc::listxattr(c.as_ptr(), names.as_mut_ptr().cast(), names.len()) };
+        if n <= 0 {
+            return;
+        }
+        let mut value = vec![0u8; 64 << 10];
+        for name in names[..n as usize].split(|&b| b == 0).filter(|s| !s.is_empty()) {
+            let Ok(key) = std::ffi::CString::new(name) else { continue };
+            let len = unsafe { libc::getxattr(c.as_ptr(), key.as_ptr(), value.as_mut_ptr().cast(), value.len()) };
+            if len >= 0 {
+                unsafe {
+                    libc::fsetxattr(file.as_raw_fd(), key.as_ptr(), value.as_ptr().cast(), len as usize, 0);
+                }
+            }
         }
     }
 
@@ -621,6 +762,7 @@ mod place {
         temp_path: &Path,
         target: &Path,
         _replacing: bool,
+        _special: bool,
         dir: &Path,
     ) -> (bool, Option<FileId>, Option<PathBuf>) {
         if fs::rename(temp_path, target).is_err() {
@@ -685,6 +827,10 @@ fn write_content(
                 Encoding::Utf16Le | Encoding::Utf16Be => {
                     out.clear();
                     u16e.push(c, &mut out);
+                    if u16e.lossy && !lossy_ok {
+                        err = Some(SaveError::Lossy);
+                        return false;
+                    }
                     w.write_all(&out)
                 }
                 Encoding::Ansi => {
@@ -715,11 +861,11 @@ fn write_content(
         Encoding::Ansi => ansi.finish(&mut out),
         _ => {}
     }
-    if ansi.lossy && !lossy_ok {
+    if (ansi.lossy || u16e.lossy) && !lossy_ok {
         return Err(SaveError::Lossy);
     }
     w.write_all(&out)?;
-    Ok((idx, ansi.lossy))
+    Ok((idx, ansi.lossy || u16e.lossy))
 }
 
 /// Removes hidden temp files of saves that never finished (Slate was killed or crashed mid-save) in `dir`, and
@@ -791,7 +937,7 @@ pub fn save(
     let temp = (0..50).find_map(|_| {
         let n = SAVE_COUNTER.fetch_add(1, Ordering::Relaxed);
         let p = dir.join(format!(".slate-save-{}-{n}.tmp", std::process::id()));
-        place::create_temp(&p).ok().map(|f| (f, p))
+        place::create_temp(&p, old.as_ref()).ok().map(|f| (f, p))
     });
 
     // Never write over the original directly: a cancelled or failed save must leave it as it was.
@@ -818,7 +964,7 @@ pub fn save(
             return Err(SaveError::Changed);
         }
         file.sync_all()?;
-        place::copy_identity(&file, old.as_ref());
+        place::copy_identity(&file, old.as_ref(), &target);
         Ok(r)
     })();
     let (idx, lossy) = match result {
@@ -833,7 +979,8 @@ pub fn save(
     // Swap the new file into place: on Windows a POSIX rename (atomic, and it replaces a file still open with
     // delete sharing, as Slate keeps big files); where the file system doesn't have those (network shares, FAT
     // drives) a plain rename, and if that can't replace the file because Slate still has it open, ReplaceFile.
-    let (renamed, written, set_aside) = place::swap_in(file, &temp_path, &target, old.is_some(), dir);
+    let special = old.as_ref().is_some_and(|m| place::special(&target, m));
+    let (renamed, written, set_aside) = place::swap_in(file, &temp_path, &target, old.is_some(), special, dir);
     if !renamed {
         let _ = fs::remove_file(&temp_path);
         return Err(SaveError::Io(match set_aside {
@@ -1110,24 +1257,25 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn an_original_replace_file_left_aside_is_never_cleaned_up() {
-        use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_HIDDEN as HIDDEN, SetFileAttributesW};
+        use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_HIDDEN as HIDDEN, FILE_FLAGS_AND_ATTRIBUTES, SetFileAttributesW};
         use windows::core::PCWSTR;
         let dir = test_dir("setaside");
         let yesterday = std::time::SystemTime::now() - std::time::Duration::from_secs(86_400);
-        // Left by a Slate that's gone (no such process): the original, which couldn't be put back, and a hidden
-        // leftover of a ReplaceFile that worked.
-        for (name, hidden) in [(".slate-bak-4294967280-0.tmp", false), (".slate-bak-4294967280-1.tmp", true)] {
+        // Left by a Slate that's gone (no such process): the original, which couldn't be put back (one of them a
+        // hidden file of the user's), and a leftover of a ReplaceFile that worked (hidden and temporary).
+        let temporary = FILE_FLAGS_AND_ATTRIBUTES(HIDDEN.0 | 0x100);
+        for (name, attrs) in [(".slate-bak-4294967280-0.tmp", None), (".slate-bak-4294967280-1.tmp", Some(temporary)), (".slate-bak-4294967280-2.tmp", Some(HIDDEN))] {
             let f = File::create(dir.join(name)).unwrap();
             f.set_modified(yesterday).unwrap();
             drop(f);
-            if hidden {
+            if let Some(a) = attrs {
                 let w = place::wide(&dir.join(name));
-                unsafe { SetFileAttributesW(PCWSTR(w.as_ptr()), HIDDEN) }.unwrap();
+                unsafe { SetFileAttributesW(PCWSTR(w.as_ptr()), a) }.unwrap();
             }
         }
         let mut doc = Document::from_text(b"another file");
         save(&doc.snapshot(), &dir.join("other.txt"), Encoding::Utf8, false, false, &ctx()).unwrap();
-        assert_eq!(names(&dir), [".slate-bak-4294967280-0.tmp", "other.txt"]);
+        assert_eq!(names(&dir), [".slate-bak-4294967280-0.tmp", ".slate-bak-4294967280-2.tmp", "other.txt"]);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1276,6 +1424,86 @@ mod tests {
         assert_eq!(doc.encoding, Encoding::Utf8);
         save(&doc.snapshot(), &path, doc.encoding, doc.bom, false, &ctx()).unwrap();
         assert_eq!(fs::read(&path).unwrap(), bytes);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn utf16_saves_that_would_lose_bytes_stop_first() {
+        // (a mostly-UTF-8 file's stray byte can't be written in UTF-16: asked first, as for ANSI)
+        let dir = test_dir("u16lossy");
+        let path = dir.join("t.txt");
+        let mut bytes = "Grüße – naïve café ✓ 日本語\r\n".repeat(20).into_bytes();
+        bytes.extend_from_slice(b"one stray byte: \xFF\r\n");
+        let mut doc = document_from_bytes(bytes);
+        assert_eq!(doc.encoding, Encoding::Utf8);
+        assert!(matches!(save(&doc.snapshot(), &path, Encoding::Utf16Le, true, false, &ctx()), Err(SaveError::Lossy)));
+        assert!(!path.exists());
+        let saved = save(&doc.snapshot(), &path, Encoding::Utf16Le, true, true, &ctx()).unwrap();
+        assert!(saved.lossy && path.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_line_and_column_after_a_name_opens_the_file() {
+        // (on Windows `lines.txt:3:2` isn't "not found" but no name at all: a stream of a type)
+        let dir = test_dir("linecol");
+        let path = dir.join("lines.txt");
+        fs::write(&path, b"a\nb\nc\n").unwrap();
+        let n: Notify = Arc::new(|| {});
+        for full in ["lines.txt:3:2", "lines.txt:3"] {
+            let o = open_either(&dir.join(full), &path, n.clone(), false, &ctx());
+            assert!(o.loading.is_ok(), "{full}: {:?}", o.loading.as_ref().err());
+            assert_eq!(o.path, path);
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_save_keeps_the_files_permissions_and_is_private_while_written() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = test_dir("unixmode");
+        let path = dir.join("secret.txt");
+        fs::write(&path, b"old").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let mut doc = Document::from_text(b"new secret");
+        save(&doc.snapshot(), &path, Encoding::Utf8, false, false, &ctx()).unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o7777, 0o600);
+        // the temp file a save writes: only its owner can read it
+        let old = fs::metadata(&path).ok();
+        let temp = dir.join(".slate-save-test.tmp");
+        drop(place::create_temp(&temp, old.as_ref()).unwrap());
+        assert_eq!(fs::metadata(&temp).unwrap().permissions().mode() & 0o077, 0);
+        // a new file gets the usual permissions
+        let new = dir.join("new.txt");
+        save(&doc.snapshot(), &new, Encoding::Utf8, false, false, &ctx()).unwrap();
+        assert_ne!(fs::metadata(&new).unwrap().permissions().mode() & 0o044, 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_save_keeps_alternate_streams_and_encryption_marks() {
+        // (the "downloaded from the internet" mark is such a stream: a rename into place would drop it)
+        let dir = test_dir("streams");
+        let path = dir.join("downloaded.txt");
+        fs::write(&path, b"old").unwrap();
+        let mark = PathBuf::from(format!("{}:Zone.Identifier", path.display()));
+        fs::write(&mark, b"[ZoneTransfer]\r\nZoneId=3\r\n").unwrap();
+        let m = fs::metadata(&path).unwrap();
+        assert!(place::special(&path, &m));
+        let mut doc = Document::from_text(b"edited");
+        save(&doc.snapshot(), &path, Encoding::Utf8, false, false, &ctx()).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"edited");
+        assert_eq!(fs::read(&mark).unwrap(), b"[ZoneTransfer]\r\nZoneId=3\r\n");
+        assert_eq!(names(&dir), ["downloaded.txt"]);
+        // a plain file: renamed into place as always
+        let plain = dir.join("plain.txt");
+        fs::write(&plain, b"x").unwrap();
+        assert!(!place::has_streams(&plain));
+        // (no permissions of its own either, in a folder whose permissions it takes; a test run in an app container's
+        // temp folder may give new files their own)
+        assert_eq!(place::special(&plain, &fs::metadata(&plain).unwrap()), place::own_permissions(&plain));
         let _ = fs::remove_dir_all(&dir);
     }
 

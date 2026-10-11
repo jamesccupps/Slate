@@ -572,6 +572,14 @@ impl Source {
         if now.size < self.len {
             return true;
         }
+        // Same size but written to: rewritten in place, which a few samples can't rule out (a value changed to one
+        // of the same length deep in the file), as `same_as` says. (Exactly an hour apart is a FAT drive across a
+        // daylight saving change.) Grown: a log, if the samples say so; only new change times: a new owner or
+        // permissions.
+        const HOUR: i64 = 3600 * 10_000_000;
+        if now.size == then.size && now.written != then.written && (now.written - then.written).abs() != HOUR {
+            return true;
+        }
         let fp = self.fingerprint.lock().unwrap().clone();
         let same = fp.is_some_and(|fp| self.matches(&fp));
         if same {
@@ -1205,12 +1213,29 @@ mod tests {
         let (p, grew) = indexed(&dir, "grew.txt", &data);
         write_at(&p, data.len() as u64, b"more lines\n");
         assert!(!grew.changed_in_place());
-        // only new times (opened for writing, nothing changed)
+        // a new last-write time with the same size: written in place, as far as anyone can tell without reading it
+        // all (a value changed to one of the same length, somewhere between the samples)
         let (p, touched) = indexed(&dir, "touched.txt", &data);
         let f = os::shared().write(true).open(&p).unwrap();
         f.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(60)).unwrap();
         drop(f);
-        assert!(!touched.changed_in_place());
+        assert!(touched.changed_in_place());
+        let (p, poked) = indexed(&dir, "poked.txt", &data);
+        let at = data.len() / 3;
+        write_at(&p, at as u64, &[data[at] ^ 1]);
+        let f = os::shared().write(true).open(&p).unwrap();
+        f.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(120)).unwrap();
+        drop(f);
+        assert!(poked.changed_in_place());
+        // only a new change time (its permissions): the same bytes
+        let (p, chmod) = indexed(&dir, "chmod.txt", &data);
+        let mut perm = std::fs::metadata(&p).unwrap().permissions();
+        perm.set_readonly(true);
+        std::fs::set_permissions(&p, perm.clone()).unwrap();
+        #[allow(clippy::permissions_set_readonly_false)]
+        perm.set_readonly(false);
+        std::fs::set_permissions(&p, perm).unwrap();
+        assert!(!chmod.changed_in_place());
         // rewritten in place, same length, other content (truncated and written, like most programs save)
         let (p, rewritten) = indexed(&dir, "rewritten.txt", &data);
         std::fs::write(&p, sample(700_000, 6)).unwrap();
@@ -1223,7 +1248,7 @@ mod tests {
         let (p, cut) = indexed(&dir, "cut.txt", &data);
         os::shared().write(true).open(&p).unwrap().set_len(1000).unwrap();
         assert!(cut.changed_in_place());
-        drop((same, grew, touched, rewritten, end, cut));
+        drop((same, grew, touched, poked, chmod, rewritten, end, cut));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -28,11 +28,14 @@ jobs:
       - name: The tag matches Cargo.toml's version
         if: startsWith(github.ref, 'refs/tags/v')
         shell: pwsh
+        env:
+          TAG: ${{ github.ref_name }}
         run: |
           # Slate's updater compares the release tag with the version built into Slate.exe: if they differ, every
-          # Slate would download this release again every day.
+          # Slate would download this release again every day. (The tag through the environment: never pasted into
+          # the script.)
           $v = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
-          if ("v$v" -ne "${{ github.ref_name }}") { throw "The tag ${{ github.ref_name }} doesn't match Cargo.toml's version ($v)" }
+          if ("v$v" -ne $env:TAG) { throw "The tag $env:TAG doesn't match Cargo.toml's version ($v)" }
 
       - name: Rust (GNU toolchain, no Visual Studio needed)
         shell: pwsh
@@ -99,6 +102,12 @@ jobs:
           if ($p.ExitCode -ne 0) { throw "--uninstall failed (exit code $($p.ExitCode))" }
           if (Test-Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Slate') { throw "--uninstall left the Installed apps entry" }
           if (Test-Path $lnk) { throw "--uninstall left the Start menu entry" }
+          # the installed copy goes too, a moment after it ended (its folder with it)
+          $gone = $false
+          foreach ($k in 1..20) { if (!(Test-Path $exe)) { $gone = $true; break }; Start-Sleep -Seconds 1 }
+          if (!$gone) { throw "--uninstall left $exe" }
+          Start-Sleep -Seconds 2
+          if (Test-Path (Split-Path $exe)) { throw "--uninstall left Slate's folder" }
 
       - name: Package
         shell: pwsh

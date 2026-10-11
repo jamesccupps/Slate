@@ -730,7 +730,7 @@ impl<'w> Formatter<'w> {
         }
         self.pos += data.len() as u64;
         if let Some(e) = self.io_err.take() {
-            return Err(err(self.pos, format!("Couldn't write the result: {e}")));
+            return Err(err(self.pos, format!("{}: {e}", super::json::WRITE_FAILED)));
         }
         Ok(())
     }
@@ -759,7 +759,7 @@ impl<'w> Formatter<'w> {
         }
         self.flush();
         if let Some(e) = self.io_err.take() {
-            return Err(err(self.pos, format!("Couldn't write the result: {e}")));
+            return Err(err(self.pos, format!("{}: {e}", super::json::WRITE_FAILED)));
         }
         Ok(self.stats)
     }

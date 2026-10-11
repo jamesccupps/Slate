@@ -8,8 +8,9 @@
 //! `find:<text>`, `replace:<text>`, `goto:<line>`, `answer:save,dont,cancel` (or a path for Open and Save as),
 //! `lang:<name>`, `set:wrap=true` (also `line_numbers`, `font_size`), `wait:<ms>`, `jobs` (wait for background
 //! work), `shot:<file.png>`, `print:<what>` (`text`, `sel`, `status`, `title`, `tabs`, `lang`, `asked`,
-//! `clipboard`, `find`, `dirty`, `top`), `expect:<what>=<value>`, `t:<label>` (a timing mark), `persist`,
-//! `session:save|restore`, `quit`.
+//! `clipboard`, `find`, `dirty`, `top`, `session`: the session folder's files, `notice`), `expect:<what>=<value>`,
+//! `t:<label>` (a timing mark), `persist`, `session:save|soon|restore` (`soon`: on another thread, as the timer
+//! does), `quit`.
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -288,11 +289,20 @@ async fn script(lines: Vec<String>, test: Rc<Test>) -> i32 {
                     log(&mut out, format!("session:{arg} needs SLATE_DATA_DIR"));
                     failures += 1;
                 } else if arg == "save" {
-                    let _ = ui.app.try_borrow_mut().map(|mut a| session::save(&mut a));
+                    let ok = ui.app.try_borrow_mut().map(|mut a| session::save(&mut a)).unwrap_or(false);
+                    if !ok {
+                        log(&mut out, "session: not all written".into());
+                    }
+                } else if arg == "soon" {
+                    // (as the timer does: on another thread)
+                    ui.with(|a| {
+                        let notify = a.notify.clone();
+                        session::start(a, notify);
+                    });
                 } else if arg == "restore" {
                     ui.with(|a| {
                         a.tabs.clear();
-                        session::restore(a);
+                        session::restore(a, false);
                         if a.tabs.is_empty() {
                             a.new_untitled();
                         }
@@ -344,6 +354,15 @@ fn value(what: &str, test: &Test) -> String {
         "top" => format!("{}+{}", tab.view.top, tab.view.top_row),
         "wrap" => a.settings.wrap.to_string(),
         "theme" => if a.theme.dark { "dark" } else { "light" }.to_string(),
+        // the files in the session folder
+        "session" => {
+            let mut v: Vec<String> = std::fs::read_dir(crate::settings::data_dir().join("session"))
+                .map(|rd| rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect())
+                .unwrap_or_default();
+            v.sort();
+            v.join(" ")
+        }
+        "notice" => tab.notice.clone().unwrap_or_default(),
         other => format!("(unknown: {other})"),
     }
 }

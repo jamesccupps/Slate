@@ -347,7 +347,7 @@ pub fn stop_default(cell: &Cell) {
     let detail = "Slate comes off \"Open with\", the right-click menu and Default apps, and the file types you set to \
                   open with Slate open the way they did without it (or Windows asks which app to use). Slate stays \
                   installed, with your settings and tabs; Help → Open files with Slate… sets it up again.";
-    if win::ask(hwnd, "Slate", "Stop opening files with Slate?", detail, &["Stop", "Cancel"]) != Some(0) {
+    if win::ask(hwnd, "Slate", "Stop opening files with Slate?", detail, &["&Stop", "Cancel"]) != Some(0) {
         return;
     }
     unassociate();
@@ -400,7 +400,7 @@ pub fn make_default(cell: &Cell) {
          \"Edit with Slate\" when you right-click a file.\n\nThen Windows' Default apps page opens, where you can choose Slate \
          for the file types you want (Windows only lets you do that step yourself)."
     );
-    if win::ask(hwnd, "Slate", "Open your text files with Slate?", &detail, &["Set up", "Cancel"]) != Some(0) {
+    if win::ask(hwnd, "Slate", "Open your text files with Slate?", &detail, &["&Set up", "Cancel"]) != Some(0) {
         return;
     }
     let exe = match install_exe() {
@@ -447,18 +447,51 @@ pub fn uninstall(quiet: bool) {
             let _ = std::fs::remove_file(PathBuf::from(appdata).join(r"Microsoft\Windows\Start Menu\Programs\Slate.lnk"));
         }
         SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, None, None);
-        if quiet {
-            return;
+        let installed = installed_copy();
+        if !quiet {
+            let data = super::settings::data_dir().display().to_string();
+            let first = if installed.is_some() {
+                "Slate was removed.".to_string()
+            } else {
+                let folder = super::settings::exe_dir().map(|d| d.display().to_string()).unwrap_or_default();
+                format!("Slate was removed from your account's settings. You can now delete its folder ({folder}).")
+            };
+            win::info(
+                windows::Win32::Foundation::HWND::default(),
+                "Slate",
+                &format!("{first}\n\nYour settings and unsaved text are in {data}; delete that folder too if you don't need them."),
+            );
         }
-        let folder = super::settings::exe_dir().map(|d| d.display().to_string()).unwrap_or_default();
-        let data = super::settings::data_dir().display().to_string();
-        win::info(
-            windows::Win32::Foundation::HWND::default(),
-            "Slate",
-            &format!(
-                "Slate was removed from your account's settings. You can now delete its folder ({folder}).\n\nYour settings \
-                 and unsaved text are in {data}; delete that folder too if you don't need them."
-            ),
-        );
+        if let Some(exe) = installed {
+            remove_after_exit(&exe);
+        }
     }
+}
+
+/// The running exe, when it's the copy setup put in `%LOCALAPPDATA%\Programs\Slate` (winget's, or Help → Open
+/// files with Slate…'s). A copy anywhere else (a portable one, a download) is the user's own.
+fn installed_copy() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let installed = install_dir().join("Slate.exe");
+    (installed.exists() && crate::core::io::same_file(&exe, &installed)).then_some(installed)
+}
+
+/// Deletes `exe` (and leftovers of updates beside it, and its folder if nothing else is in it) once this Slate has
+/// ended: a running exe can't delete itself, so a hidden `cmd` tries again every second for half a minute.
+fn remove_after_exit(exe: &Path) {
+    let Some(dir) = exe.parent() else { return };
+    let (exe, dir) = (exe.display(), dir.display());
+    let script = format!(
+        "for /l %i in (1,1,30) do @(if exist \"{exe}\" (del /f /q \"{exe}\" 2>nul & ping -n 2 127.0.0.1 >nul)) & \
+         del /f /q \"{dir}\\Slate.old-*.exe\" \"{dir}\\Slate.update-*.exe\" 2>nul & rd \"{dir}\" 2>nul"
+    );
+    let system = std::env::var_os("SystemRoot").map_or(PathBuf::from(r"C:\Windows"), PathBuf::from);
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    // (cmd takes away the outer quotes)
+    let _ = std::process::Command::new(system.join(r"System32\cmd.exe"))
+        .raw_arg(format!("/d /c \"{script}\""))
+        .current_dir(&system)
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn();
 }

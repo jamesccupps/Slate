@@ -27,13 +27,22 @@ type:<a><b>x</b></a>
 lang:XML
 cmd:Format
 jobs
-print:text
+expect:text=<a>\r\n  <b>x</b>\r\n</a>\r\n
 cmd:NewTab
 type:fn main() {\n    println!("hi"); // done\n}
 lang:Rust
 cmd:SelectAll
 cmd:ToggleComment
-print:text
+expect:text=// fn main() {\n//     println!("hi"); // done\n// }
+# `name:line:col` from a command line (on Windows not a "file not found" but no name at all: an alternate stream)
+cmd:NewTab
+type:one\ntwo\nthree
+saveas:smoke-lines.txt
+jobs
+args:smoke-lines.txt:3:2
+jobs
+expect:sel=9..9
+cmd:CloseTab
 shot:smoke-rust.png
 expect:tabs=3
 # What closing keeps comes back: the session, written into the data folder SLATE_DATA_DIR names. That folder has to

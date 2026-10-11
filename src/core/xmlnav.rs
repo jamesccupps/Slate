@@ -7,7 +7,8 @@
 
 use super::job::Ctx;
 use super::jsonnav::{
-    Child, Children, Chunked, DENSE_MAX, Kind, Missing, NESTED_MAX, ORD_UNKNOWN, STRIDE, Step, key_label, same_step,
+    Child, Children, Chunked, DENSE_MAX, DEPTH_MAX, Kind, Missing, NESTED_MAX, ORD_UNKNOWN, STRIDE, Step, key_label,
+    same_step,
 };
 use std::sync::Arc;
 
@@ -166,6 +167,11 @@ struct Scanner {
     end: Option<u64>,
     content_end: u64,
     broken: bool,
+    /// Elements open inside one too deep to follow (`DEPTH_MAX`), and that one's `<`, start tag length and name.
+    deep: u64,
+    deep_start: u64,
+    deep_tag_len: u64,
+    deep_name: u32,
 }
 
 impl Scanner {
@@ -188,6 +194,10 @@ impl Scanner {
             end: None,
             content_end: 0,
             broken: false,
+            deep: 0,
+            deep_start: 0,
+            deep_tag_len: 0,
+            deep_name: 0,
         }
     }
 
@@ -243,17 +253,39 @@ impl Scanner {
             }
             return;
         }
-        if empty {
+        if self.deep > 0 {
+            // (inside an element too deep to follow: only its end matters)
+            self.deep += !empty as u64;
+        } else if empty {
             let c = Child { start: self.tag_start, end, key_back: 0, key_len: info(tag_len, false) };
             self.add_child(c, self.tag_hash);
+        } else if self.stack.len() > DEPTH_MAX {
+            // Too deep to follow: it becomes a child of the deepest element followed, its insides skipped. Every level
+            // costs memory, and a file of nothing but `<a>` would otherwise take about 100 bytes a byte.
+            (self.deep, self.deep_start, self.deep_tag_len, self.deep_name) = (1, self.tag_start, tag_len, self.tag_hash);
         } else {
             let from = self.items.len();
             self.stack.push(Level::new(Some(self.tag_start), self.tag_hash, tag_len, from, true));
         }
     }
 
+    /// The element too deep to follow ends at `end`: a child of the deepest one followed.
+    fn deep_done(&mut self, end: u64) {
+        self.deep = 0;
+        let c = Child { start: self.deep_start, end, key_back: 0, key_len: info(self.deep_tag_len, true) };
+        self.add_child(c, self.deep_name);
+    }
+
     /// An end tag (from `self.tag_start`, ending at `end`) closes the element it names, and what's open inside it.
     fn end_tag(&mut self, end: u64) {
+        if self.deep > 0 {
+            // (any end tag: what's that deep is taken to be well-formed)
+            self.deep -= 1;
+            if self.deep == 0 {
+                self.deep_done(end);
+            }
+            return;
+        }
         let h = self.tag_hash;
         let found = self.stack.iter().rev().take(MAX_UNCLOSED).position(|l| l.open.is_some() && l.name == h);
         let Some(d) = found.map(|k| self.stack.len() - 1 - k) else {
@@ -500,7 +532,10 @@ fn run(sc: &mut Scanner, src: &dyn Chunked, start: u64, bound: u64, ctx: Option<
         Some(e) => e,
         None => {
             // the file (or the element) ends with elements still open (or the one scanned): they end there
-            let unclosed = sc.stack.len() > 1 || sc.stack[0].open.is_some();
+            let unclosed = sc.stack.len() > 1 || sc.stack[0].open.is_some() || sc.deep > 0;
+            if sc.deep > 0 && !cancelled {
+                sc.deep_done(total);
+            }
             if !cancelled {
                 while sc.stack.len() > 1 {
                     sc.finish(total, total, true);
@@ -573,8 +608,8 @@ pub fn path_at(
             }
         };
         path.push(step);
-        // in its content (past the start tag) with elements in it: go in
-        if has_elements(&c) && offset >= c.start + tag_len(&c) && offset < c.end {
+        // in its content (past the start tag) with elements in it: go in (no deeper than a scan follows)
+        if has_elements(&c) && offset >= c.start + tag_len(&c) && offset < c.end && path.len() < DEPTH_MAX {
             (open, end) = (Some(c.start), c.end);
             continue;
         }
@@ -699,6 +734,27 @@ mod tests {
     }
 
     const DOC: &str = "<?xml version=\"1.0\"?>\n<!DOCTYPE catalog [<!ELEMENT catalog ANY>]>\n<!-- a <comment> -->\n<catalog xmlns=\"urn:x\">\n  <book id=\"1\" note='a > b'><title>XML <i>Guide</i></title><price>4</price></book>\n  <book id=\"2\"><title><![CDATA[<raw>]]></title><empty/></book>\n  <?pi x?>\n  <magazine/>\n</catalog>\n";
+
+    #[test]
+    fn nesting_too_deep_to_follow_is_one_element_and_costs_little() {
+        let deep = DEPTH_MAX + 1000;
+        // never closed (a file of nothing but `<a>`), and closed with an element after it
+        for s in ["<a>".repeat(deep * 2), format!("<r>{}x{}<after/></r>", "<a>".repeat(deep), "</a>".repeat(deep))] {
+            let src = Bits(s.into_bytes(), 1 << 20);
+            let lists = scan(&src, None, None, u64::MAX, Some(src.total() / 2), None);
+            assert!(lists.len() <= DEPTH_MAX + 3, "{} lists", lists.len());
+        }
+        let s = format!("<r>{}x{}<after/></r>", "<a>".repeat(deep), "</a>".repeat(deep));
+        let src = Bits(s.into_bytes(), 1 << 20);
+        let top = children(&src, None, None, None);
+        let r = children(&src, Some(top.items[0].start), None, None);
+        assert_eq!(names(&src, &r), ["a", "after"]);
+        let at = src.total() / 2;
+        let cache: HashMap<Option<u64>, Arc<Children>> =
+            scan(&src, None, None, u64::MAX, Some(at), None).into_iter().map(|(o, c)| (o, Arc::new(c))).collect();
+        let p = path_at(&src, at, &[], &mut |o| cache.get(&o).cloned()).unwrap();
+        assert!(p.len() <= DEPTH_MAX + 2, "{}", p.len());
+    }
 
     #[test]
     fn lists_elements_and_skips_the_rest() {
@@ -922,5 +978,19 @@ mod tests {
         let s = format!("<rows>{}</rows>", "<row>x</row>".repeat(120_000));
         let d = Document::from_text(s.as_bytes());
         assert_eq!(path(&d, s.len() as u64 - 12), "rows › row[120000]");
+    }
+
+    /// `SLATE_SCAN_FILE=<file> cargo test --release --lib xml_scan_speed -- --ignored --nocapture`: how long the
+    /// outline scan of a big XML file takes (in memory).
+    #[test]
+    #[ignore]
+    fn xml_scan_speed() {
+        let Some(p) = std::env::var_os("SLATE_SCAN_FILE") else { return };
+        let d = Document::from_text(&std::fs::read(p).unwrap());
+        for _ in 0..3 {
+            let t = std::time::Instant::now();
+            let lists = scan(&d, None, None, 1 << 20, None, None);
+            println!("xml scan: {} lists in {:.1} ms", lists.len(), t.elapsed().as_secs_f64() * 1000.0);
+        }
     }
 }

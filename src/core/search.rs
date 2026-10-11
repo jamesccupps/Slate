@@ -1,6 +1,8 @@
 //! Find and replace over documents of any size. The text is searched in windows of a few MB (zero-copy when a
 //! window sits in one in-memory piece), so even multi-GB files stream through at disk speed. Every query becomes
-//! a byte regex (plain text is escaped), which also gives fast literal search.
+//! a byte regex (plain text is escaped). Plain text without Whole word is helped along, finding exactly what the
+//! regex would (`Literal`): with Match case byte for byte (`memmem`); ignoring case, a query like
+//! `"status":"refunded"` (the commonest search in a JSON file) by its rarest-looking part first.
 //!
 //! A window is searched together with an overlap after it, so a match that starts in it can finish there; one that
 //! runs into the end of that is searched again in a bigger window. A match that ends even further on can't be told
@@ -18,7 +20,8 @@
 
 use std::io::{self, Write};
 
-use regex::bytes::{Match, Regex, RegexBuilder};
+use memchr::memmem;
+use regex::bytes::{Regex, RegexBuilder};
 
 use super::buffer::Snapshot;
 use super::document::Document;
@@ -76,11 +79,59 @@ impl Haystack for Document {
     }
 }
 
+#[derive(Clone)]
 pub struct Matcher {
     re: Regex,
+    /// Plain text searched without the regex (it finds the same).
+    lit: Option<Literal>,
     regex_mode: bool,
     /// Bytes after a window a match that starts in it may need (see `OVERLAP`).
     overlap: u64,
+}
+
+/// A plain-text query searched more directly than through its regex, finding exactly what the regex would.
+#[derive(Clone)]
+enum Literal {
+    /// Match case: the bytes as they are.
+    Exact(memmem::Finder<'static>),
+    /// Ignoring case, an ASCII query whose longest run of letters and digits isn't where it starts
+    /// (`"status":"refunded"`): its regex looks for it from its start, which is often far commoner than all of it
+    /// (every record's `"status"`), and checks each place. That run is looked for instead (`run`, a regex of its own:
+    /// as fast as plain text goes), then the whole query around each place it is (`span`: the most bytes a match can
+    /// take, a letter of other case taking up to three times its bytes).
+    Anchored { run: Regex, span: usize },
+}
+
+impl Literal {
+    fn new(q: &Query) -> Option<Literal> {
+        if q.regex || q.whole_word {
+            return None;
+        }
+        if q.match_case {
+            return Some(Literal::Exact(memmem::Finder::new(q.text.as_bytes()).into_owned()));
+        }
+        if !q.text.is_ascii() {
+            return None;
+        }
+        let b = q.text.as_bytes();
+        let (mut best, mut i) = ((0, 0), 0);
+        while i < b.len() {
+            let s = i;
+            while i < b.len() && b[i].is_ascii_alphanumeric() {
+                i += 1;
+            }
+            if i - s > best.1 - best.0 {
+                best = (s, i);
+            }
+            i = i.max(s + 1);
+        }
+        // (where the query starts, or short: the regex does as well)
+        if best.0 == 0 || best.1 - best.0 < 3 {
+            return None;
+        }
+        let run = RegexBuilder::new(&regex::escape(&q.text[best.0..best.1])).case_insensitive(true).build().ok()?;
+        Some(Literal::Anchored { run, span: 3 * b.len() })
+    }
 }
 
 fn is_word_char(c: char) -> bool {
@@ -116,7 +167,29 @@ impl Matcher {
             })?;
         // (plain text: what the query can match, a letter of other case taking up to three times its bytes)
         let overlap = if q.regex { OVERLAP_REGEX } else { OVERLAP.max(4 * q.text.len() as u64 + CTX) };
-        Ok(Matcher { re, regex_mode: q.regex, overlap })
+        Ok(Matcher { re, lit: Literal::new(q), regex_mode: q.regex, overlap })
+    }
+
+    /// The first match in `hay` starting at `at` or after (the text before `at` counts for `\b` and `^`).
+    fn find_at(&self, hay: &[u8], at: usize) -> Option<(usize, usize)> {
+        match &self.lit {
+            Some(Literal::Exact(f)) => f.find(&hay[at..]).map(|i| (at + i, at + i + f.needle().len())),
+            Some(Literal::Anchored { run, span }) => {
+                // At each place the run is, the whole query in a window around it: the first match there that starts
+                // no later than the run is the first match of all (one that starts later is found at its own run,
+                // where it fits in the window whole; see the tests).
+                let mut from = at;
+                while let Some(r) = run.find_at(hay, from) {
+                    let (ws, we) = (r.start().saturating_sub(*span).max(at), (r.start() + 2 * span).min(hay.len()));
+                    if let Some(m) = self.re.find_at(&hay[..we], ws).filter(|m| m.start() <= r.start()) {
+                        return Some((m.start(), m.end()));
+                    }
+                    from = r.start() + 1;
+                }
+                None
+            }
+            None => self.re.find_at(hay, at).map(|m| (m.start(), m.end())),
+        }
     }
 
     /// How long a text can be to search it on the UI thread: plain text is searched at several GB/s (32 MB in a few
@@ -185,16 +258,16 @@ impl Matcher {
             let mut best = None;
             let mut at = (start - hs) as usize;
             while at <= hay.len() {
-                let Some(m) = self.re.find_at(hay, at) else { break };
-                let ms = hs + m.start() as u64;
+                let Some(m) = self.find_at(hay, at) else { break };
+                let ms = hs + m.0 as u64;
                 if ms >= end {
                     break;
                 }
-                let me = hs + m.end() as u64;
+                let me = hs + m.1 as u64;
                 if me <= to {
                     best = Some((ms, me));
                 }
-                at = next_at(hay, &m);
+                at = next_at(hay, m);
             }
             if best.is_some() {
                 return best;
@@ -255,9 +328,9 @@ impl Matcher {
             let mut next = limit.min(to);
             let mut grow = false;
             while at <= hay.len() {
-                let Some(m) = self.re.find_at(hay, at) else { break };
-                let ms = hs + m.start() as u64;
-                let me = hs + m.end() as u64;
+                let Some(m) = self.find_at(hay, at) else { break };
+                let ms = hs + m.0 as u64;
+                let me = hs + m.1 as u64;
                 // An empty match at the very end of the text counts (e.g. `^` after a final line break).
                 if ms > to || (ms == to && (to < len || me > ms)) {
                     return;
@@ -267,7 +340,7 @@ impl Matcher {
                     // in the overlap may run past its end (and then this is one inside it).
                     break;
                 }
-                if m.end() == hay.len() && he < len {
+                if m.1 == hay.len() && he < len {
                     // The match may continue past this window: search again from it with a bigger window.
                     next = ms;
                     grow = win < MAX_WINDOW;
@@ -281,11 +354,11 @@ impl Matcher {
                     break;
                 }
                 // Skip an empty match right where the previous match ended.
-                if !(m.start() == m.end() && last_end == Some(ms)) && !f(hay, hs, Hit::Match(ms, me)) {
+                if !(m.0 == m.1 && last_end == Some(ms)) && !f(hay, hs, Hit::Match(ms, me)) {
                     return;
                 }
                 last_end = Some(me);
-                at = next_at(hay, &m);
+                at = next_at(hay, m);
                 // (not inside a character: after an empty match `at` is past it)
                 next = (hs + at as u64).max(limit.min(to));
             }
@@ -306,12 +379,24 @@ impl Matcher {
 
     /// All matches within `hay` (a small piece of text such as the visible lines), as offsets from `base`.
     pub fn matches_in(&self, hay: &[u8], base: u64, limit: usize) -> Vec<(u64, u64)> {
-        self.re
-            .find_iter(hay)
-            .filter(|m| m.start() != m.end())
-            .take(limit)
-            .map(|m| (base + m.start() as u64, base + m.end() as u64))
-            .collect()
+        if self.lit.is_none() {
+            return self
+                .re
+                .find_iter(hay)
+                .filter(|m| m.start() != m.end())
+                .take(limit)
+                .map(|m| (base + m.start() as u64, base + m.end() as u64))
+                .collect();
+        }
+        // (plain text: never empty)
+        let mut v = Vec::new();
+        let mut at = 0;
+        while v.len() < limit {
+            let Some((s, e)) = self.find_at(hay, at) else { break };
+            v.push((base + s as u64, base + e as u64));
+            at = e;
+        }
+        v
     }
 
     /// Whether `[s, e)` of `h` is a match where it is, with the text around it (to decide if the selection is the
@@ -321,7 +406,7 @@ impl Matcher {
         let he = (e + CTX).min(h.hay_len());
         let mut scratch = Vec::new();
         let hay = h.hay(hs, he, &mut scratch);
-        self.re.find_at(hay, (s - hs) as usize).is_some_and(|m| hs + m.start() as u64 == s && hs + m.end() as u64 == e)
+        self.find_at(hay, (s - hs) as usize).is_some_and(|m| hs + m.0 as u64 == s && hs + m.1 as u64 == e)
     }
 
     /// The replacement for the match at `[s, e)` of `hay` (expands `$1`, `${name}` in regex mode).
@@ -404,13 +489,9 @@ enum Hit {
     Done(u64),
 }
 
-/// Where to continue after match `m` (one character further after an empty match).
-fn next_at(hay: &[u8], m: &Match) -> usize {
-    if m.end() > m.start() {
-        m.end()
-    } else {
-        m.end() + super::text::char_len_at(&hay[m.end()..]).max(1)
-    }
+/// Where to continue after match `m` (start, end; one character further after an empty match).
+fn next_at(hay: &[u8], m: (usize, usize)) -> usize {
+    if m.1 > m.0 { m.1 } else { m.1 + super::text::char_len_at(&hay[m.1..]).max(1) }
 }
 
 /// Matches counted (and their positions, up to a limit) by a background search.
@@ -461,6 +542,52 @@ mod tests {
             b.insert(0, chunk);
         }
         b.snapshot()
+    }
+
+    #[test]
+    fn plain_text_finds_what_the_regex_finds() {
+        // every case of the letters, `ſ` and the Kelvin sign (the regex's case folding), keys and values as in JSON
+        // (runs found first, then the query around them), across small windows and pieces
+        let parts = [
+            "status", "STATUS", "Status", "ſtatus", "ſtatuſ", "\u{212A}ey", "key", "KEY", "\"s\":", "é", "ß", " ", "\n", "x",
+            "\"status\":\"", "\"ſtatus\":\"", "\"\u{212A}EY\":\"", "refunded\"", "REFUNDED\"", "\"", ":", "\"\"",
+        ];
+        let mut r = 0x5DEE_CE66_D1CE_4E5Bu64;
+        let mut text = String::new();
+        for _ in 0..20_000 {
+            r ^= r << 13;
+            r ^= r >> 7;
+            r ^= r << 17;
+            text.push_str(parts[(r % parts.len() as u64) as usize]);
+        }
+        let snap = fragmented(text.as_bytes());
+        let mut anchored = 0;
+        for query in [
+            "status", "Status", "key", "\"s\":", "s", "k", "ss", "x x", "tus\nk", "é", "\"status\":\"refunded\"",
+            "\"key\":\"REFUNDED", "\":\"refunded", "\"\"status", " key", "x\"status\":\"",
+        ] {
+            for match_case in [false, true] {
+                let qq = Query { text: query.into(), match_case, ..Default::default() };
+                let lit = Matcher::new(&qq).unwrap();
+                assert!(lit.lit.is_some() || !match_case, "{query:?}");
+                anchored += matches!(lit.lit, Some(Literal::Anchored { .. })) as u32;
+                let mut re = lit.clone();
+                re.lit = None;
+                let (a, b) = (count_all(&lit, &snap, &ctx()), count_all(&re, &snap, &ctx()));
+                assert!(a.count > 0 || match_case || query == "x x", "{query:?}");
+                assert_eq!(a.positions, b.positions, "{query:?}, match case {match_case}");
+                for at in (0..snap.len()).step_by(997) {
+                    assert_eq!(lit.find_fwd(&snap, at, snap.len(), None), re.find_fwd(&snap, at, snap.len(), None), "{query:?} at {at}");
+                    assert_eq!(lit.find_back(&snap, 0, at, None), re.find_back(&snap, 0, at, None), "{query:?} at {at}");
+                }
+                let hay = &text.as_bytes()[..5000];
+                assert_eq!(lit.matches_in(hay, 7, 100), re.matches_in(hay, 7, 100));
+            }
+        }
+        assert!(anchored >= 5, "{anchored}");
+        // Whole word and regexes stay with the regex
+        assert!(Matcher::new(&Query { text: "status".into(), whole_word: true, ..Default::default() }).unwrap().lit.is_none());
+        assert!(Matcher::new(&Query { text: "s+".into(), regex: true, ..Default::default() }).unwrap().lit.is_none());
     }
 
     #[test]
@@ -538,7 +665,7 @@ mod tests {
                 v.push((x.start() as u64, x.end() as u64));
             }
             last_end = Some(x.end());
-            at = next_at(text, &x);
+            at = next_at(text, (x.start(), x.end()));
         }
         v
     }
@@ -717,5 +844,37 @@ mod tests {
         let mut out = Vec::new();
         m.replace_all_to(&snap, b"> ", &mut out, &mut IndexBuilder::new(), &ctx()).unwrap();
         assert_eq!(out, b"> x\n> y\n> ");
+    }
+
+    /// Times ways of searching plain text ignoring case over a file (`SLATE_SEARCH_FILE`):
+    /// `SLATE_SEARCH_FILE=<file> cargo test --release --lib search_speed -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn search_speed() {
+        let Some(p) = std::env::var_os("SLATE_SEARCH_FILE") else { return };
+        let text = std::fs::read(p).unwrap();
+        let time = |name: &str, f: &dyn Fn() -> usize| {
+            let t = std::time::Instant::now();
+            let n = f();
+            println!("{name:40} {n:>9} in {:7.1} ms", t.elapsed().as_secs_f64() * 1000.0);
+        };
+        for query in ["\"status\":\"refunded\"", "Leave at the door", "refunded", "Atlanta"] {
+            println!("-- {query}");
+            let re = RegexBuilder::new(&regex::escape(query)).case_insensitive(true).build().unwrap();
+            time("regex", &|| re.find_iter(&text).count());
+            let m = Matcher::new(&Query { text: query.into(), ..Default::default() }).unwrap();
+            time(if m.lit.is_some() { "Matcher (anchored)" } else { "Matcher (regex)" }, &|| {
+                let (mut n, mut at) = (0, 0);
+                while let Some((_, e)) = m.find_at(&text, at) {
+                    n += 1;
+                    at = e;
+                }
+                n
+            });
+            let src = Arc::new(Source::from_vec(text.clone()));
+            let mut b = Buffer::from_source(src, 0);
+            let snap = b.snapshot();
+            time("count_all", &|| count_all(&m, &snap, &ctx()).count as usize);
+        }
     }
 }

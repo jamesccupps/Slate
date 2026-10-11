@@ -1,6 +1,6 @@
 [package]
 name = "slate"
-version = "0.8.2"
+version = "0.9.0"
 edition = "2024"
 description = "A fast, simple text editor for Windows and Linux that handles huge files"
 license = "MIT"

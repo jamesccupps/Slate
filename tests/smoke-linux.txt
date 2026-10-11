@@ -29,13 +29,14 @@ type:<a><b>x</b></a>
 lang:XML
 cmd:xml-format
 jobs
-print:text
+expect:text=<a>\n  <b>x</b>\n</a>\n
 cmd:new-tab
 type:fn main() {\n    println!("hi"); // done\n}
 lang:Rust
 cmd:select-all
 cmd:toggle-comment
-print:text
+# (typed: Enter after the { indents by itself, then the four spaces are typed too)
+expect:text=// fn main() {\n//         println!("hi"); // done\n// }
 shot:smoke-rust.png
 expect:tabs=3
 # What closing keeps comes back: the session, written into the data folder SLATE_DATA_DIR names (empty to begin with).

@@ -3,7 +3,7 @@
 //! App methods never open modal UI (menus, dialogs) because they run while the App is borrowed; they queue a
 //! `Deferred` instead, which `run` performs after the borrow ends.
 
-use crate::edit::Sink;
+use crate::edit::{Sink, convert_eol, lines_done, nothing_to_clean};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -23,7 +23,7 @@ use windows::core::{HSTRING, PCWSTR, w};
 
 use crate::core::document::{Document, EditKind, Sel};
 use crate::core::io::{self as fileio, Loading, SaveError};
-use crate::core::job::{Ctx as JobCtx, Job, Notify};
+use crate::core::job::{Job, Notify};
 use crate::core::json::{self, Mode as JsonMode};
 use crate::core::lines::{self, CaseOp, LineOp};
 use crate::core::xml;
@@ -59,73 +59,14 @@ pub const TIMER_FLASH: usize = 8;
 pub const TIMER_COUNT: usize = 9;
 /// The mouse has rested on a part with a tooltip: show it.
 pub const TIMER_TIP: usize = 10;
+/// The typing has paused: the JSON/XML path bar and structure panel are worked out again (`Structure::waiting`).
+pub const TIMER_STRUCTURE: usize = 11;
 
 const BIG_CLIPBOARD: u64 = 64 << 20;
 
 thread_local! {
     /// Test mode: where the mouse pointer is (client DIPs), for scrolling while dragging.
     pub static TEST_POINTER: std::cell::Cell<Option<(f32, f32)>> = const { std::cell::Cell::new(None) };
-}
-
-fn convert_eol(snap: &crate::core::buffer::Snapshot, to_crlf: bool, w: &mut dyn Write, idx: &mut IndexBuilder, ctx: &JobCtx) -> io::Result<u64> {
-    let mut out = Vec::with_capacity(1 << 20);
-    let mut changed = 0u64;
-    let mut prev_cr = false;
-    let mut pending_cr = false;
-    let mut pos = 0u64;
-    let mut err = None;
-    while pos < snap.len() {
-        if ctx.cancelled() {
-            return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
-        }
-        let end = (pos + (8 << 20)).min(snap.len());
-        snap.chunks(pos, end, &mut |c| {
-            for &b in c {
-                if to_crlf {
-                    if b == b'\n' && !prev_cr {
-                        out.push(b'\r');
-                        changed += 1;
-                    }
-                    out.push(b);
-                    prev_cr = b == b'\r';
-                } else {
-                    if pending_cr {
-                        pending_cr = false;
-                        if b == b'\n' {
-                            changed += 1;
-                        } else {
-                            out.push(b'\r');
-                        }
-                    }
-                    if b == b'\r' {
-                        pending_cr = true;
-                    } else {
-                        out.push(b);
-                    }
-                }
-            }
-            if out.len() >= 1 << 20 {
-                idx.push(&out);
-                if let Err(e) = w.write_all(&out) {
-                    err = Some(e);
-                    return false;
-                }
-                out.clear();
-            }
-            true
-        });
-        if let Some(e) = err.take() {
-            return Err(e);
-        }
-        pos = end;
-        ctx.set(pos);
-    }
-    if pending_cr {
-        out.push(b'\r');
-    }
-    idx.push(&out);
-    w.write_all(&out)?;
-    Ok(changed)
 }
 
 /// Runs a background transform; if part of the text couldn't be read meanwhile (the file shrank or went away),
@@ -1661,13 +1602,14 @@ impl App {
         let version = tab.doc.version;
         let eol = tab.doc.eol.as_bytes().to_vec();
         let len = snap.len();
+        let line_count = tab.doc.line_count().unwrap_or(0);
         let job = match kind {
             TaskKind::Format(f) | TaskKind::Minify(f) => {
                 let pretty = matches!(kind, TaskKind::Format(_));
                 let mode = if pretty { JsonMode::Pretty } else { JsonMode::Minify };
                 let hint = if pretty { len.saturating_mul(3) } else { len };
                 Job::spawn(len, notify, move |ctx| guarded(&snap, || {
-                    let mut sink = match Sink::new(hint) {
+                    let mut sink = match Sink::limited(hint, crate::edit::transform_max(len)) {
                         Ok(s) => s,
                         Err(e) => return TaskResult::Failed(format!("Couldn't create a temporary file: {e}")),
                     };
@@ -1683,6 +1625,8 @@ impl App {
                             Err(e) => TaskResult::Failed(format!("Couldn't write the result: {e}")),
                         },
                         Err(_) if ctx.cancelled() => TaskResult::Cancelled,
+                        // (the result, not the text: a full disk, or far too big)
+                        Err((_, msg)) if msg.starts_with(crate::core::json::WRITE_FAILED) => TaskResult::Failed(msg),
                         Err((offset, msg)) => TaskResult::FormatError { offset, msg },
                     }
                 }))
@@ -1709,8 +1653,8 @@ impl App {
                 }
             })),
             TaskKind::Lines(op) => {
-                if len > LINES_MAX {
-                    self.flash("Sorting and cleaning up lines works for files up to 512 MB.", true);
+                if len > LINES_MAX || line_count > lines::COUNT_MAX {
+                    self.flash("Sorting and cleaning up lines works for files up to 512 MB and 32 million lines.", true);
                     return;
                 }
                 Job::spawn(len, notify, move |ctx| guarded(&snap, || {
@@ -1804,6 +1748,9 @@ impl App {
 
     /// After any change to the text.
     pub fn after_edit(&mut self) {
+        if self.flash.as_ref().is_some_and(|f| f.0 == "Saved") {
+            self.flash = None;
+        }
         let tab = &mut self.tabs[self.active];
         tab.discard = false;
         tab.view.sync(&mut tab.doc);
@@ -3067,7 +3014,7 @@ impl App {
                 self.caret_on = !self.caret_on;
                 self.invalidate();
             }
-            TIMER_FLASH | TIMER_COUNT => {
+            TIMER_FLASH | TIMER_COUNT | TIMER_STRUCTURE => {
                 self.kill_timer(id);
                 self.invalidate();
             }
@@ -3433,23 +3380,11 @@ impl App {
                 });
             }
             Cmd::ToggleComment => {
-                let Some(mut style) = self.tab().lang.comment() else {
+                let tab = self.tab();
+                let Some(style) = crate::edit::comment_style(&tab.doc, tab.lang, tab.view.sel.start()) else {
                     self.flash(format!("{} has no comments", self.tab().lang.label()), true);
                     return;
                 };
-                let ext = self.tab().doc.path.as_ref().and_then(|p| p.extension()).map(|e| e.to_ascii_lowercase());
-                if self.tab().lang == Lang::Ini && ext.as_ref().is_some_and(|e| e == "ini" || e == "inf" || e == "reg") {
-                    style = super::highlight::CommentStyle::Line(";");
-                }
-                if self.tab().lang == Lang::InnoSetup {
-                    // its [Code] section is Pascal, where a `;` would only be an empty statement
-                    let doc = &self.tab().doc;
-                    let a = doc.line_start_of(self.tab().view.sel.start());
-                    let before = doc.read(a.saturating_sub(4 << 20), a);
-                    if super::highlight::inno_code_line(&before, &doc.read(a, doc.line_end_of(a))) {
-                        style = super::highlight::CommentStyle::Line("//");
-                    }
-                }
                 if !self.editable() {
                     return;
                 }
@@ -4014,15 +3949,6 @@ fn caret_timeout() -> Duration {
     Duration::from_millis(if got.is_ok() && ms > 0 { ms as u64 } else { 5000 })
 }
 
-fn lines_done(op: LineOp, n: u64) -> String {
-    match op {
-        LineOp::SortAsc | LineOp::SortDesc => format!("Sorted {}", plural(n, "line", "lines")),
-        LineOp::Dedupe => format!("Removed {}", plural(n, "duplicate line", "duplicate lines")),
-        LineOp::RemoveBlank => format!("Removed {}", plural(n, "blank line", "blank lines")),
-        LineOp::TrimTrailing => format!("Trimmed spaces from {}", plural(n, "line", "lines")),
-    }
-}
-
 /// Files where Tab must insert a real tab: tab-separated data, and makefiles (a recipe line starts with one).
 fn needs_tabs(t: &Tab) -> bool {
     if t.lang == Lang::Tsv {
@@ -4030,15 +3956,6 @@ fn needs_tabs(t: &Tab) -> bool {
     }
     let name = t.doc.path.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().to_ascii_lowercase());
     name.is_some_and(|n| matches!(n.as_str(), "makefile" | "gnumakefile" | "bsdmakefile") || n.ends_with(".mk") || n.ends_with(".mak"))
-}
-
-fn nothing_to_clean(op: LineOp) -> &'static str {
-    match op {
-        LineOp::SortAsc | LineOp::SortDesc => "The lines are already in that order",
-        LineOp::Dedupe => "No duplicate lines",
-        LineOp::RemoveBlank => "No blank lines",
-        LineOp::TrimTrailing => "No spaces at line ends",
-    }
 }
 
 /// Where line `line` (1-based, at most the last) and column `col` (in characters, 1-based, at most the line's end)
@@ -4095,10 +4012,6 @@ fn line_suffix(p: &Path) -> Option<(PathBuf, u64, Option<u64>)> {
 
 fn unix_now() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
-}
-
-fn plural(n: u64, one: &str, many: &str) -> String {
-    if n == 1 { format!("1 {one}") } else { format!("{} {many}", group(n)) }
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -4487,9 +4400,9 @@ pub fn run_cmd(cell: &Cell, cmd: Cmd) {
             cell.borrow_mut().exec(cmd);
         }
         Cmd::ReopenEncoding(_) | Cmd::Reload => {
-            let (dirty, saving, hwnd, title) = {
+            let (id, dirty, saving, hwnd, title) = {
                 let a = cell.borrow();
-                (a.tab().doc.is_dirty(), a.tab().save.is_some(), a.hwnd, a.tab().title())
+                (a.tab().id, a.tab().doc.is_dirty(), a.tab().save.is_some(), a.hwnd, a.tab().title())
             };
             if saving {
                 // (said in a box: the status bar shows the save going on)
@@ -4502,6 +4415,14 @@ pub fn run_cmd(cell: &Cell, cmd: Cmd) {
                 if win::ask(hwnd, "Slate", &q, "", &["&Reload", "Cancel"]) != Some(0) {
                     return;
                 }
+                // The prompt let other things happen (a file opened meanwhile can have become the tab shown): the tab
+                // asked about is the one reloaded, if it's still there and not being saved now.
+                let Some(i) = tab_index(cell, id) else { return };
+                let mut a = cell.borrow_mut();
+                if a.tabs[i].save.is_some() {
+                    return;
+                }
+                a.activate(i);
             }
             cell.borrow_mut().exec(cmd);
         }

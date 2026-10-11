@@ -58,6 +58,9 @@ enum St {
     Slash,
 }
 
+/// How an error writing the result (not one in the text) starts (XML's too).
+pub const WRITE_FAILED: &str = "Couldn't write the result";
+
 /// The message when the text has `//` or `/* */` comments, which plain JSON doesn't allow.
 pub const COMMENTS: &str = "It has comments (JSONC), which plain JSON doesn't allow";
 
@@ -412,7 +415,7 @@ impl<'w> Formatter<'w> {
         }
         self.pos += data.len() as u64;
         if let Some(e) = self.io_err.take() {
-            return Err(err(self.pos, format!("Couldn't write the result: {e}")));
+            return Err(err(self.pos, format!("{WRITE_FAILED}: {e}")));
         }
         Ok(())
     }
@@ -438,7 +441,7 @@ impl<'w> Formatter<'w> {
         }
         self.flush();
         if let Some(e) = self.io_err.take() {
-            return Err(err(at, format!("Couldn't write the result: {e}")));
+            return Err(err(at, format!("{WRITE_FAILED}: {e}")));
         }
         Ok(self.stats)
     }

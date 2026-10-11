@@ -22,6 +22,11 @@ use super::theme::Theme;
 
 /// Containers up to this size are scanned right away on the UI thread; bigger ones in the background.
 const SYNC_SCAN: u64 = 4 << 20;
+/// After an edit to a document bigger than `QUICK`, its structure is read again only once the typing pauses this
+/// long (`waiting`): scanning it again after every key took a frame's time for a few MB on the UI thread, and a whole
+/// background read of a big file per key. Meanwhile the path and the tree stay as they were (not current).
+pub const PAUSE: std::time::Duration = std::time::Duration::from_millis(200);
+const QUICK: u64 = 256 << 10;
 /// A background scan also keeps the child lists of every container at least this big it passes through.
 const KEEP: u64 = 1 << 20;
 const BUCKET: u64 = 100;
@@ -111,6 +116,8 @@ pub struct Structure {
     pub broken: bool,
     /// The document is XML (else JSON).
     xml: bool,
+    /// A document version not read yet (an edit), and when it was first seen (`waiting`).
+    edited: Option<(u64, std::time::Instant)>,
     /// An XML document's root element was opened when the tree was first shown.
     root_opened: bool,
 }
@@ -162,6 +169,27 @@ impl Structure {
 
     pub fn busy(&self) -> bool {
         self.scanning.is_some()
+    }
+
+    /// Whether to leave the path and the tree as they are for now: the text changed less than `PAUSE` ago (the
+    /// caller looks again then). A document read for the first time, or a small one, doesn't wait.
+    pub fn waiting(&mut self, doc: &Document) -> bool {
+        if self.version == doc.version || self.version == 0 || doc.len() <= QUICK {
+            self.edited = None;
+            return false;
+        }
+        match self.edited {
+            Some((v, at)) if v == doc.version => at.elapsed() < PAUSE,
+            _ => {
+                self.edited = Some((doc.version, std::time::Instant::now()));
+                true
+            }
+        }
+    }
+
+    /// The typing pause `waiting` waits for is still going on (test mode waits for it like for a job).
+    pub fn pausing(&self) -> bool {
+        self.edited.is_some_and(|(_, at)| at.elapsed() < PAUSE)
     }
 
     /// Whether the tree rows are for the text as it is now (see `rows_version`).

@@ -6,6 +6,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
 
+/// The zoom levels Zoom in and Zoom out step through (the settings keep one between the first and the last).
+pub const ZOOM_STEPS: [f32; 15] = [0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0, 4.0, 5.0];
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum ThemeMode {
     #[default]
@@ -187,6 +190,10 @@ impl Settings {
     }
 
     pub fn add_recent(&mut self, p: &std::path::Path) {
+        // (settings.json can only hold names that are text: one that isn't would keep it from being written at all)
+        if p.to_str().is_none() {
+            return;
+        }
         self.recent.retain(|r| r != p);
         self.recent.insert(0, p.to_path_buf());
         self.recent.truncate(15);

@@ -17,9 +17,9 @@ JSON file opens instantly, scrolls smoothly, and can be searched, edited, format
 
 - Opens huge files instantly: nothing is loaded up front, only what's on screen is read and drawn. Files open in the
   background, so a slow network drive never freezes the window.
-- Tabs that come back after a restart, including unsaved changes (like Windows 11 Notepad), for big files too. Work
-  is never lost silently: anything that can't be kept is asked about, and Windows won't shut down over it without
-  asking.
+- Tabs that come back after a restart, including unsaved changes (like Windows 11 Notepad), for big files too (on
+  Linux, up to 64 MB). Work is never lost silently: anything that can't be kept is asked about, and Windows won't
+  shut down over it without asking.
 - Find and replace with match case, whole word and regular expressions; fast on huge files.
 - Syntax colors for 52 kinds of files: Python, PowerShell, Batch, Shell, VBScript/VBA, AutoHotkey, Perl, R, C, C++,
   C#, Objective-C and Objective-C++, Java, Kotlin, Scala, Swift, Dart, Go, Rust, JavaScript, TypeScript, PHP, Ruby,
@@ -49,8 +49,10 @@ JSON file opens instantly, scrolls smoothly, and can be searched, edited, format
   them with *Edit with Slate* on the right-click menu.
 - Keeps itself up to date: at most once a day it asks GitHub for the latest release, and when there's a newer one
   an *Update* button appears in the status bar. One click downloads it, checks it against the release's checksum
-  (and, from 0.8.1, that it's signed by the same publisher) and restarts Slate with your tabs (and their unsaved text) back where they were. If the new version can't start,
-  the old one comes back by itself. *Help → Check for updates* does it on demand.
+  (and, from 0.8.1, that it's signed by the same publisher) and restarts Slate with your tabs (and their unsaved
+  text) back where they were. If the new version can't start, the old one comes back by itself. *Help → Check for
+  updates…* does it on demand. (On Linux, `apt` keeps Slate up to date.)
+- Screen readers (Narrator, NVDA, Orca) can't read the text yet; that's planned ([docs/ROADMAP.md](docs/ROADMAP.md)).
 
 ## Keyboard shortcuts
 
@@ -63,16 +65,16 @@ The usual ones work as in Notepad (Ctrl+N, O, S, F, H, G, Z, Y, A, X, C, V), plu
 | Ctrl+Alt+S | Save all |
 | Ctrl+D / Ctrl+Shift+K | Duplicate / delete the line |
 | Alt+Up / Alt+Down | Move the line up / down |
-| Ctrl+/ | Comment / uncomment the lines |
+| Ctrl+/ | Toggle comment (the lines) |
 | Ctrl+U / Ctrl+Shift+U | lowercase / UPPERCASE |
 | Shift+Alt+F | Format JSON or XML |
 | F3 / Shift+F3 | Next / previous match |
 | Alt+Z | Word wrap |
 | Ctrl+Plus / Ctrl+Minus / Ctrl+0 | Zoom in / out / reset |
-| Ctrl+Shift+O | JSON and XML structure panel |
+| Ctrl+Shift+O | JSON and XML structure panel (Windows) |
 | F5 | Insert the time and date |
 
-*Help → Keyboard shortcuts* lists them all.
+*Help → Keyboard shortcuts* lists them all. On Linux, Alt+1 … Alt+9 go to a tab too.
 
 ## Download
 
@@ -113,13 +115,22 @@ and code files when they're double-clicked. The package also adds Slate's own ap
 [latest release](https://github.com/jamesccupps/Slate/releases/latest) also has the packages to download yourself
 (`slate-linux-arm64.deb` for 64-bit ARM like the Pi, `slate-linux-amd64.deb` for PCs; install one with
 `sudo apt install ./slate-linux-arm64.deb`) and `.tar.gz` files with the same program to run without installing
-(those don't update). The Linux version has the same engine, colors and editing as on Windows, in a GTK window; it
-doesn't have the JSON/XML structure panel and path bar yet. Its settings and session are in `~/.local/share/slate`.
+(those don't update). Its settings, session and `crash.log` are in `~/.local/share/slate`.
+
+The Linux version has the same engine, file handling, colors, find and replace, line tools and JSON/XML tools as on
+Windows, in a GTK window. Not on Linux yet:
+
+- the JSON/XML path bar and structure panel;
+- show whitespace, the matching bracket highlighted, overtype, high contrast and the theme button;
+- word and character counts, and changing the encoding or indentation from the status bar;
+- the Encoding, Reopen with encoding, Indentation and Font menus (those settings are in `settings.json`);
+- Close other / saved / all tabs, the tab's own menu, Reload, Show in folder and Copy file path;
+- keeping unsaved changes to documents over 64 MB between runs (closing asks about them instead).
 
 ## Where Slate keeps things
 
 - Settings, the session (open tabs and unsaved text) and `crash.log` are in `%LOCALAPPDATA%\Slate`
-  (*Help → Open settings folder*). *File → Restore last session* turns the session off: closing then asks about
+  (*Help → Open settings folder*; on Linux `~/.local/share/slate`). *File → Restore last session* turns the session off: closing then asks about
   unsaved changes, like Notepad used to.
 - **Portable mode:** put an empty file named `Slate.portable` next to `Slate.exe`, and Slate keeps all of that, and
   its temporary files, in a `data` folder beside it instead (handy on a USB stick or a fast drive).
@@ -137,9 +148,9 @@ yourself, attaching those files if you like.
 
 To keep Slate but stop it opening files when they're double-clicked: *Help → Stop opening files with Slate…*; the
 file types you set to open with Slate go back to Windows' own choice. To remove it: if you used *Open files with
-Slate…*, Windows Settings → Apps → Installed apps → Slate → Uninstall. Then delete
-Slate's folder, and `%LOCALAPPDATA%\Slate` (or the portable `data` folder) if you don't need your settings and
-unsaved text any more. Otherwise just delete `Slate.exe`.
+Slate…* (or winget), Windows Settings → Apps → Installed apps → Slate → Uninstall removes it. Otherwise just delete
+`Slate.exe`. Your settings and unsaved text stay in `%LOCALAPPDATA%\Slate` (or the portable `data` folder): delete
+that too if you don't need them any more. On Linux: `sudo apt remove slate`.
 
 ## License
 
@@ -153,6 +164,7 @@ Windows: needs Rust (the GNU toolchain is enough; no Visual Studio). Run `build.
 `cargo build --release` (`target/release/Slate`); `packaging/linux/package.sh` makes the `.deb`.
 `cargo test --lib` runs the unit tests, and `Slate.exe --test tests\smoke.txt` drives the real app in a hidden
 window (set `SLATE_DATA_DIR` to an empty folder first: the smoke test writes a session there and reads it back).
-GitHub Actions builds and tests every push, for Windows and for Linux on x86-64 and ARM64 (on Debian 12, under Xvfb:
+GitHub Actions builds and tests every push to `main`, every pull request and every version tag, for Windows and for
+Linux on x86-64 and ARM64 (on Debian 12, under Xvfb:
 `tests/smoke-linux.txt`); a version tag (`v1.2.3`) drafts a release with `Slate.exe`, `Slate.exe.sha256` and the
 Linux packages attached. What's planned is in [docs/ROADMAP.md](docs/ROADMAP.md).

@@ -64,6 +64,17 @@ Slate on Linux, Raspberry Pi included: the same engine, colors and editing opera
 open as fast as on Windows; colors are drawn with the glyphs, only what's in view. Details in the
 [0.8.0 release notes](release-notes-0.8.0.md).
 
+## 0.9.0: the third audit
+
+An outside audit (October 2026) of both versions, checked finding by finding. The Linux version's session now follows
+Windows' rules (a session file it can't read or write never costs unsaved text; written on another thread; logging
+out and shutting down write it first), a file that can't be opened no longer ends it, and its menus, shortcuts and
+commands match Windows' (Line endings for the whole text, Format by language, Open recent). On both: saves keep a
+file's permissions, encryption, streams and extended attributes; a same-length rewrite by another program is
+noticed; absurdly deep JSON or XML and huge Format results no longer use gigabytes; `file:line:col` works on Windows;
+searching JSON for a key and value is 3-5 times faster, sorting nearly 3 times, typing with the path bar on no longer
+rescans the file per key. Details in the [0.9.0 release notes](release-notes-0.9.0.md).
+
 ## Next
 
 1. **Accessibility: UI Automation (L).** The high-contrast theme (Windows' colors, read again when they change) and a
@@ -84,8 +95,9 @@ open as fast as on Windows; colors are drawn with the glyphs, only what's in vie
      UTF-16 over huge documents and ones whose lines are still being counted; testing with Narrator and NVDA.
 2. **Release basics (S–M).** Slate.exe is signed since 0.8.0 (Azure Artifact Signing, in CI); since 0.8.1 the
    updater checks that an update is signed by the same publisher, and `Slate.exe --install` installs silently for
-   winget (`JamesCupps.Slate`, submitted with 0.8.1). Next: a winget manifest PR made by CI for each release (needs
-   a GitHub token of the user's as a secret), Scoop. (Licensed MIT since October 2026.)
+   winget (`JamesCupps.Slate`, submitted with 0.8.1 and moved to 0.8.2 before it was merged). Next: a winget
+   manifest PR made by CI for each release (needs a GitHub token of the user's as a secret), Scoop. (Licensed MIT
+   since October 2026.)
 3. **Big unsaved files, the rest (S–M).** Keep a big document's newline index in the session so putting it back
    doesn't count the lines again, and keep big documents that Format or Replace All rewrote (today closing still asks
    about those). (Its `.data` is already written anew, with only what the text uses, once most of it isn't.)
@@ -111,9 +123,10 @@ open as fast as on Windows; colors are drawn with the glyphs, only what's in vie
 
 - **Linux, the rest (M each unless said):** the JSON/XML structure panel and path bar; keeping big unsaved documents in the session
   (`.pieces`/`.data`, as on Windows); show whitespace, bracket matching, overtype, word counts and the tab list (S
-  each); the status bar's encoding and indentation menus, Open recent in the menu (S); following GNOME's dark/light
+  each); the status bar's encoding and indentation menus, the Encoding, Indentation and Font menus, Close other /
+  saved / all tabs and the tab's menu, Reload, Show in folder, Copy file path (S each); following GNOME's dark/light
   switch while running (S); Flatpak or AppImage for distributions without GTK 4.8 (S–M); an accessibility pass with
-  Orca (M).
+  Orca (M; GTK 4.8 has no accessible text for a custom-drawn view: GTK 4.14's `GtkAccessibleText`).
 - **Maybe: a Markdown preview** (a rendered view next to the text, off by default) (M). Only if people ask for
   it: Slate is meant to stay quick and open anything, so it must cost nothing while it isn't used.
 - Several windows; drag a tab out into its own window (L).
@@ -130,14 +143,23 @@ open as fast as on Windows; colors are drawn with the glyphs, only what's in vie
   while scrolling (`SetMaximumFrameLatency(1)`), and ClearType is used even when the user turned it off — each needs
   checking on a real screen (S each); while a big file's lines are counted, the line numbers' width is a guess, so
   the text moves once they're counted (S); emoji cost ~0.5 ms each to draw (a glyph cache) (M).
-- The path bar and structure panel scan a big JSON file again after each edit (in the background, ~1.5 s for
-  800 MB): wait for typing to pause, or keep the lists for edits that don't change the structure (S–M). Line tools
-  on a selection run on the UI thread (sorting 16 MB takes ~0.2 s): run them like the whole document's (S).
+- The path bar and structure panel scan the JSON again once typing pauses after an edit (in the background, ~1.5 s
+  for 800 MB): keep the lists through edits that don't change the structure, rescanning only the container edited
+  (S–M); in a list kept sparse, one huge child is read again on every caret move inside it (keep a checkpoint after
+  any child over 1 MiB) (S). Line tools on a selection run on the UI thread (sorting 16 MB takes ~0.2 s), and
+  changing case is limited to 16 MB selections: run both like the whole document's line tools (S).
+- The session: documents from a few MB up to 64 MiB are copied whole at least every 20 s while being edited (an
+  hour on a 60 MB file writes ~10 GB): the pieces scheme above a few MB (S–M); at the start, copies are read on the UI
+  thread and copied twice (S). Memory: per-tab layout and block caches kept while a tab is hidden, and undo keeping a
+  Format's or Replace all's whole previous text in memory (trim, or spill to disk) (S–M). Typing after a snapshot
+  starts a new piece (an append-only add store) (M).
 - Engine: a piece tree with O(log n) lookups for documents with hundreds of thousands of edits (M); in files over
   64 MiB, regex matches longer than 1 MiB (Find next/previous) or 16 MiB (Count all, Replace all) that cross a
   search window: carry the regex's state across windows (M); UTF-16 files with unpaired surrogates kept byte-exact (S);
   saving where Slate can't create files, and keeping hard links (S–M); trimming what undo history keeps alive (S);
   Home/End on a big file whose lines are still being counted shouldn't read far (S).
+- Tests: a table of the key bindings checked against the shortcut lists and the README (S); the close and quit
+  prompts and the updater's swap in the smoke tests (S–M).
 - Colors: a misdetected heredoc should end sooner than at its end word; exact states for lexers with look-ahead at
   the 8 KiB cuts of very long lines; VB ` _` continued comments, AutoHotkey continuation sections, R raw strings, C#
   holes inside nested interpolated strings, quotes inside Swift `\(…)` and Kotlin `${…}` holes, CSS

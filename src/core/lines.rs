@@ -178,41 +178,118 @@ fn char_key(s: &[u8], i: usize, base: bool) -> (u32, usize) {
     }
 }
 
+/// Whole-document line tools refuse texts with more lines than this: each line costs memory (8 bytes, twice while
+/// sorting), and a file of nothing but line breaks would otherwise need gigabytes.
+pub const COUNT_MAX: u64 = 32 << 20;
+
+/// A line of the text: where it starts and how long it is, without its line break (texts up to 4 GB).
+#[derive(Clone, Copy)]
+struct Line(u32, u32);
+
+impl Line {
+    fn of(self, text: &[u8]) -> &[u8] {
+        &text[self.0 as usize..(self.0 + self.1) as usize]
+    }
+}
+
+/// The order Sort puts lines in (equal only for the same bytes).
+fn line_order(a: &[u8], b: &[u8]) -> Ordering {
+    natural_cmp(a, b).then_with(|| a.cmp(b))
+}
+
+/// Sorts `lines` in `line_order`, on several threads for many lines: runs sorted side by side, then merged.
+fn sort_lines(lines: &mut Vec<Line>, text: &[u8]) {
+    let cmp = |a: &Line, b: &Line| line_order(a.of(text), b.of(text));
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(8);
+    if threads < 2 || lines.len() < 200_000 {
+        lines.sort_unstable_by(cmp);
+        return;
+    }
+    let run = lines.len().div_ceil(threads);
+    std::thread::scope(|s| {
+        for part in lines.chunks_mut(run) {
+            s.spawn(move || part.sort_unstable_by(cmp));
+        }
+    });
+    // runs of `width` merged pairwise into runs twice as long, the pairs side by side
+    let mut from = std::mem::take(lines);
+    let mut to = from.clone();
+    let mut width = run;
+    while width < from.len() {
+        std::thread::scope(|s| {
+            for (src, dst) in from.chunks(2 * width).zip(to.chunks_mut(2 * width)) {
+                s.spawn(move || {
+                    let (a, b) = src.split_at(width.min(src.len()));
+                    let (mut i, mut j) = (0, 0);
+                    for d in dst.iter_mut() {
+                        *d = if j >= b.len() || (i < a.len() && cmp(&a[i], &b[j]) != Ordering::Greater) {
+                            i += 1;
+                            a[i - 1]
+                        } else {
+                            j += 1;
+                            b[j - 1]
+                        };
+                    }
+                });
+            }
+        });
+        std::mem::swap(&mut from, &mut to);
+        width *= 2;
+    }
+    *lines = from;
+}
+
 /// Runs `op` over `text` (whole lines). Returns the new text and how many lines were sorted, removed or changed.
-/// Line breaks come out as the kind most of the text uses.
+/// Line breaks come out as the kind most of the text uses. (Up to 4 GB and `COUNT_MAX` lines: the caller says so
+/// when it's more.)
 pub fn apply(op: LineOp, text: &[u8]) -> (Vec<u8>, u64) {
     let ends_nl = text.last() == Some(&b'\n');
     let body = if ends_nl { &text[..text.len() - 1] } else { text };
     // CRLF if most line breaks are
     let crlf = memchr::memmem::find_iter(text, b"\r\n").count() * 2 > memchr::memchr_iter(b'\n', text).count();
-    // Lines without their line break.
-    let mut lines: Vec<&[u8]> = body.split(|&b| b == b'\n').map(|l| l.strip_suffix(b"\r").unwrap_or(l)).collect();
+    // Lines without their line break (a `\r` before a `\n` is part of it; a lone one at the very end is text).
+    let mut lines: Vec<Line> = Vec::new();
+    let mut start = 0usize;
+    for nl in memchr::memchr_iter(b'\n', body).chain(std::iter::once(body.len())) {
+        let followed = nl < body.len() || ends_nl;
+        let end = if followed && nl > start && body[nl - 1] == b'\r' { nl - 1 } else { nl };
+        lines.push(Line(start as u32, (end - start) as u32));
+        start = nl + 1;
+    }
     let before = lines.len() as u64;
     let mut count = 0;
     match op {
         LineOp::SortAsc | LineOp::SortDesc => {
-            let was = lines.clone();
-            // (lines that compare equal are the same bytes: an unstable sort gives the same result)
-            lines.sort_unstable_by(|a, b| natural_cmp(a, b).then_with(|| a.cmp(b)));
-            if op == LineOp::SortDesc {
-                lines.reverse();
+            // (in that order already: nothing changes, so nothing is sorted)
+            let asc = op == LineOp::SortAsc;
+            let sorted = lines.windows(2).all(|w| {
+                let o = line_order(w[0].of(text), w[1].of(text));
+                if asc { o != Ordering::Greater } else { o != Ordering::Less }
+            });
+            if !sorted {
+                // (lines that compare equal are the same bytes: an unstable sort gives the same result)
+                sort_lines(&mut lines, text);
+                if !asc {
+                    lines.reverse();
+                }
+                count = before;
             }
-            count = if lines == was { 0 } else { before };
         }
         LineOp::Dedupe => {
+            // (sized for every line at once: growing it as it goes took a fifth longer on millions of lines)
             let mut seen = HashSet::with_capacity(lines.len());
-            lines.retain(|l| seen.insert(*l));
+            lines.retain(|l| seen.insert(l.of(text)));
             count = before - lines.len() as u64;
         }
         LineOp::RemoveBlank => {
-            lines.retain(|l| !l.iter().all(|b| b.is_ascii_whitespace()));
+            lines.retain(|l| !l.of(text).iter().all(|b| b.is_ascii_whitespace()));
             count = before - lines.len() as u64;
         }
         LineOp::TrimTrailing => {
             for l in lines.iter_mut() {
-                let t = l.trim_ascii_end();
-                if t.len() != l.len() {
-                    *l = t;
+                let t = l.of(text).trim_ascii_end().len() as u32;
+                if t != l.1 {
+                    l.1 = t;
                     count += 1;
                 }
             }
@@ -224,7 +301,7 @@ pub fn apply(op: LineOp, text: &[u8]) -> (Vec<u8>, u64) {
         if k > 0 {
             out.extend_from_slice(eol);
         }
-        out.extend_from_slice(l);
+        out.extend_from_slice(l.of(text));
     }
     if ends_nl && !lines.is_empty() {
         out.extend_from_slice(eol);
@@ -388,6 +465,38 @@ mod tests {
                 assert_eq!(natural_cmp(a, b), whole, "{a:?} {b:?}");
             }
         }
+    }
+
+    #[test]
+    fn a_lone_cr_at_the_end_is_kept() {
+        // (shown as a symbol: it's text, not half a line break)
+        assert_eq!(run(LineOp::SortAsc, "b\na\r"), ("a\r\nb".into(), 2));
+        assert_eq!(run(LineOp::SortAsc, "b\r\na\r\n"), ("a\r\nb\r\n".into(), 2));
+        assert_eq!(run(LineOp::Dedupe, "x\r\nx\r\nx\r").0, "x\r\nx\r");
+    }
+
+    #[test]
+    fn sorting_many_lines_in_parts_is_the_same() {
+        // (more lines than are sorted on one thread: runs merged; with every kind of line natural_cmp tells apart)
+        let parts = ["file", "File", "10", "9", "-5", "é", "e", "v1.10", "v1.9", "a b", "", " ", "x\u{FF}", "Z"];
+        let mut r = 0x1234_5678_9ABC_DEF1u64;
+        let mut text = String::new();
+        for _ in 0..250_003 {
+            r ^= r << 13;
+            r ^= r >> 7;
+            r ^= r << 17;
+            text.push_str(parts[(r % parts.len() as u64) as usize]);
+            text.push_str(&((r >> 20) % 1000).to_string());
+            text.push('\n');
+        }
+        let mut want: Vec<&str> = text.lines().collect();
+        want.sort_by(|a, b| line_order(a.as_bytes(), b.as_bytes()));
+        let want = want.join("\n") + "\n";
+        assert!(run(LineOp::SortAsc, &text).0 == want);
+        let desc: Vec<&str> = want.lines().rev().collect();
+        assert!(run(LineOp::SortDesc, &text).0 == desc.join("\n") + "\n");
+        // already in order: nothing to do
+        assert_eq!(run(LineOp::SortAsc, &want).1, 0);
     }
 
     #[test]

@@ -68,6 +68,8 @@ pub struct Ui {
     regex_btn: gtk4::ToggleButton,
     notice: gtk4::Box,
     notice_label: gtk4::Label,
+    /// The notice's Save as… button (after a save that failed).
+    notice_save_as: gtk4::Button,
     status_menu: gtk4::PopoverMenu,
     im: gtk4::IMMulticontext,
     css: gtk4::CssProvider,
@@ -85,12 +87,24 @@ pub struct Ui {
     css_dark: Cell<Option<bool>>,
     /// The window may close now (the session is written).
     closing: Cell<bool>,
+    /// The text was drawn once (the tabs from the session are shown: `session::restored`).
+    painted: Cell<bool>,
+    /// Logging out waits while there's unsaved work the session can't keep (the session manager's cookie).
+    inhibited: Cell<Option<u32>>,
+    /// File → Open recent, and the files it shows.
+    recent_menu: gio::Menu,
+    recent_shown: RefCell<Option<Vec<PathBuf>>>,
+    /// Slate opens text files when they're double-clicked (Help shows Stop opening files with Slate… then).
+    is_default: Cell<bool>,
     pub test: Option<Rc<testmode::Test>>,
 }
 
 thread_local! {
     static UI: RefCell<Option<Rc<Ui>>> = const { RefCell::new(None) };
 }
+
+/// Set by SIGTERM, SIGHUP or SIGINT (the system stopping Slate): it writes the session and ends.
+static STOPPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub fn get_ui() -> Option<Rc<Ui>> {
     UI.with(|u| u.borrow().clone())
@@ -107,11 +121,62 @@ fn notifier() -> Notify {
     })
 }
 
-pub fn run(args: Vec<String>) -> i32 {
-    if args.first().map(String::as_str) == Some("--test") {
-        return testmode::run(&args[1..]);
+/// Adds a line to crash.log in the data folder.
+fn log_crash(what: &str) {
+    let dir = crate::settings::data_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let now = unsafe {
+        let t = libc::time(std::ptr::null_mut());
+        let mut tm: libc::tm = std::mem::zeroed();
+        libc::localtime_r(&t, &mut tm);
+        format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec)
+    };
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("crash.log")) {
+        let _ = writeln!(f, "[{now}] Slate {}: {what}", env!("CARGO_PKG_VERSION"));
     }
+}
+
+/// What to hand GApplication for a file named on the command line: an absolute path (GIO reads a relative
+/// `notes.txt:120` as a link with the scheme "notes.txt" and drops it), and a `file://` link for a name that isn't
+/// UTF-8 (GTK only takes text). Anything else (an option, a link) as it is.
+fn open_arg(a: std::ffi::OsString, cwd: Option<&std::path::Path>) -> String {
+    use std::os::unix::ffi::OsStrExt;
+    let bytes = a.as_bytes();
+    let is_link = bytes.windows(3).position(|w| w == b"://").is_some_and(|k| k > 0 && bytes[..k].iter().all(|b| b.is_ascii_alphanumeric() || b"+-.".contains(b)));
+    if bytes.first() == Some(&b'-') || is_link {
+        return a.to_string_lossy().into_owned();
+    }
+    let p = PathBuf::from(&a);
+    let abs = match cwd {
+        Some(d) if p.is_relative() => d.join(&p),
+        _ => p,
+    };
+    match abs.to_str() {
+        Some(s) => s.to_string(),
+        None => {
+            let mut link = String::from("file://");
+            for &b in abs.as_os_str().as_bytes() {
+                if b.is_ascii_alphanumeric() || b"/-._~".contains(&b) {
+                    link.push(b as char);
+                } else {
+                    link.push_str(&format!("%{b:02X}"));
+                }
+            }
+            link
+        }
+    }
+}
+
+pub fn run(args: Vec<std::ffi::OsString>) -> i32 {
+    if args.first().is_some_and(|a| a == "--test") {
+        let args: Vec<String> = args[1..].iter().map(|a| a.to_string_lossy().into_owned()).collect();
+        return testmode::run(&args);
+    }
+    std::panic::set_hook(Box::new(|info| log_crash(&info.to_string())));
     let application = gtk4::Application::builder().application_id(APP_ID).flags(gio::ApplicationFlags::HANDLES_OPEN).build();
+    // (logging out: the session manager asks, `query-end`)
+    application.set_register_session(true);
     application.connect_activate(|a| {
         let ui = window(a, None);
         ui.window.present();
@@ -122,7 +187,13 @@ pub fn run(args: Vec<String>) -> i32 {
         ui.with(|app| app.open_paths(&paths));
         ui.window.present();
     });
-    let argv: Vec<String> = std::iter::once("slate".to_string()).chain(args).collect();
+    application.connect_query_end(|_| {
+        if let Some(ui) = get_ui() {
+            ui.ending();
+        }
+    });
+    let cwd = std::env::current_dir().ok();
+    let argv: Vec<String> = std::iter::once("slate".to_string()).chain(args.into_iter().map(|a| open_arg(a, cwd.as_deref()))).collect();
     if application.run_with_args(&argv) == glib::ExitCode::SUCCESS { 0 } else { 1 }
 }
 
@@ -155,19 +226,47 @@ fn make_default() -> Result<usize, String> {
     Ok(done)
 }
 
+/// Whether Slate is what opens text files when they're double-clicked.
+fn slate_is_default() -> bool {
+    let id = format!("{APP_ID}.desktop");
+    gio::AppInfo::default_for_type("text/plain", false).and_then(|d| d.id()).is_some_and(|d| d == id)
+}
+
 /// Help → Stop opening files with Slate…: the kinds of files Slate is the default for go back to the system's own
-/// choice (GIO forgets what `make_default` wrote to `~/.config/mimeapps.list` for them).
+/// choice. Only Slate's entries go from `~/.config/mimeapps.list` (what `make_default` wrote): choices made for other
+/// apps stay (GIO's `reset_type_associations` would forget those too).
 fn stop_default() -> Result<usize, String> {
     let id = format!("{APP_ID}.desktop");
     let Some(info) = gio::AppInfo::all().into_iter().find(|i| i.id().is_some_and(|s| s == id)) else {
         return Err("Slate isn't installed from its package (the .deb), so it isn't opening any files.".into());
     };
+    let path = glib::user_config_dir().join("mimeapps.list");
+    let kf = glib::KeyFile::new();
+    if kf.load_from_file(&path, glib::KeyFileFlags::KEEP_COMMENTS | glib::KeyFileFlags::KEEP_TRANSLATIONS).is_err() {
+        // (no list: nothing was set up)
+        return Ok(0);
+    }
     let mut n = 0;
     for t in info.supported_types() {
-        if gio::AppInfo::default_for_type(&t, false).and_then(|d| d.id()).is_some_and(|d| d == id) {
-            gio::AppInfo::reset_type_associations(&t);
-            n += 1;
+        for group in ["Default Applications", "Added Associations"] {
+            let Ok(list) = kf.string_list(group, &t) else { continue };
+            let kept: Vec<String> = list.iter().map(|s| s.to_string()).filter(|s| *s != id).collect();
+            if kept.len() == list.len() {
+                continue;
+            }
+            if group == "Default Applications" {
+                n += 1;
+            }
+            if kept.is_empty() {
+                let _ = kf.remove_key(group, &t);
+            } else {
+                // (a list as mimeapps.list has them: `a.desktop;b.desktop;`)
+                kf.set_string(group, &t, &format!("{};", kept.join(";")));
+            }
         }
+    }
+    if n > 0 {
+        kf.save_to_file(&path).map_err(|e| format!("The default apps couldn't be changed ({}): {e}", path.display()))?;
     }
     Ok(n)
 }
@@ -290,13 +389,17 @@ pub fn window(application: &gtk4::Application, test: Option<Rc<testmode::Test>>)
     notice_label.set_xalign(0.0);
     notice_label.set_hexpand(true);
     let notice_close = icon_button("window-close-symbolic", "Dismiss");
+    let notice_save_as = gtk4::Button::with_label("Save as…");
+    notice_save_as.set_visible(false);
     let notice = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
     notice.add_css_class("slate-notice");
     notice.append(&notice_label);
+    notice.append(&notice_save_as);
     notice.append(&notice_close);
     notice.set_visible(false);
 
-    let menubar = gtk4::PopoverMenuBar::from_model(Some(&menu_model()));
+    let recent_menu = gio::Menu::new();
+    let menubar = gtk4::PopoverMenuBar::from_model(Some(&menu_model(&recent_menu)));
     // A menu bar item clicked kept the keyboard once its menu closed (typing went nowhere, as Ctrl+N's new tab
     // showed): as on Windows, the keyboard stays in the text, and the menus open in popovers of their own.
     let mut item = menubar.first_child();
@@ -331,7 +434,7 @@ pub fn window(application: &gtk4::Application, test: Option<Rc<testmode::Test>>)
 
     let style = make_style(&text.pango_context(), &settings);
     let mut app = App::new(settings, style, notifier(), system_dark());
-    session::restore(&mut app);
+    session::restore(&mut app, test.is_none());
     if app.tabs.is_empty() {
         app.new_untitled();
     }
@@ -355,6 +458,7 @@ pub fn window(application: &gtk4::Application, test: Option<Rc<testmode::Test>>)
         regex_btn,
         notice,
         notice_label,
+        notice_save_as,
         status_menu,
         im,
         css,
@@ -369,6 +473,11 @@ pub fn window(application: &gtk4::Application, test: Option<Rc<testmode::Test>>)
         polling: Cell::new(false),
         css_dark: Cell::new(None),
         closing: Cell::new(false),
+        painted: Cell::new(false),
+        inhibited: Cell::new(None),
+        recent_menu,
+        recent_shown: RefCell::new(None),
+        is_default: Cell::new(test.is_none() && slate_is_default()),
         test,
     });
     UI.with(|u| *u.borrow_mut() = Some(ui.clone()));
@@ -377,6 +486,12 @@ pub fn window(application: &gtk4::Application, test: Option<Rc<testmode::Test>>)
     // timers: the caret, files changed by other programs, the session
     glib::timeout_add_local(Duration::from_millis(BLINK_MS), || {
         if let Some(ui) = get_ui() {
+            if STOPPED.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                ui.ending();
+                ui.closing.set(true);
+                ui.gtk_app.quit();
+                return glib::ControlFlow::Break;
+            }
             ui.blink();
         }
         glib::ControlFlow::Continue
@@ -387,17 +502,34 @@ pub fn window(application: &gtk4::Application, test: Option<Rc<testmode::Test>>)
         }
         glib::ControlFlow::Continue
     });
+    // (written on another thread: a big copy on an SD card takes a while)
     glib::timeout_add_local(Duration::from_secs(5), || {
         if let Some(ui) = get_ui() {
-            let dirty = ui.app.try_borrow().is_ok_and(|a| a.session_dirty);
-            if dirty && ui.test.is_none() {
-                if let Ok(mut a) = ui.app.try_borrow_mut() {
-                    session::save(&mut a);
-                }
+            if ui.test.is_none() {
+                ui.guarded(|a| {
+                    if a.session_dirty {
+                        session::start(a, notifier());
+                    }
+                });
             }
         }
         glib::ControlFlow::Continue
     });
+    // Stopped by the system (shutting down, a terminal closed): the session is written first (the caret's timer
+    // sees `STOPPED`).
+    if ui.test.is_none() {
+        extern "C" fn on_signal(_: libc::c_int) {
+            STOPPED.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        for signal in [libc::SIGTERM, libc::SIGHUP, libc::SIGINT] {
+            unsafe {
+                let mut sa: libc::sigaction = std::mem::zeroed();
+                sa.sa_sigaction = on_signal as extern "C" fn(libc::c_int) as usize;
+                libc::sigemptyset(&mut sa.sa_mask);
+                libc::sigaction(signal, &sa, std::ptr::null_mut());
+            }
+        }
+    }
     ui.apply_theme();
     ui.text.grab_focus();
     ui.refresh();
@@ -411,21 +543,26 @@ fn connect(ui: &Rc<Ui>, prev: &gtk4::Button, next: &gtk4::Button, close_find: &g
             ui.paint_text(area, cr, w as f64, h as f64);
         }
     });
+    // (a panic while drawing is only logged, by the panic hook: showing a message would draw, and fail, again)
     ui.tabs.set_draw_func(|area, cr, w, h| {
         if let Some(ui) = get_ui() {
-            let Ok(app) = ui.app.try_borrow() else { return };
-            let mut first = ui.first_tab.get();
-            let strip = chrome::tab_strip(&app, w as f64, &mut first);
-            ui.first_tab.set(first);
-            chrome::paint_tabs(cr, &area.pango_context(), &app, &strip, h as f64, ui.hover.get());
-            *ui.strip.borrow_mut() = strip;
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let Ok(app) = ui.app.try_borrow() else { return };
+                let mut first = ui.first_tab.get();
+                let strip = chrome::tab_strip(&app, w as f64, &mut first);
+                ui.first_tab.set(first);
+                chrome::paint_tabs(cr, &area.pango_context(), &app, &strip, h as f64, ui.hover.get());
+                *ui.strip.borrow_mut() = strip;
+            }));
         }
     });
     ui.status.set_draw_func(|area, cr, w, h| {
         if let Some(ui) = get_ui() {
-            let Ok(app) = ui.app.try_borrow() else { return };
-            let items = chrome::paint_status(cr, &area.pango_context(), &app, w as f64, h as f64);
-            *ui.status_items.borrow_mut() = items;
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let Ok(app) = ui.app.try_borrow() else { return };
+                let items = chrome::paint_status(cr, &area.pango_context(), &app, w as f64, h as f64);
+                *ui.status_items.borrow_mut() = items;
+            }));
         }
     });
 
@@ -638,9 +775,18 @@ fn connect(ui: &Rc<Ui>, prev: &gtk4::Button, next: &gtk4::Button, close_find: &g
     cmd_button(close_find, Cmd::CloseFind);
     cmd_button(replace_one, Cmd::ReplaceOne);
     cmd_button(replace_all, Cmd::ReplaceAll);
+    ui.notice_save_as.connect_clicked(|_| {
+        if let Some(ui) = get_ui() {
+            ui.command(Cmd::SaveAs);
+        }
+    });
     notice_close.connect_clicked(|_| {
         if let Some(ui) = get_ui() {
-            ui.with(|a| a.tab_mut().notice = None);
+            ui.with(|a| {
+                let tab = a.tab_mut();
+                tab.notice = None;
+                tab.notice_save_as = false;
+            });
         }
     });
 
@@ -718,10 +864,12 @@ fn commands() -> Vec<(&'static str, Cmd, &'static [&'static str])> {
         ("upper", Cmd::Case(CaseOp::Upper), &["<Control><Shift>u"]),
         ("lower", Cmd::Case(CaseOp::Lower), &["<Control>u"]),
         ("title-case", Cmd::Case(CaseOp::Title), &[]),
-        ("json-format", Cmd::JsonFormat, &["<Shift><Alt>f"]),
+        ("format", Cmd::Format, &["<Shift><Alt>f"]),
+        ("json-format", Cmd::JsonFormat, &[]),
         ("json-minify", Cmd::JsonMinify, &[]),
         ("json-check", Cmd::JsonCheck, &[]),
         ("xml-format", Cmd::XmlFormat, &[]),
+        ("xml-minify", Cmd::XmlMinify, &[]),
         ("xml-check", Cmd::XmlCheck, &[]),
         ("wrap", Cmd::Wrap, &["<Alt>z"]),
         ("line-numbers", Cmd::LineNumbers, &[]),
@@ -772,7 +920,8 @@ fn actions(ui: &Rc<Ui>) {
             }
         });
         ui.window.add_action(&a);
-        ui.gtk_app.set_accels_for_action(&format!("win.{name}"), &[&format!("<Alt>{k}")]);
+        // (Ctrl as on Windows; Alt as in other Linux apps)
+        ui.gtk_app.set_accels_for_action(&format!("win.{name}"), &[&format!("<Control>{k}"), &format!("<Alt>{k}")]);
     }
     // (its state is the tab's language: the menu shows a dot at that one)
     let lang = gio::SimpleAction::new_stateful("set-lang", Some(glib::VariantTy::STRING), &"".to_variant());
@@ -793,25 +942,38 @@ fn actions(ui: &Rc<Ui>) {
     ui.window.add_action(&recent);
 }
 
+/// Menu items shown only while their action is on: JSON's and XML's for those files (as on Windows), and Help's
+/// Open files with Slate… or Stop opening files with Slate…, whichever applies (`Ui::sync_menu`).
+const SHOWN_WHEN_ON: &[&str] =
+    &["json-format", "json-minify", "json-check", "xml-format", "xml-minify", "xml-check", "make-default", "stop-default"];
+
 fn section(items: &[(&str, &str)]) -> gio::Menu {
     let commands = commands();
     let m = gio::Menu::new();
     for (label, action) in items {
         let item = gio::MenuItem::new(Some(label), Some(&format!("win.{action}")));
         // GTK shows no shortcut for an action that has more than one (New tab, Redo, Zoom in): the first is the one
-        // shown, as on Windows.
+        // shown, as on Windows. Format JSON and Format XML show Format's.
         if let Some((_, _, accels)) = commands.iter().find(|(n, _, a)| n == action && a.len() > 1) {
             item.set_attribute_value("accel", Some(&accels[0].to_variant()));
+        }
+        if matches!(*action, "json-format" | "xml-format") {
+            item.set_attribute_value("accel", Some(&"<Shift><Alt>f".to_variant()));
+        }
+        if SHOWN_WHEN_ON.contains(action) {
+            item.set_attribute_value("hidden-when", Some(&"action-disabled".to_variant()));
         }
         m.append_item(&item);
     }
     m
 }
 
-fn menu_model() -> gio::Menu {
+fn menu_model(recent: &gio::Menu) -> gio::Menu {
     let bar = gio::Menu::new();
     let file = gio::Menu::new();
-    file.append_section(None, &section(&[("New tab", "new-tab"), ("Open…", "open")]));
+    let open = section(&[("New tab", "new-tab"), ("Open…", "open")]);
+    open.append_submenu(Some("Open recent"), recent);
+    file.append_section(None, &open);
     file.append_section(None, &section(&[("Save", "save"), ("Save as…", "save-as"), ("Save all", "save-all")]));
     file.append_section(None, &section(&[("Close tab", "close-tab"), ("Reopen closed tab", "reopen-closed"), ("Quit", "quit")]));
     bar.append_submenu(Some("_File"), &file);
@@ -819,30 +981,56 @@ fn menu_model() -> gio::Menu {
     edit.append_section(None, &section(&[("Undo", "undo"), ("Redo", "redo")]));
     edit.append_section(None, &section(&[("Cut", "cut"), ("Copy", "copy"), ("Paste", "paste"), ("Select all", "select-all")]));
     edit.append_section(None, &section(&[("Find…", "find"), ("Replace…", "replace"), ("Find next", "find-next"), ("Find previous", "find-prev"), ("Go to line…", "goto-line")]));
-    edit.append_section(None, &section(&[("Comment / uncomment", "toggle-comment"), ("Duplicate line", "duplicate-line"), ("Delete line", "delete-line")]));
+    edit.append_section(None, &section(&[("Toggle comment", "toggle-comment"), ("Duplicate line", "duplicate-line"), ("Delete line", "delete-line")]));
     let lines = section(&[("Sort A to Z", "sort-asc"), ("Sort Z to A", "sort-desc"), ("Remove duplicate lines", "dedupe"), ("Remove blank lines", "remove-blank"), ("Trim spaces at line ends", "trim")]);
     edit.append_submenu(Some("Lines"), &lines);
     let case = section(&[("UPPERCASE", "upper"), ("lowercase", "lower"), ("Title Case", "title-case")]);
     edit.append_submenu(Some("Change case"), &case);
-    edit.append_section(None, &section(&[("Insert time and date", "date-time")]));
+    edit.append_section(None, &section(&[("Time/date", "date-time")]));
     bar.append_submenu(Some("_Edit"), &edit);
     let view = gio::Menu::new();
     view.append_section(None, &section(&[("Word wrap", "wrap"), ("Line numbers", "line-numbers")]));
     view.append_section(None, &section(&[("Zoom in", "zoom-in"), ("Zoom out", "zoom-out"), ("Reset zoom", "zoom-reset")]));
-    let theme = section(&[("Like the system", "theme-system"), ("Light", "theme-light"), ("Dark", "theme-dark")]);
+    let theme = section(&[("Use system setting", "theme-system"), ("Light", "theme-light"), ("Dark", "theme-dark")]);
     view.append_submenu(Some("Theme"), &theme);
     bar.append_submenu(Some("_View"), &view);
     let format = gio::Menu::new();
     format.append_section(None, &section(&[("Format JSON", "json-format"), ("Minify JSON", "json-minify"), ("Check JSON", "json-check")]));
-    format.append_section(None, &section(&[("Format XML", "xml-format"), ("Check XML", "xml-check")]));
-    let eol = section(&[("Unix (LF)", "eol-lf"), ("Windows (CRLF)", "eol-crlf")]);
-    format.append_submenu(Some("Line breaks"), &eol);
-    format.append_submenu(Some("Language"), &lang_menu());
+    format.append_section(None, &section(&[("Format XML", "xml-format"), ("Minify XML", "xml-minify"), ("Check XML", "xml-check")]));
+    let rest = gio::Menu::new();
+    rest.append_submenu(Some("Language"), &lang_menu());
+    rest.append_submenu(Some("Line endings"), &eol_menu());
+    format.append_section(None, &rest);
     bar.append_submenu(Some("F_ormat"), &format);
     let help = gio::Menu::new();
     help.append_section(None, &section(&[("Keyboard shortcuts", "shortcuts"), ("Open files with Slate…", "make-default"), ("Stop opening files with Slate…", "stop-default"), ("About Slate", "about")]));
     bar.append_submenu(Some("_Help"), &help);
     bar
+}
+
+fn eol_menu() -> gio::Menu {
+    section(&[("Windows (CRLF)", "eol-crlf"), ("Unix (LF)", "eol-lf")])
+}
+
+/// File → Open recent: the files opened last (`Ui::sync_menu` keeps it current).
+fn fill_recent(menu: &gio::Menu, recent: &[PathBuf]) {
+    menu.remove_all();
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    for p in recent {
+        // (a name that isn't UTF-8 can't be a menu's target)
+        let Some(target) = p.to_str() else { continue };
+        let shown = match home.as_ref().and_then(|h| p.strip_prefix(h).ok()) {
+            Some(rest) => format!("~/{}", rest.display()),
+            None => p.display().to_string(),
+        };
+        // (an underscore would be taken for an access key)
+        let item = gio::MenuItem::new(Some(&shown.replace('_', "__")), None);
+        item.set_action_and_target_value(Some("win.open-recent"), Some(&target.to_variant()));
+        menu.append_item(&item);
+    }
+    if menu.n_items() == 0 {
+        menu.append(Some("No files opened yet"), None);
+    }
 }
 
 fn lang_menu() -> gio::Menu {
@@ -865,24 +1053,27 @@ const SHORTCUTS: &str = "Slate keyboard shortcuts
   Ctrl+Alt+S               Save all
   Ctrl+W / Ctrl+Shift+T    Close tab / reopen the tab closed last
   Ctrl+Tab, Ctrl+PgDn      Next tab (Ctrl+Shift+Tab, Ctrl+PgUp: previous)
-  Alt+1 … Alt+9            Go to a tab (9: the last)
+  Ctrl+1 … Ctrl+9          Go to a tab (9: the last; Alt+1 … Alt+9 too)
   Ctrl+Q                   Quit
 
-  Ctrl+Z / Ctrl+Y          Undo / redo
+  Ctrl+Z / Ctrl+Y          Undo / redo (Ctrl+Shift+Z: redo too)
   Ctrl+X, C, V, A          Cut, copy, paste, select all (with nothing selected: the line)
   Ctrl+F / Ctrl+H          Find / replace
-  F3 / Shift+F3            Next / previous match
+  F3 / Shift+F3            Next / previous match (in the find box: Enter / Shift+Enter)
+  Ctrl+Alt+Enter           Replace all
+  Esc                      Close the find bar
   Ctrl+G                   Go to line
-  Ctrl+/                   Comment / uncomment the lines
+  Ctrl+/                   Toggle comment
   Ctrl+D / Ctrl+Shift+K    Duplicate / delete the line
   Alt+Up / Alt+Down        Move the line up / down
   Tab / Shift+Tab          Indent / outdent (with lines selected)
   Ctrl+U / Ctrl+Shift+U    lowercase / UPPERCASE
-  Shift+Alt+F              Format JSON
+  Shift+Alt+F              Format JSON or XML
   F5                       Insert the time and date
 
   Alt+Z                    Word wrap
   Ctrl+Plus / Ctrl+Minus   Zoom in / out (Ctrl+0: reset)
+  Ctrl+?                   This list
 ";
 
 impl Ui {
@@ -906,12 +1097,62 @@ impl Ui {
 
     /// Runs `f` on the app, then shows what came of it.
     pub fn with<R>(&self, f: impl FnOnce(&mut App) -> R) -> Option<R> {
-        let r = match self.app.try_borrow_mut() {
-            Ok(mut a) => f(&mut a),
-            Err(_) => return None,
-        };
+        let r = self.guarded(f);
         self.refresh();
-        Some(r)
+        r
+    }
+
+    /// Runs `f` on the app (None if the app is busy, or `f` panicked). A panic in a GTK callback would end Slate
+    /// there and then, so it's caught: logged in crash.log (by the panic hook), the session written, and the window
+    /// says so.
+    fn guarded<R>(&self, f: impl FnOnce(&mut App) -> R) -> Option<R> {
+        let r = {
+            let mut a = self.app.try_borrow_mut().ok()?;
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&mut a)))
+        };
+        match r {
+            Ok(r) => Some(r),
+            Err(_) => {
+                if let Ok(mut a) = self.app.try_borrow_mut() {
+                    if self.test.is_none() {
+                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| session::save(&mut a)));
+                    }
+                    a.asks.clear();
+                    a.flash("Something went wrong (details in crash.log in Slate's data folder). Your work is kept.", true);
+                }
+                None
+            }
+        }
+    }
+
+    /// The desktop session is ending (logging out, shutting down) or Slate was told to stop: the session is written
+    /// now, so everything up to the last key comes back next time. Unsaved work it can't keep makes logging out wait
+    /// (where the session manager does), and the window shows it.
+    pub fn ending(&self) {
+        let unkept = self
+            .guarded(|a| {
+                if self.test.is_none() {
+                    session::save(a);
+                    self.save_settings(a);
+                }
+                (0..a.tabs.len()).any(|i| a.tabs[i].doc.is_dirty() && !session::keeps(a, i))
+            })
+            .unwrap_or(false);
+        if unkept && self.inhibited.get().is_none() {
+            let cookie = self.gtk_app.inhibit(Some(&self.window), gtk4::ApplicationInhibitFlags::LOGOUT, Some("Unsaved changes"));
+            if cookie != 0 {
+                self.inhibited.set(Some(cookie));
+            }
+            self.window.present();
+        }
+    }
+
+    fn save_settings(&self, a: &mut App) {
+        let (w, h) = self.window.default_size();
+        a.settings.window = Some(crate::settings::Placement { x: 0, y: 0, w, h, maximized: self.window.is_maximized() });
+        if crate::settings::persist() {
+            a.settings.save();
+        }
     }
 
     fn touch(&self) {
@@ -979,10 +1220,7 @@ impl Ui {
         let _timing = Timing("key", Instant::now());
         self.touch();
         let g = self.geom();
-        let handled = match self.app.try_borrow_mut() {
-            Ok(mut a) => a.on_key(&g, keyval, state),
-            Err(_) => false,
-        };
+        let handled = self.guarded(|a| a.on_key(&g, keyval, state)).unwrap_or(false);
         if handled {
             self.refresh();
         }
@@ -1162,7 +1400,7 @@ impl Ui {
         let Some(&(k, ix, iw)) = items.iter().find(|(_, ix, iw)| x >= *ix && x < ix + iw) else { return };
         let menu = match k {
             1 => lang_menu(),
-            2 => section(&[("Unix (LF)", "eol-lf"), ("Windows (CRLF)", "eol-crlf")]),
+            2 => eol_menu(),
             _ => return,
         };
         self.status_menu.set_menu_model(Some(&menu));
@@ -1205,10 +1443,9 @@ impl Ui {
 
     /// Background work finished (or is still running: then again soon).
     fn poll(&self) {
-        let running = match self.app.try_borrow_mut() {
-            Ok(mut a) => a.poll_jobs(),
-            Err(_) => true,
-        };
+        // (the app busy: looked at again soon)
+        let busy = self.app.try_borrow_mut().is_err();
+        let running = busy || self.guarded(|a| a.poll_jobs()).unwrap_or(false);
         self.refresh();
         if running && !self.polling.get() {
             self.polling.set(true);
@@ -1254,6 +1491,11 @@ impl Ui {
 
     /// Shows what the app asked for and what changed: dialogs, the clipboard, the title, the find bar, a redraw.
     pub fn refresh(&self) {
+        // (a panic in here is logged by the panic hook; Slate carries on)
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.refresh_now()));
+    }
+
+    fn refresh_now(&self) {
         loop {
             let asks = match self.app.try_borrow_mut() {
                 Ok(mut a) => std::mem::take(&mut a.asks),
@@ -1351,10 +1593,18 @@ impl Ui {
             Some(n) => {
                 self.notice_label.set_text(n);
                 self.notice.set_visible(true);
+                self.notice_save_as.set_visible(a.tab().notice_save_as);
             }
             None => self.notice.set_visible(false),
         }
         self.hbar.set_visible(!a.style.wrap);
+        // (logging out waited for unsaved work the session can't keep: not any more once it's dealt with)
+        if let Some(cookie) = self.inhibited.get() {
+            if !(0..a.tabs.len()).any(|i| a.tabs[i].doc.is_dirty() && !session::keeps(&a, i)) {
+                self.gtk_app.uninhibit(cookie);
+                self.inhibited.set(None);
+            }
+        }
         let find_open = a.find.open;
         self.syncing.set(false);
         let dark = a.theme.dark;
@@ -1386,6 +1636,29 @@ impl Ui {
             self.set_action_state(name, on.to_variant());
         }
         self.set_action_state("set-lang", tab.lang.label().to_variant());
+        // JSON's and XML's items only for those files; Open files or Stop opening files with Slate, whichever applies
+        let default = self.is_default.get();
+        let on = [
+            ("json-format", tab.lang == Lang::Json),
+            ("json-minify", tab.lang == Lang::Json),
+            ("json-check", tab.lang == Lang::Json),
+            ("xml-format", tab.lang == Lang::Xml),
+            ("xml-minify", tab.lang == Lang::Xml),
+            ("xml-check", tab.lang == Lang::Xml),
+            ("make-default", !default),
+            ("stop-default", default),
+        ];
+        for (name, enabled) in on {
+            if let Some(action) = self.window.lookup_action(name).and_downcast::<gio::SimpleAction>() {
+                if action.is_enabled() != enabled {
+                    action.set_enabled(enabled);
+                }
+            }
+        }
+        if self.recent_shown.borrow().as_deref() != Some(a.settings.recent.as_slice()) {
+            fill_recent(&self.recent_menu, &a.settings.recent);
+            *self.recent_shown.borrow_mut() = Some(a.settings.recent.clone());
+        }
     }
 
     fn set_action_state(&self, name: &str, state: glib::Variant) {
@@ -1417,6 +1690,14 @@ impl Ui {
     }
 
     fn paint_text(&self, area: &gtk4::DrawingArea, cr: &cairo::Context, w: f64, h: f64) {
+        // (a panic while drawing is only logged: showing a message would draw, and fail, again)
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.paint_text_now(area, cr, w, h)));
+        if !self.painted.replace(true) && self.test.is_none() {
+            session::restored();
+        }
+    }
+
+    fn paint_text_now(&self, area: &gtk4::DrawingArea, cr: &cairo::Context, w: f64, h: f64) {
         let started = Instant::now();
         let _timing = Timing("paint", started);
         let Ok(mut a) = self.app.try_borrow_mut() else { return };
@@ -1474,29 +1755,37 @@ impl Ui {
     /// the settings are written and the window goes.
     pub fn try_quit(&self) {
         let pending = {
-            let Ok(a) = self.app.try_borrow() else { return };
+            let Ok(mut a) = self.app.try_borrow_mut() else { return };
+            if !a.quitting {
+                // (a new try: the session may be writable again)
+                a.session_failed = false;
+            }
+            a.quitting = true;
             if a.tabs.iter().any(|t| t.saving()) {
-                return; // waits for the saves (`poll` asks again)
+                return; // waits for the saves (`finish_save` carries on)
             }
-            (0..a.tabs.len()).find(|&i| a.tabs[i].doc.is_dirty() && !session::keeps(&a, i))
+            (0..a.tabs.len()).find(|&i| a.tabs[i].doc.is_dirty() && !session::keeps(&a, i)).map(|i| a.tabs[i].id)
         };
-        if let Some(i) = pending {
-            let id = self.app.borrow().tabs[i].id;
-            if let Ok(mut a) = self.app.try_borrow_mut() {
-                a.quitting = true;
-            }
-            self.ask(Ask::CloseUnsaved { tab: id });
+        if let Some(tab) = pending {
+            self.ask(Ask::CloseUnsaved { tab });
             return;
         }
-        if let Ok(mut a) = self.app.try_borrow_mut() {
-            if self.test.is_none() {
-                session::save(&mut a);
-                let (w, h) = self.window.default_size();
-                a.settings.window = Some(crate::settings::Placement { x: 0, y: 0, w, h, maximized: self.window.is_maximized() });
-                if crate::settings::persist() {
-                    a.settings.save();
+        let written = self
+            .guarded(|a| {
+                // (in a test, only with `persist`)
+                let ok = session::save(a);
+                if self.test.is_none() {
+                    self.save_settings(a);
                 }
-            }
+                ok || a.session_failed || !a.tabs.iter().any(|t| t.doc.is_dirty()) || {
+                    // The session can't be written (a full or read-only disk): every unsaved tab is asked about.
+                    a.session_failed = true;
+                    false
+                }
+            })
+            .unwrap_or(true);
+        if !written {
+            return self.try_quit();
         }
         self.closing.set(true);
         self.window.close();
@@ -1560,10 +1849,16 @@ impl Ui {
                 chooser.show();
             }
             Ask::CloseUnsaved { tab } => {
-                let name = self.app.borrow().index_of(tab).map(|i| self.app.borrow().tabs[i].title()).unwrap_or_default();
+                let (name, why) = {
+                    let a = self.app.borrow();
+                    match a.index_of(tab) {
+                        Some(i) => (a.tabs[i].title(), session::unkept_reason(&a, i)),
+                        None => return,
+                    }
+                };
                 self.dialog(
                     &format!("Save changes to {name}?"),
-                    "Your changes will be lost if you don't save them.",
+                    why,
                     &[("Cancel", "cancel"), ("Don't save", "dont"), ("Save", "save")],
                     move |answer| {
                         if let Some(ui) = get_ui() {
@@ -1573,17 +1868,39 @@ impl Ui {
                 );
             }
             Ask::Lossy { tab, path, encoding, close_after } => {
+                let (title, bad) = {
+                    let a = self.app.borrow();
+                    match a.index_of(tab) {
+                        Some(i) => (a.tabs[i].title(), a.tabs[i].doc.bad_units),
+                        None => return,
+                    }
+                };
                 let ask = Ask::Lossy { tab, path, encoding, close_after };
-                self.dialog(
-                    "Some characters can't be saved in this encoding",
-                    "Saving anyway turns them into \"?\" (or keeps a damaged file's broken parts as they read now).",
-                    &[("Cancel", "cancel"), ("Save anyway", "anyway"), ("Save as UTF-8", "utf8")],
-                    move |answer| {
-                        if let Some(ui) = get_ui() {
-                            ui.answer(ask.clone(), answer);
-                        }
-                    },
-                );
+                let done = move |answer: &str| {
+                    if let Some(ui) = get_ui() {
+                        ui.answer(ask.clone(), answer);
+                    }
+                };
+                if bad > 0 {
+                    // A file that wasn't all text in its encoding: what wasn't shows as U+FFFD, and can't be saved back.
+                    let what = if bad == 1 { "One place shows".to_string() } else { format!("{bad} places show") };
+                    self.dialog(
+                        &format!("Parts of {title} weren't {} text", encoding.label()),
+                        &format!("{what} \"\u{FFFD}\" where the file had something else, and would be saved that way."),
+                        &[("Cancel", "cancel"), ("Save anyway", "damaged")],
+                        done,
+                    );
+                } else {
+                    self.dialog(
+                        &format!("Some characters in {title} can't be saved as ANSI"),
+                        &format!(
+                            "In {} they would become \"?\". UTF-8 keeps every character, and nearly every program reads it.",
+                            encoding.label()
+                        ),
+                        &[("Cancel", "cancel"), ("Save as ANSI anyway", "anyway"), ("Save as UTF-8", "utf8")],
+                        done,
+                    );
+                }
             }
             Ask::GotoLine => self.goto_dialog(),
             Ask::Quit => self.try_quit(),
@@ -1629,9 +1946,17 @@ impl Ui {
             }
             Ask::Shortcuts => {
                 self.with(|a| {
-                    let i = a.add_text_tab(SHORTCUTS.as_bytes(), None, Some(Lang::Plain));
-                    a.tabs[i].doc.mark_saved();
-                    a.active = i;
+                    // (the tab that shows them already, if there is one)
+                    let i = match a.tabs.iter().position(|t| t.title_override.as_deref() == Some("Keyboard shortcuts")) {
+                        Some(i) => i,
+                        None => {
+                            let i = a.add_text_tab(SHORTCUTS.as_bytes(), None, Some(Lang::Plain));
+                            a.tabs[i].doc.mark_saved();
+                            a.tabs[i].title_override = Some("Keyboard shortcuts".into());
+                            i
+                        }
+                    };
+                    a.activate(i);
                     a.dirty_title = true;
                 });
             }
@@ -1647,6 +1972,9 @@ impl Ui {
                 }
                 // (A test only says what it would do, like Open files with Slate…)
                 let result = if self.test.is_some() { Ok(0) } else { stop_default() };
+                if result.is_ok() {
+                    self.is_default.set(false);
+                }
                 self.with(|a| match result {
                     Ok(0) => a.flash("Slate wasn't opening any kind of file by default.", false),
                     Ok(n) => a.flash(format!("{n} kinds of files open with the system's own choice again."), false),
@@ -1659,6 +1987,9 @@ impl Ui {
                 }
                 // (A test only says what it would do: it mustn't change the defaults of whoever runs it.)
                 let result = if self.test.is_some() { Ok(0) } else { make_default() };
+                if result.is_ok() {
+                    self.is_default.set(self.test.is_some() || slate_is_default());
+                }
                 self.with(|a| match result {
                     Ok(n) => a.flash(format!("Slate now opens {n} kinds of files when they're double-clicked."), false),
                     Err(e) => a.flash(e, true),
@@ -1704,8 +2035,17 @@ impl Ui {
                 self.with(|a| {
                     let Some(i) = a.index_of(tab) else { return };
                     match answer {
-                        "anyway" => a.start_save(i, path, encoding, close_after, true),
-                        "utf8" => a.start_save(i, path, crate::core::text::Encoding::Utf8, close_after, false),
+                        // (a damaged file, saved as it reads now: closing carries on)
+                        "damaged" | "anyway" if a.tabs[i].doc.bad_units > 0 => a.start_save(i, path, encoding, close_after, true),
+                        // ANSI with "?" in it: the tab (and the window) stay open, the text still in it
+                        "anyway" => {
+                            a.quitting = false;
+                            a.start_save(i, path, encoding, false, true);
+                        }
+                        "utf8" => {
+                            a.tabs[i].doc.bom = false;
+                            a.start_save(i, path, crate::core::text::Encoding::Utf8, close_after, false);
+                        }
                         _ => a.quitting = false,
                     }
                 });

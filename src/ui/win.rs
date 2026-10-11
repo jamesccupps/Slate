@@ -11,7 +11,7 @@ use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, CoTask
 use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard, SetClipboardData,
 };
-use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+use windows::Win32::System::LibraryLoader::{GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW};
 use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock};
 use windows::Win32::System::Ole::CF_UNICODETEXT;
 use windows::Win32::UI::Controls::{
@@ -193,7 +193,8 @@ pub fn caret_pos() -> Option<(i32, i32)> {
 /// since 1809 like the ones below); nothing if it's missing.
 pub fn allow_dark(hwnd: HWND) {
     unsafe {
-        let Ok(lib) = LoadLibraryW(w!("uxtheme.dll")) else { return };
+        // (from System32 only, never a uxtheme.dll beside Slate.exe)
+        let Ok(lib) = LoadLibraryExW(w!("uxtheme.dll"), None, LOAD_LIBRARY_SEARCH_SYSTEM32) else { return };
         if let Some(f) = GetProcAddress(lib, PCSTR(133usize as *const u8)) {
             let f: extern "system" fn(HWND, BOOL) -> BOOL = std::mem::transmute(f);
             let _ = f(hwnd, BOOL(1));
@@ -205,7 +206,8 @@ pub fn allow_dark(hwnd: HWND) {
 /// 1903 and which many apps (Notepad++ among them) rely on; silently does nothing if they're missing.
 pub fn set_menu_dark(dark: bool) {
     unsafe {
-        let Ok(lib) = LoadLibraryW(w!("uxtheme.dll")) else { return };
+        // (from System32 only, never a uxtheme.dll beside Slate.exe)
+        let Ok(lib) = LoadLibraryExW(w!("uxtheme.dll"), None, LOAD_LIBRARY_SEARCH_SYSTEM32) else { return };
         // SetPreferredAppMode(mode): 0 default, 1 allow dark, 2 force dark, 3 force light
         if let Some(f) = GetProcAddress(lib, PCSTR(135usize as *const u8)) {
             let f: extern "system" fn(i32) -> i32 = std::mem::transmute(f);

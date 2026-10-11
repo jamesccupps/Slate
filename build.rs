@@ -137,7 +137,7 @@ fn version_info(version: &str) -> Vec<u8> {
         fixed.extend_from_slice(&d.to_le_bytes());
     }
     let strings: Vec<Vec<u8>> = [
-        ("CompanyName", "Slate"),
+        ("CompanyName", "James Cupps"),
         ("FileDescription", "Slate"),
         ("FileVersion", version),
         ("InternalName", "Slate"),
