@@ -72,8 +72,8 @@ out and shutting down write it first), a file that can't be opened no longer end
 commands match Windows' (Line endings for the whole text, Format by language, Open recent). On both: saves keep a
 file's permissions, encryption, streams and extended attributes; a same-length rewrite by another program is
 noticed; absurdly deep JSON or XML and huge Format results no longer use gigabytes; `file:line:col` works on Windows;
-searching JSON for a key and value is 3-5 times faster, sorting nearly 3 times, typing with the path bar on no longer
-rescans the file per key. Details in the [0.9.0 release notes](release-notes-0.9.0.md).
+searching JSON for a key and value is 3-5 times faster, sorting about twice as fast, typing with the path bar on no
+longer rescans the file per key. Details in the [0.9.0 release notes](release-notes-0.9.0.md).
 
 ## 0.9.1
 
@@ -87,8 +87,11 @@ full speed. Details in the [0.9.1 release notes](release-notes-0.9.1.md).
 ## 0.10.0: Print
 
 File → Print (Ctrl+P) on both: the system's print dialog, the file or the selection in its colors, line numbers and
-page numbers, long lines breaking between words; up to 10,000 pages (asked about past 100). Details in the
-[0.10.0 release notes](release-notes-0.10.0.md).
+page numbers, long lines breaking between words; up to 10,000 pages (asked about past 100). Also what an outside
+recheck of 0.9.1 found: Linux logging out with a session it can't write asks about unsaved tabs, Save as UTF-16 no
+longer ends in an ANSI save, a line-ending change keeps the caret on its line, Save As on Linux, the scrollbar's
+marks, uninstalling right before a reinstall, and the apt repository checked as apt checks it before it's published;
+a pretty-printed JSON's structure a third faster. Details in the [0.10.0 release notes](release-notes-0.10.0.md).
 
 ## Next
 
@@ -111,14 +114,26 @@ page numbers, long lines breaking between words; up to 10,000 pages (asked about
 2. **Release basics (S–M).** Slate.exe is signed since 0.8.0 (Azure Artifact Signing, in CI); since 0.8.1 the
    updater checks that an update is signed by the same publisher, and `Slate.exe --install` installs silently for
    winget (`JamesCupps.Slate`, submitted with 0.8.1 and moved to 0.8.2 before it was merged). Next: a winget
-   manifest PR made by CI for each release (needs a GitHub token of the user's as a secret), Scoop. (Licensed MIT
-   since October 2026.)
+   manifest PR made by CI for each release (needs a GitHub token of the user's as a secret), Scoop and Chocolatey.
+   (Licensed MIT since October 2026.)
 3. **Big unsaved files, the rest (S–M).** Keep a big document's newline index in the session so putting it back
    doesn't count the lines again, and keep big documents that Format or Replace All rewrote (today closing still asks
    about those). (Its `.data` is already written anew, with only what the text uses, once most of it isn't.)
 
 ## Soon
 
+- **Show only the lines that match** (M): a search's matching lines in a view of their own (or the lines that don't
+  match, to hide noise), a click going to the line. What big-log tools (klogg, glogg, LogExpert) are used for, built
+  on Count all, which already finds every match of an 800 MB file in a fraction of a second.
+- **Bookmarks** (S): Ctrl+F2 marks a line, F2 and Shift+F2 go from one to the next; kept in the session, shown on the
+  scrollbar like search matches.
+- **Read-only tabs** (S): `slate --read-only`, a lock on the tab; offered by itself for a file that's read-only on
+  disk, instead of a failed save.
+- **The character at the caret** (S): its code point and bytes (`U+00E9 é · C3 A9`) from the status bar's encoding.
+- **Invisible and look-alike characters shown** (S): zero-width and non-breaking spaces, a byte order mark inside the
+  text, and the bidirectional controls of the "Trojan Source" trick, as symbols, as control characters are already.
+- **`slate --wait` and standard input** (S): `--wait` returns when the tab closes (Slate as git's editor);
+  `some-command | slate -` opens the output in a new tab.
 - **Page setup** (M): margins, the text at the top and bottom of the pages, printing without colors (Print itself
   came in 0.10.0).
 - **Find:** in the selection, a history, `\n` and `\t` in regex replacements, find in all open tabs (S–M).
@@ -145,6 +160,14 @@ page numbers, long lines breaking between words; up to 10,000 pages (asked about
   Orca (M; GTK 4.8 has no accessible text for a custom-drawn view: GTK 4.14's `GtkAccessibleText`).
 - **Maybe: a Markdown preview** (a rendered view next to the text, off by default) (M). Only if people ask for
   it: Slate is meant to stay quick and open anything, so it must cost nothing while it isn't used.
+- JSON and XML: **go to a path** typed in Go to line (`data[1203].name`, `/catalog/book[3]/title`) (S). CSV and TSV:
+  the caret's column by its name in the status bar, and **sort by this column** (S–M).
+- **EditorConfig** (`.editorconfig`: indentation, line endings, a final newline, the encoding) (S).
+- **A command palette** (Ctrl+Shift+P) over every command and setting (M; on Linux it would also be the settings
+  window it hasn't got).
+- **Two views of one document**, one above the other (M). **Compare** with the file as saved, or two tabs (M–L, up
+  to some size).
+- Format → Convert: Base64, URL encoding, JSON string escapes, and SHA-256 of the selection or the file (S each).
 - Several windows; drag a tab out into its own window (L).
 - A hex view for binary files (M). Files with only CR line endings converted on open (S).
 - Smooth scrolling (M). Right-to-left text (S–M). Any font and size (S).
@@ -173,7 +196,10 @@ page numbers, long lines breaking between words; up to 10,000 pages (asked about
   64 MiB, regex matches longer than 1 MiB (Find next/previous) or 16 MiB (Count all, Replace all) that cross a
   search window: carry the regex's state across windows (M); UTF-16 files with unpaired surrogates kept byte-exact (S);
   saving where Slate can't create files, and keeping hard links (S–M); trimming what undo history keeps alive (S);
-  Home/End on a big file whose lines are still being counted shouldn't read far (S).
+  Home/End on a big file whose lines are still being counted shouldn't read far (S); a big edited file whose time
+  alone changed (touched, synced unchanged) can't be saved (only Reload): a whole-file hash taken while its lines are
+  counted, if that costs the count nothing, would tell (S–M); the JSON outline stops at a container nested over
+  50,000 deep: reading past it cost every scan 3-6%, tried twice (S).
 - Tests: a table of the key bindings checked against the shortcut lists and the README (S); the close and quit
   prompts and the updater's swap in the smoke tests (S–M).
 - Colors: a misdetected heredoc should end sooner than at its end word; exact states for lexers with look-ahead at
@@ -198,6 +224,11 @@ page numbers, long lines breaking between words; up to 10,000 pages (asked about
   (`\p{Age=…}`, `\p{Alphabetic}`, `\p{Emoji}`, grapheme/word/sentence break classes) it's 155 KB smaller; without
   general categories and scripts too (`\p{L}`, `\p{Greek}`), 240 KB. Case-insensitive search in every language and
   `\w`, `\d`, `\s`, `\b` stay either way. To decide (S).
+
+## Not planned
+
+Plugins, project or workspace panels, language servers (IntelliSense), a terminal, Git: they'd make Slate slower to
+start and heavier, and turn it into another IDE. Slate is the editor that opens anything instantly.
 
 ## Infrastructure
 
