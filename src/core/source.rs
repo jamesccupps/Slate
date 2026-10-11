@@ -754,6 +754,26 @@ impl Source {
         }
     }
 
+    /// Reads `[start, start + dst.len())`, which must be within the source, over `dst`.
+    pub fn read_to(&self, start: u64, dst: &mut [u8]) {
+        let end = start + dst.len() as u64;
+        match &self.store {
+            Store::Mem(d) => dst.copy_from_slice(&d[start as usize..end as usize]),
+            Store::File { .. } => {
+                if end - start <= 4 * BLOCK {
+                    let mut at = 0;
+                    self.chunks(start, end, &mut |c| {
+                        dst[at..at + c.len()].copy_from_slice(c);
+                        at += c.len();
+                        true
+                    });
+                } else {
+                    self.file_read(self.bulk(), start, dst);
+                }
+            }
+        }
+    }
+
     pub fn byte_at(&self, pos: u64) -> u8 {
         match &self.store {
             Store::Mem(d) => d[pos as usize],

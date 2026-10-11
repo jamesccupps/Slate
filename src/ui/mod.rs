@@ -34,7 +34,7 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx};
 use windows::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Threading::CreateMutexW;
+use windows::Win32::System::Threading::{CreateMutexW, GetCurrentProcessId};
 use windows::Win32::UI::Input::Ime::{
     CFS_POINT, COMPOSITIONFORM, ImmGetContext, ImmReleaseContext, ImmSetCompositionFontW, ImmSetCompositionWindow,
 };
@@ -747,41 +747,55 @@ fn hand_over(lock: PCWSTR, class: PCWSTR, text: &str, tries: u32) -> Running {
                 // (it can't be opened at all: look for the window anyway)
                 Err(_) => {}
             }
-            if let Ok(h) = FindWindowW(class, None) {
-                if !h.is_invalid() {
-                    let cds = COPYDATASTRUCT {
-                        dwData: COPYDATA_OPEN,
-                        cbData: (text.len() * 2) as u32,
-                        lpData: text.as_ptr() as *mut _,
-                    };
-                    let mut pid = 0u32;
-                    GetWindowThreadProcessId(h, Some(&mut pid));
-                    let _ = AllowSetForegroundWindow(pid);
-                    // A Slate that hangs doesn't hold this one up.
-                    let mut res = 0usize;
-                    let sent = SendMessageTimeoutW(
-                        h,
-                        WM_COPYDATA,
-                        WPARAM(0),
-                        LPARAM(&cds as *const _ as isize),
-                        SMTO_ABORTIFHUNG | SMTO_BLOCK,
-                        10_000,
-                        Some(&mut res),
-                    );
-                    if sent.0 != 0 && res != 0 {
-                        return Running::Took;
-                    }
-                    // Busy or hung, its window still there: a window of its own. The window gone meanwhile, or not
-                    // ready for files yet: look again.
-                    if sent.0 == 0 && IsWindow(h).as_bool() {
-                        return Running::Busy;
-                    }
+            if let Some(h) = slate_window(class) {
+                let cds = COPYDATASTRUCT {
+                    dwData: COPYDATA_OPEN,
+                    cbData: (text.len() * 2) as u32,
+                    lpData: text.as_ptr() as *mut _,
+                };
+                let mut pid = 0u32;
+                GetWindowThreadProcessId(h, Some(&mut pid));
+                let _ = AllowSetForegroundWindow(pid);
+                // A Slate that hangs doesn't hold this one up.
+                let mut res = 0usize;
+                let sent = SendMessageTimeoutW(
+                    h,
+                    WM_COPYDATA,
+                    WPARAM(0),
+                    LPARAM(&cds as *const _ as isize),
+                    SMTO_ABORTIFHUNG | SMTO_BLOCK,
+                    10_000,
+                    Some(&mut res),
+                );
+                if sent.0 != 0 && res != 0 {
+                    return Running::Took;
+                }
+                // Busy or hung, its window still there: a window of its own. The window gone meanwhile, or not
+                // ready for files yet: look again.
+                if sent.0 == 0 && IsWindow(h).as_bool() {
+                    return Running::Busy;
                 }
             }
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
     Running::Busy
+}
+
+/// The running Slate's window: one of that class whose process runs as this user with the same rights (another
+/// program can make a window of that class too; files go only to a Slate's).
+fn slate_window(class: PCWSTR) -> Option<HWND> {
+    let me = win::process_identity(unsafe { GetCurrentProcessId() })?;
+    let mut after = HWND::default();
+    loop {
+        let h = unsafe { FindWindowExW(None, after, class, None) }.ok().filter(|h| !h.is_invalid())?;
+        let mut pid = 0u32;
+        unsafe { GetWindowThreadProcessId(h, Some(&mut pid)) };
+        if win::process_identity(pid).as_ref() == Some(&me) {
+            return Some(h);
+        }
+        after = h;
+    }
 }
 
 pub fn register_class() -> HINSTANCE {
@@ -1365,6 +1379,15 @@ mod tests {
         });
         is_ready.recv().unwrap();
         t
+    }
+
+    #[test]
+    fn a_process_is_known_by_its_user_and_rights() {
+        let me = win::process_identity(unsafe { GetCurrentProcessId() });
+        assert!(me.as_ref().is_some_and(|(sid, _)| !sid.is_empty()));
+        assert_eq!(win::process_identity(unsafe { GetCurrentProcessId() }), me);
+        // (the System Idle Process can't be opened)
+        assert_eq!(win::process_identity(0), None);
     }
 
     #[test]

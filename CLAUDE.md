@@ -62,18 +62,25 @@ icons) and a tarball, each with a `.sha256`.
    It signs in to Azure with GitHub's OIDC token (no password anywhere): the app registration "Slate signing"
    trusts only `repo:jamesccupps@148652101/Slate@1409482725:environment:release` (GitHub's immutable subject:
    owner and repository IDs, the repo's default), and the `release` environment only `v*` tags; the
-   repository secrets `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID` say which app.
+   repository secrets `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID` say which app. The workflows'
+   actions are pinned to commits (the version in a comment); Dependabot (`.github/dependabot.yml`) proposes newer
+   ones monthly.
 4. Publishing the release runs `.github/workflows/apt.yml` (named "apt repository"; it also publishes the website, and
-   runs again when `site/` or `docs/images/` change on `main`) (it starts itself again on `main`, as GitHub Pages only
-   publishes from there): `packaging/linux/apt-repo.sh` makes the apt repository from the latest release's `.deb`s,
-   signed with the secret `APT_SIGNING_KEY`, and Pages (Source: GitHub Actions) publishes it at
-   `https://jamesccupps.github.io/Slate/apt` (suite `stable`, component `main`). Every `.deb` brings the public key
+   runs again when `site/` or `docs/images/` change on `main`, and monthly) (it starts itself again on `main`, as
+   GitHub Pages only publishes from there): `packaging/linux/apt-repo.sh` makes the apt repository from the latest
+   release's `.deb`s, signed with `APT_SIGNING_KEY` (its job runs in the `apt` environment: the secret belongs
+   there, the environment limited to `main`), and Pages (Source: GitHub Actions) publishes it at
+   `https://jamesccupps.github.io/Slate/apt` (suite `stable`, component `main`). The Release file is valid for a year
+   from signing (`Valid-Until`) and the monthly run signs it again; GitHub stops a schedule after 60 days without
+   activity in the repository, so then run it by hand (Actions → apt repository → Run workflow) within the year, or
+   every system's `apt update` refuses the repository. Every `.deb` brings the keyring
    (`packaging/linux/slate-archive-keyring.gpg` → `/usr/share/keyrings/`) and adds
    `/etc/apt/sources.list.d/slate.list` when installed (removed with the package), so `apt upgrade` updates Slate.
    The private key's only other copy is on the development PC in `%USERPROFILE%\.slate-apt-key` (never in the
-   repo). The repository's URL, suite, component, keyring path and key can never change, as every installed Slate
-   reads them: with another key, apt refuses the repository until a `.deb` bringing the new key is installed by
-   hand.
+   repo). The repository's URL, suite, component and keyring path can never change, as every installed Slate reads
+   them. It may be signed by any key in the keyring (apt-repo.sh checks that it is one), so a second key added there,
+   kept offline, can take over once the packages bringing it are installed; a key no installed keyring has makes apt
+   refuse the repository until a `.deb` bringing it is installed by hand.
 
 5. winget: the package is `JamesCupps.Slate` in microsoft/winget-pkgs (first submitted with 0.8.1, moved to 0.8.2 before it was merged, as 0.8.1's --install registered .bat:
    microsoft/winget-pkgs#449740, from the user's fork `jamesccupps/winget-pkgs`). Its installer is the release's
@@ -88,7 +95,10 @@ pre-release suffix), assets named exactly `Slate.exe` and `Slate.exe.sha256` (`<
 repository, `/releases/latest`. Slate.exe stays the x64 build. The updater never goes back to a lower version, so a
 bad release is fixed by publishing a higher one; a new version that doesn't start is undone on the user's PC by the
 version before it (see update.rs). A copy deployed from a local build also updates itself from GitHub once a higher
-version is published (unless its automatic check is off).
+version is published (unless its automatic check is off). Nor can who signs it: from 0.9.1 the updater wants the
+download's certificate to have the running exe's name and every identity usage it has (`1.3.6.1.4.1.311.97.…`, the
+identity Artifact Signing validated; the issuing CA varies, so it isn't compared), so a new identity validation or
+another signing service means every copy from 0.9.1 on has to be updated by hand once.
 
 Commits use the GitHub no-reply address (repo-local git config); GitHub refuses pushes that would publish another one.
 
@@ -161,8 +171,10 @@ accent stay Windows-only), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate
     exactly what it would (`Literal`, a test compares them, `ſ` and the Kelvin sign included): Match case by
     `memmem`; ignoring case, an ASCII query whose longest run of letters and digits isn't at its start
     (`"status":"refunded"`) by that run first, then the query in a window around each place (5x faster in a JSON
-    file, where the start is every record's key). `SLATE_SEARCH_FILE=<file> cargo test --release --lib search_speed
-    -- --ignored --nocapture` times them. Plain text: 8 MB windows, the overlap at least the query's length, always
+    file, where the start is every record's key), but only where timing both ways on the first 256 KiB says so
+    (`anchor_pays`, once per `Matcher`): for `Wool socks`, whose run is as common as its start, the regex alone is 20%
+    faster. `SLATE_SEARCH_FILE=<file> cargo test --release --lib search_speed -- --ignored --nocapture` times them.
+    Windows are read over the same buffer (`Snapshot::read_over`; zeroing each first made counts 5% slower). Plain text: 8 MB windows, the overlap at least the query's length, always
     exact. A regex is exact in documents up to 64 MiB (one window; Find previous scans from the start); in bigger
     ones Count all and Replace all use 64 MiB windows with 16 MiB after (exact while no match is longer than that),
     Find next/previous 8 MB with 1 MiB. Past that, a match at a seam is missed or cut short and the matches after it
@@ -203,7 +215,8 @@ accent stay Windows-only), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate
     Windows' own conversions), display decoding (control chars → symbols), char classes.
   - `job.rs` — background jobs with progress/cancel, notify the UI by posting a window message (on Linux: an idle
     callback on GLib's main loop).
-- `src/gtk/` — the Linux app (GTK 4): `mod.rs` the window (menu bar from a `gio::Menu`, actions with accelerators,
+- `src/gtk/` — the Linux app (GTK 4): `mod.rs` the window (menu bar from a `gio::Menu`, actions with accelerators
+    in a group of their own inserted as `win` (`win_actions`: the window's own group is published on D-Bus),
     the find bar's GtkEntry boxes, a notice line (with Save as… after a save that failed), native scrollbars mapping
     bytes, dialogs: `FileChooserNative` and `MessageDialog` as GTK 4.8 has them; one Slate per session through
     GApplication/D-Bus, `HANDLES_OPEN`: `run` hands it absolute paths, as GIO reads a relative `notes.txt:120` as a
@@ -284,7 +297,7 @@ accent stay Windows-only), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate
     installed copy too when it's the one running, by a hidden `cmd` once it has ended; CI runs all three on a
     runner); `update.rs` (updates from GitHub releases: WinHTTP, SHA-256 check, from 0.8.1 the same
     publisher's signature when the running exe's own signature checks out (`signer_of`: WinVerifyTrust, no online
-    revocation lookup), swap the exe, restart with
+    revocation lookup; the name, and from 0.9.1 the identity usages too), swap the exe, restart with
     `--updated`, undone if the new one doesn't start); `crash.rs` (a minidump next to crash.log on a native crash,
     written by a thread waiting for it from the start; Help → Report a problem opens a filled-in GitHub issue form
     the user sends themselves; the version string with the commit, which build.rs passes in); `prompt.rs` (prompts
@@ -395,7 +408,8 @@ accent stay Windows-only), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate
   doesn't answer (a share that's gone, a file another program holds, a drive or folder that isn't there: only "not
   found" in a folder that is means gone) waits too and looks again, less often each time, as long as it's one of
   those; until a tab is back, the session keeps its entry as read.
-- One Slate per user session: a second start hands its files to the running one. A Slate running as administrator
+- One Slate per user session: a second start hands its files to the running one (to a window of Slate's class whose
+  process runs as the same user with the same rights: `slate_window`). A Slate running as administrator
   is separate (its own lock, window class and session), as Windows doesn't let the two talk. A second start tries
   for up to ~10 s while the running one is starting (its window not there yet, or not ready for files) or closing
   (then it becomes the Slate once the old one has ended); files count as handed over only when the window answers 1

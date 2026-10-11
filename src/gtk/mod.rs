@@ -53,6 +53,9 @@ pub struct Ui {
     pub app: RefCell<App>,
     pub gtk_app: gtk4::Application,
     pub window: gtk4::ApplicationWindow,
+    /// The `win.…` actions of the menus and shortcuts: a group inserted into the window, not the window's own, which
+    /// GTK publishes on D-Bus for other programs to run.
+    win_actions: gio::SimpleActionGroup,
     tabs: gtk4::DrawingArea,
     text: gtk4::DrawingArea,
     status: gtk4::DrawingArea,
@@ -443,6 +446,7 @@ pub fn window(application: &gtk4::Application, test: Option<Rc<testmode::Test>>)
         app: RefCell::new(app),
         gtk_app: application.clone(),
         window,
+        win_actions: gio::SimpleActionGroup::new(),
         tabs,
         text,
         status,
@@ -895,6 +899,8 @@ fn commands() -> Vec<(&'static str, Cmd, &'static [&'static str])> {
 const CHECKED: &[&str] = &["wrap", "line-numbers", "theme-system", "theme-light", "theme-dark", "eol-lf", "eol-crlf"];
 
 fn actions(ui: &Rc<Ui>) {
+    // (in place of the window's own "win" group: menus and shortcuts find these the same way)
+    ui.window.insert_action_group("win", Some(&ui.win_actions));
     for (name, cmd, accels) in commands() {
         let a = if CHECKED.contains(&name) {
             gio::SimpleAction::new_stateful(name, None, &false.to_variant())
@@ -906,7 +912,7 @@ fn actions(ui: &Rc<Ui>) {
                 ui.command(cmd);
             }
         });
-        ui.window.add_action(&a);
+        ui.win_actions.add_action(&a);
         if !accels.is_empty() {
             ui.gtk_app.set_accels_for_action(&format!("win.{name}"), accels);
         }
@@ -919,7 +925,7 @@ fn actions(ui: &Rc<Ui>) {
                 ui.command(Cmd::GoTab(k));
             }
         });
-        ui.window.add_action(&a);
+        ui.win_actions.add_action(&a);
         // (Ctrl as on Windows; Alt as in other Linux apps)
         ui.gtk_app.set_accels_for_action(&format!("win.{name}"), &[&format!("<Control>{k}"), &format!("<Alt>{k}")]);
     }
@@ -931,7 +937,7 @@ fn actions(ui: &Rc<Ui>) {
             ui.command(Cmd::SetLang(l));
         }
     });
-    ui.window.add_action(&lang);
+    ui.win_actions.add_action(&lang);
     let recent = gio::SimpleAction::new("open-recent", Some(glib::VariantTy::STRING));
     recent.connect_activate(|_, v| {
         let Some(p) = v.and_then(|v| v.get::<String>()) else { return };
@@ -939,7 +945,7 @@ fn actions(ui: &Rc<Ui>) {
             ui.with(|a| a.open_paths(&[PathBuf::from(p)]));
         }
     });
-    ui.window.add_action(&recent);
+    ui.win_actions.add_action(&recent);
 }
 
 /// Menu items shown only while their action is on: JSON's and XML's for those files (as on Windows), and Help's
@@ -1649,7 +1655,7 @@ impl Ui {
             ("stop-default", default),
         ];
         for (name, enabled) in on {
-            if let Some(action) = self.window.lookup_action(name).and_downcast::<gio::SimpleAction>() {
+            if let Some(action) = self.win_actions.lookup_action(name).and_downcast::<gio::SimpleAction>() {
                 if action.is_enabled() != enabled {
                     action.set_enabled(enabled);
                 }
@@ -1662,7 +1668,7 @@ impl Ui {
     }
 
     fn set_action_state(&self, name: &str, state: glib::Variant) {
-        if let Some(action) = self.window.lookup_action(name).and_downcast::<gio::SimpleAction>() {
+        if let Some(action) = self.win_actions.lookup_action(name).and_downcast::<gio::SimpleAction>() {
             if action.state().as_ref() != Some(&state) {
                 action.set_state(&state);
             }

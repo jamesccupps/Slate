@@ -1,0 +1,11 @@
+# The workflows' actions are pinned to commits (the version in a comment): Dependabot opens a pull request when a
+# new version comes out, with the new commit.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      actions:
+        patterns: ["*"]

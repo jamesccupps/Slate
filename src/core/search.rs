@@ -87,6 +87,9 @@ pub struct Matcher {
     regex_mode: bool,
     /// Bytes after a window a match that starts in it may need (see `OVERLAP`).
     overlap: u64,
+    /// Whether an Anchored literal's run goes first, once tried on a text (`anchor_for`): find next asks again at
+    /// each press.
+    anchor: std::sync::OnceLock<bool>,
 }
 
 /// A plain-text query searched more directly than through its regex, finding exactly what the regex would.
@@ -95,10 +98,10 @@ enum Literal {
     /// Match case: the bytes as they are.
     Exact(memmem::Finder<'static>),
     /// Ignoring case, an ASCII query whose longest run of letters and digits isn't where it starts
-    /// (`"status":"refunded"`): its regex looks for it from its start, which is often far commoner than all of it
-    /// (every record's `"status"`), and checks each place. That run is looked for instead (`run`, a regex of its own:
-    /// as fast as plain text goes), then the whole query around each place it is (`span`: the most bytes a match can
-    /// take, a letter of other case taking up to three times its bytes).
+    /// (`"status":"refunded"`): its regex looks for it from its start, which can be far commoner than all of it
+    /// (every record's `"status"`), and checks each place. Where that's slower (`anchor_pays`), that run is looked
+    /// for instead (`run`, a regex of its own: as fast as plain text goes), then the whole query around each place it
+    /// is (`span`: the most bytes a match can take, a letter of other case taking up to three times its bytes).
     Anchored { run: Regex, span: usize },
 }
 
@@ -167,14 +170,15 @@ impl Matcher {
             })?;
         // (plain text: what the query can match, a letter of other case taking up to three times its bytes)
         let overlap = if q.regex { OVERLAP_REGEX } else { OVERLAP.max(4 * q.text.len() as u64 + CTX) };
-        Ok(Matcher { re, lit: Literal::new(q), regex_mode: q.regex, overlap })
+        Ok(Matcher { re, lit: Literal::new(q), regex_mode: q.regex, overlap, anchor: std::sync::OnceLock::new() })
     }
 
-    /// The first match in `hay` starting at `at` or after (the text before `at` counts for `\b` and `^`).
-    fn find_at(&self, hay: &[u8], at: usize) -> Option<(usize, usize)> {
+    /// The first match in `hay` starting at `at` or after (the text before `at` counts for `\b` and `^`); `anchor`:
+    /// an Anchored literal's run is looked for first (where `anchor_pays`).
+    fn find_at(&self, hay: &[u8], at: usize, anchor: bool) -> Option<(usize, usize)> {
         match &self.lit {
             Some(Literal::Exact(f)) => f.find(&hay[at..]).map(|i| (at + i, at + i + f.needle().len())),
-            Some(Literal::Anchored { run, span }) => {
+            Some(Literal::Anchored { run, span, .. }) if anchor => {
                 // At each place the run is, the whole query in a window around it: the first match there that starts
                 // no later than the run is the first match of all (one that starts later is found at its own run,
                 // where it fits in the window whole; see the tests).
@@ -188,8 +192,39 @@ impl Matcher {
                 }
                 None
             }
-            None => self.re.find_at(hay, at).map(|m| (m.start(), m.end())),
+            _ => self.re.find_at(hay, at).map(|m| (m.start(), m.end())),
         }
+    }
+
+    /// Whether looking for an Anchored literal's run first pays in a text like `sample`. How fast the regex alone
+    /// goes depends on how common the query's start is and on how the regex looks for it (each letter in its cases),
+    /// which only trying tells: both ways are timed on the sample's first 256 KiB (each a second time, set up), and
+    /// the run first is taken only when it's clearly faster. In a shop's orders, `"status":"refunded"` goes 3 to 14
+    /// times faster that way, but "Wool socks" 20% slower (the run as common as the start: each place searched twice).
+    fn anchor_pays(&self, sample: &[u8]) -> bool {
+        if !matches!(self.lit, Some(Literal::Anchored { .. })) || sample.len() < 64 << 10 {
+            return false;
+        }
+        let sample = &sample[..sample.len().min(256 << 10)];
+        let time = |anchor: bool| {
+            let t = std::time::Instant::now();
+            let mut at = 0;
+            while let Some(m) = self.find_at(sample, at, anchor) {
+                at = m.1.max(m.0 + 1);
+            }
+            t.elapsed()
+        };
+        let _ = (time(false), time(true));
+        let (regex, run) = (time(false), time(true));
+        run * 4 < regex * 3
+    }
+
+    /// `anchor_pays`, tried once (on the first text big enough to tell).
+    fn anchor_for(&self, sample: &[u8]) -> bool {
+        if !matches!(self.lit, Some(Literal::Anchored { .. })) || sample.len() < 64 << 10 {
+            return false;
+        }
+        *self.anchor.get_or_init(|| self.anchor_pays(sample))
     }
 
     /// How long a text can be to search it on the UI thread: plain text is searched at several GB/s (32 MB in a few
@@ -255,10 +290,11 @@ impl Matcher {
             let hs = start.saturating_sub(CTX);
             let he = (end + self.overlap).min(len);
             let hay = h.hay(hs, he, &mut scratch);
+            let anchor = self.anchor_for(hay);
             let mut best = None;
             let mut at = (start - hs) as usize;
             while at <= hay.len() {
-                let Some(m) = self.find_at(hay, at) else { break };
+                let Some(m) = self.find_at(hay, at, anchor) else { break };
                 let ms = hs + m.0 as u64;
                 if ms >= end {
                     break;
@@ -325,10 +361,11 @@ impl Matcher {
             let limit = if he == len { u64::MAX } else { pos + win };
             let hay = h.hay(hs, he, &mut scratch);
             let mut at = (pos - hs) as usize;
+            let anchor = self.anchor_for(&hay[at..]);
             let mut next = limit.min(to);
             let mut grow = false;
             while at <= hay.len() {
-                let Some(m) = self.find_at(hay, at) else { break };
+                let Some(m) = self.find_at(hay, at, anchor) else { break };
                 let ms = hs + m.0 as u64;
                 let me = hs + m.1 as u64;
                 // An empty match at the very end of the text counts (e.g. `^` after a final line break).
@@ -392,7 +429,7 @@ impl Matcher {
         let mut v = Vec::new();
         let mut at = 0;
         while v.len() < limit {
-            let Some((s, e)) = self.find_at(hay, at) else { break };
+            let Some((s, e)) = self.find_at(hay, at, false) else { break };
             v.push((base + s as u64, base + e as u64));
             at = e;
         }
@@ -406,7 +443,7 @@ impl Matcher {
         let he = (e + CTX).min(h.hay_len());
         let mut scratch = Vec::new();
         let hay = h.hay(hs, he, &mut scratch);
-        self.find_at(hay, (s - hs) as usize).is_some_and(|m| hs + m.0 as u64 == s && hs + m.1 as u64 == e)
+        self.find_at(hay, (s - hs) as usize, false).is_some_and(|m| hs + m.0 as u64 == s && hs + m.1 as u64 == e)
     }
 
     /// The replacement for the match at `[s, e)` of `hay` (expands `$1`, `${name}` in regex mode).
@@ -582,6 +619,16 @@ mod tests {
                 }
                 let hay = &text.as_bytes()[..5000];
                 assert_eq!(lit.matches_in(hay, 7, 100), re.matches_in(hay, 7, 100));
+                // (the run looked for first, whichever way the counts above went on this text)
+                let all = |anchor: bool| {
+                    let (mut v, mut at) = (Vec::new(), 0);
+                    while let Some(m) = lit.find_at(text.as_bytes(), at, anchor) {
+                        v.push(m);
+                        at = m.1.max(m.0 + 1);
+                    }
+                    v
+                };
+                assert_eq!(all(true), all(false), "{query:?}, match case {match_case}");
             }
         }
         assert!(anchored >= 5, "{anchored}");
@@ -858,14 +905,15 @@ mod tests {
             let n = f();
             println!("{name:40} {n:>9} in {:7.1} ms", t.elapsed().as_secs_f64() * 1000.0);
         };
-        for query in ["\"status\":\"refunded\"", "Leave at the door", "refunded", "Atlanta"] {
+        for query in ["\"status\":\"refunded\"", "Wool socks", "Leave at the door", "refunded", "Atlanta"] {
             println!("-- {query}");
             let re = RegexBuilder::new(&regex::escape(query)).case_insensitive(true).build().unwrap();
             time("regex", &|| re.find_iter(&text).count());
             let m = Matcher::new(&Query { text: query.into(), ..Default::default() }).unwrap();
-            time(if m.lit.is_some() { "Matcher (anchored)" } else { "Matcher (regex)" }, &|| {
+            let anchor = m.anchor_pays(&text);
+            time(if anchor { "Matcher (run first)" } else { "Matcher (regex)" }, &|| {
                 let (mut n, mut at) = (0, 0);
-                while let Some((_, e)) = m.find_at(&text, at) {
+                while let Some((_, e)) = m.find_at(&text, at, anchor) {
                     n += 1;
                     at = e;
                 }

@@ -325,8 +325,9 @@ fn convert_to_temp(src: &Source, encoding: Encoding, bom: u64, verify: bool, ctx
             if ctx.cancelled() {
                 return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
             }
-            input.clear();
-            src.read_into(pos, pos + CHUNK, &mut input);
+            // (read over the last chunk's bytes: zeroing them first would write as much again)
+            input.resize((src.len() - pos).min(CHUNK) as usize, 0);
+            src.read_to(pos, &mut input);
             pos += input.len() as u64;
             out.clear();
             match encoding {

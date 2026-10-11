@@ -75,6 +75,15 @@ noticed; absurdly deep JSON or XML and huge Format results no longer use gigabyt
 searching JSON for a key and value is 3-5 times faster, sorting nearly 3 times, typing with the path bar on no longer
 rescans the file per key. Details in the [0.9.0 release notes](release-notes-0.9.0.md).
 
+## 0.9.1
+
+The audit's remaining release and update findings, and the speed 0.9.0 lost in two places. Updates check the
+signing identity as well as the name; a second Slate hands its files only to a Slate running as the same user with
+the same rights; on Linux the menu actions aren't published on D-Bus; the apt repository's index expires a year after
+signing and is signed again monthly; the workflows' actions are pinned to commits. Counting and Replace all in big
+files are about 10% faster than in 0.8.2 (0.9.0 had made them 5% slower), and searches like `Wool socks` are back to
+full speed. Details in the [0.9.1 release notes](release-notes-0.9.1.md).
+
 ## Next
 
 1. **Accessibility: UI Automation (L).** The high-contrast theme (Windows' colors, read again when they change) and a

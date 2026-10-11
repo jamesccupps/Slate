@@ -1,8 +1,9 @@
 #!/bin/sh
 # Makes Slate's apt repository from a release's .deb files: <out>/apt/{pool,dists/stable}, the Release file signed
-# with the key in $APT_SIGNING_KEY (ASCII-armored, no passphrase), and the public key next to it. The Pages workflow
+# with the key in $APT_SIGNING_KEY (ASCII-armored, no passphrase), and the keyring next to it. The Pages workflow
 # (.github/workflows/apt.yml) publishes <out> at https://jamesccupps.github.io/Slate/ (with the site's pages from
-# site/) when a release is published.
+# site/) when a release is published, and again every month: the Release file is valid for a year from signing
+# (Valid-Until), so apt never takes an old one for current, and each run signs it anew.
 # Users' systems read it through /etc/apt/sources.list.d/slate.list, which the package itself adds:
 #   deb [signed-by=/usr/share/keyrings/slate-archive-keyring.gpg] https://jamesccupps.github.io/Slate/apt stable main
 #   packaging/linux/apt-repo.sh <dir with the .debs> <out dir>
@@ -38,21 +39,23 @@ apt-ftparchive \
     -o APT::FTPArchive::Release::Architectures="amd64 arm64 armhf i386" \
     -o APT::FTPArchive::Release::Components=main \
     -o APT::FTPArchive::Release::Description="Slate, a fast text editor for files of any size" \
+    -o APT::FTPArchive::Release::ValidTime=31536000 \
     release dists/stable > Release
 mv Release dists/stable/Release
 
 GNUPGHOME=$(mktemp -d)
 export GNUPGHOME
 printf '%s\n' "$APT_SIGNING_KEY" | gpg --batch --quiet --import
-gpg --batch --yes --armor --detach-sign -o dists/stable/Release.gpg dists/stable/Release
-gpg --batch --yes --clearsign -o dists/stable/InRelease dists/stable/Release
-# The repository must be signed by the key the package brings (users' apt checks it against that one).
-gpg --export > signer.gpg
-if ! cmp -s signer.gpg "$here/slate-archive-keyring.gpg"; then
-    echo "APT_SIGNING_KEY isn't the key in packaging/linux/slate-archive-keyring.gpg" >&2
+# The repository must be signed by a key the package brings (users' apt checks it against those): the keyring holds
+# the signing key and a backup kept offline, which can take over without every system installing a new key by hand.
+signer=$(gpg --batch --with-colons --list-secret-keys | awk -F: '$1 == "fpr" { print $10; exit }')
+if ! gpg --batch --with-colons --show-keys "$here/slate-archive-keyring.gpg" | grep -q "^fpr:.*:$signer:\$"; then
+    echo "APT_SIGNING_KEY isn't one of the keys in packaging/linux/slate-archive-keyring.gpg" >&2
     exit 1
 fi
-mv signer.gpg slate-archive-keyring.gpg
+gpg --batch --yes --armor --detach-sign -o dists/stable/Release.gpg dists/stable/Release
+gpg --batch --yes --clearsign -o dists/stable/InRelease dists/stable/Release
+cp "$here/slate-archive-keyring.gpg" slate-archive-keyring.gpg
 gpgconf --kill gpg-agent
 rm -rf "$GNUPGHOME"
 

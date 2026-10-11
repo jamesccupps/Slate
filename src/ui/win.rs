@@ -590,6 +590,47 @@ pub fn set_window_icons(hwnd: HWND, big: isize, small: isize) {
     }
 }
 
+/// Who a process runs as: its user (the SID's bytes) and its integrity level. None when that can't be read (a
+/// process that ended, or one of another user or with more rights).
+pub fn process_identity(pid: u32) -> Option<(Vec<u8>, u32)> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::Security::{
+        GetLengthSid, GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, TOKEN_INFORMATION_CLASS,
+        TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TOKEN_USER, TokenIntegrityLevel, TokenUser,
+    };
+    use windows::Win32::System::Threading::{OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION};
+    unsafe {
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let mut token = HANDLE::default();
+        let opened = OpenProcessToken(process, TOKEN_QUERY, &mut token).is_ok();
+        let _ = CloseHandle(process);
+        if !opened {
+            return None;
+        }
+        let info = |class: TOKEN_INFORMATION_CLASS| -> Option<Vec<u64>> {
+            let mut len = 0u32;
+            let _ = GetTokenInformation(token, class, None, 0, &mut len);
+            if len == 0 {
+                return None;
+            }
+            let mut buf = vec![0u64; (len as usize).div_ceil(8)];
+            GetTokenInformation(token, class, Some(buf.as_mut_ptr() as *mut _), len, &mut len).ok()?;
+            Some(buf)
+        };
+        let (user, level) = (info(TokenUser), info(TokenIntegrityLevel));
+        let _ = CloseHandle(token);
+        let (user, level) = (user?, level?);
+        let sid = (*(user.as_ptr() as *const TOKEN_USER)).User.Sid;
+        let sid = std::slice::from_raw_parts(sid.0 as *const u8, GetLengthSid(sid) as usize).to_vec();
+        let label = (*(level.as_ptr() as *const TOKEN_MANDATORY_LABEL)).Label.Sid;
+        let n = *GetSidSubAuthorityCount(label);
+        if n == 0 {
+            return None;
+        }
+        Some((sid, *GetSidSubAuthority(label, n as u32 - 1)))
+    }
+}
+
 /// Whether this Slate was started "as administrator" next to the user's normal rights (UAC gave it the full token of
 /// a split one). Such a Slate keeps its own window and session, apart from a normal one (Windows doesn't let the two
 /// exchange messages). With UAC off, or as the built-in Administrator, every Slate has the same rights and there's

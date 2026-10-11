@@ -756,6 +756,29 @@ impl Snapshot {
         }
     }
 
+    /// Makes `out` the bytes of `[a, b)`, read over what it holds rather than zeroed first: a search reads window after
+    /// window into the same buffer (zeroing each, 0.9.0 wrote as much again as it read).
+    pub fn read_over(&self, a: u64, b: u64, out: &mut Vec<u8>) {
+        let b = b.min(self.len);
+        let n = b.saturating_sub(a) as usize;
+        if out.len() < n {
+            out.resize(n, 0);
+        } else {
+            out.truncate(n);
+        }
+        let mut i = self.pieces.partition_point(|(off, p)| off + p.len <= a);
+        let mut at = 0;
+        while at < n && i < self.pieces.len() {
+            let (off, p) = self.pieces[i];
+            let s = a.max(off) - off;
+            let e = (b - off).min(p.len);
+            let len = (e - s) as usize;
+            self.sources[p.src as usize].read_to(p.start + s, &mut out[at..at + len]);
+            at += len;
+            i += 1;
+        }
+    }
+
     /// The bytes of `[a, b)` without copying when they sit in one in-memory piece.
     pub fn slice<'a>(&'a self, a: u64, b: u64, scratch: &'a mut Vec<u8>) -> &'a [u8] {
         let b = b.min(self.len);
@@ -770,8 +793,7 @@ impl Snapshot {
                 return &m[s..s + (b - a) as usize];
             }
         }
-        scratch.clear();
-        self.read_into(a, b, scratch);
+        self.read_over(a, b, scratch);
         scratch
     }
 
@@ -929,6 +951,28 @@ mod tests {
         b.insert_pieces(5, &removed);
         assert!(b.read_errors() > 0);
         assert_eq!(b.file_sources().len(), 1);
+    }
+
+    #[test]
+    fn a_window_read_over_an_old_one_is_the_text() {
+        use std::io::Write;
+        // a file big enough to be read straight (not through the block cache), typed into in two places
+        let (mut f, path) = crate::core::source::create_temp_file().unwrap();
+        let data: Vec<u8> = (0..1_500_000u32).map(|i| b'a' + (i % 26) as u8).collect();
+        f.write_all(&data).unwrap();
+        let mut b = Buffer::from_source(Arc::new(Source::from_file(f, data.len() as u64, path, true, None)), 0);
+        b.insert(700_000, b"TYPED");
+        b.insert(10, b"MORE");
+        let s = b.snapshot();
+        let mut out = vec![b'#'; 2_000_000];
+        for (a, z) in [(0, 1_500_009), (5, 900_000), (699_990, 700_020), (1_400_000, 1_600_000), (3, 3), (0, 2_000_000)] {
+            let mut want = Vec::new();
+            s.read_into(a, z, &mut want);
+            s.read_over(a, z, &mut out);
+            assert!(out == want, "{a}..{z}");
+            let mut scratch = vec![b'#'; 10];
+            assert!(s.slice(a, z, &mut scratch) == &want[..], "{a}..{z}");
+        }
     }
 
     #[test]
