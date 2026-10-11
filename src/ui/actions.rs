@@ -1528,7 +1528,7 @@ impl App {
                     TaskKind::ReplaceAll => format!("Replaced {}", plural(count, "match", "matches")),
                     TaskKind::Eol(e) => format!("Line endings changed to {} ({})", e.short(), plural(count, "line", "lines")),
                     TaskKind::Lines(op) => lines_done(op, count),
-                    TaskKind::Validate(_) => String::new(),
+                    TaskKind::Validate(_) | TaskKind::Print => String::new(),
                 };
                 if matches!(task.kind, TaskKind::Format(_)) {
                     // (now indented by the formatter's own rule)
@@ -1580,6 +1580,7 @@ impl App {
                 });
                 self.layout();
             }
+            TaskResult::Done(m) => self.flash(m, false),
             TaskResult::Cancelled => self.flash("Cancelled", false),
         }
     }
@@ -1604,6 +1605,8 @@ impl App {
         let len = snap.len();
         let line_count = tab.doc.line_count().unwrap_or(0);
         let job = match kind {
+            // (started by `start_print`)
+            TaskKind::Print => return,
             TaskKind::Format(f) | TaskKind::Minify(f) => {
                 let pretty = matches!(kind, TaskKind::Format(_));
                 let mode = if pretty { JsonMode::Pretty } else { JsonMode::Minify };
@@ -1717,6 +1720,48 @@ impl App {
             })),
         };
         tab.task = Some(Task { kind, job, version });
+        self.timer(TIMER_JOBS, 100);
+        self.invalidate();
+    }
+
+    /// Prints the tab's text (or its selection) on a started printer, on another thread; `pages`: which (None: all).
+    pub fn start_print(&mut self, printer: super::print::Printer, selection: bool, pages: Option<Vec<(u32, u32)>>) {
+        let notify = self.notify.clone();
+        let s = &self.settings;
+        let tab = &mut self.tabs[self.active];
+        let sel = tab.view.sel;
+        let snap = tab.doc.snapshot();
+        let (from, to) = if selection && !sel.is_empty() { (sel.start(), sel.end()) } else { (0, snap.len()) };
+        let line = tab.doc.line_of(from).unwrap_or(0) + 1;
+        let line_start = tab.doc.line_start_of(from);
+        let style = super::print::Style {
+            font: s.font.clone(),
+            size: s.font_size,
+            numbers: s.line_numbers,
+            tab: s.tab_size as usize,
+            title: tab.title(),
+            last_line: tab.doc.line_of(to).unwrap_or(0) + 1,
+            theme: crate::theme::Theme::light(crate::theme::rgb(0x0067C0)),
+        };
+        let lang = tab.lang;
+        let job = Job::spawn(to - from, notify, move |ctx| {
+            let before = snap.read_errors();
+            let state = crate::print::state_at(&snap, lang, line_start, from);
+            let text = crate::print::Text { snap: &snap, from, to, line, lang, state };
+            let mut going = |done: u64| {
+                ctx.set(done);
+                !ctx.cancelled()
+            };
+            match super::print::print(printer, &text, &style, pages.as_deref(), &mut going) {
+                Ok(Some(_)) if snap.read_errors() != before => {
+                    TaskResult::Failed("Printed, but part of the file couldn't be read (was it changed or removed?): the printout misses it.".into())
+                }
+                Ok(Some(n)) => TaskResult::Done(super::print::done_message(n)),
+                Ok(None) => TaskResult::Cancelled,
+                Err(m) => TaskResult::Failed(format!("Couldn't print: {m}")),
+            }
+        });
+        tab.task = Some(Task { kind: TaskKind::Print, job, version: tab.doc.version });
         self.timer(TIMER_JOBS, 100);
         self.invalidate();
     }
@@ -3681,9 +3726,11 @@ impl App {
                     item(Cmd::SaveAs, "Save &as…", "Ctrl+Shift+S"),
                     item(Cmd::SaveAll, "Save a&ll", "Ctrl+Alt+S"),
                     Item::Sep,
+                    item(Cmd::Print, "&Print…", "Ctrl+P"),
+                    Item::Sep,
                     enabled(Cmd::Reload, "Reloa&d from disk", "", has_path),
                     enabled(Cmd::RevealFile, "Show in &folder", "", has_path),
-                    enabled(Cmd::CopyPath, "Copy file &path", "", has_path),
+                    enabled(Cmd::CopyPath, "Copy file pat&h", "", has_path),
                     Item::Sep,
                     item(Cmd::CloseTab, "&Close tab", "Ctrl+W"),
                     item(Cmd::CloseOthers, "Close o&ther tabs", ""),
@@ -4288,6 +4335,60 @@ pub fn run(cell: &Cell, d: Deferred) {
     }
 }
 
+/// File → Print: the system's print dialog, a question first when it's a lot of pages, then the pages printed on
+/// another thread (`App::start_print`).
+fn print_tab(cell: &Cell) {
+    let (hwnd, has_sel, busy, counted, title) = {
+        let a = cell.borrow();
+        let t = a.tab();
+        (a.hwnd, !t.view.sel.is_empty(), t.task.is_some() || t.save.is_some(), t.doc.line_count().is_some(), t.title())
+    };
+    if busy {
+        cell.borrow_mut().flash("Still working on the previous task (Esc cancels it).", true);
+        return;
+    }
+    if !counted {
+        cell.borrow_mut().flash("Print works once the file's lines are counted (a moment).", true);
+        return;
+    }
+    let Some(choice) = ({
+        let mut last = std::mem::take(&mut cell.borrow_mut().print_last);
+        let c = super::print::dialog(hwnd, has_sel, &mut last);
+        cell.borrow_mut().print_last = last;
+        c
+    }) else {
+        return;
+    };
+    let estimate = {
+        let a = cell.borrow();
+        let t = a.tab();
+        let (from, to) = if choice.selection { (t.view.sel.start(), t.view.sel.end()) } else { (0, t.doc.len()) };
+        let lines = t.doc.line_of(to).unwrap_or(0) - t.doc.line_of(from).unwrap_or(0) + 1;
+        let all = crate::print::estimate_pages(to - from, lines);
+        match &choice.pages {
+            Some(r) => all.min(r.iter().map(|&(a, b)| (b.saturating_sub(a) + 1) as u64).sum()),
+            None => all,
+        }
+    };
+    if estimate > crate::print::PAGES_MAX {
+        choice.printer.discard();
+        let q = format!("That's about {} pages", group(estimate));
+        let more = format!("Slate prints up to {} pages at a time. Select the part to print, then choose Print and Selection.", group(crate::print::PAGES_MAX));
+        win::ask(hwnd, "Slate", &q, &more, &["OK"]);
+        return;
+    }
+    if estimate > crate::print::PAGES_ASK {
+        let q = format!("Print about {} pages?", group(estimate));
+        if win::ask(hwnd, "Slate", &q, "", &["&Print", "Cancel"]) != Some(0) {
+            choice.printer.discard();
+            return;
+        }
+    }
+    // (on this thread: a printer's own dialog, like Print to PDF's Save as, belongs to the window)
+    let Some(printer) = choice.printer.start(&title, None) else { return };
+    cell.borrow_mut().start_print(printer, choice.selection, choice.pages);
+}
+
 pub fn run_cmd(cell: &Cell, cmd: Cmd) {
     match cmd {
         Cmd::Open => {
@@ -4384,6 +4485,7 @@ pub fn run_cmd(cell: &Cell, cmd: Cmd) {
                 }
             }
         }
+        Cmd::Print => print_tab(cell),
         Cmd::Exit => close_window(cell),
         Cmd::Copy | Cmd::Cut => {
             let (size, hwnd) = {

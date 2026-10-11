@@ -1,6 +1,6 @@
 [package]
 name = "slate"
-version = "0.9.1"
+version = "0.10.0"
 edition = "2024"
 description = "A fast, simple text editor for Windows and Linux that handles huge files"
 license = "MIT"
@@ -50,6 +50,7 @@ features = [
     "Win32_Graphics_Imaging",
     "Win32_Security",
     "Win32_Storage_FileSystem",
+    "Win32_Storage_Xps",
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",
     "Win32_System_DataExchange",
@@ -72,6 +73,7 @@ features = [
     "Win32_System_Variant",
     "Win32_UI_Accessibility",
     "Win32_UI_Controls",
+    "Win32_UI_Controls_Dialogs",
     "Win32_UI_HiDpi",
     "Win32_UI_Input_Ime",
     "Win32_UI_Input_KeyboardAndMouse",

@@ -48,7 +48,8 @@
 //! script (frames go through the hidden window's own swap chain, from the paint after the first command on, as in a
 //! real start; `gfx:late` too: its Direct3D device is made then, not from the start), `idle:<ms>` (the real message
 //! loop for that long, with the 2 s disk check: what woke it), `copydata:<path>` (a file handed over the way a second
-//! Slate does it, and whether it was taken); `session:…` says how long it took, and needs `SLATE_DATA_DIR` (as
+//! Slate does it, and whether it was taken), `printpdf:<file>[|selection]` (the tab printed into a PDF file through
+//! Microsoft Print to PDF, no dialog); `session:…` says how long it took, and needs `SLATE_DATA_DIR` (as
 //! `persist` does); `print:datadir` is `empty` while that folder has nothing in it.
 
 use std::path::{Path, PathBuf};
@@ -1082,6 +1083,24 @@ pub fn run(args: &[String]) -> i32 {
                 out.push_str(&format!("idle: {}\n", idle(arg.parse().unwrap_or(10_000))));
             }
             // What another Slate sends to hand its files over.
+            "printpdf" => {
+                // printpdf:<file>[|selection]: the tab printed into a PDF file through Microsoft Print to PDF
+                let (file, selection) = match arg.split_once('|') {
+                    Some((f, s)) => (f, s == "selection"),
+                    None => (arg, false),
+                };
+                let path = std::path::absolute(file).unwrap_or_else(|_| std::path::PathBuf::from(file));
+                match super::print::Printer::pdf() {
+                    None => out.push_str("printpdf: no Microsoft Print to PDF printer\n"),
+                    Some(p) => {
+                        let title = cell.borrow().tab().title();
+                        match p.start(&title, Some(&path)) {
+                            Some(p) => cell.borrow_mut().start_print(p, selection, None),
+                            None => out.push_str("printpdf: the document didn't start\n"),
+                        }
+                    }
+                }
+            }
             "copydata" => {
                 use windows::Win32::Foundation::{LPARAM, WPARAM};
                 use windows::Win32::System::DataExchange::COPYDATASTRUCT;

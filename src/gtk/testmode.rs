@@ -10,7 +10,7 @@
 //! work), `shot:<file.png>`, `print:<what>` (`text`, `sel`, `status`, `title`, `tabs`, `lang`, `asked`,
 //! `clipboard`, `find`, `dirty`, `top`, `session`: the session folder's files, `notice`), `expect:<what>=<value>`,
 //! `t:<label>` (a timing mark), `persist`, `session:save|soon|restore` (`soon`: on another thread, as the timer
-//! does), `quit`.
+//! does), `printpdf:<file>[|selection]` (the tab printed into a PDF file, no dialog), `quit`.
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -284,6 +284,15 @@ async fn script(lines: Vec<String>, test: Rc<Test>) -> i32 {
                 mark = now;
             }
             "persist" => {}
+            "printpdf" => {
+                // printpdf:<file>[|selection]: the tab printed into a PDF file (no dialog)
+                let (file, selection) = match arg.split_once('|') {
+                    Some((f, s)) => (f, s == "selection"),
+                    None => (arg, false),
+                };
+                let path = std::path::absolute(file).unwrap_or_else(|_| std::path::PathBuf::from(file));
+                super::print::run(&ui, Some((path, selection)));
+            }
             "session" => {
                 if std::env::var_os("SLATE_DATA_DIR").is_none() {
                     log(&mut out, format!("session:{arg} needs SLATE_DATA_DIR"));

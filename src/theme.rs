@@ -3,6 +3,8 @@
 //! darker (or lighter) frame. While Windows' high contrast is on, every color comes from Windows instead
 //! (`Theme::high_contrast`).
 
+use crate::highlight::Tok;
+
 #[cfg(windows)]
 use windows::Win32::Graphics::Gdi::{
     COLOR_GRAYTEXT, COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT, COLOR_HOTLIGHT, COLOR_WINDOW, COLOR_WINDOWTEXT, GetSysColor,
@@ -18,6 +20,36 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 #[cfg(windows)]
 use windows::core::w;
+
+/// The color text of kind `tok` is drawn in.
+pub fn tok_color(t: &Theme, tok: Tok) -> u32 {
+    match tok {
+        Tok::Key => t.syn_key,
+        Tok::Str => t.syn_string,
+        Tok::Num => t.syn_number,
+        Tok::Lit => t.syn_literal,
+        Tok::Punct => t.syn_punct,
+        Tok::Comment => t.syn_comment,
+        Tok::Section => t.syn_section,
+        Tok::Error => t.syn_error,
+        Tok::Warn => t.syn_warn,
+        Tok::Info => t.syn_info,
+        Tok::Dim => t.syn_dim,
+        Tok::Keyword => t.syn_keyword,
+        Tok::Control => t.syn_control,
+        Tok::Type => t.syn_type,
+        Tok::Func => t.syn_func,
+        Tok::Tag => t.syn_tag,
+        Tok::Attr => t.syn_attr,
+        Tok::Var => t.syn_var,
+        Tok::Heading => t.syn_heading,
+        Tok::Link => t.syn_link,
+        Tok::Added => t.syn_added,
+        Tok::Removed => t.syn_removed,
+        Tok::Col(k) => t.syn_cols[k as usize % 8],
+        Tok::Bold | Tok::Italic => t.text,
+    }
+}
 
 /// Opaque color from 0xRRGGBB.
 pub const fn rgb(c: u32) -> u32 {

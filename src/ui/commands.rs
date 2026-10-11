@@ -22,6 +22,8 @@ pub enum Cmd {
     Save,
     SaveAs,
     SaveAll,
+    /// File → Print… (the system's print dialog).
+    Print,
     Reload,
     RevealFile,
     CopyPath,
@@ -174,6 +176,7 @@ pub fn global_key(vk: u16, m: &Mods) -> Option<Cmd> {
         (VK_O, true, false) => Cmd::Open,
         (VK_S, true, false) => Cmd::Save,
         (VK_S, true, true) => Cmd::SaveAs,
+        (VK_P, true, false) => Cmd::Print,
         (VK_W, true, false) | (VK_F4, true, false) => Cmd::CloseTab,
         (VK_F, true, false) => Cmd::Find,
         (VK_H, true, false) => Cmd::Replace,
@@ -323,6 +326,7 @@ Files
   Ctrl+S                        Save
   Ctrl+Shift+S                  Save as
   Ctrl+Alt+S                    Save all
+  Ctrl+P                        Print
   Ctrl+W / Ctrl+F4              Close tab
   Ctrl+Shift+T                  Reopen the tab closed last
   Ctrl+Tab / Ctrl+PgDn          Next tab

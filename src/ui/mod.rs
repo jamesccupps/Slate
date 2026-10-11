@@ -12,6 +12,7 @@ pub use crate::highlight;
 pub use crate::settings;
 pub use crate::theme;
 pub mod install;
+pub mod print;
 pub mod prompt;
 pub mod session;
 pub mod structure;

@@ -24,7 +24,7 @@ pub use crate::edit::*;
 
 use super::gfx::{Gfx, Ink, Rect};
 use super::highlight::{self, CommentStyle, Lang, Span, State as HlState, Tok};
-use super::theme::{Theme, metrics};
+use super::theme::{Theme, metrics, tok_color};
 
 const WINDOW_EXTRA: u64 = 64 * 1024;
 const PREFIX_MAX: u64 = 4096;
@@ -102,35 +102,6 @@ fn layout_rows_of(layout: &IDWriteTextLayout, at: u32, end: u32) -> Vec<(u32, u3
         last.1 = end;
     }
     rows
-}
-
-fn tok_color(t: &Theme, tok: Tok) -> u32 {
-    match tok {
-        Tok::Key => t.syn_key,
-        Tok::Str => t.syn_string,
-        Tok::Num => t.syn_number,
-        Tok::Lit => t.syn_literal,
-        Tok::Punct => t.syn_punct,
-        Tok::Comment => t.syn_comment,
-        Tok::Section => t.syn_section,
-        Tok::Error => t.syn_error,
-        Tok::Warn => t.syn_warn,
-        Tok::Info => t.syn_info,
-        Tok::Dim => t.syn_dim,
-        Tok::Keyword => t.syn_keyword,
-        Tok::Control => t.syn_control,
-        Tok::Type => t.syn_type,
-        Tok::Func => t.syn_func,
-        Tok::Tag => t.syn_tag,
-        Tok::Attr => t.syn_attr,
-        Tok::Var => t.syn_var,
-        Tok::Heading => t.syn_heading,
-        Tok::Link => t.syn_link,
-        Tok::Added => t.syn_added,
-        Tok::Removed => t.syn_removed,
-        Tok::Col(k) => t.syn_cols[k as usize % 8],
-        Tok::Bold | Tok::Italic => t.text,
-    }
 }
 
 /// Colors a layout of the segment's text from UTF-16 position `at` to `end` with the spans (byte ranges of the

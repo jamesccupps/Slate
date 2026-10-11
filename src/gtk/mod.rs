@@ -5,6 +5,7 @@
 
 mod app;
 mod chrome;
+mod print;
 mod session;
 mod testmode;
 mod view;
@@ -99,6 +100,8 @@ pub struct Ui {
     recent_shown: RefCell<Option<Vec<PathBuf>>>,
     /// Slate opens text files when they're double-clicked (Help shows Stop opening files with Slate… then).
     is_default: Cell<bool>,
+    /// The printer and its settings chosen last (File → Print).
+    print_settings: RefCell<Option<gtk4::PrintSettings>>,
     pub test: Option<Rc<testmode::Test>>,
 }
 
@@ -482,6 +485,7 @@ pub fn window(application: &gtk4::Application, test: Option<Rc<testmode::Test>>)
         recent_menu,
         recent_shown: RefCell::new(None),
         is_default: Cell::new(test.is_none() && slate_is_default()),
+        print_settings: RefCell::new(None),
         test,
     });
     UI.with(|u| *u.borrow_mut() = Some(ui.clone()));
@@ -840,6 +844,7 @@ fn commands() -> Vec<(&'static str, Cmd, &'static [&'static str])> {
         ("open", Cmd::Open, &["<Control>o"]),
         ("save", Cmd::Save, &["<Control>s"]),
         ("save-as", Cmd::SaveAs, &["<Control><Shift>s"]),
+        ("print", Cmd::Print, &["<Control>p"]),
         ("save-all", Cmd::SaveAll, &["<Control><Alt>s"]),
         ("close-tab", Cmd::CloseTab, &["<Control>w"]),
         ("reopen-closed", Cmd::ReopenClosed, &["<Control><Shift>t"]),
@@ -981,6 +986,7 @@ fn menu_model(recent: &gio::Menu) -> gio::Menu {
     open.append_submenu(Some("Open recent"), recent);
     file.append_section(None, &open);
     file.append_section(None, &section(&[("Save", "save"), ("Save as…", "save-as"), ("Save all", "save-all")]));
+    file.append_section(None, &section(&[("Print…", "print")]));
     file.append_section(None, &section(&[("Close tab", "close-tab"), ("Reopen closed tab", "reopen-closed"), ("Quit", "quit")]));
     bar.append_submenu(Some("_File"), &file);
     let edit = gio::Menu::new();
@@ -1057,6 +1063,7 @@ const SHORTCUTS: &str = "Slate keyboard shortcuts
   Ctrl+O                   Open
   Ctrl+S / Ctrl+Shift+S    Save / Save as
   Ctrl+Alt+S               Save all
+  Ctrl+P                   Print
   Ctrl+W / Ctrl+Shift+T    Close tab / reopen the tab closed last
   Ctrl+Tab, Ctrl+PgDn      Next tab (Ctrl+Shift+Tab, Ctrl+PgUp: previous)
   Ctrl+1 … Ctrl+9          Go to a tab (9: the last; Alt+1 … Alt+9 too)
@@ -1950,6 +1957,14 @@ impl Ui {
                     },
                 );
             }
+            Ask::Print { pages } if pages > crate::print::PAGES_ASK => {
+                self.dialog(&format!("Print about {} pages?", crate::edit::group(pages)), "", &[("Cancel", "cancel"), ("Print", "print")], |answer| {
+                    if let (Some(ui), "print") = (get_ui(), answer) {
+                        print::run(&ui, None);
+                    }
+                });
+            }
+            Ask::Print { .. } => print::run(self, None),
             Ask::Shortcuts => {
                 self.with(|a| {
                     // (the tab that shows them already, if there is one)

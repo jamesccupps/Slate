@@ -33,6 +33,9 @@ JSON file opens instantly, scrolls smoothly, and can be searched, edited, format
 - JSON and XML: format (pretty-print), minify and check, also for JSON Lines; a path bar showing where the caret
   is (`data › [1203] › name`, `catalog › book[3] › title`; copy it as a JSON path or XPath) and a structure panel to
   browse objects, arrays and elements, fast on huge files.
+- Print (Ctrl+P): the file or the selection, in its colors, with line numbers (when they're shown) and page numbers;
+  long lines go on in the next row, breaking between words. *Microsoft Print to PDF* (Windows) and *Print to File*
+  (Linux) make a PDF.
 - Go to line (`slate notes.txt:120` opens a file at a line), word wrap, line numbers, show whitespace, the matching
   bracket highlighted, overtype, zoom, dark and light themes (follows Windows, or switch with the sun/moon button).
   With Windows' high contrast on, Slate uses its colors, and Magnifier follows the text cursor.
@@ -63,6 +66,7 @@ The usual ones work as in Notepad (Ctrl+N, O, S, F, H, G, Z, Y, A, X, C, V), plu
 | Ctrl+W / Ctrl+Shift+T | Close tab / reopen the tab closed last |
 | Ctrl+Tab, Ctrl+1 … Ctrl+9 | Next tab, go to a tab |
 | Ctrl+Alt+S | Save all |
+| Ctrl+P | Print |
 | Ctrl+D / Ctrl+Shift+K | Duplicate / delete the line |
 | Alt+Up / Alt+Down | Move the line up / down |
 | Ctrl+/ | Toggle comment (the lines) |

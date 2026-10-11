@@ -49,6 +49,8 @@ pub enum Ask {
     MakeDefault,
     /// Stop Slate being the default app for them?
     StopDefault,
+    /// File → Print: GTK's print dialog (after a question when it's about `pages` pages, a lot).
+    Print { pages: u64 },
 }
 
 /// A menu command or shortcut.
@@ -59,6 +61,7 @@ pub enum Cmd {
     Save,
     SaveAs,
     SaveAll,
+    Print,
     CloseTab,
     ReopenClosed,
     Quit,
@@ -447,6 +450,27 @@ impl App {
         }
         self.dirty_title = true;
         self.dirty_view = true;
+    }
+
+    /// File → Print: GTK's print dialog for the tab (`Ask::Print`), unless it's far too long.
+    fn print(&mut self) {
+        let tab = self.tab();
+        if tab.busy() {
+            self.flash("Still working on the previous task (Esc cancels it).", true);
+            return;
+        }
+        let Some(lines) = tab.doc.line_count() else {
+            self.flash("Print works once the file's lines are counted (a moment).", true);
+            return;
+        };
+        // (a selection can be printed instead, chosen in the dialog)
+        let pages = if tab.view.sel.is_empty() { crate::print::estimate_pages(tab.doc.len(), lines) } else { 0 };
+        if pages > crate::print::PAGES_MAX {
+            let msg = format!("That's about {} pages: select the part to print, then print the selection.", crate::edit::group(pages));
+            self.flash(msg, true);
+            return;
+        }
+        self.asks.push(Ask::Print { pages });
     }
 
     /// Whether anything runs in the background (test mode waits for it).
@@ -1167,6 +1191,7 @@ impl App {
             Cmd::ReplaceOne => self.replace_one(),
             Cmd::ReplaceAll => self.start_task(TaskKind::ReplaceAll),
             Cmd::GotoLine => self.asks.push(Ask::GotoLine),
+            Cmd::Print => self.print(),
             Cmd::ToggleComment => {
                 let tab = self.tab();
                 let Some(style) = edit::comment_style(&tab.doc, tab.lang, tab.view.sel.start()) else {

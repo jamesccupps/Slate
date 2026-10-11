@@ -84,6 +84,12 @@ signing and is signed again monthly; the workflows' actions are pinned to commit
 files are about 10% faster than in 0.8.2 (0.9.0 had made them 5% slower), and searches like `Wool socks` are back to
 full speed. Details in the [0.9.1 release notes](release-notes-0.9.1.md).
 
+## 0.10.0: Print
+
+File → Print (Ctrl+P) on both: the system's print dialog, the file or the selection in its colors, line numbers and
+page numbers, long lines breaking between words; up to 10,000 pages (asked about past 100). Details in the
+[0.10.0 release notes](release-notes-0.10.0.md).
+
 ## Next
 
 1. **Accessibility: UI Automation (L).** The high-contrast theme (Windows' colors, read again when they change) and a
@@ -113,7 +119,8 @@ full speed. Details in the [0.9.1 release notes](release-notes-0.9.1.md).
 
 ## Soon
 
-- **Print** and page setup (M).
+- **Page setup** (M): margins, the text at the top and bottom of the pages, printing without colors (Print itself
+  came in 0.10.0).
 - **Find:** in the selection, a history, `\n` and `\t` in regex replacements, find in all open tabs (S–M).
 - **Editing:** column (Alt+drag) selection (S). Drag and drop of text (M).
 - **Spell check** like Notepad's (M). **Inline IME composition** for Chinese, Japanese and Korean (M).

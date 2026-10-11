@@ -4,6 +4,7 @@
 pub mod core;
 pub mod edit;
 pub mod highlight;
+pub mod print;
 pub mod settings;
 pub mod theme;
 #[cfg(target_os = "linux")]

@@ -862,7 +862,7 @@ pub fn decode_char_before(bytes: &[u8]) -> (char, usize) {
 }
 
 /// Visible stand-in for characters that would otherwise be invisible or break the layout.
-fn display_char(c: char) -> char {
+pub fn display_char(c: char) -> char {
     match c {
         '\t' => '\t',
         '\u{0}'..='\u{1F}' => char::from_u32(0x2400 + c as u32).unwrap(),

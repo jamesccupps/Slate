@@ -215,6 +215,15 @@ accent stay Windows-only), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate
     their other half and an odd last byte read as U+FFFD and are counted in `Document::bad_units`; ANSI = the system
     code page, Windows-1252 under the UTF-8 code page option; single-byte code pages through tables made once from
     Windows' own conversions), display decoding (control chars → symbols), char classes.
+  - `src/print.rs` (shared, beside `core`) — printing's layout: rows of a fixed number of columns (a row ends at a
+    space where it can, a word longer than a row is cut; tabs to stops counted from the line's start; control
+    characters as their symbols; East Asian wide characters two columns), colored by the lexers as in the editor
+    (the state carried from line to line; past 32 MiB each line on its own), at most 10,000 pages (`PAGES_MAX`,
+    asked about past 100). The windows measure their font and draw: `ui/print.rs` (PrintDlgEx; the document started
+    on the UI thread, where a printer's own dialog such as Print to PDF's Save as belongs; the pages drawn with GDI on
+    a job's thread, each character on the columns' grid through ExtTextOutW's advances; a guard ends or abandons the
+    document and lets the printer go) and `gtk/print.rs` (GtkPrintOperation: the layout in begin-print, when the
+    paper is known; Pango and cairo in draw-page; the settings kept while Slate runs).
   - `job.rs` — background jobs with progress/cancel, notify the UI by posting a window message (on Linux: an idle
     callback on GLib's main loop).
 - `src/gtk/` — the Linux app (GTK 4): `mod.rs` the window (menu bar from a `gio::Menu`, actions with accelerators
@@ -451,6 +460,9 @@ accent stay Windows-only), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate
   session now, writes it the way the timer does, or restores it. `SLATE_UPDATE_TEST_VERSION=0.1.0` makes Slate
   believe it's that version (to try the updater against the real latest release, in a scratch folder);
   `SLATE_TEST_SLOW_OPEN=<ms>` makes reading each file take that much longer (a slow network drive).
+- `printpdf:<file>[|selection]` (both test modes) prints the tab into a PDF file without a dialog (Windows:
+  Microsoft Print to PDF; Linux: GTK's export, which the Linux smoke test does). To look at the pages, render them
+  with poppler's `pdftoppm` in a throwaway container (the PC has no poppler).
 - `tests/smoke.txt` is the smoke test CI runs on the built exe (paths in it are relative to the working folder). It
   checks Format XML, Toggle comment and `name:line:col`, writes a session and puts it back, so it needs
   `SLATE_DATA_DIR` set to an empty folder. Linux's test mode also has `session:soon` (written on another thread),

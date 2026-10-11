@@ -21,7 +21,7 @@ use crate::core::document::{Document, Sel};
 use crate::core::text;
 use crate::edit::{self, HlIndex, Seg, SEG};
 use crate::highlight::{self, Lang, Span, State as HlState, Tok};
-use crate::theme::Theme;
+use crate::theme::{Theme, tok_color};
 
 /// Bytes read around a segment, so its neighbours come from the same read.
 const WINDOW_EXTRA: u64 = 64 * 1024;
@@ -231,35 +231,6 @@ impl Default for View {
 pub fn set_color(cr: &cairo::Context, argb: u32) {
     let f = |s: u32| ((argb >> s) & 0xFF) as f64 / 255.0;
     cr.set_source_rgba(f(16), f(8), f(0), f(24));
-}
-
-pub fn tok_color(t: &Theme, tok: Tok) -> u32 {
-    match tok {
-        Tok::Key => t.syn_key,
-        Tok::Str => t.syn_string,
-        Tok::Num => t.syn_number,
-        Tok::Lit => t.syn_literal,
-        Tok::Punct => t.syn_punct,
-        Tok::Comment => t.syn_comment,
-        Tok::Section => t.syn_section,
-        Tok::Error => t.syn_error,
-        Tok::Warn => t.syn_warn,
-        Tok::Info => t.syn_info,
-        Tok::Dim => t.syn_dim,
-        Tok::Keyword => t.syn_keyword,
-        Tok::Control => t.syn_control,
-        Tok::Type => t.syn_type,
-        Tok::Func => t.syn_func,
-        Tok::Tag => t.syn_tag,
-        Tok::Attr => t.syn_attr,
-        Tok::Var => t.syn_var,
-        Tok::Heading => t.syn_heading,
-        Tok::Link => t.syn_link,
-        Tok::Added => t.syn_added,
-        Tok::Removed => t.syn_removed,
-        Tok::Col(k) => t.syn_cols[k as usize % 8],
-        Tok::Bold | Tok::Italic => t.text,
-    }
 }
 
 /// The segment's bytes as text Pango can lay out: control characters as their symbols (␀, ␍...), bytes that

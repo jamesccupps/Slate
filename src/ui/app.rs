@@ -81,6 +81,7 @@ pub enum TaskKind {
     ReplaceAll,
     Eol(Eol),
     Lines(LineOp),
+    Print,
 }
 
 /// The structured formats Slate can format and check.
@@ -106,6 +107,8 @@ pub enum TaskResult {
     Valid(String),
     /// Not valid JSON / XML: where and why.
     FormatError { offset: u64, msg: String },
+    /// Done (printed): what to say.
+    Done(String),
     Failed(String),
     Cancelled,
 }
@@ -473,6 +476,8 @@ pub struct App {
     pub overtype: bool,
     /// Tabs closed recently (with a file), the last one closed last; Ctrl+Shift+T opens them again.
     pub closed_tabs: Vec<ClosedTab>,
+    /// The printer and its settings chosen last (File → Print).
+    pub print_last: super::print::Last,
     /// The button listing all tabs, at the end of the tab strip (zero size while all tabs fit).
     pub tablist_rect: Rect,
     /// Characters and words of a document (tab id, document version), and a count running on another thread.
@@ -571,6 +576,7 @@ impl App {
             disk_job: None,
             overtype: false,
             closed_tabs: Vec::new(),
+            print_last: Default::default(),
             tablist_rect: Rect::default(),
             doc_counts: None,
             count_job: None,
@@ -1605,6 +1611,7 @@ impl App {
                 TaskKind::Eol(_) => "Converting line endings".into(),
                 TaskKind::Lines(LineOp::SortAsc | LineOp::SortDesc) => "Sorting lines".into(),
                 TaskKind::Lines(_) => "Cleaning up lines".into(),
+                TaskKind::Print => "Printing".into(),
             };
             return Some((format!("{what}… {:.0}%  (Esc to cancel)", task.job.fraction() * 100.0), false));
         }
