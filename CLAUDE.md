@@ -80,7 +80,9 @@ icons) and a tarball, each with a `.sha256`.
    repo). The repository's URL, suite, component and keyring path can never change, as every installed Slate reads
    them. It may be signed by any key in the keyring (apt-repo.sh checks that it is one), so a second key added there,
    kept offline, can take over once the packages bringing it are installed; a key no installed keyring has makes apt
-   refuse the repository until a `.deb` bringing it is installed by hand.
+   refuse the repository until a `.deb` bringing it is installed by hand. The keyring holds the signing key
+   (`543472F1…46F8`) and, from 0.9.1, a backup (`1A06C0D8…96AF`, made in a throwaway container: Git Bash's
+   gpg-agent hangs on this PC), whose private half the user keeps offline.
 
 5. winget: the package is `JamesCupps.Slate` in microsoft/winget-pkgs (first submitted with 0.8.1, moved to 0.8.2 before it was merged, as 0.8.1's --install registered .bat:
    microsoft/winget-pkgs#449740, from the user's fork `jamesccupps/winget-pkgs`). Its installer is the release's
