@@ -34,7 +34,8 @@ pub const MAX_LINE_OPS: u64 = 200_000;
 pub const COPY_MAX: u64 = 16 << 20;
 /// Indenting rewrites the lines as one replacement up to this much text (bigger: line by line, in place).
 pub const INDENT_AT_ONCE_MAX: u64 = 64 << 20;
-pub const TOO_MANY_LINES: &str = "Too many lines selected for that.";
+pub const TOO_MANY_LINES: &str = "Select fewer lines for that (up to 200,000).";
+const _: () = assert!(MAX_LINE_OPS == 200_000);
 pub const TOO_MUCH_TEXT: &str = "That's too much text for this (more than 16 MB).";
 
 /// What Tab and the automatic indentation insert: a tab character, or this many spaces per level.
@@ -819,7 +820,7 @@ pub fn toggle_comment(doc: &mut Document, sel: Sel, style: CommentStyle) -> Resu
 
 /// `toggle_comment`, rewriting up to `at_once_max` bytes of lines as one replacement (more: line by line).
 fn toggle_comment_with(doc: &mut Document, sel: Sel, style: CommentStyle, at_once_max: u64) -> Result<Sel, String> {
-    let lines = selected_lines(doc, sel).ok_or("Too many lines selected for that.")?;
+    let lines = selected_lines(doc, sel).ok_or(TOO_MANY_LINES)?;
     let (mut anchor, mut caret) = (sel.anchor, sel.caret);
     let start = sel.start();
     let ranged = !sel.is_empty();

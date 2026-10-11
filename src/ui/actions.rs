@@ -1526,7 +1526,7 @@ impl App {
                     TaskKind::Format(_) => "Formatted".to_string(),
                     TaskKind::Minify(_) => "Minified".to_string(),
                     TaskKind::ReplaceAll => format!("Replaced {}", plural(count, "match", "matches")),
-                    TaskKind::Eol(e) => format!("Line endings changed to {} ({} lines)", e.short(), group(count)),
+                    TaskKind::Eol(e) => format!("Line endings changed to {} ({})", e.short(), plural(count, "line", "lines")),
                     TaskKind::Lines(op) => lines_done(op, count),
                     TaskKind::Validate(_) => String::new(),
                 };

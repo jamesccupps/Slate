@@ -1506,7 +1506,7 @@ impl App {
                 let msg = match kind {
                     TaskKind::ReplaceAll => format!("Replaced {}", edit::plural(count, "match", "matches")),
                     TaskKind::Lines(op) => edit::lines_done(op, count),
-                    TaskKind::Eol(e) => format!("Line endings changed to {} ({} lines)", e.short(), edit::group(count)),
+                    TaskKind::Eol(e) => format!("Line endings changed to {} ({})", e.short(), edit::plural(count, "line", "lines")),
                     TaskKind::Json(json::Mode::Minify) | TaskKind::Xml(json::Mode::Minify) => "Minified".into(),
                     _ => "Formatted".into(),
                 };

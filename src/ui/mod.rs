@@ -990,7 +990,7 @@ fn restore_session(app: &mut App) -> Option<u64> {
         msg.push(format!("Not found any more: {}.", missing.join(", ")));
     }
     if !unreachable.is_empty() {
-        msg.push(format!("Doesn't answer (network?), opened as soon as it does: {}.", unreachable.join(", ")));
+        msg.push(format!("Not answering yet (a network drive?), so it opens as soon as it does: {}.", unreachable.join(", ")));
     }
     if !damaged.is_empty() {
         msg.push(format!(
