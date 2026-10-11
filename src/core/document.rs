@@ -358,6 +358,19 @@ impl Document {
         self.prev_newline(off).map_or(0, |p| p + 1)
     }
 
+    /// Where `off` is as (line, bytes into it), to find the same place again with `offset_of_place` after the line
+    /// breaks changed (CRLF to LF, say: an offset kept as it was would land elsewhere, or inside a CRLF).
+    pub fn place_of(&self, off: u64) -> Option<(u64, u64)> {
+        let line = self.line_of(off)?;
+        Some((line, off - self.line_start_of(off)))
+    }
+
+    /// The offset of a place from `place_of` (at most its line's end).
+    pub fn offset_of_place(&self, (line, col): (u64, u64)) -> Option<u64> {
+        let start = self.line_start(line)?;
+        Some((start + col).min(self.line_end_of(start)))
+    }
+
     /// End of the text of the line containing `off` (before `\r\n` / `\n`).
     pub fn line_end_of(&self, off: u64) -> u64 {
         match self.next_newline(off) {
@@ -688,6 +701,23 @@ mod tests {
 
     fn text(d: &Document) -> String {
         String::from_utf8(d.read(0, d.len())).unwrap()
+    }
+
+    #[test]
+    fn a_place_is_found_again_after_the_line_breaks_change() {
+        let mut d = Document::from_text(b"abc\ndef\nxy");
+        let places: Vec<(u64, u64)> = [0, 2, 3, 4, 6, 8, 10].iter().map(|&p| d.place_of(p).unwrap()).collect();
+        d.begin(EditKind::Other, Sel::at(0));
+        d.replace_all_with(Arc::new(Source::from_vec(b"abc\r\ndef\r\nxy".to_vec())), 2);
+        d.end(Sel::at(0));
+        let back: Vec<u64> = places.iter().map(|&p| d.offset_of_place(p).unwrap()).collect();
+        assert_eq!(back, [0, 2, 3, 5, 7, 10, 12]);
+        // and back to LF
+        d.begin(EditKind::Other, Sel::at(0));
+        d.replace_all_with(Arc::new(Source::from_vec(b"abc\ndef\nxy".to_vec())), 2);
+        d.end(Sel::at(0));
+        let again: Vec<u64> = places.iter().map(|&p| d.offset_of_place(p).unwrap()).collect();
+        assert_eq!(again, [0, 2, 3, 4, 6, 8, 10]);
     }
 
     fn typ(d: &mut Document, sel: &mut Sel, s: &str) {

@@ -58,3 +58,11 @@ expect:lang=Rust
 cmd:NextTab
 expect:title=smoke.json
 expect:dirty=false
+# A line-ending change keeps the caret on its line (it was moved to the start)
+cmd:NewTab
+type:abc\ndef\n
+goto:2
+cmd:EolLf
+jobs
+type:X
+expect:text=abc\nXdef\n

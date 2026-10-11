@@ -336,6 +336,9 @@ impl<'w> Formatter<'w> {
         }
         self.preserve = false;
         self.space = false;
+        if self.stack.len() >= crate::core::jsonnav::DEPTH_MAX {
+            return Err(err(self.mark, crate::core::json::TOO_DEEP));
+        }
         self.markup(self.stack.len(), false);
         self.emit(&[b'<', b]);
         self.stack.push((self.names.len(), self.mark));

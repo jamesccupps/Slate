@@ -61,6 +61,9 @@ enum St {
 /// How an error writing the result (not one in the text) starts (XML's too).
 pub const WRITE_FAILED: &str = "Couldn't write the result";
 
+/// The message for nesting deeper than Slate follows (`jsonnav::DEPTH_MAX` levels; XML's too).
+pub const TOO_DEEP: &str = "It's nested more than 50,000 levels deep, which is more than Slate follows";
+
 /// The message when the text has `//` or `/* */` comments, which plain JSON doesn't allow.
 pub const COMMENTS: &str = "It has comments (JSONC), which plain JSON doesn't allow";
 
@@ -200,11 +203,15 @@ impl<'w> Formatter<'w> {
         }
     }
 
-    fn open(&mut self, c: u8, obj: bool) {
+    fn open(&mut self, c: u8, obj: bool, at: u64) -> Result<(), JsonError> {
+        if self.stack.len() >= crate::core::jsonnav::DEPTH_MAX {
+            return Err(err(at, TOO_DEEP));
+        }
         self.value_start();
         self.pending_open = Some(c);
         self.stack.push(obj);
         self.stats.max_depth = self.stats.max_depth.max(self.stack.len());
+        Ok(())
     }
 
     fn close(&mut self, c: u8, obj: bool, at: u64) -> Result<(), JsonError> {
@@ -347,14 +354,14 @@ impl<'w> Formatter<'w> {
                             if self.stack.is_empty() {
                                 self.bare = false;
                             }
-                            self.open(b'{', true);
+                            self.open(b'{', true, at)?;
                             self.st = St::KeyOrClose;
                         }
                         (St::Value | St::ValueOrClose, b'[') => {
                             if self.stack.is_empty() {
                                 self.bare = false;
                             }
-                            self.open(b'[', false);
+                            self.open(b'[', false, at)?;
                             self.st = St::ValueOrClose;
                         }
                         (St::ValueOrClose, b']') | (St::After, b']') => self.close(b']', false, at)?,

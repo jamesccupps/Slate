@@ -69,7 +69,7 @@ The usual ones work as in Notepad (Ctrl+N, O, S, F, H, G, Z, Y, A, X, C, V), plu
 | Ctrl+P | Print |
 | Ctrl+D / Ctrl+Shift+K | Duplicate / delete the line |
 | Alt+Up / Alt+Down | Move the line up / down |
-| Ctrl+/ | Toggle comment (the lines) |
+| Ctrl+/ | Toggle comment |
 | Ctrl+U / Ctrl+Shift+U | lowercase / UPPERCASE |
 | Shift+Alt+F | Format JSON or XML |
 | F3 / Shift+F3 | Next / previous match |
@@ -127,15 +127,20 @@ Windows, in a GTK window. Not on Linux yet:
 - the JSON/XML path bar and structure panel;
 - show whitespace, the matching bracket highlighted, overtype, high contrast and the theme button;
 - word and character counts, and changing the encoding or indentation from the status bar;
-- the Encoding, Reopen with encoding, Indentation and Font menus (those settings are in `settings.json`);
-- Close other / saved / all tabs, the tab's own menu, Reload, Show in folder and Copy file path;
+- the Encoding, Reopen with encoding, Indentation, Font and JSON indentation menus (the font, the indentation and
+  JSON's are set in `settings.json`);
+- Close other / saved / all tabs, the list of all tabs, the tab's own menu, Reload, Show in folder and Copy file
+  path, and clearing the Open recent list;
+- *File → Restore last session* (`restore_session` in `settings.json`), *Help → Open settings folder*, *Help →
+  Report a problem…* and crash dumps;
 - keeping unsaved changes to documents over 64 MB between runs (closing asks about them instead).
 
 ## Where Slate keeps things
 
 - Settings, the session (open tabs and unsaved text) and `crash.log` are in `%LOCALAPPDATA%\Slate`
-  (*Help → Open settings folder*; on Linux `~/.local/share/slate`). *File → Restore last session* turns the session off: closing then asks about
-  unsaved changes, like Notepad used to.
+  (*Help → Open settings folder*; on Linux `~/.local/share/slate`). *File → Restore last session* (Windows; on Linux
+  `restore_session` in `settings.json`) turns the session off: closing then asks about unsaved changes, like Notepad
+  used to.
 - **Portable mode:** put an empty file named `Slate.portable` next to `Slate.exe`, and Slate keeps all of that, and
   its temporary files, in a `data` folder beside it instead (handy on a USB stick or a fast drive).
 - Slate running as administrator keeps its own session, apart from the normal one.
@@ -144,9 +149,9 @@ Windows, in a GTK window. Not on Linux yet:
 
 The update check is one request to `api.github.com` for the latest release of this repository; it sends nothing
 about you or your files. Turn it off with *Help → Check for updates automatically*. Slate doesn't send anything
-else anywhere. If it crashes, it writes `crash.log` (and a small crash dump) in its settings folder, and only
-there; *Help → Report a problem…* opens a GitHub issue form with the version filled in, which you can edit and send
-yourself, attaching those files if you like.
+else anywhere. If it crashes, it writes `crash.log` (and on Windows a small crash dump) in its settings folder, and
+only there; *Help → Report a problem…* (Windows) opens a GitHub issue form with the version filled in, which you can
+edit and send yourself, attaching those files if you like.
 
 ## Uninstalling
 

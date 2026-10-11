@@ -345,7 +345,7 @@ Editing
   Ctrl+Shift+K                  Delete the line
   Alt+Up / Alt+Down             Move the line up / down
   Tab / Shift+Tab               Indent / outdent the selected lines
-  Ctrl+/                        Comment / uncomment the lines
+  Ctrl+/                        Toggle comment
   Ctrl+U / Ctrl+Shift+U         lowercase / UPPERCASE
   Ctrl+Backspace / Ctrl+Del     Delete the word before / after the caret
   Insert                        Overtype on / off (typing replaces the next character)

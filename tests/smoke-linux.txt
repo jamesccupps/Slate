@@ -54,3 +54,25 @@ expect:lang=Rust
 cmd:next-tab
 expect:tabnames=smoke.json, Untitled, Untitled
 expect:dirty=false
+# A line-ending change keeps the caret on its line (it could be left inside the line break, then split it)
+cmd:new-tab
+type:abc\ndef\n
+goto:2
+cmd:eol-crlf
+jobs
+type:X
+expect:text=abc\r\nXdef\r\n
+# After Save As, the file under its first name opens again, in a tab of its own
+answer:smoke-a.txt
+cmd:save-as
+jobs
+cmd:close-tab
+open:smoke-a.txt
+jobs
+answer:smoke-b.txt
+cmd:save-as
+jobs
+open:smoke-a.txt
+jobs
+expect:tabs=5
+expect:text=abc\r\nXdef\r\n

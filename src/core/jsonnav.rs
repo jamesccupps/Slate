@@ -485,7 +485,14 @@ fn scan_core(
             }
             let lv = stack.last_mut().unwrap();
             match c {
-                C_WS => {}
+                C_WS => {
+                    // a run of spaces at once (a pretty-printed file is a third indentation)
+                    if chunk.get(i + 1).is_some_and(|&x| CLASS[x as usize] == C_WS) {
+                        let k = chunk[i + 2..].iter().position(|&x| CLASS[x as usize] != C_WS);
+                        i = k.map_or(n, |k| i + 2 + k);
+                        continue;
+                    }
+                }
                 C_COMMENT => {
                     comment = if chunk[i + 1] == b'/' { LINE_COMMENT } else { BLOCK_COMMENT };
                     i += 2;

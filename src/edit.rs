@@ -224,6 +224,25 @@ pub fn transform_max(len: u64) -> u64 {
     len.saturating_mul(64).saturating_add(64 << 20)
 }
 
+/// What to say when Format stopped writing its result (`msg`, which starts with `json::WRITE_FAILED`): when the
+/// result was only too big (`TOO_BIG`), the rest of the text is checked first, and a mistake in it is what's said
+/// (2 MB of `[` is broken JSON more than it's deep JSON). Err: that mistake (offset, message).
+pub fn format_stopped(xml: bool, snap: &Snapshot, msg: String, ctx: &Ctx) -> Result<String, (u64, String)> {
+    use crate::core::json::{self, Mode};
+    if !msg.contains(TOO_BIG) {
+        return Ok(msg);
+    }
+    let r = if xml {
+        crate::core::xml::run(snap, Mode::Validate, b"", b"\n", None, None, ctx).map(|_| ()).map_err(|e| (e.offset, e.msg))
+    } else {
+        json::run(snap, Mode::Validate, b"", b"\n", None, None, ctx).map(|_| ()).map_err(|e| (e.offset, e.msg))
+    };
+    match r {
+        Err(e) if !ctx.cancelled() => Err(e),
+        _ => Ok(msg),
+    }
+}
+
 impl Sink {
     pub fn new(len_hint: u64) -> io::Result<Sink> {
         Sink::limited(len_hint, u64::MAX)

@@ -182,6 +182,8 @@ impl Structure {
             Some((v, at)) if v == doc.version => at.elapsed() < PAUSE,
             _ => {
                 self.edited = Some((doc.version, std::time::Instant::now()));
+                // (a scan of the text as it was is of no use any more: dropping it stops it)
+                self.scanning = None;
                 true
             }
         }

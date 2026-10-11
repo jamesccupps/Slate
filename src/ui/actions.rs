@@ -1415,7 +1415,11 @@ impl App {
                 if saved.lossy {
                     tab.notice = Some(Notice {
                         kind: NoticeKind::Warn,
-                        text: "Some characters can't be stored in ANSI and were saved as \"?\".".into(),
+                        text: if st.encoding == Encoding::Ansi {
+                            "Some characters can't be stored in ANSI and were saved as \"?\".".into()
+                        } else {
+                            format!("Bytes that weren't text were saved in {} as \"\u{FFFD}\".", st.encoding.label())
+                        },
                         actions: vec![
                             ("Save as UTF-8".into(), NoticeAction::SaveUtf8),
                             ("Dismiss".into(), NoticeAction::Dismiss),
@@ -1460,7 +1464,7 @@ impl App {
                     SaveError::Lossy => {
                         // Nothing was written: ask what to do (outside this borrow, it shows a dialog).
                         let tab = &mut self.tabs[i];
-                        tab.ask_lossy = Some((st.path.clone(), st.close_after, closing));
+                        tab.ask_lossy = Some((st.path.clone(), st.close_after, closing, st.encoding));
                         self.pending.push(Deferred::AskLossy(tab.id));
                         return false;
                     }
@@ -1510,16 +1514,25 @@ impl App {
                 }
                 let sel = tab.view.sel;
                 let new_len = src.len();
+                // (line endings: the caret and the view stay on their lines; an offset kept as it was could be
+                // inside a CRLF)
+                let places = matches!(task.kind, TaskKind::Eol(_)).then(|| (tab.doc.place_of(sel.caret), tab.doc.place_of(tab.view.top)));
                 tab.doc.begin(EditKind::Other, sel);
                 tab.doc.replace_all_with(src, nl);
                 let keep_place = matches!(task.kind, TaskKind::ReplaceAll | TaskKind::Lines(_));
-                let new_sel = if keep_place { Sel::at(sel.caret.min(new_len)) } else { Sel::at(0) };
+                let new_sel = match places {
+                    Some((caret, _)) => Sel::at(caret.and_then(|p| tab.doc.offset_of_place(p)).unwrap_or(0)),
+                    None if keep_place => Sel::at(sel.caret.min(new_len)),
+                    None => Sel::at(0),
+                };
                 tab.doc.end(new_sel);
                 tab.view.sel = new_sel;
                 if let TaskKind::Eol(e) = task.kind {
                     tab.doc.eol = e;
                 }
-                if !keep_place {
+                if let Some((_, top)) = places {
+                    tab.view.top = top.and_then(|p| tab.doc.offset_of_place(p)).map_or(0, |o| tab.doc.line_start_of(o));
+                } else if !keep_place {
                     tab.view.top = 0;
                 }
                 let msg = match task.kind {
@@ -1558,8 +1571,12 @@ impl App {
                     Some(l) => format!(" (line {}, column {})", group(l + 1), group(col)),
                     None => String::new(),
                 };
+                // (nested deeper than Slate follows isn't invalid)
+                let deep = msg == crate::core::json::TOO_DEEP;
                 let verb = match task.kind {
+                    TaskKind::Validate(_) if deep => format!("Couldn't check this {what}"),
                     TaskKind::Validate(_) => format!("Not valid {what}"),
+                    _ if deep => format!("Couldn't format this {what}"),
                     _ => format!("Couldn't format: not valid {what}"),
                 };
                 tab.notice = Some(Notice {
@@ -1629,7 +1646,12 @@ impl App {
                         },
                         Err(_) if ctx.cancelled() => TaskResult::Cancelled,
                         // (the result, not the text: a full disk, or far too big)
-                        Err((_, msg)) if msg.starts_with(crate::core::json::WRITE_FAILED) => TaskResult::Failed(msg),
+                        Err((_, msg)) if msg.starts_with(crate::core::json::WRITE_FAILED) => {
+                            match crate::edit::format_stopped(f == Fmt::Xml, &snap, msg, ctx) {
+                                Ok(msg) => TaskResult::Failed(msg),
+                                Err((offset, msg)) => TaskResult::FormatError { offset, msg },
+                            }
+                        }
                         Err((offset, msg)) => TaskResult::FormatError { offset, msg },
                     }
                 }))
@@ -2431,6 +2453,7 @@ impl App {
         }
         tab.search.key = Some(key);
         tab.search.found = None;
+        tab.search.marks = None;
         let snap = tab.doc.snapshot();
         tab.search.job = Some(Job::spawn(snap.len(), notify, move |ctx| search::count_all(&m, &snap, ctx)));
         self.timer(TIMER_JOBS, 100);
@@ -4571,7 +4594,7 @@ fn tab_index(cell: &Cell, id: u64) -> Option<usize> {
 /// save it as UTF-8 instead (carrying on with closing, if that's what it was for), save as ANSI anyway (the
 /// characters become "?"; the tab then stays open, with the text still in it), or don't save.
 fn ask_lossy(cell: &Cell, id: u64) {
-    let (hwnd, title, (path, close_after, closing), damaged) = {
+    let (hwnd, title, (path, close_after, closing, enc), damaged) = {
         let mut a = cell.borrow_mut();
         let hwnd = a.hwnd;
         let Some(t) = a.tabs.iter_mut().find(|t| t.id == id) else { return };
@@ -4595,12 +4618,24 @@ fn ask_lossy(cell: &Cell, id: u64) {
         }
         return;
     }
-    let q = format!("Some characters in {title} can't be saved as ANSI");
-    let detail = format!(
-        "In {} they would become \"?\". UTF-8 keeps every character, and nearly every program reads it.",
-        Encoding::Ansi.label()
-    );
-    let choice = win::ask(hwnd, "Slate", &q, &detail, &["Save as &UTF-8", "Save as &ANSI anyway", "Cancel"]);
+    let (q, detail, anyway) = if enc == Encoding::Ansi {
+        (
+            format!("Some characters in {title} can't be saved as ANSI"),
+            format!(
+                "In {} they would become \"?\". UTF-8 keeps every character, and nearly every program reads it.",
+                Encoding::Ansi.label()
+            ),
+            "Save as &ANSI anyway".to_string(),
+        )
+    } else {
+        // UTF-16 (bytes that aren't text, in a file that was mostly UTF-8, have no UTF-16 form)
+        (
+            format!("Parts of {title} aren't text and can't be saved as {}", enc.label()),
+            "In UTF-16 they would become \"\u{FFFD}\". UTF-8 keeps them as they are.".to_string(),
+            format!("Save as {} &anyway", enc.label()),
+        )
+    };
+    let choice = win::ask(hwnd, "Slate", &q, &detail, &["Save as &UTF-8", &anyway, "Cancel"]);
     // The dialog let other things happen (tabs can close or move meanwhile): find the tab again.
     let Some(i) = tab_index(cell, id) else { return };
     match choice {
@@ -4617,7 +4652,7 @@ fn ask_lossy(cell: &Cell, id: u64) {
             }
         }
         Some(1) => {
-            cell.borrow_mut().start_save_lossy(i, path, Encoding::Ansi, false, true);
+            cell.borrow_mut().start_save_lossy(i, path, enc, false, true);
         }
         _ => {}
     }
@@ -4776,6 +4811,10 @@ pub fn close_window(cell: &Cell) {
             session::clear();
         }
         a.settings.save();
+        // (a start that never drew its window, minimized say, didn't crash while restoring)
+        if !a.g.offscreen {
+            session::restored();
+        }
         a.hwnd
     };
     unsafe {

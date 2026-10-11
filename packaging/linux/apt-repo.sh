@@ -53,8 +53,12 @@ if ! gpg --batch --with-colons --show-keys "$here/slate-archive-keyring.gpg" | g
     echo "APT_SIGNING_KEY isn't one of the keys in packaging/linux/slate-archive-keyring.gpg" >&2
     exit 1
 fi
-gpg --batch --yes --armor --detach-sign -o dists/stable/Release.gpg dists/stable/Release
-gpg --batch --yes --clearsign -o dists/stable/InRelease dists/stable/Release
+# ("!": that key itself, never a subkey of it the keyring wouldn't have)
+gpg --batch --yes --local-user "$signer!" --armor --detach-sign -o dists/stable/Release.gpg dists/stable/Release
+gpg --batch --yes --local-user "$signer!" --clearsign -o dists/stable/InRelease dists/stable/Release
+# Checked as users' apt checks it, against the keyring the package brings, before anything is published.
+gpgv --keyring "$here/slate-archive-keyring.gpg" dists/stable/InRelease
+gpgv --keyring "$here/slate-archive-keyring.gpg" dists/stable/Release.gpg dists/stable/Release
 cp "$here/slate-archive-keyring.gpg" slate-archive-keyring.gpg
 gpgconf --kill gpg-agent
 rm -rf "$GNUPGHOME"

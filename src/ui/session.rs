@@ -124,8 +124,13 @@ fn each_tab<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<SessionTab>, D::Error
 /// Backup files this Slate wrote or read: the only ones it deletes.
 static OWNED: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
 
+/// `OWNED` (a panic while it was held, in a write that's over, doesn't keep later ones from using it).
+fn owned() -> std::sync::MutexGuard<'static, BTreeSet<String>> {
+    OWNED.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn own(name: &str) {
-    OWNED.lock().unwrap().insert(name.to_string());
+    owned().insert(name.to_string());
 }
 
 /// A backup file name no other tab uses, now or in an earlier run.
@@ -480,7 +485,7 @@ fn write_session_file(dir: &Path, json: &[u8]) -> bool {
 /// Deletes this Slate's backups that the session doesn't refer to any more, and leftovers of interrupted writes.
 fn prune(dir: &Path, keep: &[String]) {
     let Ok(rd) = fs::read_dir(dir) else { return };
-    let mut owned = OWNED.lock().unwrap();
+    let mut owned = owned();
     for e in rd.flatten() {
         let name = e.file_name().to_string_lossy().into_owned();
         if !name.starts_with("tab-") || keep.contains(&name) {
@@ -548,7 +553,7 @@ fn set_aside_in(d: &Path, name: &str) {
         let f = OpenOptions::new().access_mode(0x100).share_mode(0x7).open(&to); // FILE_WRITE_ATTRIBUTES
         let _ = f.and_then(|f| f.set_modified(SystemTime::now()));
     }
-    OWNED.lock().unwrap().remove(name);
+    owned().remove(name);
 }
 
 /// How long what was set aside in `damaged\` is kept.
@@ -640,7 +645,7 @@ pub fn put_aside() -> PathBuf {
             }
         }
     }
-    OWNED.lock().unwrap().clear();
+    owned().clear();
     to
 }
 
@@ -654,7 +659,7 @@ pub fn clear() {
     for name in ["session.json", "session.json.bak", "session.json.tmp"] {
         let _ = fs::remove_file(d.join(name));
     }
-    let mut owned = OWNED.lock().unwrap();
+    let mut owned = owned();
     for name in std::mem::take(&mut *owned) {
         let _ = fs::remove_file(d.join(&name));
     }
@@ -1483,7 +1488,10 @@ fn finish_rewrites_in(d: &Path, tabs: &mut [SessionTab]) {
             let Some((header, pieces)) = fs::read(d.join(pieces_file(&x))).ok().and_then(|b| decode_pieces(&b)) else {
                 continue;
             };
-            let Some(w) = header.replaces.clone().filter(|w| *w != x && d.join(pieces_file(w)).exists()) else { continue };
+            let Some(w) = header.replaces.clone().filter(|w| *w != x && slates_name(w, false) && d.join(pieces_file(w)).exists())
+            else {
+                continue;
+            };
             // (its text is written before the list, under a temporary name until after it)
             let (data, tmp) = (d.join(data_file(&x)), d.join(format!("{}.tmp", data_file(&x))));
             if !data.exists() && tmp.exists() {

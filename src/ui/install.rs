@@ -480,6 +480,10 @@ fn installed_copy() -> Option<PathBuf> {
 /// ended: a running exe can't delete itself, so a hidden `cmd` tries again every second for half a minute.
 fn remove_after_exit(exe: &Path) {
     let Some(dir) = exe.parent() else { return };
+    // A running exe can be renamed: under a name of its own, a Slate.exe installed again while this one is still
+    // there (winget uninstall, then install) isn't the one deleted.
+    let own = dir.join(format!("Slate.old-{}.exe", std::process::id()));
+    let exe = if std::fs::rename(exe, &own).is_ok() { own } else { exe.to_path_buf() };
     let (exe, dir) = (exe.display(), dir.display());
     let script = format!(
         "for /l %i in (1,1,30) do @(if exist \"{exe}\" (del /f /q \"{exe}\" 2>nul & ping -n 2 127.0.0.1 >nul)) & \

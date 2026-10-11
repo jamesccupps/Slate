@@ -99,8 +99,11 @@ bad release is fixed by publishing a higher one; a new version that doesn't star
 version before it (see update.rs). A copy deployed from a local build also updates itself from GitHub once a higher
 version is published (unless its automatic check is off). Nor can who signs it: from 0.9.1 the updater wants the
 download's certificate to have the running exe's name and every identity usage it has (`1.3.6.1.4.1.311.97.…`, the
-identity Artifact Signing validated; the issuing CA varies, so it isn't compared), so a new identity validation or
-another signing service means every copy from 0.9.1 on has to be updated by hand once.
+identity Artifact Signing validated; from 0.10.0 not the service's own usages under `…97.1.`, the same for everyone;
+the issuing CA varies, so it isn't compared). Before ever signing with a new identity (validated again: a new name
+or address, a new account), add its usage to `update::ALSO_TRUSTED` in a release signed with the old one, and wait
+until most copies have it: copies without it refuse the new one ("…with another identity…, download the new version")
+and have to be updated by hand once.
 
 Commits use the GitHub no-reply address (repo-local git config); GitHub refuses pushes that would publish another one.
 
@@ -128,8 +131,10 @@ accent stay Windows-only), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate
   and times in 100 ns units like Windows', as the session keeps them —, self-deleting temp files, free space,
   whether a process runs, which errors pass by themselves). Saving on Linux is a rename (atomic; open files keep the
   old one), the directory synced; the temp file is readable by its owner only while it's written (when it replaces a
-  file), then gets the old file's owner, then its permissions (in that order: a chown clears setuid), then its
-  extended attributes (ACLs, SELinux labels; a hard link is split, as by any rename); ANSI there is Windows-1252 from a
+  file), then gets the old file's owner, then its permissions (in that order: a chown clears setuid; setuid and setgid
+  only when the owner and group could be kept, as `cp -p`), then its extended attributes (ACLs, SELinux labels; not
+  IMA's and EVM's, the kernel's for the old content; a hard link is split, as by any rename), all before the fsync and
+  the rename; ANSI there is Windows-1252 from a
   built-in table (checked against Windows' own by a test on Windows). New documents get `Eol::NATIVE`.
   - `source.rs` — immutable byte sources: memory, or a file read on demand via a 64 KiB block cache (opened with
     full sharing, never locked). Newline index = cumulative count per 64 KiB block, built in the background; a file
@@ -162,7 +167,8 @@ accent stay Windows-only), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate
     cleaned up. After a big save the text reads exactly the bytes written, from the file written (found by its file
     ID), never what another program put at that path next. On Windows a file with what a renamed new one wouldn't
     have (permissions of its own rather than its folder's, EFS, compression, alternate streams such as the
-    downloaded-from-the-internet mark: `place::special`) is put in place with ReplaceFile first, which keeps those;
+    downloaded-from-the-internet mark: `place::special`) is put in place with ReplaceFile first, which keeps those
+    (where it can't, the POSIX rename and MoveFileEx as for any file: saved, without them);
     a set-aside original ReplaceFile couldn't put back is never hidden+temporary, which is what marks a deletable
     leftover. Saving as UTF-16 asks first (`Lossy`) when a mostly-UTF-8 document's stray bytes would become U+FFFD.
     `open_either` (`name.txt:120:5`) falls back to the name without the suffix on "not found" and on Windows'
@@ -198,8 +204,11 @@ accent stay Windows-only), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate
     can also keep the lists of every container holding an offset (`path_to`): the path to the caret, however deep,
     then needs one scan, and a walk takes the last path's steps as they are where it goes the same way. A scan stops
     at a container deeper than `DEPTH_MAX` (50,000) inside the one scanned (partial from there; stopping costs the
-    scan nothing, reading on past it made every scan 5% slower), xmlnav reads past such an element as one child, and
-    paths go no deeper: a file of nothing but `[` took ~200 bytes a byte (gigabytes, then an abort).
+    scan nothing, reading on past it made every scan 3-6% slower, measured twice: in 0.9.0, and again in 0.10.0 with
+    the reading past outside the loop), xmlnav reads past such an element as one child, and paths go no deeper: a file
+    of nothing but `[` took ~200 bytes a byte (gigabytes, then an abort). Check and Format stop there too ("nested
+    more than 50,000 levels deep"), as they keep an entry per level open. Runs of whitespace are skipped at once (a
+    pretty-printed file's outline in 60% of the time; one-line JSON the same).
     `SLATE_SCAN_FILE=<file> cargo test --release --lib scan_speed -- --ignored --nocapture` (`xml_scan_speed`) times
     an outline scan.
   - `xmlnav.rs` — the same for XML, filling in jsonnav's lists: the elements inside one element (names hashed as
@@ -438,7 +447,8 @@ accent stay Windows-only), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate
   (`structure::PAUSE`, 200 ms; documents up to 256 KiB at once): a rescan per key took a frame's time on a few MB, and
   a whole background read of a big file per key. Meanwhile they show the old places (not current: clicks are ignored).
 - Transforms (Format, Minify, line tools, Replace all, line endings) write into a `Sink`: memory until it passes
-  64 MiB, then a temp file; Format refuses a result over 64 times the text plus 64 MiB (absurd nesting).
+  64 MiB, then a temp file; Format refuses a result over 64 times the text plus 64 MiB (absurd nesting; when the
+  text isn't valid JSON or XML, that's what it says instead: `edit::format_stopped`).
 - The keyboard focus is read with `win::focus()` when painting, not tracked from WM_SETFOCUS (which can't reach the
   App while it is borrowed). Always `win::set_focus` / `win::focus`, never SetFocus / GetFocus: in test mode the focus
   is only noted, and nothing activates the hidden window (`SWP_NOACTIVATE`, a CBT hook refusing activation), so a
@@ -446,7 +456,7 @@ accent stay Windows-only), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate
 
 ## Testing
 
-- `cargo test --lib` — all unit tests, the UI's included (~210, ~5 s).
+- `cargo test --lib` — all unit tests, the UI's included (~240, ~5 s).
 - `Slate.exe --test script.txt` drives the real app in a hidden window and renders frames offscreen into PNGs; the
   commands are listed at the top of `src/ui/testmode.rs` (`open:`, `type:`, `key:`, `cmd:`, `jobs`, `shot:`,
   `print:`, `expect:`, `answer:`, `lang:<name>` …; `print:menu0`…`menu4` lists a menu's items). In this mode

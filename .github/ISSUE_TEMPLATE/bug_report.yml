@@ -51,5 +51,5 @@ body:
       label: Anything else
       description: >
         Screenshots, what kind of file and how big. If Slate crashed: crash.log and any crash-*.dmp file in Slate's
-        settings folder (Help → Open settings folder) help find out why. They can contain bits of the text you had
-        open, so attach them only if that's all right.
+        settings folder (Windows: Help → Open settings folder; Linux: ~/.local/share/slate) help find out why. They
+        can contain bits of the text you had open, so attach them only if that's all right.

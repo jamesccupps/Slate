@@ -758,6 +758,9 @@ impl App {
                 let ext = |p: &Path| p.extension().map(|e| e.to_ascii_lowercase());
                 let renamed = tab.doc.path.as_deref().map(ext) != Some(ext(&st.path));
                 tab.doc.path = Some(st.path.clone());
+                // (another open of the file it is now finds this tab; the shortcuts tab saved as a file is that file)
+                tab.canon = saved.canon;
+                tab.title_override = None;
                 tab.doc.encoding = st.encoding;
                 tab.doc.disk = saved.disk;
                 tab.doc.mark_saved_at(st.state);
@@ -777,8 +780,10 @@ impl App {
                 let name = tab.title();
                 self.settings.add_recent(&st.path);
                 self.session_dirty = true;
-                if saved.lossy {
+                if saved.lossy && st.encoding == Encoding::Ansi {
                     self.flash("Some characters can't be stored in ANSI and were saved as \"?\".", true);
+                } else if saved.lossy {
+                    self.flash(format!("Bytes that weren't text were saved in {} as \"\u{FFFD}\".", st.encoding.label()), true);
                 } else {
                     self.flash(format!("Saved {name}"), false);
                 }
@@ -802,7 +807,7 @@ impl App {
                 let tab = &mut self.tabs[i];
                 tab.notice = Some(format!("Couldn't save {}: {e}", st.path.display()));
                 tab.notice_save_as = true;
-                self.flash("Couldn't save (see above the text)", true);
+                self.flash("Couldn't save (see above the text).", true);
                 self.quitting = false;
             }
         }
@@ -815,6 +820,12 @@ impl App {
     /// Closes tab `i`: right away when it has nothing unsaved (or the session keeps its text: no, a closed tab's
     /// text isn't kept anywhere, so unsaved changes are asked about).
     pub fn close_tab(&mut self, i: usize) {
+        if let Some(st) = self.tabs[i].save.as_mut() {
+            // (when nothing was typed since, it closes once saved; otherwise closing it again asks)
+            st.close_after = true;
+            self.flash("Saving… the tab closes once that's done.", false);
+            return;
+        }
         if self.tabs[i].doc.is_dirty() {
             let tab = self.tabs[i].id;
             self.asks.push(Ask::CloseUnsaved { tab });
@@ -1418,7 +1429,12 @@ impl App {
                         },
                         Err(_) if ctx.cancelled() => TaskResult::Cancelled,
                         // (the result, not the text: a full disk, or far too big)
-                        Err((_, msg)) if msg.starts_with(json::WRITE_FAILED) => TaskResult::Failed(msg),
+                        Err((_, msg)) if msg.starts_with(json::WRITE_FAILED) => {
+                            match edit::format_stopped(matches!(kind, TaskKind::Xml(_)), &snap, msg, ctx) {
+                                Ok(msg) => TaskResult::Failed(msg),
+                                Err((offset, msg)) => TaskResult::FormatError { offset, msg },
+                            }
+                        }
                         Err((offset, msg)) => TaskResult::FormatError { offset, msg },
                     }
                 }
@@ -1506,6 +1522,8 @@ impl App {
                         return;
                     }
                 }
+                self.session_dirty = true;
+                self.dirty_title = true;
                 if let TaskKind::Eol(e) = kind {
                     tab.doc.eol = e;
                     if count == 0 {
@@ -1517,13 +1535,21 @@ impl App {
                 }
                 let sel = tab.view.sel;
                 let new_len = src.len();
+                let places = matches!(kind, TaskKind::Eol(_)).then(|| (tab.doc.place_of(sel.caret), tab.doc.place_of(tab.view.top)));
                 tab.doc.begin(EditKind::Other, sel);
                 tab.doc.replace_all_with(src, nl);
                 let keep = matches!(kind, TaskKind::ReplaceAll | TaskKind::Lines(_) | TaskKind::Eol(_));
-                let new_sel = if keep { Sel::at(sel.caret.min(new_len)) } else { Sel::at(0) };
+                let new_sel = match places {
+                    Some((caret, _)) => Sel::at(caret.and_then(|p| tab.doc.offset_of_place(p)).unwrap_or(0)),
+                    None if keep => Sel::at(sel.caret.min(new_len)),
+                    None => Sel::at(0),
+                };
                 tab.doc.end(new_sel);
                 tab.doc.seal();
                 tab.view.sel = new_sel;
+                if let Some((_, top)) = places {
+                    tab.view.top = top.and_then(|p| tab.doc.offset_of_place(p)).unwrap_or(0);
+                }
                 if !keep {
                     tab.view.top = 0;
                     tab.view.top_row = 0;
@@ -1771,6 +1797,8 @@ impl App {
                 // lines counted so far
                 let path = tab.doc.path.clone().unwrap();
                 let notify = self.notify.clone();
+                // (a re-read that fails isn't tried again until the file changes again; `loaded` forgets it)
+                tab.seen_disk = Some(now);
                 tab.goto = None;
                 tab.reload = Some(tab.view.sel.caret >= tab.doc.len() && !tab.doc.is_empty());
                 let prev = tab.doc.buffer().sources().iter().find(|s| s.file_path() == Some(path.as_path())).cloned();

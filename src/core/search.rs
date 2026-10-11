@@ -206,17 +206,27 @@ impl Matcher {
             return false;
         }
         let sample = &sample[..sample.len().min(256 << 10)];
-        let time = |anchor: bool| {
+        // (in slices, so a way that's slower than `limit` is given up on after the first: a query whose run is as
+        // common as the text, `,` and a thousand `0`s in a file of zeros, would take seconds over all of it)
+        let time = |anchor: bool, limit: std::time::Duration| {
             let t = std::time::Instant::now();
-            let mut at = 0;
-            while let Some(m) = self.find_at(sample, at, anchor) {
-                at = m.1.max(m.0 + 1);
+            for slice in sample.chunks(8 << 10) {
+                let mut at = 0;
+                while let Some(m) = self.find_at(slice, at, anchor) {
+                    at = m.1.max(m.0 + 1);
+                }
+                if t.elapsed() > limit {
+                    return None;
+                }
             }
-            t.elapsed()
+            Some(t.elapsed())
         };
-        let _ = (time(false), time(true));
-        let (regex, run) = (time(false), time(true));
-        run * 4 < regex * 3
+        let forever = std::time::Duration::MAX;
+        let _ = time(false, forever);
+        let Some(regex) = time(false, forever) else { return false };
+        // the run first, set up, then timed: taken only when clearly faster
+        let limit = regex * 3 / 4;
+        time(true, limit).is_some() && time(true, limit).is_some_and(|run| run < limit)
     }
 
     /// `anchor_pays`, tried once (on the first text big enough to tell).

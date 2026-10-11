@@ -99,8 +99,13 @@ fn dir() -> PathBuf {
 /// The copies this Slate wrote or read: the only ones it deletes.
 static OWNED: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
 
+/// `OWNED` (a panic while it was held, in a write that's over, doesn't keep later ones from using it).
+fn owned() -> std::sync::MutexGuard<'static, BTreeSet<String>> {
+    OWNED.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn own(name: &str) {
-    OWNED.lock().unwrap().insert(name.to_string());
+    owned().insert(name.to_string());
 }
 
 /// A name for a tab's copy that no other tab uses, now or in an earlier run (process ids come round again).
@@ -135,7 +140,7 @@ fn read_copy(path: &Path) -> io::Result<Vec<u8>> {
 fn set_aside(d: &Path, name: &str) {
     let _ = fs::create_dir_all(d.join("damaged"));
     let _ = fs::rename(d.join(name), d.join("damaged").join(name));
-    OWNED.lock().unwrap().remove(name);
+    owned().remove(name);
 }
 
 /// Creates (or empties) `path` for writing, readable by this user only: it holds their text.
@@ -189,7 +194,7 @@ fn write_session_file(d: &Path, json: &[u8]) -> bool {
 /// Deletes this Slate's copies that the session doesn't refer to any more, and leftovers of interrupted writes.
 fn prune(d: &Path, keep: &[String]) {
     let Ok(rd) = fs::read_dir(d) else { return };
-    let mut owned = OWNED.lock().unwrap();
+    let mut owned = owned();
     for e in rd.flatten() {
         let name = e.file_name().to_string_lossy().into_owned();
         if !name.starts_with("tab-") || keep.contains(&name) {
@@ -340,7 +345,10 @@ fn apply(app: &mut App, out: &Outcome) {
             t.session_version = *version;
         }
     }
-    if !out.ok {
+    if out.ok {
+        // (it can be written again: closing keeps unsaved tabs again)
+        app.session_failed = false;
+    } else {
         app.session_dirty = true;
     }
 }
@@ -443,7 +451,7 @@ pub fn restore(app: &mut App, watch: bool) {
     if watch && marker.exists() {
         let to = put_aside(&d);
         let _ = fs::remove_file(&marker);
-        app.flash(format!("Slate stopped while putting your tabs back last time, so they were set aside in {}.", to.display()), true);
+        app.flash(format!("Slate stopped while reopening last time's tabs. Their unsaved text is kept in {}.", to.display()), true);
         return;
     }
     let s = load(&d);

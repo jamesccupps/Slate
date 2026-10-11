@@ -677,7 +677,13 @@ mod place {
             if replaced || set_aside.is_some() {
                 return (replaced, None, set_aside);
             }
-            // (it can't, there: saved all the same, as a new file)
+            // It can't, there: saved all the same, as a new file, the usual way (a POSIX rename replaces a big file
+            // Slate still reads; then a plain one).
+            if let Ok(f) = OpenOptions::new().access_mode(DELETE | GENERIC_READ).share_mode(SHARE_READ_DELETE).open(verbatim(temp_path)) {
+                if posix_rename(&f, &verbatim(target)).is_ok() {
+                    return (true, stamp_of(&f).map(|s| s.1), None);
+                }
+            }
             return (move_file(temp_path, target), None, None);
         }
         let posix = posix_rename(&file, &verbatim(target)).is_ok();
@@ -725,11 +731,22 @@ mod place {
     /// change of owner clears setuid and setgid), then its extended attributes (ACLs, an SELinux label…) where
     /// allowed.
     pub fn copy_identity(file: &File, old: Option<&fs::Metadata>, old_path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
         let Some(m) = old else { return };
         let _ = std::os::unix::fs::fchown(file, Some(m.uid()), Some(m.gid()));
         // (not allowed to give it away: keep the group at least, which may be)
         let _ = std::os::unix::fs::fchown(file, None, Some(m.gid()));
-        let _ = file.set_permissions(m.permissions());
+        // setuid and setgid only with the owner and group they were for: else the file would run as whoever saved it
+        // (as `cp -p` does)
+        let now = file.metadata().ok();
+        let mut mode = m.permissions().mode();
+        if now.as_ref().is_none_or(|n| n.uid() != m.uid()) {
+            mode &= !0o4000;
+        }
+        if now.as_ref().is_none_or(|n| n.gid() != m.gid()) {
+            mode &= !0o2000;
+        }
+        let _ = file.set_permissions(fs::Permissions::from_mode(mode));
         copy_xattrs(file, old_path);
     }
 
@@ -738,13 +755,20 @@ mod place {
         use std::os::fd::AsRawFd;
         use std::os::unix::ffi::OsStrExt;
         let Ok(c) = std::ffi::CString::new(from.as_os_str().as_bytes()) else { return };
-        let mut names = vec![0u8; 4096];
+        // (how long the list is first: it has no limit)
+        let len = unsafe { libc::listxattr(c.as_ptr(), std::ptr::null_mut(), 0) };
+        if len <= 0 {
+            return;
+        }
+        let mut names = vec![0u8; len as usize + 256];
         let n = unsafe { libc::listxattr(c.as_ptr(), names.as_mut_ptr().cast(), names.len()) };
         if n <= 0 {
             return;
         }
         let mut value = vec![0u8; 64 << 10];
-        for name in names[..n as usize].split(|&b| b == 0).filter(|s| !s.is_empty()) {
+        // (IMA's and EVM's are the kernel's, about the old content: never copied)
+        let kernels = |s: &[u8]| s == b"security.ima" || s == b"security.evm";
+        for name in names[..n as usize].split(|&b| b == 0).filter(|s| !s.is_empty() && !kernels(s)) {
             let Ok(key) = std::ffi::CString::new(name) else { continue };
             let len = unsafe { libc::getxattr(c.as_ptr(), key.as_ptr(), value.as_mut_ptr().cast(), value.len()) };
             if len >= 0 {
@@ -964,8 +988,9 @@ pub fn save(
         if snap.changed_in_place() {
             return Err(SaveError::Changed);
         }
-        file.sync_all()?;
+        // (the old file's owner, permissions and the like first: on the disk with the text, before the swap)
         place::copy_identity(&file, old.as_ref(), &target);
+        file.sync_all()?;
         Ok(r)
     })();
     let (idx, lossy) = match result {

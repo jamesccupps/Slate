@@ -1,4 +1,5 @@
-# Builds and tests Slate on every push: the Windows exe, and the Linux packages for x86-64 and ARM64 (Raspberry Pi).
+# Builds and tests Slate on every push to main and every pull request: the Windows exe, and the Linux packages for
+# x86-64 and ARM64 (Raspberry Pi).
 # For a version tag (v1.2.3) it also signs Slate.exe and drafts a GitHub release with all of them attached; publishing
 # the draft is what makes Slate's built-in updater on Windows offer it (it reads only Slate.exe and Slate.exe.sha256)
 # and what updates the apt repository (apt.yml).
@@ -102,12 +103,11 @@ jobs:
           if ($p.ExitCode -ne 0) { throw "--uninstall failed (exit code $($p.ExitCode))" }
           if (Test-Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Slate') { throw "--uninstall left the Installed apps entry" }
           if (Test-Path $lnk) { throw "--uninstall left the Start menu entry" }
-          # the installed copy goes too, a moment after it ended (its folder with it)
+          # the installed copy goes too, a moment after it ended (renamed at once, then deleted; its folder with it)
+          if (Test-Path $exe) { throw "--uninstall left $exe" }
           $gone = $false
-          foreach ($k in 1..20) { if (!(Test-Path $exe)) { $gone = $true; break }; Start-Sleep -Seconds 1 }
-          if (!$gone) { throw "--uninstall left $exe" }
-          Start-Sleep -Seconds 2
-          if (Test-Path (Split-Path $exe)) { throw "--uninstall left Slate's folder" }
+          foreach ($k in 1..20) { if (!(Test-Path (Split-Path $exe))) { $gone = $true; break }; Start-Sleep -Seconds 1 }
+          if (!$gone) { throw "--uninstall left Slate's folder: $(Get-ChildItem (Split-Path $exe) -Name)" }
 
       - name: Package
         shell: pwsh
@@ -268,7 +268,12 @@ jobs:
           notes="docs/release-notes-${tag#v}.md"
           if [ -f "$notes" ]; then set -- --notes-file "$notes"; else set -- --generate-notes; fi
           if gh release view "$tag" > /dev/null 2>&1; then
-            # Run again (the release is there already): replace its files.
+            # Run again (the release is there already): replace its files, only while it's a draft (a published
+            # release's files are what people downloaded, and what the updater checks against).
+            if [ "$(gh release view "$tag" --json isDraft --jq .isDraft)" != "true" ]; then
+              echo "$tag is published: its files stay as they are." >&2
+              exit 1
+            fi
             gh release upload "$tag" out/* --clobber
           else
             gh release create "$tag" out/* --draft --title "Slate $tag" "$@"

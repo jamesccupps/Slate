@@ -234,8 +234,9 @@ pub fn download(rel: &Release, ctx: &Ctx) -> Result<PathBuf, String> {
 }
 
 /// Who signed a file: the certificate's name ("James Cupps") and the identity behind it. Artifact Signing's
-/// certificates last days, but each names the identity it validated as extended key usages under
-/// 1.3.6.1.4.1.311.97, the same in every certificate it makes for that identity.
+/// certificates last days, but each names the identity it validated as an extended key usage under
+/// 1.3.6.1.4.1.311.97, the same in every certificate it makes for that identity (the ones under
+/// 1.3.6.1.4.1.311.97.1, the service's own, the same for everyone, aren't counted).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Signer {
     pub name: String,
@@ -243,13 +244,25 @@ pub struct Signer {
     pub ids: Vec<String>,
 }
 
+/// Identities besides the running exe's own that an update may be signed with. Artifact Signing's identity changes
+/// when it's validated again (a new name or address, a new account): add the new one's usage here one release before
+/// signing with it, so the copies out there take it.
+const ALSO_TRUSTED: &[&str] = &[];
+
 /// An update has to come from the publisher this Slate came from: when the running exe's signature checks out on
-/// this PC, the download's must as well, by the same name and with every identity the running one's names. A Slate
-/// that isn't signed (0.7.0 and older, a local build) has nothing to compare with and goes by the checksum alone.
+/// this PC, the download's must as well, by the same name and with every identity the running one's names (or by an
+/// identity in `ALSO_TRUSTED`). A Slate that isn't signed (0.7.0 and older, a local build) has nothing to compare
+/// with and goes by the checksum alone.
 pub fn same_publisher(current: Option<&Signer>, new: Option<&Signer>) -> Result<(), String> {
     match (current, new) {
         (None, _) => Ok(()),
         (Some(a), Some(b)) if a.name == b.name && a.ids.iter().all(|id| b.ids.contains(id)) => Ok(()),
+        (Some(_), Some(b)) if b.ids.iter().any(|id| ALSO_TRUSTED.contains(&id.as_str())) => Ok(()),
+        (Some(a), Some(b)) if a.name == b.name => Err(format!(
+            "The download is signed by {} with another identity than this Slate's, so it wasn't installed: download \
+             the new version from github.com/jamesccupps/Slate",
+            a.name
+        )),
         (Some(a), _) => Err(format!("The download isn't signed by {} like this Slate is, so it wasn't installed", a.name)),
     }
 }
@@ -301,7 +314,7 @@ pub fn signer_of(path: &Path) -> Option<Signer> {
                         if CertGetEnhancedKeyUsage(cert, flags, Some(u), &mut len).is_ok() {
                             for i in 0..(*u).cUsageIdentifier as usize {
                                 if let Ok(oid) = (*(*u).rgpszUsageIdentifier.add(i)).to_string() {
-                                    if oid.starts_with("1.3.6.1.4.1.311.97.") {
+                                    if oid.starts_with("1.3.6.1.4.1.311.97.") && !oid.starts_with("1.3.6.1.4.1.311.97.1.") {
                                         ids.push(oid);
                                     }
                                 }
@@ -542,14 +555,15 @@ mod tests {
     #[test]
     fn updates_come_from_the_same_publisher() {
         let signer = |name: &str, ids: &[&str]| Signer { name: name.into(), ids: ids.iter().map(|s| s.to_string()).collect() };
-        let me = signer("James Cupps", &["1.3.6.1.4.1.311.97.1.0", "1.3.6.1.4.1.311.97.5.6.7.8"]);
+        let me = signer("James Cupps", &["1.3.6.1.4.1.311.97.5.6.7.8"]);
         assert!(same_publisher(None, None).is_ok());
         assert!(same_publisher(None, Some(&signer("Someone", &[]))).is_ok());
         assert!(same_publisher(Some(&me), Some(&me)).is_ok());
-        // (a usage added later is fine; one missing isn't)
-        let more = signer("James Cupps", &["1.3.6.1.4.1.311.97.1.0", "1.3.6.1.4.1.311.97.2.0", "1.3.6.1.4.1.311.97.5.6.7.8"]);
+        // (a usage added later is fine; one missing isn't, and that's said)
+        let more = signer("James Cupps", &["1.3.6.1.4.1.311.97.2.3.4.5", "1.3.6.1.4.1.311.97.5.6.7.8"]);
         assert!(same_publisher(Some(&me), Some(&more)).is_ok());
-        assert!(same_publisher(Some(&me), Some(&signer("James Cupps", &["1.3.6.1.4.1.311.97.1.0"]))).is_err());
+        let other = same_publisher(Some(&me), Some(&signer("James Cupps", &["1.3.6.1.4.1.311.97.9.9.9.9"])));
+        assert!(other.is_err_and(|e| e.contains("another identity")));
         assert!(same_publisher(Some(&me), Some(&signer("Someone else", &me.ids.iter().map(|s| s.as_str()).collect::<Vec<_>>()))).is_err());
         assert!(same_publisher(Some(&me), None).is_err());
         // a signer without such usages: the name alone, as before

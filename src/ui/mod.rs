@@ -678,6 +678,9 @@ fn handle(cell: &Cell, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<L
                 if let Ok(mut a) = cell.try_borrow_mut() {
                     a.save_session();
                     a.settings.save();
+                    if !a.g.offscreen {
+                        session::restored();
+                    }
                 }
                 // Windows may end the process once this returns.
                 update::wait_for_swap();
@@ -1005,7 +1008,11 @@ fn restore_session(app: &mut App) -> Option<u64> {
         msg.push(format!("Not found any more: {}.", missing.join(", ")));
     }
     if !unreachable.is_empty() {
-        msg.push(format!("Not answering yet (a network drive?), so it opens as soon as it does: {}.", unreachable.join(", ")));
+        msg.push(if unreachable.len() == 1 {
+            format!("Not answering yet (a network drive?), so it opens as soon as it does: {}.", unreachable[0])
+        } else {
+            format!("Not answering yet (a network drive?), so they open as soon as they do: {}.", unreachable.join(", "))
+        });
     }
     if !damaged.is_empty() {
         msg.push(format!(

@@ -219,6 +219,9 @@ fn cmd_of(name: &str) -> Option<Cmd> {
         "Title" => Cmd::Case(crate::core::lines::CaseOp::Title),
         "EolLf" => Cmd::SetEol(crate::core::text::Eol::Lf),
         "EolCrlf" => Cmd::SetEol(crate::core::text::Eol::Crlf),
+        "SaveUtf8" => Cmd::SaveEncoding(crate::core::text::Encoding::Utf8),
+        "SaveUtf16Le" => Cmd::SaveEncoding(crate::core::text::Encoding::Utf16Le),
+        "SaveAnsi" => Cmd::SaveEncoding(crate::core::text::Encoding::Ansi),
         "NextTab" => Cmd::NextTab,
         "PrevTab" => Cmd::PrevTab,
         "Reload" => Cmd::Reload,
@@ -614,6 +617,13 @@ fn describe(cell: &Cell, what: &str) -> String {
             a.update_find_status();
             a.find.status.clone()
         }
+        // (the JSON or XML path bar, as last worked out)
+        "path" => {
+            let s = &a.tab().structure;
+            s.path.as_ref().map_or("none".into(), |p| s.path_text(p))
+        }
+        // (where the scrollbar's match marks are, in pixels from its top, as last drawn)
+        "marks" => a.tab().search.marks.as_ref().map_or("none".into(), |m| format!("{:?}", m.1.iter().map(|y| y.round() as i32).collect::<Vec<_>>())),
         // (milliseconds since the process was created: the start's steps, then this command)
         "startup" => {
             super::mark("now");

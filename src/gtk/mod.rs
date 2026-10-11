@@ -95,6 +95,8 @@ pub struct Ui {
     painted: Cell<bool>,
     /// Logging out waits while there's unsaved work the session can't keep (the session manager's cookie).
     inhibited: Cell<Option<u32>>,
+    /// Questions (and Save as) open now: the window's close button doesn't start another round of them meanwhile.
+    asking: Cell<u32>,
     /// File → Open recent, and the files it shows.
     recent_menu: gio::Menu,
     recent_shown: RefCell<Option<Vec<PathBuf>>>,
@@ -174,6 +176,20 @@ fn open_arg(a: std::ffi::OsString, cwd: Option<&std::path::Path>) -> String {
     }
 }
 
+/// The folder relative names on the command line are in, as the shell shows it: `$PWD` when that's this folder (through
+/// a symbolic link, say), as GLib takes it too; the physical one otherwise.
+fn shell_dir() -> Option<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    if let Some(pwd) = std::env::var_os("PWD").map(PathBuf::from).filter(|p| p.is_absolute()) {
+        if let (Ok(a), Ok(b)) = (std::fs::metadata(&pwd), std::fs::metadata(".")) {
+            if a.dev() == b.dev() && a.ino() == b.ino() {
+                return Some(pwd);
+            }
+        }
+    }
+    std::env::current_dir().ok()
+}
+
 pub fn run(args: Vec<std::ffi::OsString>) -> i32 {
     if args.first().is_some_and(|a| a == "--test") {
         let args: Vec<String> = args[1..].iter().map(|a| a.to_string_lossy().into_owned()).collect();
@@ -198,7 +214,7 @@ pub fn run(args: Vec<std::ffi::OsString>) -> i32 {
             ui.ending();
         }
     });
-    let cwd = std::env::current_dir().ok();
+    let cwd = shell_dir();
     let argv: Vec<String> = std::iter::once("slate".to_string()).chain(args.into_iter().map(|a| open_arg(a, cwd.as_deref()))).collect();
     if application.run_with_args(&argv) == glib::ExitCode::SUCCESS { 0 } else { 1 }
 }
@@ -482,6 +498,7 @@ pub fn window(application: &gtk4::Application, test: Option<Rc<testmode::Test>>)
         closing: Cell::new(false),
         painted: Cell::new(false),
         inhibited: Cell::new(None),
+        asking: Cell::new(0),
         recent_menu,
         recent_shown: RefCell::new(None),
         is_default: Cell::new(test.is_none() && slate_is_default()),
@@ -815,6 +832,10 @@ fn connect(ui: &Rc<Ui>, prev: &gtk4::Button, next: &gtk4::Button, close_find: &g
         if ui.closing.get() {
             return glib::Propagation::Proceed;
         }
+        // (a question is open, closing's own maybe: that one is answered first)
+        if ui.asking.get() > 0 {
+            return glib::Propagation::Stop;
+        }
         ui.try_quit();
         if ui.closing.get() { glib::Propagation::Proceed } else { glib::Propagation::Stop }
     });
@@ -1041,7 +1062,7 @@ fn fill_recent(menu: &gio::Menu, recent: &[PathBuf]) {
         menu.append_item(&item);
     }
     if menu.n_items() == 0 {
-        menu.append(Some("No files opened yet"), None);
+        menu.append(Some("No recent files"), None);
     }
 }
 
@@ -1127,11 +1148,19 @@ impl Ui {
             Ok(r) => Some(r),
             Err(_) => {
                 if let Ok(mut a) = self.app.try_borrow_mut() {
-                    if self.test.is_none() {
-                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| session::save(&mut a)));
-                    }
+                    // (closing, if it was, stops there: it asks again)
+                    a.quitting = false;
+                    let kept = self.test.is_some()
+                        || std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| session::save(&mut a))).unwrap_or(false);
                     a.asks.clear();
-                    a.flash("Something went wrong (details in crash.log in Slate's data folder). Your work is kept.", true);
+                    a.flash(
+                        if kept {
+                            "Something went wrong (details in crash.log in Slate's data folder). Your work is kept."
+                        } else {
+                            "Something went wrong (details in crash.log in Slate's data folder). Save your work to be safe."
+                        },
+                        true,
+                    );
                 }
                 None
             }
@@ -1145,7 +1174,12 @@ impl Ui {
         let unkept = self
             .guarded(|a| {
                 if self.test.is_none() {
-                    session::save(a);
+                    // (a session that couldn't be written keeps nothing: every unsaved tab counts then)
+                    if session::save(a) {
+                        session::restored();
+                    } else {
+                        a.session_failed = true;
+                    }
                     self.save_settings(a);
                 }
                 (0..a.tabs.len()).any(|i| a.tabs[i].doc.is_dirty() && !session::keeps(a, i))
@@ -1783,22 +1817,36 @@ impl Ui {
             self.ask(Ask::CloseUnsaved { tab });
             return;
         }
-        let written = self
-            .guarded(|a| {
-                // (in a test, only with `persist`)
-                let ok = session::save(a);
-                if self.test.is_none() {
-                    self.save_settings(a);
+        let written = self.guarded(|a| {
+            // (in a test, only with `persist`)
+            let ok = session::save(a);
+            if self.test.is_none() {
+                self.save_settings(a);
+            }
+            ok || a.session_failed || !a.tabs.iter().any(|t| t.doc.is_dirty()) || {
+                // The session can't be written (a full or read-only disk): every unsaved tab is asked about.
+                a.session_failed = true;
+                false
+            }
+        });
+        match written {
+            Some(true) => {}
+            Some(false) => return self.try_quit(),
+            None => {
+                // The write panicked: as if it failed, so every unsaved tab is asked about (once: after that, it's
+                // closing that went wrong, and the questions were answered).
+                let first = self.app.try_borrow_mut().is_ok_and(|mut a| {
+                    a.quitting = true;
+                    !std::mem::replace(&mut a.session_failed, true)
+                });
+                if first {
+                    return self.try_quit();
                 }
-                ok || a.session_failed || !a.tabs.iter().any(|t| t.doc.is_dirty()) || {
-                    // The session can't be written (a full or read-only disk): every unsaved tab is asked about.
-                    a.session_failed = true;
-                    false
-                }
-            })
-            .unwrap_or(true);
-        if !written {
-            return self.try_quit();
+            }
+        }
+        // (an orderly end: a start that never drew its window doesn't count as one that crashed while restoring)
+        if self.test.is_none() {
+            session::restored();
         }
         self.closing.set(true);
         self.window.close();
@@ -1846,6 +1894,9 @@ impl Ui {
                 let keep = keep_until_answered(&chooser);
                 #[allow(deprecated)]
                 chooser.connect_response(move |c, r| {
+                    if let Some(ui) = get_ui() {
+                        ui.asking.set(ui.asking.get().saturating_sub(1));
+                    }
                     if r == gtk4::ResponseType::Accept {
                         if let Some(path) = c.file().and_then(|f| f.path()) {
                             if let Some(ui) = get_ui() {
@@ -1858,6 +1909,7 @@ impl Ui {
                     keep.take();
                     c.destroy();
                 });
+                self.asking.set(self.asking.get() + 1);
                 #[allow(deprecated)]
                 chooser.show();
             }
@@ -1947,8 +1999,8 @@ impl Ui {
             Ask::StopDefault => {
                 self.dialog(
                     "Stop opening files with Slate?",
-                    "The kinds of files Slate opens when they're double-clicked go back to the system's own choice. \
-                     Slate stays installed; Help → Open files with Slate… sets it up again.",
+                    "The kinds of files Slate opens when they're double-clicked go back to the system's own choice (not to \
+                     apps you picked before Slate). Slate stays installed; Help → Open files with Slate… sets it up again.",
                     &[("Cancel", "cancel"), ("Stop", "stop")],
                     |answer| {
                         if let Some(ui) = get_ui() {
@@ -1998,7 +2050,10 @@ impl Ui {
                 }
                 self.with(|a| match result {
                     Ok(0) => a.flash("Slate wasn't opening any kind of file by default.", false),
-                    Ok(n) => a.flash(format!("{n} kinds of files open with the system's own choice again."), false),
+                    Ok(n) => a.flash(
+                        format!("{} open with the system's own choice again.", crate::edit::plural(n as u64, "kind of file", "kinds of files")),
+                        false,
+                    ),
                     Err(e) => a.flash(e, true),
                 });
             }
@@ -2012,7 +2067,10 @@ impl Ui {
                     self.is_default.set(self.test.is_some() || slate_is_default());
                 }
                 self.with(|a| match result {
-                    Ok(n) => a.flash(format!("Slate now opens {n} kinds of files when they're double-clicked."), false),
+                    Ok(n) => a.flash(
+                        format!("Slate now opens {} when they're double-clicked.", crate::edit::plural(n as u64, "kind of file", "kinds of files")),
+                        false,
+                    ),
                     Err(e) => a.flash(e, true),
                 });
             }
@@ -2110,8 +2168,12 @@ impl Ui {
                 _ => "cancel",
             };
             d.destroy();
+            if let Some(ui) = get_ui() {
+                ui.asking.set(ui.asking.get().saturating_sub(1));
+            }
             done(answer);
         });
+        self.asking.set(self.asking.get() + 1);
         d.present();
     }
 

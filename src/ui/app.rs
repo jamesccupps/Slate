@@ -213,7 +213,7 @@ pub struct Tab {
     pub title_override: Option<String>,
     /// A save stopped because ANSI can't hold some characters: (path, close after, closing the window), for the
     /// question that follows (`Deferred::AskLossy`).
-    pub ask_lossy: Option<(PathBuf, bool, bool)>,
+    pub ask_lossy: Option<(PathBuf, bool, bool, Encoding)>,
     /// The document's path and its canonical form, worked out once (for "is this file open already?").
     pub canon: Option<(PathBuf, Option<PathBuf>)>,
     /// Where to go once the document is ready and its tab is shown (`slate file.txt:120`, a reopened tab).
