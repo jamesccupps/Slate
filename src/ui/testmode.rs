@@ -34,6 +34,9 @@
 //! drawn pressed), `invalidated` (repaints asked for since the last time), `realbold` (the font has a bold face of
 //! its own).
 //! `contrast:on|off|system` pretends Windows' high contrast is on or off (and tells the window it changed).
+//! Screen readers: `uia:<op>` works on a text range through the UI Automation providers, as a client would
+//! (`uia::command`), and `print:uia`, `uia-line`, `uia-word`, `uia-char`, `uia-para`, `uia-sel`, `uia-range`,
+//! `uia-rects`, `uia-events` show what a client gets (`uia::describe`).
 //!
 //! Also: `args:<path>` (open it as if named on the command line: a missing file becomes a new one), `lang:<name>`
 //! (pick the language), `hit:<x>,<y>` / `hover:<x>,<y>` (what's at a point / move the mouse
@@ -459,6 +462,10 @@ fn write_png(path: &Path, w: u32, h: u32, bgra: &[u8]) -> std::io::Result<()> {
 }
 
 fn describe(cell: &Cell, what: &str) -> String {
+    // (before the App is borrowed: the providers borrow it themselves)
+    if let Some(v) = super::uia::describe(cell, what) {
+        return v;
+    }
     let mut a = cell.borrow_mut();
     match what {
         "text" => {
@@ -1140,6 +1147,15 @@ pub fn run(args: &[String]) -> i32 {
                 out.push_str(&format!("copydata: {}\n", if took.0 != 0 { "taken" } else { "not taken" }));
                 pump(&cell, 0);
             }
+            "uia" => {
+                let r = super::uia::command(&cell, arg);
+                if r.starts_with("uia failed") {
+                    failures += 1;
+                }
+                if !r.is_empty() {
+                    out.push_str(&format!("uia:{arg}: {r}\n"));
+                }
+            }
             _ => {
                 out.push_str(&format!("unknown op {op}\n"));
                 failures += 1;
@@ -1153,6 +1169,8 @@ pub fn run(args: &[String]) -> i32 {
             a.update_find_status();
             a.paint();
         }
+        // (and screen readers hear what changed, as after a message)
+        super::uia::after(&cell);
     }
     let log = std::env::var("SLATE_TEST_LOG").unwrap_or_else(|_| "slate-test.log".into());
     let _ = std::fs::write(&log, &out);

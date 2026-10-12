@@ -102,22 +102,20 @@ themselves for files that can't be written. Details in the [0.11.0 release notes
 
 ## Next
 
-1. **Accessibility: UI Automation (L).** The high-contrast theme (Windows' colors, read again when they change) and a
-   hidden system caret that Magnifier and other tools follow are done. Next, so screen readers can read the text, a
-   provider for the text area:
-   - `WM_GETOBJECT` (`UiaRootObjectId`) answers `UiaReturnRawElementProvider` with one COM object:
-     `IRawElementProviderSimple` (Document control type, the tab's title as its name, `ServerSideProvider |
-     UseComThreading` so calls come on the UI thread) and `ITextProvider` (`DocumentRange`, `GetSelection`,
-     `GetVisibleRanges`, `RangeFromPoint`). The tab strip, menus and status bar can wait; the find bar's boxes are
-     native and already readable.
-   - `ITextRangeProvider` as two byte offsets into the active document, kept up to date through its change log like
-     the scroll position. Units: character (as the caret moves), word (`word_left`/`word_right`), line (the view's
-     rows), paragraph (lines), document. `GetText` reads at most what it's asked for (a range can be a whole 800 MB
-     file); `GetBoundingRectangles` only for rows on screen; `Select`, `ScrollIntoView`, `Compare`/`Move` endpoints.
-   - Events: text selection changed after the caret moves, text changed after edits.
-   - Why it's L: COM classes through the windows crate's `implement` feature; the provider is called while the App
-     may be borrowed (`try_borrow`, else `UIA_E_ELEMENTNOTAVAILABLE`, and never a panic across COM); offsets to
-     UTF-16 over huge documents and ones whose lines are still being counted; testing with Narrator and NVDA.
+1. **Accessibility: screen readers (L).** The high-contrast theme and a hidden system caret for Magnifier are done,
+   and so is the text (`src/ui/uia.rs`, not released yet): a Document element named after the tab with the Text
+   pattern, its ranges byte offsets moved by each edit, units as screen readers read them (the character the caret
+   steps over, words, the rows on screen as lines, the document's lines as paragraphs), events for the caret,
+   edits, another tab and Save As, and huge files kept cheap (text read for a client capped at 1 M characters, moves
+   by many characters or paragraphs counted in bulk). Checked in test mode and by a real UI Automation client
+   (`tests/uia-client.ps1`). Next:
+   - Trying it with Narrator and NVDA (focus events can only be checked in a real, focused window).
+   - Notifications (`UiaRaiseNotificationEvent`, Windows 10 1709+) for what the status bar says ("Saved", "Not
+     found", a search's count) and for the line a Find next lands on while the find box has the keyboard.
+   - The tab strip (a Tab with its tab items, selectable), the status bar (a StatusBar: NVDA reads it with
+     NVDA+End) and the menu bar (its titles as menu items while Alt has it; the menus are Windows' own and read already).
+   - The JSON and XML path bar and structure panel (a tree), and Linux: Orca needs GTK 4.14's `GtkAccessibleText`
+     for a view Slate draws itself (Debian 12 and Raspberry Pi OS 12 have GTK 4.8).
 2. **Release basics (S–M).** Slate.exe is signed since 0.8.0 (Azure Artifact Signing, in CI); since 0.8.1 the
    updater checks that an update is signed by the same publisher, and `Slate.exe --install` installs silently for
    winget (`JamesCupps.Slate`, submitted with 0.8.1 and moved to 0.8.2 before it was merged). Next: a winget

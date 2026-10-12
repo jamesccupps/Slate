@@ -328,7 +328,8 @@ accent stay Windows-only), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate
     in the theme's colors, as Windows' task dialogs and message boxes stay light: a real dialog of Windows' own
     controls, push buttons themed `DarkMode_Explorer` when dark, so the keyboard, screen readers and Ctrl+C work as in
     any dialog; `win::ask` falls back to a task dialog if it can't be made; text taller than the screen is cut to whole lines,
-    Ctrl+C still copies all of it; WM_GETDPISCALEDSIZE sizes it for another monitor); `testmode.rs`. Symbol-only
+    Ctrl+C still copies all of it; WM_GETDPISCALEDSIZE sizes it for another monitor); `testmode.rs`; `uia.rs` (screen
+    readers: see Design decisions). Symbol-only
     buttons, status bar items and tabs (their file's path) have tooltips: `win::Tip`, Windows' own tracking tooltip,
     made the first time one shows (never in test mode), its texts from `App::tip_text`.
   - `gfx.rs` — Direct2D drawing into a D3D11 **flip-model swap chain** (FLIP_DISCARD, then FLIP_SEQUENTIAL), with
@@ -376,7 +377,20 @@ accent stay Windows-only), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate
   WM_THEMECHANGED. The caret stops blinking (shown) after Windows' caret timeout (`SPI_GETCARETTIMEOUT`), as in
   other apps, until the next key or click. A hidden system caret (`win::follow_caret`, never shown) is moved to the drawn caret after each
   paint while the text has the keyboard, with EVENT_OBJECT_LOCATIONCHANGE for OBJID_CARET; WM_KILLFOCUS destroys it
-  (the find box's edit control makes its own), and so does the caret scrolling out of view. UI Automation is designed in the roadmap, not built.
+  (the find box's edit control makes its own), and so does the caret scrolling out of view.
+- Screen readers (`uia.rs`, UI Automation): WM_GETOBJECT for UiaRootObjectId answers a fragment root that adds one
+  child to the window's own element: the active tab's text, a Document named after the tab with the Text pattern
+  (ITextProvider2). Its ranges are byte offsets in a table (`RANGES`), moved by `View::sync` with each edit. Units: a
+  character is what the caret steps over, a word letters and digits or punctuation with the spaces after them (each
+  line starts a new one), a line the view's row (wrapped or not), a paragraph a line of the document. UIAutomationCore.dll
+  is loaded only when a client first asks (no cost at startup); events (focus when another tab's text gets the
+  keyboard, text selection changed, text changed, the name after Save As) go out after each message, only while
+  clients listen (`uia::after`, outside the App's borrow: UI Automation may call back). Providers keep only ids: a call
+  finds the App on the UI thread (`UseComThreading`), fails with UIA_E_ELEMENTNOTAVAILABLE while it's borrowed or the
+  tab or document is gone, and catches panics. A range can be a whole huge file: a client gets at most 1 M UTF-16 units
+  of text at once (`TEXT_MAX`), a move by characters past 4096 counts them in bulk (2 billion through 400 MB: 72 ms),
+  by paragraphs uses the line index, by rows stops after 250 ms. Not yet: the tab strip, status bar and menu bar as
+  elements, notifications for messages and search results, Linux (Orca).
 - Dark mode reaches everything Slate draws, its menus (uxtheme's dark menus) and its prompts (`prompt.rs`). The Open
   and Save As dialogs are Windows' own: they follow Windows' light/dark setting, not Slate's switch.
 - Status bar counts: the caret's column is worked out once per caret place (`CaretPlace`), not each frame. A
@@ -498,6 +512,14 @@ accent stay Windows-only), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate
   `leave`, `print:pressed` and `print:invalidated` (repaints asked for) for the pressed states; `set:font=<family>`
   and `print:realbold`; `print:datadir` (`empty` or not). `session:`, `persist` and `crash` refuse to run without
   `SLATE_DATA_DIR`.
+- Screen readers: `uia:<op>` works on a range through the providers the way a client does (`caret`, `sel`, `doc`,
+  `visible`, `point=<x>,<y>` pick one; `expand=<unit>`, `move=<unit>,<n>`, `start=` / `end=<unit>,<n>`, `find=<text>`,
+  `select`, `scroll` change it; units char, format, word, line, para, page, doc), and `print:uia` (the text element),
+  `uia-line`, `uia-word`, `uia-char`, `uia-para` (the unit at the caret), `uia-sel`, `uia-range`, `uia-len`,
+  `uia-rects`, `uia-attrs` and `uia-events` (raised since the last time) show what a client gets. These call the COM
+  objects directly; `tests/uia-client.ps1` is a real client (.NET's, in Windows PowerShell) reading the hidden test
+  window through UIAutomationCore while `tests/uia.txt` idles (start it first). Focus events never reach it: Windows
+  passes those on only from the window with the keyboard, which a test window never is.
 - `SLATE_TEST_VISIBLE=1` runs the same scripts in the real window (on top, without taking the focus), drawing
   through the real swap chain; `shot:` then captures the screen.
 - Don't drive the user's desktop with real mouse/keyboard input.

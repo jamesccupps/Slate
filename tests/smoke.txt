@@ -85,3 +85,17 @@ expect:bookmarks=3
 cmd:ToggleReadOnly
 type:x
 expect:text=one apple\ntwo\nthree apple\nfour
+# Screen readers (UI Automation): what a client reads at the caret, a range moved by rows, the events
+cmd:NewTab
+type:hello, world\nsecond line
+key:ctrl+home
+expect:uia-line=hello, world\n
+expect:uia-word=hello
+expect:uia-char=h
+uia:caret
+uia:expand=line
+uia:move=line,1
+expect:uia-range=second line
+print:uia-events
+key:right
+expect:uia-events=selection

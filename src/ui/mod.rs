@@ -17,6 +17,7 @@ pub mod prompt;
 pub mod session;
 pub mod structure;
 pub mod testmode;
+pub mod uia;
 pub mod update;
 pub mod win;
 
@@ -242,6 +243,8 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
         if msg != WM_COPYDATA {
             drain_pending(&cell);
         }
+        // Screen readers hear what changed (only while they listen).
+        uia::after(&cell);
         r
     });
     match r {
@@ -286,6 +289,7 @@ fn handle(cell: &Cell, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<L
             Some(LRESULT(0))
         }
         WM_ERASEBKGND => Some(LRESULT(1)),
+        WM_GETOBJECT => uia::on_getobject(hwnd, wp, lp),
         WM_SIZE => {
             if let Ok(mut a) = cell.try_borrow_mut() {
                 a.layout();
@@ -693,6 +697,7 @@ fn handle(cell: &Cell, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<L
             Some(LRESULT(0))
         }
         WM_DESTROY => {
+            uia::on_destroy(hwnd);
             unsafe { PostQuitMessage(0) };
             Some(LRESULT(0))
         }

@@ -1,0 +1,17 @@
+# Screen readers end to end: tests/uia-client.ps1 reads this window through UI Automation while it idles.
+size:1000x600
+dpi:96
+type:hello world\nsecond line here\n\nlast
+key:ctrl+home
+key:down
+key:right
+# the client connects, reads, and starts listening
+idle:9000
+# then the caret moves and text is typed, while it listens
+key:down
+key:end
+type:!
+cmd:NewTab
+cmd:PrevTab
+idle:12000
+print:uia-events

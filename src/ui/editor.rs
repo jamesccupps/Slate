@@ -434,10 +434,12 @@ impl View {
         self.hl.reset();
     }
 
-    /// Applies the document's change log to the scroll position and the bookmarks.
+    /// Applies the document's change log to the scroll position, the bookmarks and screen readers' text ranges.
     pub fn sync(&mut self, doc: &mut Document) {
         let mut moved = false;
-        for (k, c) in doc.take_changes().iter().enumerate() {
+        let changes = doc.take_changes();
+        super::uia::follow(doc.id(), &changes);
+        for (k, c) in changes.iter().enumerate() {
             self.top = c.map(self.top);
             crate::edit::map_marks(&mut self.bookmarks, c);
             moved = true;
@@ -1142,6 +1144,32 @@ impl View {
         for (rc, _) in self.range_rects(cx, a, b, ox, eol) {
             cx.g.fill(rc, color);
         }
+    }
+
+    /// Where `[a, b)` is on screen (client DIPs, cut to the text area; the rows as last laid out): a rectangle for each
+    /// row part it covers, its line breaks too, or for an empty range a caret's width where it is. For screen readers.
+    pub fn screen_rects(&mut self, cx: &Ctx, a: u64, b: u64) -> Vec<Rect> {
+        let ox = cx.geom.text_x - self.scroll_x;
+        let mut out: Vec<Rect> = Vec::new();
+        if a < b {
+            out.extend(self.range_rects(cx, a, b, ox, true).into_iter().map(|(r, _)| r));
+        } else {
+            let (seg, lay, row, x) = self.caret_place(cx, a, false);
+            let rs = seg.start + lay.row_bytes(row).0;
+            if let Some(vr) = self.rows.iter().find(|r| r.start == rs && r.seg.start == seg.start) {
+                out.push(Rect::new(ox + x, vr.y, 1.0, cx.style.row_h));
+            }
+        }
+        let (left, right) = (cx.geom.text_x, cx.geom.text_x + cx.geom.text_w);
+        let (top, bottom) = (cx.geom.rect.y, cx.geom.rect.bottom());
+        out.into_iter()
+            .filter_map(|r| {
+                let (x0, x1) = (r.x.max(left), r.right().min(right));
+                let (y0, y1) = (r.y.max(top), r.bottom().min(bottom));
+                // (an empty range's 1-pixel box at the right edge still counts)
+                (x1 >= x0 && y1 > y0 && (x1 > x0 || a == b)).then(|| Rect::new(x0, y0, (x1 - x0).max(if a == b { 1.0 } else { 0.0 }), y1 - y0))
+            })
+            .collect()
     }
 
     /// Where `[a, b)` is on the visible rows (client DIPs), with the index of the row of each part. `eol` adds a
