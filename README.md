@@ -59,7 +59,10 @@ JSON file opens instantly, scrolls smoothly, and can be searched, edited, format
   (and, from 0.8.1, that it's signed by the same publisher) and restarts Slate with your tabs (and their unsaved
   text) back where they were. If the new version can't start, the old one comes back by itself. *Help → Check for
   updates…* does it on demand. (On Linux, `apt` keeps Slate up to date.)
-- Screen readers (Narrator, NVDA, Orca) can't read the text yet; that's planned ([docs/ROADMAP.md](docs/ROADMAP.md)).
+- Screen readers on Windows (Narrator, NVDA, JAWS) read the text through UI Automation: the line, word or character
+  at the cursor as it moves, the selection and edits, and the tab's name when another tab gets the keyboard; huge
+  files too. Not yet: the tab strip, status bar and menu bar, and Linux (Orca)
+  ([docs/ROADMAP.md](docs/ROADMAP.md)).
 
 ## Keyboard shortcuts
 

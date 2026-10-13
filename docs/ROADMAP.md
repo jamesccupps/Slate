@@ -100,15 +100,17 @@ file, Enter or a double-click going to the line there; filtering such a tab agai
 lines out of a 400 MB log in 0.3 s. Bookmarks (Ctrl+F2, F2, Shift+F2), kept with the tabs. Read-only tabs, on by
 themselves for files that can't be written. Details in the [0.11.0 release notes](release-notes-0.11.0.md).
 
+## 0.12.0: screen readers, and a security review
+
+Screen readers on Windows read the text (UI Automation: `src/ui/uia.rs`): the line, word or character at the caret,
+the selection, edits and the tab's name, on huge files too. A security review's fixes: Slate.exe takes its DLLs from
+System32 only, saving keeps a file's own permissions in every case, and the parsers were fuzzed (14,000 inputs, no
+crash or hang). Details in the [0.12.0 release notes](release-notes-0.12.0.md).
+
 ## Next
 
-1. **Accessibility: screen readers (L).** The high-contrast theme and a hidden system caret for Magnifier are done,
-   and so is the text (`src/ui/uia.rs`, not released yet): a Document element named after the tab with the Text
-   pattern, its ranges byte offsets moved by each edit, units as screen readers read them (the character the caret
-   steps over, words, the rows on screen as lines, the document's lines as paragraphs), events for the caret,
-   edits, another tab and Save As, and huge files kept cheap (text read for a client capped at 1 M characters, moves
-   by many characters or paragraphs counted in bulk). Checked in test mode and by a real UI Automation client
-   (`tests/uia-client.ps1`). Next:
+1. **Accessibility: screen readers, the rest (M).** The text is read since 0.12.0 (checked in test mode and by a real
+   UI Automation client, `tests/uia-client.ps1`). Next:
    - Trying it with Narrator and NVDA (focus events can only be checked in a real, focused window).
    - Notifications (`UiaRaiseNotificationEvent`, Windows 10 1709+) for what the status bar says ("Saved", "Not
      found", a search's count) and for the line a Find next lands on while the find box has the keyboard.
