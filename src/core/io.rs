@@ -443,6 +443,7 @@ mod place {
     use std::os::windows::io::AsRawHandle;
 
     use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Security::PSECURITY_DESCRIPTOR;
     use windows::Win32::Storage::FileSystem::{
         FILE_ATTRIBUTE_HIDDEN as HIDDEN, FILE_BASIC_INFO, FILE_FLAGS_AND_ATTRIBUTES, FILE_RENAME_INFO, FileBasicInfo,
         FileRenameInfoEx, FindClose, FindFirstStreamW, FindNextStreamW, FindStreamInfoStandard, GetFileAttributesW,
@@ -585,11 +586,16 @@ mod place {
             .open(p)
     }
 
-    /// Whether the file at `target` (its metadata `m`) has what a new file renamed into its place wouldn't: permissions
-    /// of its own (not only the folder's), encryption, compression, or alternate data streams (the "downloaded from
-    /// the internet" mark among them). ReplaceFile keeps all of those.
+    /// Whether the file at `target` (its metadata `m`) has what a new file renamed into its place wouldn't:
+    /// encryption, compression, or alternate data streams (the "downloaded from the internet" mark among them).
+    /// ReplaceFile keeps those. (Its permissions: `keep_permissions`.)
     pub fn special(target: &Path, m: &fs::Metadata) -> bool {
-        m.file_attributes() & (ENCRYPTED | COMPRESSED) != 0 || has_streams(target) || own_permissions(target)
+        m.file_attributes() & (ENCRYPTED | COMPRESSED) != 0 || has_streams(target)
+    }
+
+    /// Whether the file is encrypted (EFS): its temp file has to be, too.
+    pub fn encrypted(m: &fs::Metadata) -> bool {
+        m.file_attributes() & ENCRYPTED != 0
     }
 
     pub fn has_streams(target: &Path) -> bool {
@@ -617,45 +623,79 @@ mod place {
         more
     }
 
-    /// Whether the file's permissions are its own: not inherited from its folder, or with entries of its own.
-    pub fn own_permissions(target: &Path) -> bool {
-        use windows::Win32::Security::{
-            ACE_HEADER, ACL, DACL_SECURITY_INFORMATION, GetAce, GetFileSecurityW, GetSecurityDescriptorControl,
-            GetSecurityDescriptorDacl, PSECURITY_DESCRIPTOR,
-        };
-        const SE_DACL_PROTECTED: u16 = 0x1000;
-        const INHERITED_ACE: u8 = 0x10;
-        let w = wide(&verbatim(target));
+    /// A security descriptor holding the DACL, read by `get(buffer, its size, size needed)`.
+    fn read_dacl(get: impl Fn(PSECURITY_DESCRIPTOR, u32, &mut u32) -> bool) -> Option<Vec<u64>> {
         let mut need = 0u32;
-        unsafe {
-            let _ = GetFileSecurityW(PCWSTR(w.as_ptr()), DACL_SECURITY_INFORMATION.0, PSECURITY_DESCRIPTOR::default(), 0, &mut need);
-        }
+        get(PSECURITY_DESCRIPTOR::default(), 0, &mut need);
         if need == 0 || need > 1 << 20 {
-            return false;
+            return None;
         }
         let mut buf = vec![0u64; (need as usize).div_ceil(8)];
-        let sd = PSECURITY_DESCRIPTOR(buf.as_mut_ptr() as *mut _);
+        get(PSECURITY_DESCRIPTOR(buf.as_mut_ptr() as *mut _), need, &mut need).then_some(buf)
+    }
+
+    /// The DACL in a security descriptor read by `read_dacl`: whether it's protected (inherits nothing) and its bytes
+    /// (its entries, each with its inherited flag), empty for none.
+    fn dacl_of(sd: &mut [u64]) -> Option<(bool, Vec<u8>)> {
+        use windows::Win32::Security::{ACL, GetSecurityDescriptorControl, GetSecurityDescriptorDacl};
+        const SE_DACL_PROTECTED: u16 = 0x1000;
+        let sd = PSECURITY_DESCRIPTOR(sd.as_mut_ptr() as *mut _);
+        let (mut control, mut rev) = (0u16, 0u32);
+        let (mut present, mut defaulted) = (Default::default(), Default::default());
+        let mut dacl: *mut ACL = std::ptr::null_mut();
         unsafe {
-            if !GetFileSecurityW(PCWSTR(w.as_ptr()), DACL_SECURITY_INFORMATION.0, sd, need, &mut need).as_bool() {
-                return false;
-            }
-            let (mut control, mut rev) = (0u16, 0u32);
-            if GetSecurityDescriptorControl(sd, &mut control, &mut rev).is_ok() && control & SE_DACL_PROTECTED != 0 {
-                return true;
-            }
-            let (mut present, mut defaulted) = (Default::default(), Default::default());
-            let mut dacl: *mut ACL = std::ptr::null_mut();
-            if GetSecurityDescriptorDacl(sd, &mut present, &mut dacl, &mut defaulted).is_err() || !present.as_bool() || dacl.is_null() {
-                return false;
-            }
-            for k in 0..(*dacl).AceCount as u32 {
-                let mut ace = std::ptr::null_mut();
-                if GetAce(dacl, k, &mut ace).is_ok() && !ace.is_null() && (*(ace as *const ACE_HEADER)).AceFlags & INHERITED_ACE == 0 {
-                    return true;
-                }
-            }
+            GetSecurityDescriptorControl(sd, &mut control, &mut rev).ok()?;
+            GetSecurityDescriptorDacl(sd, &mut present, &mut dacl, &mut defaulted).ok()?;
+            let bytes = if present.as_bool() && !dacl.is_null() {
+                std::slice::from_raw_parts(dacl as *const u8, (*dacl).AclSize as usize).to_vec()
+            } else {
+                Vec::new()
+            };
+            Some((control & SE_DACL_PROTECTED != 0, bytes))
         }
-        false
+    }
+
+    /// Gives `temp` (just made in the folder of the file at `target`, which it will replace) that file's permissions
+    /// when they aren't the ones a new file there got: entries of its own, a list that inherits nothing, or the entries
+    /// it came with from the folder it was moved from (a private file moved into a shared folder keeps its list, every
+    /// entry still marked inherited; a new file in its place would take the shared folder's, and others could read it).
+    /// Copied as they are, with SetKernelObjectSecurity, which doesn't work the inherited entries out again from the
+    /// folder (SetSecurityInfo and ReplaceFile do). False when they differ and couldn't be copied (or read).
+    pub fn keep_permissions(target: &Path, temp: &File, temp_path: &Path) -> bool {
+        use windows::Win32::Security::{
+            DACL_SECURITY_INFORMATION, GetFileSecurityW, GetKernelObjectSecurity, PROTECTED_DACL_SECURITY_INFORMATION,
+            SetKernelObjectSecurity,
+        };
+        let w = wide(&verbatim(target));
+        let info = DACL_SECURITY_INFORMATION.0;
+        let handle = HANDLE(temp.as_raw_handle());
+        let old = read_dacl(|sd, len, need| unsafe { GetFileSecurityW(PCWSTR(w.as_ptr()), info, sd, len, need).as_bool() });
+        let read_new = || read_dacl(|sd, len, need| unsafe { GetKernelObjectSecurity(handle, info, sd, len, need).is_ok() });
+        let (mut old, mut new) = match (old, read_new()) {
+            (Some(a), Some(b)) => (a, b),
+            // (a file system without permissions, FAT: neither has any)
+            (None, None) => return true,
+            _ => return false,
+        };
+        let Some(want) = dacl_of(&mut old) else { return false };
+        if dacl_of(&mut new).as_ref() == Some(&want) {
+            return true;
+        }
+        // (through a handle of its own: the one writing it hasn't the right to change permissions, and asking for that
+        // when it's made would stop saves in a folder that doesn't give it)
+        const WRITE_DAC: u32 = 0x0004_0000;
+        let Ok(owner) = OpenOptions::new().access_mode(WRITE_DAC).share_mode(0x7).open(verbatim(temp_path)) else { return false };
+        let protect = if want.0 { PROTECTED_DACL_SECURITY_INFORMATION.0 } else { 0 };
+        let set = unsafe {
+            SetKernelObjectSecurity(
+                HANDLE(owner.as_raw_handle()),
+                windows::Win32::Security::OBJECT_SECURITY_INFORMATION(info | protect),
+                PSECURITY_DESCRIPTOR(old.as_mut_ptr() as *mut _),
+            )
+        };
+        drop(owner);
+        // (as it is now: the same as the original's)
+        set.is_ok() && read_new().is_some_and(|mut n| dacl_of(&mut n).as_ref() == Some(&want))
     }
 
     /// Puts the written temp file (`file`, at `temp_path`) in place of `target` (see the module docs). Returns
@@ -728,6 +768,15 @@ mod place {
     /// Never on Unix (see the Windows side).
     pub fn special(_: &Path, _: &fs::Metadata) -> bool {
         false
+    }
+
+    pub fn encrypted(_: &fs::Metadata) -> bool {
+        false
+    }
+
+    /// (`copy_identity` gives the new file the old one's owner, mode and extended attributes.)
+    pub fn keep_permissions(_: &Path, _: &File, _: &Path) -> bool {
+        true
     }
 
     /// Gives the new file the old one's owner and group where that's allowed, then its permissions (in that order: a
@@ -970,6 +1019,14 @@ pub fn save(
 
     // Never write over the original directly: a cancelled or failed save must leave it as it was.
     let Some((file, temp_path)) = temp else {
+        if old.as_ref().is_some_and(place::encrypted) {
+            // (saved unencrypted, it would be readable on the disk: not done)
+            return Err(SaveError::Io(
+                "This file is encrypted, and Windows can't make an encrypted file in that folder (a network share or \
+                 a drive without encryption?), so it wasn't saved. Use Save As to save it in a folder on this PC."
+                    .into(),
+            ));
+        }
         return Err(SaveError::Io(
             "Slate couldn't create a temporary file in that folder (no permission?). Try Save As somewhere else."
                 .into(),
@@ -1008,7 +1065,8 @@ pub fn save(
     // Swap the new file into place: on Windows a POSIX rename (atomic, and it replaces a file still open with
     // delete sharing, as Slate keeps big files); where the file system doesn't have those (network shares, FAT
     // drives) a plain rename, and if that can't replace the file because Slate still has it open, ReplaceFile.
-    let special = old.as_ref().is_some_and(|m| place::special(&target, m));
+    // (the original's permissions kept on the new file; where they can't be, ReplaceFile tries)
+    let special = old.as_ref().is_some_and(|m| place::special(&target, m) || !place::keep_permissions(&target, &file, &temp_path));
     let (renamed, written, set_aside) = place::swap_in(file, &temp_path, &target, old.is_some(), special, dir);
     if !renamed {
         let _ = fs::remove_file(&temp_path);
@@ -1530,9 +1588,45 @@ mod tests {
         let plain = dir.join("plain.txt");
         fs::write(&plain, b"x").unwrap();
         assert!(!place::has_streams(&plain));
-        // (no permissions of its own either, in a folder whose permissions it takes; a test run in an app container's
-        // temp folder may give new files their own)
-        assert_eq!(place::special(&plain, &fs::metadata(&plain).unwrap()), place::own_permissions(&plain));
+        assert!(!place::special(&plain, &fs::metadata(&plain).unwrap()));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The DACL of `path` as icacls lists it (one line per entry, the file name taken out).
+    #[cfg(windows)]
+    fn acl_lines(path: &Path) -> Vec<String> {
+        let out = std::process::Command::new("icacls").arg(path).output().unwrap();
+        let text = String::from_utf8_lossy(&out.stdout).replace(&path.display().to_string(), "");
+        text.lines().map(|l| l.trim().to_string()).filter(|l| l.contains(':') && !l.starts_with("Successfully")).collect()
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_private_file_moved_into_a_shared_folder_stays_private() {
+        // A file made in a folder only its owner can read keeps that list when it's moved (on the same drive) into a
+        // folder others can read, every entry still marked inherited. Saving must keep it, not give it the new
+        // folder's: others could read it from then on.
+        let dir = test_dir("moved-private");
+        let (private, shared) = (dir.join("private"), dir.join("shared"));
+        fs::create_dir_all(&private).unwrap();
+        fs::create_dir_all(&shared).unwrap();
+        let me = std::env::var("USERNAME").unwrap();
+        let icacls = |args: &[&str]| std::process::Command::new("icacls").args(args).output().unwrap().status.success();
+        assert!(icacls(&[private.to_str().unwrap(), "/inheritance:r", "/grant:r", &format!("{me}:(OI)(CI)F")]));
+        // (others may read what's in the shared folder)
+        assert!(icacls(&[shared.to_str().unwrap(), "/grant", "*S-1-5-32-545:(OI)(CI)R"]));
+        let made = private.join("notes.txt");
+        fs::write(&made, b"secret").unwrap();
+        let path = shared.join("notes.txt");
+        fs::rename(&made, &path).unwrap();
+        let before = acl_lines(&path);
+        assert!(!before.iter().any(|l| l.contains("S-1-5-32-545") || l.contains("BUILTIN\\Users")), "{before:?}");
+        let mut doc = Document::from_text(b"still secret");
+        save(&doc.snapshot(), &path, Encoding::Utf8, false, false, &ctx()).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"still secret");
+        assert_eq!(acl_lines(&path), before);
+        assert_eq!(names(&shared), ["notes.txt"]);
+        let _ = icacls(&[private.to_str().unwrap(), "/reset", "/T"]);
         let _ = fs::remove_dir_all(&dir);
     }
 

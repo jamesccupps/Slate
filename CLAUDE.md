@@ -27,6 +27,12 @@ cargo test --lib
 - The `windows` crate is pinned to **0.58**: newer versions link through raw-dylib, which needs `dlltool` + an
   assembler that the GNU toolchain doesn't bundle.
 - `build.rs` writes the resource object (manifest, icon, version info) itself; there is no rc.exe/windres.
+- `scripts/load-config.ps1 -Exe <exe>` runs after every release build (CI's, and `build.cmd`'s): GNU ld doesn't fill in
+  the PE's load configuration, so the script points it at `_load_config_used` in `src/main.rs`, whose
+  DependentLoadFlags (LOAD_LIBRARY_SEARCH_SYSTEM32) make Windows take the DLLs Slate.exe imports from System32 only,
+  never from the folder it's in (Downloads, the first time: a DLL a web page got saved there isn't loaded). It fails
+  unless that structure is in the exe once, and recomputes the PE checksum. A plain `cargo build` lacks it. Timed: no
+  difference at startup (the first starts of any new exe are slower while Windows scans it: warm it up first).
 - `scripts/deploy.ps1 -Exe <exe> -Dir <folder> [-Portable]` copies a build into place, also while the old one runs
   (it renames the running exe out of the way; Slate deletes such leftovers on start).
 - Never start Slate (or anything long-running) from a Claude session expecting it to persist: Claude is an MSIX app,
@@ -166,9 +172,15 @@ accent stay Windows-only), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate
     (`Document::bad_units`, which can't be saved back as it was) asks first. Stale temp files of dead processes are
     cleaned up. After a big save the text reads exactly the bytes written, from the file written (found by its file
     ID), never what another program put at that path next. On Windows a file with what a renamed new one wouldn't
-    have (permissions of its own rather than its folder's, EFS, compression, alternate streams such as the
-    downloaded-from-the-internet mark: `place::special`) is put in place with ReplaceFile first, which keeps those
-    (where it can't, the POSIX rename and MoveFileEx as for any file: saved, without them);
+    have (EFS, compression, alternate streams such as the downloaded-from-the-internet mark: `place::special`) is put
+    in place with ReplaceFile first, which keeps those (where it can't, the POSIX rename and MoveFileEx as for any
+    file: saved, without them). Permissions: when the original's DACL isn't the one the temp file got in that folder
+    (entries of its own, a protected list, or a file moved in from another folder with that folder's entries still
+    marked inherited), `place::keep_permissions` copies it onto the temp file as it is (SetKernelObjectSecurity, which
+    doesn't work inherited entries out again from the folder as SetSecurityInfo and ReplaceFile do; through a handle
+    of its own with WRITE_DAC), checks it, and only if that fails goes the ReplaceFile way. An encrypted file in a
+    folder where Windows can't make an encrypted temp file isn't saved (it would be on the disk unencrypted): the
+    message says so;
     a set-aside original ReplaceFile couldn't put back is never hidden+temporary, which is what marks a deletable
     leftover. Saving as UTF-16 asks first (`Lossy`) when a mostly-UTF-8 document's stray bytes would become U+FFFD.
     `open_either` (`name.txt:120:5`) falls back to the name without the suffix on "not found" and on Windows'
@@ -482,6 +494,10 @@ accent stay Windows-only), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate
 ## Testing
 
 - `cargo test --lib` — all unit tests, the UI's included (~240, ~5 s).
+- Hostile files: `cargo test --release --lib fuzz -- --ignored --nocapture` (`src/fuzz.rs`) sends random and mutated
+  text through every lexer, JSON and XML Check/Format and the structure scans; a panic is reported with its input, a
+  step stuck for 10 s (a file that would freeze the window) stops the run and saves the input to
+  `%TEMP%\slate-fuzz-hang.bin`. `SLATE_FUZZ_ROUNDS` (2000) and `SLATE_FUZZ_SEED` choose the inputs.
 - `Slate.exe --test script.txt` drives the real app in a hidden window and renders frames offscreen into PNGs; the
   commands are listed at the top of `src/ui/testmode.rs` (`open:`, `type:`, `key:`, `cmd:`, `jobs`, `shot:`,
   `print:`, `expect:`, `answer:`, `lang:<name>` …; `print:menu0`…`menu4` lists a menu's items). In this mode

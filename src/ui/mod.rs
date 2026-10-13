@@ -551,6 +551,10 @@ fn handle(cell: &Cell, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<L
             if CLOSING.with(|c| c.get()) || cell.try_borrow().is_ok_and(|a| a.closing) {
                 return Some(LRESULT(0));
             }
+            // (from another process: nothing to read is nothing to open)
+            if cds.lpData.is_null() || cds.cbData < 2 {
+                return Some(LRESULT(1));
+            }
             let units = unsafe { std::slice::from_raw_parts(cds.lpData as *const u16, cds.cbData as usize / 2) };
             let text = String::from_utf16_lossy(units);
             let paths: Vec<PathBuf> = text.split('\n').filter(|s| !s.is_empty()).map(PathBuf::from).collect();

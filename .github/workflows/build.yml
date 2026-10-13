@@ -51,6 +51,12 @@ jobs:
       - name: Build
         run: cargo build --release --locked
 
+      - name: Load configuration (Windows takes Slate.exe's DLLs from System32 only)
+        shell: pwsh
+        # GNU ld doesn't write it: points the exe at the one src/main.rs makes (DependentLoadFlags), before the exe is
+        # tested, uploaded and signed. Fails if it isn't there.
+        run: ./scripts/load-config.ps1 -Exe target/release/Slate.exe
+
       - name: Smoke test (the built Slate.exe, in its test mode)
         shell: pwsh
         timeout-minutes: 5

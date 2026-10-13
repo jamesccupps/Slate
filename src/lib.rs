@@ -7,6 +7,8 @@ pub mod highlight;
 pub mod print;
 pub mod settings;
 pub mod theme;
+#[cfg(test)]
+mod fuzz;
 #[cfg(target_os = "linux")]
 pub mod gtk;
 #[cfg(windows)]
