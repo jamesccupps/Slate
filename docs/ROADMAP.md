@@ -107,6 +107,13 @@ the selection, edits and the tab's name, on huge files too. A security review's 
 System32 only, saving keeps a file's own permissions in every case, and the parsers were fuzzed (14,000 inputs, no
 crash or hang). Details in the [0.12.0 release notes](release-notes-0.12.0.md).
 
+## 0.12.1: polish
+
+A review of every screen on Windows and Linux (light, dark and high contrast; 100% to 200%; windows down to the
+smallest size), and what it found fixed: the tab strip keeps the tab you're on in view, the accent color in the shade
+Windows 11's apps use on each theme, status bar messages that went away too late (or, on Linux, never), the find bar's
+matches following the tab on Linux. Details in the [0.12.1 release notes](release-notes-0.12.1.md).
+
 ## Next
 
 1. **Accessibility: screen readers, the rest (M).** The text is read since 0.12.0 (checked in test mode and by a real
