@@ -147,6 +147,13 @@ matches following the tab on Linux. Details in the [0.12.1 release notes](releas
   `some-command | slate -` opens the output in a new tab.
 - **Page setup** (M): margins, the text at the top and bottom of the pages, printing without colors (Print itself
   came in 0.10.0).
+- **Print preview** (M; the user asked, October 2026): File → Print preview… opens Slate's own window with the pages
+  as they'll print (`src/print.rs`'s layout, drawn with Direct2D): page arrows, the page count, zoom, and Print, which
+  goes on to the system's dialog. The same on Windows 10 and 11 with either print dialog. (Windows 11's newer print
+  dialog says "This app doesn't support print preview" for every classic app that prints the usual way, as Slate
+  does; filling its preview would mean Windows' newer printing method, whose preview Microsoft documents for Store apps
+  only. The older dialog never had a preview.) On Linux, check GTK's print dialog first: its Preview button may already
+  work with Slate's `GtkPrintOperation`.
 - **Find:** in the selection, a history, `\n` and `\t` in regex replacements, find in all open tabs (S–M).
 - **Editing:** column (Alt+drag) selection (S). Drag and drop of text (M).
 - **Spell check** like Notepad's (M). **Inline IME composition** for Chinese, Japanese and Korean (M).
