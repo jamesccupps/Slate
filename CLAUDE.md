@@ -119,7 +119,7 @@ Commits use the GitHub no-reply address (repo-local git config); GitHub refuses 
 big button picks Windows or Linux from the browser): `apt.yml` publishes it with the apt repository, copying
 `docs/images/*` and two icon sizes into `images/`. `docs/images` also feeds the README: `slate-demo.gif` (four frames
 from Windows' test mode on a made-up 850 MB orders JSON, timings from `t:` marks in the same runs, captions drawn
-with System.Drawing; the find box's text drawn in, as offscreen frames don't capture native edit boxes),
+with System.Drawing; the find box's text was drawn in then, before `shot:` printed the find bar's edit boxes too),
 `slate-windows-dark.png`, `slate-linux.png` (test-mode shots of made-up sample files) and `social-preview.png`
 (1280x640, the repository's Settings → Social preview; the user uploads it). Never put the user's own files in
 them. Numbers in captions must be what was measured: an 810 MB file is editable once its lines are counted (0.13 s
@@ -129,7 +129,8 @@ there); the JSON outline for the path bar takes ~2 s more in the background and 
 
 Shared by both platforms: `src/core` (the engine), `src/highlight*` (colors), `src/edit.rs` (editing operations,
 display segments, coloring checkpoints, the transform sink), `src/theme.rs` (palettes; Windows' high contrast and
-accent stay Windows-only), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate`, `$XDG_DATA_HOME/slate` or
+accent stay Windows-only: the accent in the shade Windows 11's apps use on the theme, from Windows' accent palette, a
+lighter one on dark), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate`, `$XDG_DATA_HOME/slate` or
 `~/.local/share/slate` on Linux, or the portable `data` folder). Windows: `src/ui`. Linux: `src/gtk`.
 
 - `src/core/` — the engine, no UI. Unit-tested (`cargo test --lib`). What it asks the OS for goes through `os.rs`
@@ -498,7 +499,8 @@ accent stay Windows-only), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate
   text through every lexer, JSON and XML Check/Format and the structure scans; a panic is reported with its input, a
   step stuck for 10 s (a file that would freeze the window) stops the run and saves the input to
   `%TEMP%\slate-fuzz-hang.bin`. `SLATE_FUZZ_ROUNDS` (2000) and `SLATE_FUZZ_SEED` choose the inputs.
-- `Slate.exe --test script.txt` drives the real app in a hidden window and renders frames offscreen into PNGs; the
+- `Slate.exe --test script.txt` drives the real app in a hidden window and renders frames offscreen into PNGs (the
+  find bar's edit boxes, Windows' own controls, printed in: `print_children`); the
   commands are listed at the top of `src/ui/testmode.rs` (`open:`, `type:`, `key:`, `cmd:`, `jobs`, `shot:`,
   `print:`, `expect:`, `answer:`, `lang:<name>` …; `print:menu0`…`menu4` lists a menu's items). In this mode
   prompts are never shown (they take answers from `answer:` lines and are listed by `print:asked`), nor are menus

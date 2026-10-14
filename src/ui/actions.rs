@@ -63,6 +63,10 @@ pub const TIMER_TIP: usize = 10;
 pub const TIMER_STRUCTURE: usize = 11;
 
 const BIG_CLIPBOARD: u64 = 64 << 20;
+/// What the status bar says while a check for updates the user asked for runs.
+const CHECKING: &str = "Checking for updates…";
+/// How the status bar's messages about a file whose lines are still being read start.
+const STILL_READING: &str = "Still reading the file's lines";
 
 thread_local! {
     /// Test mode: where the mouse pointer is (client DIPs), for scrolling while dragging.
@@ -597,6 +601,11 @@ impl App {
         self.tabs[i].restore = None;
         if self.tabs[i].index_job.is_some() {
             self.timer(TIMER_JOBS, 100);
+        } else if i == self.active {
+            self.drop_flash(STILL_READING);
+        }
+        if i == self.active {
+            self.drop_flash("Still opening the file");
         }
         self.session_dirty = true;
         self.update_title();
@@ -1178,7 +1187,7 @@ impl App {
         let job = Job::spawn(0, self.notify.clone(), |_| update::latest());
         self.update = UpdateState::Checking { manual, job };
         if manual {
-            self.flash("Checking for updates…", false);
+            self.flash(CHECKING, false);
         }
         self.timer(TIMER_JOBS, 100);
     }
@@ -1214,6 +1223,8 @@ impl App {
                     if rel.version > Version::current() && (manual || rel.version.to_string() != self.settings.failed_update) {
                         self.update = UpdateState::Available(rel);
                         if manual {
+                            // (the prompt and the status bar's "Update to …" say it: not "Checking…" beside it)
+                            self.drop_flash(CHECKING);
                             self.pending.push(Deferred::UpdatePrompt);
                         }
                     } else if manual {
@@ -1287,6 +1298,9 @@ impl App {
                 self.tabs[i].index_job = None;
                 self.tabs[i].doc.poll_index();
                 self.tabs[i].view.clear_cache();
+                if i == self.active && self.tabs[i].doc.index_error().is_none() {
+                    self.drop_flash(STILL_READING);
+                }
                 if let Some(why) = self.tabs[i].doc.index_error() {
                     // It stays as it is (readable, not editable): line counts can't be guessed.
                     self.tabs[i].notice = Some(Notice {
@@ -1913,7 +1927,7 @@ impl App {
         let why = if tab.filter.is_some() {
             Some("These are lines of another tab, to look through: Enter or a double-click goes to one there.")
         } else if tab.read_only {
-            Some("This tab is read only (File → Read only, or a click on “Read only” below, to edit it).")
+            Some("This tab is read only: click “Read only” on the right (or File → Read only) to edit it.")
         } else if tab.restore.is_some() {
             Some("This tab from last time isn't back yet (see the note above the text).")
         } else if tab.load_job.is_some() {
@@ -2926,7 +2940,7 @@ impl App {
             self.mouse_tracking = true;
         }
         if let Some((x0, w0)) = self.split_drag {
-            self.settings.structure_width = (w0 - (x - x0)).clamp(200.0, (self.size.0 * 0.6).max(200.0));
+            self.settings.structure_width = (w0 - (x - x0)).clamp(200.0, super::app::panel_max(self.size.0));
             self.layout();
             self.invalidate();
             return;
@@ -3848,7 +3862,7 @@ impl App {
 
     fn jump_path(&mut self, i: usize) {
         if !self.tab().structure.path_current(&self.tab().doc) {
-            self.flash("The path is being worked out again after your change; try again in a moment", false);
+            self.flash("The path is being worked out again after your change — try again in a moment.", false);
             return;
         }
         let step = self.tab().structure.path.as_ref().and_then(|p| p.get(i)).cloned();
@@ -3866,7 +3880,7 @@ impl App {
         if !chevron && row.end > row.start {
             // Rows from before a change point into the old text.
             if !self.tab().structure.rows_current(&self.tab().doc) {
-                self.flash("The structure is being updated after your change; try again in a moment", false);
+                self.flash("The structure is being updated after your change — try again in a moment.", false);
                 self.invalidate();
                 return;
             }
@@ -4749,6 +4763,8 @@ pub fn run_cmd(cell: &Cell, cmd: Cmd) {
             let t = &mut a.tabs[i];
             t.title_override = Some(title.into());
             t.untitled = 0;
+            // (a list to read: a key typed there by mistake doesn't make it a tab with unsaved changes)
+            t.read_only = true;
             a.update_title();
             a.invalidate();
         }

@@ -2,7 +2,8 @@
 //! `data › [1203] › name`, `catalog › book[3] › title`) and the structure panel (a tree of the document). Both use
 //! the lazy child lists of `core::jsonnav` (or `core::xmlnav`, which fills in the same lists for elements), cached
 //! per document version. Containers with more than 100 children are grouped into ranges (`[0 … 99]`,
-//! `[100 … 199]`, and ranges of ranges), like browser JSON viewers, so even millions of items stay easy to browse.
+//! `[100 … 199]`, and ranges of ranges; in XML `[1 … 100]`, as its paths count from 1), like browser JSON viewers,
+//! so even millions of items stay easy to browse.
 //! Tree nodes are known by their path (keys and indexes; for XML the elements' places), so what's open stays open
 //! across edits, and while a big document is read again after an edit the tree and the path bar keep showing what
 //! they had.
@@ -445,10 +446,12 @@ impl Structure {
                 let expanded = self.expanded.contains(&key);
                 let start = list.get(&*doc, s).map_or(0, |c| c.first());
                 let end = list.get(&*doc, e - 1).map_or(start, |c| c.end);
+                // (XML counts elements from 1, as its paths do: `book[1]` is the first)
+                let label = if self.xml { format!("[{} … {}]", s + 1, e) } else { format!("[{} … {}]", s, e - 1) };
                 out.push(Row {
                     key,
                     depth,
-                    label: format!("[{} … {}]", s, e - 1),
+                    label,
                     is_key: false,
                     kind: None,
                     preview: String::new(),
@@ -923,7 +926,8 @@ mod tests {
             wait(&mut s);
         }
         assert_eq!(s.path_text(s.path.as_ref().unwrap()), "/items/item[123457]");
-        assert_eq!(labels(&s)[..3], ["items", "[0 … 9999]", "[10000 … 19999]"]);
+        // (counted from 1, as the path is)
+        assert_eq!(labels(&s)[..3], ["items", "[1 … 10000]", "[10001 … 20000]"]);
     }
 
     #[test]

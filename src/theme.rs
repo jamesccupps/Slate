@@ -11,7 +11,7 @@ use windows::Win32::Graphics::Gdi::{
     SYS_COLOR_INDEX,
 };
 #[cfg(windows)]
-use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
+use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_BINARY, RRF_RT_REG_DWORD, RegGetValueW};
 #[cfg(windows)]
 use windows::Win32::UI::Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW};
 #[cfg(windows)]
@@ -142,7 +142,7 @@ impl Theme {
             pressed: rgba(0x000000, 0x1A),
             border: rgb(0xE0E0E0),
             accent,
-            on_accent: rgb(0xFFFFFF),
+            on_accent: on_accent(accent),
             gutter: rgb(0xA0A0A0),
             gutter_active: rgb(0x404040),
             current_line: rgb(0xF6F6F6),
@@ -212,7 +212,7 @@ impl Theme {
             pressed: rgba(0xFFFFFF, 0x1C),
             border: rgb(0x3A3A3A),
             accent,
-            on_accent: rgb(0xFFFFFF),
+            on_accent: on_accent(accent),
             gutter: rgb(0x6E6E6E),
             gutter_active: rgb(0xD0D0D0),
             current_line: rgb(0x2E2E2E),
@@ -348,6 +348,11 @@ fn sys_color(i: SYS_COLOR_INDEX) -> u32 {
     rgb(((c & 0xFF) << 16) | (c & 0xFF00) | ((c >> 16) & 0xFF))
 }
 
+/// Text on an accent color: black on a light one (the accent's shade on the dark theme), else white.
+fn on_accent(accent: u32) -> u32 {
+    if luminance(accent) > 0.55 { rgb(0x000000) } else { rgb(0xFFFFFF) }
+}
+
 /// Relative brightness of 0xAARRGGBB, 0..1 (rough: no gamma).
 pub fn luminance(c: u32) -> f32 {
     let (r, g, b) = ((c >> 16) & 0xFF, (c >> 8) & 0xFF, c & 0xFF);
@@ -410,9 +415,28 @@ pub fn system_prefers_dark() -> bool {
     .unwrap_or(false)
 }
 
-/// The Windows accent color as 0xFFRRGGBB.
+/// The Windows accent color as 0xFFRRGGBB, in the shade Windows 11's own apps use on that theme (from Windows'
+/// accent palette: a lighter one on dark, a darker one on light), so text and marks in it stay easy to see.
 #[cfg(windows)]
-pub fn system_accent() -> u32 {
+pub fn system_accent(dark: bool) -> u32 {
+    // (eight colors, RGBA: lighter 3, 2, 1, the accent, darker 1, 2, 3, unused)
+    let mut palette = [0u8; 32];
+    let mut size = palette.len() as u32;
+    let read = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            w!(r"Software\Microsoft\Windows\CurrentVersion\Explorer\Accent"),
+            w!("AccentPalette"),
+            RRF_RT_REG_BINARY,
+            None,
+            Some(palette.as_mut_ptr() as *mut _),
+            Some(&mut size),
+        )
+    };
+    if read.is_ok() && size == 32 {
+        let c = &palette[if dark { 4 } else { 16 }..][..3];
+        return rgb(((c[0] as u32) << 16) | ((c[1] as u32) << 8) | c[2] as u32);
+    }
     // AccentColor is stored as 0xAABBGGRR.
     match reg_dword(w!(r"Software\Microsoft\Windows\DWM"), w!("AccentColor")) {
         Some(abgr) => {

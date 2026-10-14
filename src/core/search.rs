@@ -164,7 +164,15 @@ impl Matcher {
             .dfa_size_limit(64 << 20)
             .build()
             .map_err(|e| match e {
-                regex::Error::Syntax(s) => s.lines().last().unwrap_or("Invalid pattern").trim().to_string(),
+                // (its last line, "error: unclosed group", as "Unclosed group")
+                regex::Error::Syntax(s) => {
+                    let last = s.lines().last().unwrap_or("").trim();
+                    let mut c = last.strip_prefix("error:").unwrap_or(last).trim_start().chars();
+                    match c.next() {
+                        Some(f) => f.to_uppercase().chain(c).collect::<String>(),
+                        None => "Invalid pattern".into(),
+                    }
+                }
                 regex::Error::CompiledTooBig(_) => "Pattern is too big".into(),
                 _ => "Invalid pattern".into(),
             })?;
@@ -999,6 +1007,13 @@ mod tests {
         let last = memchr::memmem::rfind(&text, b"needle1").unwrap() as u64;
         assert_eq!(m.find_back(&snap, 0, snap.len(), None), Some((last, last + 7)));
         assert_eq!(m.find_back(&snap, 0, first + 6, None), None);
+    }
+
+    #[test]
+    fn a_bad_regular_expression_says_what_is_wrong_in_a_few_words() {
+        let err = |s: &str| Matcher::new(&Query { regex: true, ..q(s) }).err().unwrap();
+        assert_eq!(err("(unclosed"), "Unclosed group");
+        assert_eq!(err("a{2,1}"), "Invalid repetition count range, the start must be <= the end");
     }
 
     #[test]

@@ -328,6 +328,12 @@ impl Tab {
         }
     }
 
+    /// How far along its text is while there's none to show yet: its file being opened (not reloaded: the old text
+    /// shows meanwhile) or put back from last time.
+    pub fn text_coming(&self) -> Option<f32> {
+        if self.reload.is_some() { None } else { self.opening() }
+    }
+
     pub fn busy(&self) -> bool {
         self.load_job.is_some() || self.restore.is_some() || self.save.is_some() || self.task.is_some()
     }
@@ -448,6 +454,8 @@ pub struct App {
     pub status_rects: Vec<(StatusItem, Rect)>,
     pub notice_rects: Vec<Rect>,
     pub tab_scroll: f32,
+    /// The tab strip's width when its tabs were last placed (a new one scrolls the active tab into view).
+    tabs_width: f32,
     pub hover: Hit,
     /// What the left button was pressed on (drawn pressed while it's held there).
     pub down: Hit,
@@ -563,6 +571,7 @@ impl App {
             status_rects: Vec::new(),
             notice_rects: Vec::new(),
             tab_scroll: 0.0,
+            tabs_width: 0.0,
             hover: Hit::None,
             down: Hit::None,
             middle_down: Hit::None,
@@ -631,6 +640,15 @@ impl App {
             windows::Win32::UI::WindowsAndMessaging::SetTimer(self.hwnd, super::actions::TIMER_FLASH, 6100, None);
         }
         self.invalidate();
+    }
+
+    /// Takes a message away before its time once what it said no longer holds ("Still reading the file's lines…"
+    /// when they're read).
+    pub fn drop_flash(&mut self, starting: &str) {
+        if self.flash.as_ref().is_some_and(|f| f.0.starts_with(starting)) {
+            self.flash = None;
+            self.invalidate();
+        }
     }
 
     /// A message about the search ("No results"...), which goes away once the search changes.
@@ -730,7 +748,7 @@ impl App {
         self.r_status = Rect::new(0.0, sy, w, (h - sy).max(sh));
         let body_h = (sy - y).max(0.0);
         if json && self.settings.structure_panel {
-            let pw = self.settings.structure_width.clamp(200.0, (w * 0.6).max(200.0));
+            let pw = self.settings.structure_width.clamp(200.0, panel_max(w));
             let x = snap((w - pw).max(0.0));
             self.r_struct = Rect::new(x, y, w - x, body_h);
             self.r_edit = Rect::new(0.0, y, x, body_h);
@@ -745,6 +763,15 @@ impl App {
     }
 
     fn layout_tabs(&mut self) {
+        self.place_tabs();
+        // A window made narrower (or wider) keeps the tab being worked on in view.
+        if self.r_tabs.w != self.tabs_width {
+            self.tabs_width = self.r_tabs.w;
+            self.scroll_to_active_tab();
+        }
+    }
+
+    fn place_tabs(&mut self) {
         self.tab_rects.clear();
         let bar = self.r_tabs;
         let left = 8.0;
@@ -782,6 +809,10 @@ impl App {
     /// Scrolls the tab strip so the active tab is visible.
     pub fn reveal_active_tab(&mut self) {
         self.layout_tabs();
+        self.scroll_to_active_tab();
+    }
+
+    fn scroll_to_active_tab(&mut self) {
         if let Some((r, _)) = self.tab_rects.get(self.active) {
             let bar = self.r_tabs;
             let left = bar.x + 8.0;
@@ -791,7 +822,7 @@ impl App {
             } else if r.right() > right {
                 self.tab_scroll += r.right() - right;
             }
-            self.layout_tabs();
+            self.place_tabs();
         }
     }
 
@@ -1353,7 +1384,9 @@ impl App {
                 matches = m.matches_in(&bytes, a, 5000);
             }
         }
-        let editor_focused = focused && self.focused;
+        // (no caret or current line in a tab whose text is still coming)
+        let coming = tab.text_coming();
+        let editor_focused = focused && self.focused && coming.is_none();
         tab.view.paint(&cx, editor_focused, caret_on, &matches, self.overtype);
         if editor_focused {
             // The hidden system caret goes where Slate's is (Magnifier and screen readers follow that one). While the
@@ -1366,11 +1399,14 @@ impl App {
                 }
                 None => win::drop_caret(),
             }
+        } else if coming.is_some() && focused && self.focused {
+            win::drop_caret();
         }
-        // Loading / converting overlay.
-        if let Some(f) = tab.opening() {
+        // Loading / converting: where the text will be, on its first line.
+        if let Some(f) = coming {
             let msg = format!("Opening… {:.0}%", f * 100.0);
-            self.g.text(&msg, &self.fonts.ui, Rect::new(geom.text_x, geom.rect.y + 8.0, 400.0, 24.0), self.theme.text_dim, Align::Left);
+            let r = Rect::new(geom.text_x, geom.rect.y, geom.text_w, self.style.row_h);
+            self.g.text(&msg, &self.fonts.ui, r, self.theme.text_dim, Align::Left);
         }
         // Scrollbars.
         let t = &self.theme;
@@ -1445,12 +1481,15 @@ impl App {
         };
         let (mut pos_w, mut right_w) = (w(&pos), w(&right));
         let mut item_ws: Vec<f32> = items.iter().map(|(_, l)| w(l)).collect();
+        let (msg, bad) = self.status_message().unwrap_or_default();
         // In a narrow window things give way, the least needed first: the counts, the selection's words and lines,
-        // the indentation, the line endings, the language.
+        // the indentation, the line endings, the language. The counts also make way for a message ("Saved", why
+        // something didn't happen) while it shows.
         let too_wide = |pos_w: f32, item_ws: &[f32], right_w: f32| {
             6.0 + pos_w + 40.0 + item_ws.iter().map(|w| w + 20.0).sum::<f32>() + right_w + 24.0 > r.w
         };
-        if too_wide(pos_w, &item_ws, right_w) && counts.is_some() {
+        let msg_w = if msg.is_empty() { 0.0 } else { w(&msg) + 8.0 };
+        if too_wide(pos_w, &item_ws, right_w + msg_w) && counts.is_some() {
             right = size;
             right_w = w(&right);
         }
@@ -1494,10 +1533,6 @@ impl App {
         rects.push((StatusItem::Position, pr));
         let msg_x = pr.right() + 16.0;
         let msg_w = (x - msg_x - 8.0).max(0.0);
-        let (msg, bad) = match self.status_message() {
-            Some(m) => m,
-            None => (String::new(), false),
-        };
         if !msg.is_empty() {
             self.g.text(&msg, &fonts_ui, Rect::new(msg_x, r.y, msg_w, r.h), if bad { t.error } else { t.text_dim }, Align::Left);
         }
@@ -1539,6 +1574,10 @@ impl App {
             .filter(|c| c.chars > 0)
             .map(|c| format!("{}, {}", plural(c.words, "word", "words"), plural(c.chars, "character", "characters")));
         let (pos, pos_short) = position_text(tab, sel_counts, place);
+        if tab.text_coming().is_some() {
+            // (what an empty document would say isn't the file's: its size, line endings, indentation…)
+            return StatusTexts { pos, pos_short, items: Vec::new(), counts: None, size: String::new() };
+        }
         StatusTexts { pos, pos_short, items, counts, size: format_size(doc.len()) }
     }
 
@@ -1697,6 +1736,12 @@ pub struct StatusTexts {
     pub size: String,
 }
 
+/// How wide the structure panel can be in a window `w` DIPs wide: up to 60% of it, but in a narrow window no more
+/// than half, so the text keeps room for its lines.
+pub fn panel_max(w: f32) -> f32 {
+    (w - 360.0).clamp(w * 0.5, w * 0.6).max(200.0)
+}
+
 pub fn tab_progress(tab: &Tab) -> Option<f32> {
     if let Some(f) = tab.opening() {
         return Some(f);
@@ -1802,12 +1847,12 @@ pub fn make_theme(mode: ThemeMode) -> Theme {
     if high_contrast_on() {
         return Theme::high_contrast();
     }
-    let accent = system_accent();
     let dark = match mode {
         ThemeMode::System => system_prefers_dark(),
         ThemeMode::Light => false,
         ThemeMode::Dark => true,
     };
+    let accent = system_accent(dark);
     if dark { Theme::dark(accent) } else { Theme::light(accent) }
 }
 

@@ -397,15 +397,82 @@ fn prompt_shot(owner: HWND, path: &Path, kind: &str) -> Result<(), String> {
 /// Renders the window offscreen and writes a PNG.
 fn shot(cell: &Cell, path: &Path) -> Result<(), String> {
     let bmp = offscreen(cell)?;
-    let mut a = cell.borrow_mut();
-    let (w, h) = a.client_size();
-    unsafe {
+    let (w, h, mut px, hwnd) = {
+        let mut a = cell.borrow_mut();
+        let (w, h) = a.client_size();
         a.update_find_status();
         a.paint();
         let stride = w * 4;
         let mut px = vec![0u8; (stride * h) as usize];
-        bmp.CopyPixels(std::ptr::null(), stride, &mut px).map_err(|e| e.to_string())?;
-        write_png(path, w, h, &px).map_err(|e| e.to_string())
+        unsafe { bmp.CopyPixels(std::ptr::null(), stride, &mut px) }.map_err(|e| e.to_string())?;
+        (w, h, px, a.hwnd)
+    };
+    // (outside the App's borrow: the boxes ask the window for their colors)
+    print_children(hwnd, w, h, &mut px);
+    write_png(path, w, h, &px).map_err(|e| e.to_string())
+}
+
+/// Draws the window's own child windows (the find bar's edit boxes, which Direct2D doesn't draw) into a frame.
+fn print_children(hwnd: HWND, w: u32, h: u32, px: &mut [u8]) {
+    use windows::Win32::Foundation::{POINT, RECT};
+    use windows::Win32::Graphics::Gdi::*;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GW_CHILD, GW_HWNDNEXT, GWL_STYLE, GetWindow, GetWindowLongW, GetWindowRect, PRF_CHILDREN, PRF_CLIENT,
+        PRF_ERASEBKGND, PRF_NONCLIENT, SendMessageW, WM_PRINT, WS_VISIBLE,
+    };
+    unsafe {
+        let mut child = GetWindow(hwnd, GW_CHILD).ok();
+        while let Some(c) = child {
+            child = GetWindow(c, GW_HWNDNEXT).ok();
+            if GetWindowLongW(c, GWL_STYLE) as u32 & WS_VISIBLE.0 == 0 {
+                continue;
+            }
+            let mut r = RECT::default();
+            let _ = GetWindowRect(c, &mut r);
+            let mut at = POINT { x: r.left, y: r.top };
+            let _ = ScreenToClient(hwnd, &mut at);
+            let (cw, ch) = (r.right - r.left, r.bottom - r.top);
+            if cw <= 0 || ch <= 0 {
+                continue;
+            }
+            let screen = GetDC(None);
+            let mem = CreateCompatibleDC(screen);
+            let bmi = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: cw,
+                    biHeight: -ch,
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut bits = std::ptr::null_mut();
+            if let Ok(dib) = CreateDIBSection(mem, &bmi, DIB_RGB_COLORS, &mut bits, None, 0) {
+                let old = SelectObject(mem, dib);
+                let flags = PRF_CLIENT | PRF_ERASEBKGND | PRF_NONCLIENT | PRF_CHILDREN;
+                SendMessageW(c, WM_PRINT, WPARAM(mem.0 as usize), LPARAM(flags as isize));
+                let src = std::slice::from_raw_parts(bits as *const u8, (cw * ch * 4) as usize);
+                for y in 0..ch {
+                    for x in 0..cw {
+                        let (dx, dy) = (at.x + x, at.y + y);
+                        if dx < 0 || dy < 0 || dx >= w as i32 || dy >= h as i32 {
+                            continue;
+                        }
+                        let s = ((y * cw + x) * 4) as usize;
+                        let d = ((dy as u32 * w + dx as u32) * 4) as usize;
+                        px[d..d + 3].copy_from_slice(&src[s..s + 3]);
+                        px[d + 3] = 255;
+                    }
+                }
+                SelectObject(mem, old);
+                let _ = DeleteObject(dib);
+            }
+            let _ = DeleteDC(mem);
+            ReleaseDC(None, screen);
+        }
     }
 }
 
