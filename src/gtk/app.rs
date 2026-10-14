@@ -5,6 +5,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use gtk4::gdk;
 
@@ -30,6 +31,8 @@ pub const KEEP_MAX: u64 = 64 << 20;
 const LINES_MAX: u64 = 512 << 20;
 /// A selection the line tools work on in place.
 const SELECTION_MAX: u64 = 16 << 20;
+/// How long a message shows in the status bar (as on Windows); then the caret's place again.
+const FLASH_FOR: Duration = Duration::from_secs(6);
 
 /// What the window shows for the app (a dialog, the file chooser...), queued while the app is busy.
 #[derive(Clone, Debug, PartialEq)]
@@ -250,6 +253,8 @@ pub struct Find {
     /// All matches of the query in the active document (when counted), for which version.
     pub found: Option<(u64, Found)>,
     count_job: Option<(u64, Job<Found>)>,
+    /// The tab the last count was for.
+    count_tab: u64,
     find_job: Option<(u64, bool, Sel, Job<Option<(u64, u64)>>)>,
 }
 
@@ -262,8 +267,9 @@ pub struct App {
     pub notify: Notify,
     pub find: Find,
     pub asks: Vec<Ask>,
-    /// A message in the status bar (and whether it's bad news).
+    /// A message in the status bar (and whether it's bad news), shown for `FLASH_FOR` from `flash_at`.
     pub flash: Option<(String, bool)>,
+    pub flash_at: Instant,
     pub caret_on: bool,
     pub focused: bool,
     /// Files of tabs closed lately, for Reopen closed tab.
@@ -319,6 +325,7 @@ impl App {
             find: Find::default(),
             asks: Vec::new(),
             flash: None,
+            flash_at: Instant::now(),
             caret_on: true,
             focused: true,
             closed: Vec::new(),
@@ -375,7 +382,29 @@ impl App {
 
     pub fn flash(&mut self, msg: impl Into<String>, bad: bool) {
         self.flash = Some((msg.into(), bad));
+        self.flash_at = Instant::now();
         self.dirty_view = true;
+    }
+
+    /// What the status bar says in place of the caret's place: a recent message, else the work going on.
+    pub fn status_message(&self) -> Option<(String, bool)> {
+        if let Some(f) = self.flash.as_ref().filter(|_| self.flash_at.elapsed() < FLASH_FOR) {
+            return Some(f.clone());
+        }
+        if self.tab().task.is_some() {
+            return Some(("Working…".into(), false));
+        }
+        if self.find.find_job.is_some() {
+            return Some(("Searching…".into(), false));
+        }
+        None
+    }
+
+    /// Takes away a message that has shown long enough (the window's 2-second timer asks).
+    pub fn expire_flash(&mut self) {
+        if self.flash.is_some() && self.flash_at.elapsed() >= FLASH_FOR {
+            self.flash = None;
+        }
     }
 
     fn make_tab(&mut self, doc: Document) -> Tab {
@@ -987,7 +1016,7 @@ impl App {
             return false;
         }
         if tab.read_only {
-            self.flash("This tab is read only (File → Read only to edit it).", false);
+            self.flash("This tab is read only: click “Read only” on the right (or File → Read only) to edit it.", true);
             return false;
         }
         if tab.loading() {
@@ -1677,7 +1706,17 @@ impl App {
             })
         });
         tab.task = Some(Task { kind, job, version });
-        self.flash("Working…", false);
+        // (the status bar says "Working…" while the task runs: `status_message`; not after it)
+        self.flash = None;
+        self.dirty_view = true;
+    }
+
+    /// A check or format of tab `i` went through: the note about an error an earlier one found goes.
+    fn clear_check_error(&mut self, i: usize) {
+        let tab = &mut self.tabs[i];
+        if tab.notice.as_deref().is_some_and(|n| n.starts_with("Not valid ") || n.starts_with("Couldn't format: not valid ")) {
+            tab.notice = None;
+        }
     }
 
     fn finish_task(&mut self, i: usize, kind: TaskKind, version: u64, r: TaskResult) {
@@ -1745,13 +1784,19 @@ impl App {
                 if self.active == i {
                     self.after_edit(false);
                 }
+                if matches!(kind, TaskKind::Json(_) | TaskKind::Xml(_)) {
+                    self.clear_check_error(i);
+                }
                 self.flash(msg, false);
             }
             TaskResult::Filtered { src, nl, found, query } => {
                 let TaskKind::Filter(invert) = kind else { return };
                 self.show_filtered(i, invert, src, nl, found, &query);
             }
-            TaskResult::Valid(msg) => self.flash(msg, false),
+            TaskResult::Valid(msg) => {
+                self.clear_check_error(i);
+                self.flash(msg, false);
+            }
             TaskResult::FormatError { offset, msg } => {
                 let tab = &mut self.tabs[i];
                 let line = tab.doc.line_of(offset).map(|l| l + 1);
@@ -1763,7 +1808,23 @@ impl App {
                 self.reveal_pending = true;
                 self.reveal_center = true;
                 let at = line.map_or(format!("byte {}", edit::group(offset + 1)), |l| format!("line {}, column {}", edit::group(l), edit::group(col)));
-                self.flash(format!("{msg} ({at})"), true);
+                // Above the text, as on Windows (a message in the status bar is gone after a few seconds); the caret
+                // is where it is.
+                let (what, check) = match kind {
+                    TaskKind::Xml(m) => ("XML", m == json::Mode::Validate),
+                    TaskKind::Json(m) => ("JSON", m == json::Mode::Validate),
+                    _ => ("JSON", false),
+                };
+                // (nested deeper than Slate follows isn't invalid)
+                let deep = msg == json::TOO_DEEP;
+                let verb = match (check, deep) {
+                    (true, true) => format!("Couldn't check this {what}"),
+                    (true, false) => format!("Not valid {what}"),
+                    (false, true) => format!("Couldn't format this {what}"),
+                    (false, false) => format!("Couldn't format: not valid {what}"),
+                };
+                tab.notice = Some(format!("{verb}: {msg} ({at})"));
+                tab.notice_save_as = false;
             }
             TaskResult::Failed(msg) => self.flash(msg, true),
             TaskResult::Cancelled => self.flash("Cancelled", false),
@@ -1797,7 +1858,24 @@ impl App {
         let tab = &mut self.tabs[self.active];
         let snap: Snapshot = tab.doc.snapshot();
         let version = tab.doc.version;
+        self.find.count_tab = tab.id;
         self.find.count_job = Some((version, Job::spawn(snap.len(), notify, move |ctx| search::count_all(&m, &snap, ctx))));
+    }
+
+    /// While the find bar is open, the matches are counted (and marked) in the tab shown: again in another tab, or
+    /// after an edit (in a document up to 16 MiB: a bigger one is counted again when the search changes).
+    pub fn keep_count(&mut self) {
+        if !self.find.open || self.find.matcher.is_none() {
+            return;
+        }
+        let tab = self.tab();
+        let v = tab.doc.version;
+        let counted = matches!(&self.find.found, Some((fv, _)) if *fv == v);
+        let counting = matches!(&self.find.count_job, Some((cv, _)) if *cv == v);
+        if !counted && !counting && (tab.doc.len() <= 16 << 20 || self.find.count_tab != tab.id) {
+            self.find.found = None;
+            self.start_count();
+        }
     }
 
     fn poll_find(&mut self) -> bool {

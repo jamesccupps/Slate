@@ -241,9 +241,9 @@ pub fn status_texts(app: &App) -> (String, Vec<String>, bool) {
     let tab = app.tab();
     let doc = &tab.doc;
     let mut bad = false;
-    let left = if let Some((msg, b)) = &app.flash {
-        bad = *b;
-        msg.clone()
+    let left = if let Some((msg, b)) = app.status_message() {
+        bad = b;
+        msg
     } else if tab.loading() {
         "Opening…".into()
     } else if let Some((done, total)) = doc.index_progress() {

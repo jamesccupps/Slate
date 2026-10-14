@@ -523,7 +523,11 @@ pub fn window(application: &gtk4::Application, test: Option<Rc<testmode::Test>>)
     });
     glib::timeout_add_local(Duration::from_secs(2), || {
         if let Some(ui) = get_ui() {
-            ui.with(|a| a.check_disk());
+            // (and a message shown long enough makes way for the caret's place again)
+            ui.with(|a| {
+                a.check_disk();
+                a.expire_flash();
+            });
         }
         glib::ControlFlow::Continue
     });
@@ -1626,6 +1630,7 @@ impl Ui {
         if theme_changed {
             a.apply_theme();
         }
+        a.keep_count();
         self.sync_menu(&a);
         if std::mem::take(&mut a.reveal_pending) {
             let center = std::mem::take(&mut a.reveal_center);
