@@ -294,6 +294,58 @@ fn forget_choice(ext: &str) {
     }
 }
 
+/// The usual kinds of files, whose choice setting up reports (`choices_note`).
+const USUAL: &[&str] = &[".txt", ".log", ".json", ".xml", ".md", ".csv", ".ini", ".yaml", ".yml", ".cfg", ".conf"];
+
+/// The app chosen for a kind of file, as Windows keeps it (read only: Windows lets only the person choose).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Choice {
+    Slate,
+    Other,
+    /// None chosen: Windows asks "How do you want to open this?" the first time one is opened, also where Default
+    /// apps shows Slate for it (the only app registered for it).
+    NotYet,
+}
+
+/// The app chosen for `ext` (newer Windows 11 keeps it in UserChoiceLatest, else in UserChoice).
+fn choice_of(ext: &str) -> Choice {
+    let base = format!(r"Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts\{ext}");
+    let latest = format!(r"{base}\UserChoiceLatest");
+    let progid = read_str(&latest, "ProgId")
+        .or_else(|| read_str(&format!(r"{latest}\ProgId"), "ProgId"))
+        .or_else(|| read_str(&format!(r"{base}\UserChoice"), "ProgId"));
+    match progid {
+        Some(p) if is_slate(&p) => Choice::Slate,
+        Some(_) => Choice::Other,
+        None => Choice::NotYet,
+    }
+}
+
+/// What setting up says about the usual kinds of files: which open with Slate, which Windows still asks about the
+/// first time, and which another app opens. (Default apps shows Slate for a kind of file no app was chosen for, which
+/// looked done when it wasn't.)
+pub fn choices_note(choices: &[(&str, Choice)]) -> String {
+    let of = |c: Choice| choices.iter().filter(|(_, k)| *k == c).map(|(e, _)| *e).collect::<Vec<_>>().join(", ");
+    let (slate, not_yet, other) = (of(Choice::Slate), of(Choice::NotYet), of(Choice::Other));
+    if not_yet.is_empty() && other.is_empty() {
+        return format!("Slate is set up, and opens the usual kinds of files ({slate}).");
+    }
+    let mut s = String::from("Slate is set up.");
+    if !slate.is_empty() {
+        s.push_str(&format!(" Opening with Slate: {slate}."));
+    }
+    if !not_yet.is_empty() {
+        s.push_str(&format!(
+            " Windows asks the first time you open {not_yet}: choose Slate and \"Always\" (or click them on the Default \
+             apps page, even where it shows Slate already)."
+        ));
+    }
+    if !other.is_empty() {
+        s.push_str(&format!(" Another app opens {other}: to change that, click them on the Default apps page."));
+    }
+    s
+}
+
 /// Takes back what 0.8.1 and older registered for the kinds of files in `NOT_REGISTERED`, and a choice of Slate for
 /// .bat and .cmd files (made in the box Windows showed because of it: they opened in Slate instead of running).
 /// Once: `Software\Slate\Registration` notes it.
@@ -397,8 +449,9 @@ pub fn make_default(cell: &Cell) {
     };
     let detail = format!(
         "{place} added to the Start menu, to \"Open with\" for text, data, config, script, web and code files, and as \
-         \"Edit with Slate\" when you right-click a file.\n\nThen Windows' Default apps page opens, where you can choose Slate \
-         for the file types you want (Windows only lets you do that step yourself)."
+         \"Edit with Slate\" when you right-click a file.\n\nWindows only lets you choose the app for a kind of file \
+         yourself: the first time you open one, Windows asks; choose Slate and \"Always\". Or click the kinds of files on \
+         Windows' Default apps page, which opens next (it may show Slate before it's chosen)."
     );
     if win::ask(hwnd, "Slate", "Open your text files with Slate?", &detail, &["&Set up", "Cancel"]) != Some(0) {
         return;
@@ -417,7 +470,17 @@ pub fn make_default(cell: &Cell) {
     unsafe {
         ShellExecuteW(hwnd, w!("open"), w!("ms-settings:defaultapps?registeredAppUser=Slate"), None, None, SW_SHOWNORMAL);
     }
-    cell.borrow_mut().flash("Slate is set up. Pick it in Default apps for the file types you want.", false);
+    let choices: Vec<(&str, Choice)> = USUAL.iter().map(|&e| (e, choice_of(e))).collect();
+    let note = choices_note(&choices);
+    let mut a = cell.borrow_mut();
+    let i = a.active;
+    a.tabs[i].notice = Some(super::app::Notice {
+        kind: super::app::NoticeKind::Info,
+        text: note,
+        actions: vec![("Dismiss".into(), super::app::NoticeAction::Dismiss)],
+    });
+    a.layout();
+    a.invalidate();
 }
 
 /// `Slate.exe --install` (winget, scripts): installs Slate for the current user the way "Open files with Slate…"
@@ -502,6 +565,24 @@ fn cleanup_command(exe: &Path, dir: &Path) -> std::process::Command {
     // (cmd takes away the outer quotes)
     c.raw_arg(format!("/d /v:on /c \"{script}\"")).env("SLATE_EXE", exe).env("SLATE_DIR", dir).current_dir(&system);
     c
+}
+
+#[cfg(test)]
+mod choice_tests {
+    use super::*;
+
+    #[test]
+    fn setting_up_says_which_kinds_of_files_are_chosen() {
+        use Choice::*;
+        assert_eq!(choices_note(&[(".txt", Slate), (".log", Slate)]), "Slate is set up, and opens the usual kinds of files (.txt, .log).");
+        let s = choices_note(&[(".txt", Slate), (".json", NotYet), (".md", NotYet), (".csv", Other)]);
+        assert!(s.starts_with("Slate is set up. Opening with Slate: .txt. Windows asks the first time you open .json, .md:"), "{s}");
+        assert!(s.ends_with("Another app opens .csv: to change that, click them on the Default apps page."), "{s}");
+        let s = choices_note(&[(".txt", NotYet)]);
+        assert!(!s.contains("Opening with Slate") && !s.contains("Another app"), "{s}");
+        // the usual kinds are all ones Slate registers for
+        assert!(USUAL.iter().all(|e| registered().any(|r| r == *e)));
+    }
 }
 
 #[cfg(test)]

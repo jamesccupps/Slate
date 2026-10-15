@@ -345,7 +345,11 @@ lighter one on dark), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate`, `$
     ("Open with" entries
     in HKCU, never for what Windows runs when it's double-clicked, `NOT_REGISTERED`: .bat, .cmd, .vbs, .js, .reg,
     .py…, nor .ts — registered, they made Windows ask how to open a .bat with only Slate offered, and 0.8.2 takes
-    that back once at start, a choice of Slate for .bat/.cmd included; `Slate.exe --install` does the setup
+    that back once at start, a choice of Slate for .bat/.cmd included; Windows lets only the person choose the app
+    for a kind of file, and Default apps shows Slate for kinds no app was chosen for (Explorer still asks the first
+    time; a managed PC whose policy turns that question off just opens Slate), so after setting up a note above the
+    text says which usual kinds open with Slate, which Windows still asks about, which another app opens
+    (`choice_of` reads UserChoiceLatest/UserChoice, `choices_note`); `Slate.exe --install` does the setup
     silently for winget and scripts; Help → Stop opening files with Slate… / `--unassociate` takes back the file
     part, every UserChoice naming Slate included, and Slate stays installed; `--uninstall --quiet` removes it all, the
     installed copy too when it's the one running, by a hidden `cmd` once it has ended (the paths in environment
