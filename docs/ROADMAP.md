@@ -176,12 +176,23 @@ a changelog. Details in the [0.12.2 release notes](release-notes-0.12.2.md).
 - **A taskbar jump list** with the recent files (S).
 - **JSON structure panel:** keep an open array element open when elements are inserted before it (it's keyed by
   index today); while the panel is updating after an edit, clicks go to the row's old place (S).
-- **The first frame without waiting for the graphics driver (S–M).** Where the driver is slow to load (on an NVIDIA
-  PC `D3D11CreateDevice` takes ~250 ms in a new process; WARP ~20 ms), the first frame waits for it. The device is
-  made on another thread from the start, which hides the rest of starting (~30–50 ms) but not the driver. Next: draw
-  with WARP until the GPU's device is there (made before it: a DLL loaded while the driver loads waits for it), or
-  keep the window cloaked until its first frame. Both need checking on a real screen: a black or white frame at the
-  switch would be worse than the wait.
+- **The first frame without waiting for the graphics driver (S–M): built, being tried on a real screen (October
+  2026).** Where the driver is slow to load (on an NVIDIA PC `D3D11CreateDevice` takes ~250 ms in a new process), the
+  first frame waited for it. Now the device thread makes a WARP device first (~5 ms), the first frame is drawn with it
+  when the card's device isn't there 40 ms later (on that PC: 82–98 ms after starting instead of 220–265 ms), and the
+  window goes on to the card's device as soon as it's ready. To check before release: no black or white frame at the
+  switch (else: keep the window cloaked until its first frame instead).
+- **Count all and Show only matching lines on several cores (M).** Both search a big file on one thread: 850 MB in
+  0.35–0.45 s (a plain query is searched at several GB/s; reading the file from Windows' cache goes at 6 GB/s, faster
+  still on more threads). Split into ranges searched side by side, the counts added (and the first 10,000 places kept
+  in order), it could take 0.1–0.15 s. Show only matching lines is harder: each part's lines and line map written
+  apart, then joined in order (a big result goes to a temp file).
+- **Sort and Remove duplicates, faster (M).** On a 400 MB log of 4.85 million lines, Sort takes 2.8 s and Remove
+  duplicates 1.1 s (October 2026). Sort compares lines the way people sort (numbers by value, case ignored), on up to
+  8 threads, but its last merge runs on one: merging in parallel (splitting the runs where they meet) would save
+  ~0.5 s, and a key of each line's first bytes kept beside it would answer most comparisons without reading the text.
+  Remove duplicates is held up by memory (a faster hash saved only 5–20%): split by hash across threads, each with a
+  table of its own, it could be ~3 times faster.
 
 ## Later
 

@@ -1272,7 +1272,8 @@ mod tests {
             let src = Arc::new(Source::from_vec(text.clone()));
             let mut b = Buffer::from_source(src, 0);
             let snap = b.snapshot();
-            time("count_all", &|| count_all(&m, &snap, &ctx()).count as usize);
+            // (a test build searches in small windows, `WINDOW`, too small to try the run first in: not the app's speed)
+            time("count_all (test-sized windows)", &|| count_all(&m, &snap, &ctx()).count as usize);
         }
     }
 }

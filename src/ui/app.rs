@@ -1014,6 +1014,8 @@ impl App {
             return;
         }
         let (w, h) = self.client_size();
+        // (drawn with WARP while the graphics driver loaded: on to the card once its device is ready)
+        self.g.switch_to_gpu();
         if self.g.ensure_target(self.hwnd, w, h, self.dpi as f32).is_err() {
             return;
         }

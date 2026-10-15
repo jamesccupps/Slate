@@ -73,7 +73,10 @@ icons) and a tarball, each with a `.sha256`.
    owner and repository IDs, the repo's default), and the `release` environment only `v*` tags; the
    repository secrets `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID` say which app. The workflows'
    actions are pinned to commits (the version in a comment); Dependabot (`.github/dependabot.yml`) proposes newer
-   ones monthly.
+   ones monthly (download-artifact only runs for tags: try a new one on a throwaway branch with a workflow passing
+   files the way build.yml does before the user merges it). Checkouts keep no token in `.git`
+   (`persist-credentials: false`: nothing pushes; `gh` gets `GH_TOKEN`). Security reports: `SECURITY.md` (GitHub's
+   private reporting).
 4. Publishing the release runs `.github/workflows/apt.yml` (named "apt repository"; it also publishes the website, and
    runs again when `site/`, `docs/images/` or the apt scripts change on `main`) (it starts itself again on `main`, as
    GitHub Pages only publishes from there): `packaging/linux/apt-repo.sh` makes the apt repository from the latest
@@ -197,7 +200,8 @@ lighter one on dark), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate`, `$
     (`"status":"refunded"`) by that run first, then the query in a window around each place (5x faster in a JSON
     file, where the start is every record's key), but only where timing both ways on the first 256 KiB says so
     (`anchor_pays`, once per `Matcher`): for `Wool socks`, whose run is as common as its start, the regex alone is 20%
-    faster. `SLATE_SEARCH_FILE=<file> cargo test --release --lib search_speed -- --ignored --nocapture` times them.
+    faster. `SLATE_SEARCH_FILE=<file> cargo test --release --lib search_speed -- --ignored --nocapture` times them
+    (its `count_all` line uses a test build's 1000-byte windows, `WINDOW`: not the app's speed).
     Windows are read over the same buffer (`Snapshot::read_over`; zeroing each first made counts 5% slower). Plain text: 8 MB windows, the overlap at least the query's length, always
     exact. A regex is exact in documents up to 64 MiB (one window; Find previous scans from the start); in bigger
     ones Count all and Replace all use 64 MiB windows with 16 MiB after (exact while no match is longer than that),
@@ -221,7 +225,9 @@ lighter one on dark), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate`, `$
   - `lines.rs` — sort (natural: numbers with signs and decimals, case and accents ignored), remove duplicate / blank
     lines, trim line ends, change case. Lines are (start, length) pairs into the text (8 bytes each); a big sort runs
     on up to 8 threads (runs sorted side by side, then merged); whole documents up to 512 MB and `COUNT_MAX` (32 M)
-    lines. A `\r` is part of a line break only before a `\n` (a lone one at the very end is text).
+    lines. A `\r` is part of a line break only before a `\n` (a lone one at the very end is text). `apply_to` hands
+    the result on in 4 MB pieces (big documents: straight into the `Sink`, never whole in memory beside the text;
+    a 400 MB log's Sort peaked at 830 MB before, 490 MB since, and went from 4.5 to 2.8 s).
   - `jsonnav.rs` — lazy JSON structure: the children of one container (lists over 100,000 keep every 64th child
     and rescan between them; lists of containers inside a scanned one already over 1024), the path at an offset
     (`data[1203].name`), previews. Comments are skipped; in a file cut short, open containers end at its end. A scan
@@ -269,7 +275,8 @@ lighter one on dark), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate`, `$
     turned off, `hidden-when`), File → Open recent; Ctrl+1–9 and Alt+1–9 for tabs, Shift+Alt+F formats JSON or XML;
     a panic in a callback would abort (GTK can't pass it on): `Ui::guarded` catches it around the app's work (logged in
     crash.log by the panic hook, the session written, the window says so), drawing only logs; SIGTERM, SIGHUP and SIGINT
-    (an atomic flag the caret's timer looks at) and the session manager's `query-end` write the session first
+    (`stop_on_signals`: the handler writes a byte to a pipe, a thread asleep on it `invoke`s the rest on the main
+    loop) and the session manager's `query-end` write the session first
     (`ending`), and logging out waits while unsaved work the session can't keep is open), `app.rs` the state and
     commands (`App`, `Tab`, `Cmd`; what needs a dialog is queued in `asks`, `Ask::Quit` only after a save that closing
     waited for, so dialogs never pile up; a tab another program changed is read again keeping its view, following the
@@ -361,8 +368,13 @@ lighter one on dark), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate`, `$
   - `gfx.rs` — Direct2D drawing into a D3D11 **flip-model swap chain** (FLIP_DISCARD, then FLIP_SEQUENTIAL), with
     `ID2D1HwndRenderTarget` only as a fallback: on a PC with a Parsec virtual display adapter the HWND target reported
     "occluded" and drew nothing. Device loss → `discard_target()` and paint again.
-    The hardware device is made on another thread from the start (`make_device_early`; the first paint takes it,
-    and Slate doesn't end before that thread does): the driver can take a quarter of a second to load. The text view
+    The devices are made on another thread from the start (`make_device_early`; Slate doesn't end before that
+    thread does): WARP first (~5 ms; made after the card's, it would wait for the driver: a DLL loaded meanwhile
+    waits), then the card's, whose driver can take a quarter of a second to load. The first paint waits up to
+    `GPU_GRACE` (40 ms) for the card's device, else draws with WARP (`on_warp_for_now`) and goes on to the card's at
+    the paint after `WM_APP_GPU` (`switch_to_gpu`; `discard_target` lets go of the old swap chain at once: target
+    unset, ClearState + Flush, as a window has one at a time). On an NVIDIA PC the first frame came at 82–98 ms
+    instead of 220–265 ms. The text view
     draws through its own `IDWriteTextRenderer` (`mod text_renderer`): only the glyph runs in view (and of a long run,
     only its glyphs in view), a row's runs in one font as one Direct2D run per color, the colors given at drawing
     time through each run's cluster map rather than set on the layout (emoji through
@@ -483,7 +495,9 @@ lighter one on dark), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate`, `$
   with an error, it puts itself back and starts again with `--update-failed <version>` (that version isn't offered
   by the daily check again). Old copies are deleted by the next normal start. 0.2.0 starts the new one with
   `--wait-for <pid>` instead (still understood).
-- Panics in message handling are caught, logged to `crash.log` in the data folder, the session is saved and a
+- Panics in message handling are caught, logged to `crash.log` in the data folder (`settings::append_crash_log`:
+  past 1 MB it starts over, the last one kept as `crash.log.old`; the panic hook logs every panic, a repaint's
+  too), the session is saved and a
   message shown. A panic while painting is only logged (showing a message would paint, and fail, again), also one in
   the text renderer's callbacks (`caught`: DirectWrite's callbacks can't pass a panic on). A panic in a background job
   comes back as that job's failure (`job::Failure`), never as a job that runs forever.
@@ -532,8 +546,13 @@ lighter one on dark), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate`, `$
 - `tests/smoke.txt` is the smoke test CI runs on the built exe (paths in it are relative to the working folder). It
   checks Format XML, Toggle comment and `name:line:col`, writes a session and puts it back, so it needs
   `SLATE_DATA_DIR` set to an empty folder. Linux's test mode also has `session:soon` (written on another thread),
-  `print:session` (the session folder's files) and `print:notice`.
-- Measuring: `t:<label>` marks; `print:startup` (each startup step in ms since the process was created), `gfx:window`
+  `print:session` (the session folder's files), `print:notice` and `print:blink` (whether the caret's timer runs:
+  it stops after `BLINK_STOP` or with the window in the background, so an idle Slate sleeps).
+- Measuring: `t:<label>` marks; `print:startup` (each startup step in ms since the process was created: `warp`,
+  `device`, `first frame` or `first frame (WARP)` and the switch; a hidden test window gets no WM_PAINT, so the
+  switch shows at the harness's next paint), `SLATE_INDEX_FILE=<file> cargo test --release --lib index_speed --
+  --ignored --nocapture` (counting lines against reading alone; test mode's `jobs` adds 40–150 ms of its own),
+  `gfx:window`
   in a script or `SLATE_TEST_GPU=1` (draw through the hidden window's own swap chain on the GPU, as the real window
   does; `gfx:late` makes the device at the first paint, to compare), `idle:<ms>` (run the real message loop and count
   what wakes it), `print:busy` (what `jobs` waits for), `print:mem` (private bytes, working set). `copydata:<path>`

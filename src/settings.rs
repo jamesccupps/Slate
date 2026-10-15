@@ -138,6 +138,30 @@ pub fn data_dir() -> PathBuf {
     .clone()
 }
 
+/// How big crash.log gets before it starts over (the one before kept as crash.log.old).
+const CRASH_LOG_MAX: u64 = 1 << 20;
+
+/// Adds `line` to crash.log in the data folder. A panic that comes back at every repaint would otherwise make it grow
+/// for as long as Slate runs: past `CRASH_LOG_MAX` it starts over, keeping the last one beside it.
+pub fn append_crash_log(line: &str) {
+    let dir = data_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    append_capped(&dir.join("crash.log"), line, CRASH_LOG_MAX);
+}
+
+/// Appends `line` to `log`, first moving a log of `max` bytes or more to `<log>.old` (replacing the one there).
+fn append_capped(log: &std::path::Path, line: &str, max: u64) {
+    use std::io::Write;
+    if std::fs::metadata(log).is_ok_and(|m| m.len() >= max) {
+        let mut old = log.as_os_str().to_owned();
+        old.push(".old");
+        let _ = std::fs::rename(log, old);
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(log) {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
 /// Where big temporary files go (results of formatting or converting huge files).
 pub fn temp_dir() -> PathBuf {
     if portable() { data_dir().join("temp") } else { std::env::temp_dir() }
@@ -207,6 +231,21 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_crash_log_starts_over_when_full() {
+        let dir = std::env::temp_dir().join(format!("slate-crashlog-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("crash.log");
+        for i in 0..10 {
+            append_capped(&log, &format!("line {i}\n"), 21);
+        }
+        // 3 lines (7 bytes each) fill it: each fourth starts it over, the full one kept
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "line 9\n");
+        assert_eq!(std::fs::read_to_string(dir.join("crash.log.old")).unwrap(), "line 6\nline 7\nline 8\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn a_bad_or_newer_value_keeps_the_other_settings() {

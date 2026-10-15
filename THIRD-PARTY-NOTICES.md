@@ -12,7 +12,7 @@ Apache-2.0; aho-corasick and memchr offer MIT or the Unlicense). The MIT license
 | memchr | 2.8.3 | 2015 Andrew Gallant | https://github.com/BurntSushi/memchr |
 | regex, regex-automata, regex-syntax | 1.13.1, 0.4.18, 0.8.11 | 2014 The Rust Project Developers | https://github.com/rust-lang/regex |
 | serde, serde_core | 1.0.229 | The serde authors (Erick Tryzelaar, David Tolnay) | https://github.com/serde-rs/serde |
-| serde_json | 1.0.151 | The serde_json authors (Erick Tryzelaar, David Tolnay) | https://github.com/serde-rs/json |
+| serde_json | 1.0.154 | The serde_json authors (Erick Tryzelaar, David Tolnay) | https://github.com/serde-rs/json |
 | windows, windows-core, windows-result, windows-strings, windows-targets, windows_x86_64_gnu | 0.58.0, 0.58.0, 0.2.0, 0.1.0, 0.52.6, 0.52.6 | Microsoft Corporation | https://github.com/microsoft/windows-rs |
 | zmij | 1.0.23 | The zmij authors (David Tolnay) | https://github.com/dtolnay/zmij |
 

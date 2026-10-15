@@ -48,7 +48,7 @@ use windows::core::{PCWSTR, w};
 
 const WM_MOUSELEAVE: u32 = 0x02A3;
 
-use actions::{TIMER_DISK, WM_APP_DISK, WM_APP_JOB};
+use actions::{TIMER_DISK, WM_APP_DISK, WM_APP_GPU, WM_APP_JOB};
 use app::{App, Cell, Deferred, Hit};
 use commands::Cmd;
 
@@ -97,8 +97,6 @@ fn xy(lp: LPARAM) -> (i32, i32) {
 }
 
 fn log_crash(what: &str) {
-    let dir = settings::data_dir();
-    let _ = std::fs::create_dir_all(&dir);
     let t = unsafe { windows::Win32::System::SystemInformation::GetLocalTime() };
     let line = format!(
         "[{:04}-{:02}-{:02} {:02}:{:02}:{:02}] Slate {}: {what}\n",
@@ -110,10 +108,7 @@ fn log_crash(what: &str) {
         t.wSecond,
         crash::version()
     );
-    use std::io::Write;
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("crash.log")) {
-        let _ = f.write_all(line.as_bytes());
-    }
+    settings::append_crash_log(&line);
 }
 
 /// Startup steps and when they were done (FILETIME units), for `print:startup` in test mode.
@@ -581,6 +576,13 @@ fn handle(cell: &Cell, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<L
         WM_APP_JOB => {
             if let Ok(mut a) = cell.try_borrow_mut() {
                 a.poll_jobs();
+            }
+            Some(LRESULT(0))
+        }
+        WM_APP_GPU => {
+            // (the paint switches: `Gfx::switch_to_gpu`)
+            unsafe {
+                let _ = windows::Win32::Graphics::Gdi::InvalidateRect(hwnd, None, false);
             }
             Some(LRESULT(0))
         }
@@ -1288,6 +1290,7 @@ pub fn run(raw: Vec<std::ffi::OsString>) -> i32 {
     let hinst = register_class();
     let s = settings::Settings::load();
     let hwnd = create_window(hinst, &s);
+    gfx::early_window(hwnd);
     let cell = make_app(hwnd);
     {
         let mut a = cell.borrow_mut();

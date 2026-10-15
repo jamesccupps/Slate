@@ -45,6 +45,9 @@ pub const WM_APP_JOB: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 1;
 /// The look at the open files on disk (`check_disk`) is done: unlike the other jobs, nothing repaints for it unless it
 /// found something (every 2 s, even in a window in the background).
 pub const WM_APP_DISK: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 2;
+/// The graphics card's Direct3D device is ready (`gfx::make_device_early`): a window drawn with WARP while its driver
+/// loaded goes on to it at the next paint.
+pub const WM_APP_GPU: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 3;
 pub const TIMER_CARET: usize = 1;
 pub const TIMER_JOBS: usize = 2;
 pub const TIMER_DISK: usize = 3;
@@ -1819,16 +1822,19 @@ impl App {
                     if ctx.cancelled() {
                         return TaskResult::Cancelled;
                     }
-                    let (out, count) = lines::apply(op, text);
-                    let mut idx = IndexBuilder::new();
-                    idx.push(&out);
-                    let mut sink = match Sink::new(out.len() as u64) {
+                    let mut sink = match Sink::new(text.len() as u64) {
                         Ok(s) => s,
                         Err(e) => return TaskResult::Failed(format!("Couldn't create a temporary file: {e}")),
                     };
-                    if let Err(e) = sink.write_all(&out) {
-                        return TaskResult::Failed(format!("Couldn't write the result: {e}"));
-                    }
+                    let mut idx = IndexBuilder::new();
+                    let count = match lines::apply_to(op, text, &mut |piece| {
+                        idx.push(piece);
+                        sink.write_all(piece)
+                    }) {
+                        Ok(count) => count,
+                        Err(e) => return TaskResult::Failed(format!("Couldn't write the result: {e}")),
+                    };
+                    drop(buf);
                     match sink.finish(idx) {
                         Ok((src, nl)) => TaskResult::Content { src, nl, count },
                         Err(e) => TaskResult::Failed(format!("Couldn't write the result: {e}")),

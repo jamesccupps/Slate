@@ -8,7 +8,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 
-use windows::Win32::Foundation::{BOOL, HMODULE, HWND};
+use windows::Win32::Foundation::{BOOL, HMODULE, HWND, LPARAM, WPARAM};
 use windows::Win32::Graphics::Direct2D::Common::{
     D2D_POINT_2F, D2D_RECT_F, D2D_SIZE_U, D2D1_ALPHA_MODE_IGNORE, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F,
     D2D1_PIXEL_FORMAT,
@@ -100,7 +100,7 @@ pub enum Align {
 /// What the window is drawn through.
 enum WinTarget {
     /// Direct3D 11 + flip-model swap chain + Direct2D device context (normal).
-    Flip { dc: ID2D1DeviceContext, chain: IDXGISwapChain1, size: (u32, u32) },
+    Flip { dc: ID2D1DeviceContext, chain: IDXGISwapChain1, size: (u32, u32), dev: ID3D11Device },
     /// Direct2D's HWND render target (fallback).
     Hwnd(ID2D1HwndRenderTarget),
 }
@@ -134,6 +134,10 @@ pub struct Gfx {
     /// The user's locale ("ja-JP"...): DirectWrite picks fallback fonts by it, so kanji look Japanese to a Japanese
     /// user rather than Chinese.
     locale: HSTRING,
+    /// The window is drawn with WARP until the graphics card's device is ready (`switch_to_gpu`).
+    on_warp_for_now: bool,
+    /// A frame was shown in the window (for `print:startup`'s first-frame mark).
+    shown: bool,
 }
 
 fn user_locale() -> HSTRING {
@@ -164,34 +168,112 @@ fn device(kind: D3D_DRIVER_TYPE) -> windows::core::Result<ID3D11Device> {
 struct Device(ID3D11Device);
 unsafe impl Send for Device {}
 
-/// The hardware device `make_device_early` is making.
-static EARLY: std::sync::Mutex<Option<std::thread::JoinHandle<Option<Device>>>> = std::sync::Mutex::new(None);
+/// What `make_device_early`'s thread made so far.
+struct Early {
+    started: bool,
+    /// WARP (Direct3D in software), made first: ready in ~20 ms, for the first frames while the driver loads.
+    warp: Option<Device>,
+    warp_tried: bool,
+    /// The graphics card's device (None: there is none, or it failed).
+    hw: Option<Device>,
+    hw_tried: bool,
+    /// The window it posts `WM_APP_GPU` to when the card's device is ready (0: none yet).
+    window: isize,
+}
 
-/// Starts making the hardware Direct3D device on another thread while Slate starts: the graphics driver can take a
-/// quarter of a second to load, which the first frame would otherwise wait for on its own. Dropping what this returns
-/// waits for that thread (Slate never ends while the driver loads on it).
+static EARLY: std::sync::Mutex<Early> =
+    std::sync::Mutex::new(Early { started: false, warp: None, warp_tried: false, hw: None, hw_tried: false, window: 0 });
+static EARLY_MADE: std::sync::Condvar = std::sync::Condvar::new();
+static EARLY_THREAD: std::sync::Mutex<Option<std::thread::JoinHandle<()>>> = std::sync::Mutex::new(None);
+
+/// How long the first frame waits for the card's device before it's drawn with WARP instead: where the driver is
+/// quick, the card's from the start and no switch.
+const GPU_GRACE: std::time::Duration = std::time::Duration::from_millis(40);
+
+/// Starts making the Direct3D devices on another thread while Slate starts: the graphics driver can take a quarter of a
+/// second to load (an NVIDIA card's ~250 ms), which the first frame would otherwise wait for. WARP first: a DLL loaded
+/// while the driver loads waits for it, so WARP made after it would come no sooner. Dropping what this returns waits
+/// for that thread (Slate never ends while the driver loads on it).
 pub fn make_device_early() -> EarlyDevice {
+    EARLY.lock().unwrap().started = true;
     let made = std::thread::Builder::new().name("slate-d3d".into()).spawn(|| {
-        let made = device(D3D_DRIVER_TYPE_HARDWARE).ok().map(Device);
+        let warp = device(D3D_DRIVER_TYPE_WARP).ok().map(Device);
+        super::mark("warp");
+        {
+            let mut e = EARLY.lock().unwrap();
+            (e.warp, e.warp_tried) = (warp, true);
+        }
+        EARLY_MADE.notify_all();
+        let hw = device(D3D_DRIVER_TYPE_HARDWARE).ok().map(Device);
         super::mark("device");
-        made
+        let window = {
+            let mut e = EARLY.lock().unwrap();
+            (e.hw, e.hw_tried) = (hw, true);
+            e.window
+        };
+        EARLY_MADE.notify_all();
+        if window != 0 {
+            use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
+            let _ = unsafe { PostMessageW(HWND(window as *mut _), super::actions::WM_APP_GPU, WPARAM(0), LPARAM(0)) };
+        }
     });
-    *EARLY.lock().unwrap() = made.ok();
+    match made {
+        Ok(t) => *EARLY_THREAD.lock().unwrap() = Some(t),
+        Err(_) => EARLY.lock().unwrap().started = false,
+    }
     EarlyDevice
+}
+
+/// The window to tell when the card's device is ready (before its first paint).
+pub fn early_window(hwnd: HWND) {
+    EARLY.lock().unwrap().window = hwnd.0 as isize;
 }
 
 pub struct EarlyDevice;
 
 impl Drop for EarlyDevice {
     fn drop(&mut self) {
-        drop(early_device());
+        if let Some(t) = EARLY_THREAD.lock().unwrap().take() {
+            let _ = t.join();
+        }
     }
 }
 
-/// The device `make_device_early` made, once (waiting for it if it isn't done yet).
-fn early_device() -> Option<ID3D11Device> {
-    let made = EARLY.lock().unwrap().take()?;
-    made.join().ok().flatten().map(|d| d.0)
+/// A device for the window from what `make_device_early` makes, and whether it's WARP for now (the card's comes
+/// later: `gpu_ready`). None: nothing was started, or the card's was taken already (or there is none).
+fn early_device() -> Option<(ID3D11Device, bool)> {
+    let mut e = EARLY.lock().unwrap();
+    if !e.started {
+        return None;
+    }
+    let deadline = std::time::Instant::now() + GPU_GRACE;
+    while !e.hw_tried {
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            break;
+        }
+        e = EARLY_MADE.wait_timeout(e, deadline - now).unwrap().0;
+    }
+    if !e.hw_tried {
+        // (made first: there in a moment)
+        while !e.warp_tried {
+            e = EARLY_MADE.wait(e).unwrap();
+        }
+        if let Some(w) = e.warp.take() {
+            return Some((w.0, true));
+        }
+        while !e.hw_tried {
+            e = EARLY_MADE.wait(e).unwrap();
+        }
+    }
+    e.started = false;
+    e.warp = None;
+    e.hw.take().map(|d| (d.0, false))
+}
+
+/// Whether the card's device is ready for a window drawn with WARP for now.
+pub fn gpu_ready() -> bool {
+    EARLY.lock().unwrap().hw.is_some()
 }
 
 impl Gfx {
@@ -209,16 +291,27 @@ impl Gfx {
                 generation: 1,
                 offscreen: false,
                 locale: user_locale(),
+                on_warp_for_now: false,
+                shown: false,
             })
         }
     }
 
     /// The normal window target: a flip-model swap chain on a Direct3D 11 device (hardware, else WARP).
-    fn create_flip(&self, hwnd: HWND, w: u32, h: u32, dpi: f32) -> windows::core::Result<WinTarget> {
+    fn create_flip(&mut self, hwnd: HWND, w: u32, h: u32, dpi: f32) -> windows::core::Result<WinTarget> {
         unsafe {
             let dev = match early_device() {
-                Some(dev) => dev,
-                None => device(D3D_DRIVER_TYPE_HARDWARE).or_else(|_| device(D3D_DRIVER_TYPE_WARP))?,
+                Some((dev, for_now)) => {
+                    if self.on_warp_for_now && !for_now {
+                        super::mark("switched to the card's device");
+                    }
+                    self.on_warp_for_now = for_now;
+                    dev
+                }
+                None => {
+                    self.on_warp_for_now = false;
+                    device(D3D_DRIVER_TYPE_HARDWARE).or_else(|_| device(D3D_DRIVER_TYPE_WARP))?
+                }
             };
             let dxgi_dev: IDXGIDevice = dev.cast()?;
             let d2d_dev = self.d2d.CreateDevice(&dxgi_dev)?;
@@ -248,7 +341,7 @@ impl Gfx {
             let bmp = target_bitmap(&dc, &chain, dpi)?;
             dc.SetTarget(&bmp);
             dc.SetDpi(dpi, dpi);
-            Ok(WinTarget::Flip { dc, chain, size: (w, h) })
+            Ok(WinTarget::Flip { dc, chain, size: (w, h), dev })
         }
     }
 
@@ -273,7 +366,7 @@ impl Gfx {
             self.dpi = dpi;
         }
         match self.win.as_mut().unwrap() {
-            WinTarget::Flip { dc, chain, size } => unsafe {
+            WinTarget::Flip { dc, chain, size, .. } => unsafe {
                 if *size != (w, h) {
                     // The old back buffer must be released before the swap chain can resize.
                     dc.SetTarget(None);
@@ -311,6 +404,10 @@ impl Gfx {
             let hr = unsafe { chain.Present(1, DXGI_PRESENT(0)) };
             if hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET {
                 return false;
+            }
+            if !self.shown {
+                self.shown = true;
+                super::mark(if self.on_warp_for_now { "first frame (WARP)" } else { "first frame" });
             }
         }
         true
@@ -356,9 +453,31 @@ impl Gfx {
     /// Drops the render target (after D2DERR_RECREATE_TARGET); the next paint makes a new one.
     pub fn discard_target(&mut self) {
         self.rt = None;
-        self.win = None;
         self.brushes.borrow_mut().clear();
+        if let Some(WinTarget::Flip { dc, chain, dev, .. }) = self.win.take() {
+            // A window has one flip-model swap chain at a time, and Direct3D lets go of an old one only when its
+            // device's queued work is done: let go of it all now, so a new one can be made for the window right away.
+            unsafe {
+                dc.SetTarget(None);
+                drop(dc);
+                drop(chain);
+                if let Ok(ctx) = dev.GetImmediateContext() {
+                    ctx.ClearState();
+                    ctx.Flush();
+                }
+            }
+        }
         self.generation += 1;
+    }
+
+    /// The window was drawn with WARP while the graphics card's driver loaded, and the card's device is ready now:
+    /// the target is made again on it. Returns whether it switched (paint again then).
+    pub fn switch_to_gpu(&mut self) -> bool {
+        if !self.on_warp_for_now || !gpu_ready() {
+            return false;
+        }
+        self.discard_target();
+        true
     }
 
     pub fn has_target(&self) -> bool {

@@ -1080,6 +1080,41 @@ impl Source {
 mod tests {
     use super::*;
 
+    /// `SLATE_INDEX_FILE=<file> cargo test --release --lib index_speed -- --ignored --nocapture`: how long counting a
+    /// file's lines takes, against reading it alone and reading + counting without the index's bookkeeping.
+    #[test]
+    #[ignore]
+    fn index_speed() {
+        let Some(p) = std::env::var_os("SLATE_INDEX_FILE") else { return };
+        let p = PathBuf::from(p);
+        for _ in 0..3 {
+            let t = Instant::now();
+            let src = Source::open_file(&p).unwrap();
+            assert!(src.build_index(&AtomicBool::new(false), &AtomicU64::new(0)));
+            let index = t.elapsed();
+            let file = File::open(&p).unwrap();
+            let mut buf = vec![0u8; 4 << 20];
+            let (mut pos, mut n) = (0u64, 0u64);
+            let t = Instant::now();
+            while pos < src.len() {
+                let k = ((src.len() - pos) as usize).min(buf.len());
+                read_exact_at(&file, pos, &mut buf[..k]).unwrap();
+                pos += k as u64;
+            }
+            let read = t.elapsed();
+            pos = 0;
+            let t = Instant::now();
+            while pos < src.len() {
+                let k = ((src.len() - pos) as usize).min(buf.len());
+                read_exact_at(&file, pos, &mut buf[..k]).unwrap();
+                n += buf[..k].chunks(BLOCK as usize).map(|b| bytecount::count(b, b'\n') as u64).sum::<u64>();
+                pos += k as u64;
+            }
+            let counted = t.elapsed();
+            println!("index {index:?}, read alone {read:?}, read + count {counted:?} ({n} line breaks)");
+        }
+    }
+
     fn sample(len: usize, seed: u64) -> Vec<u8> {
         let mut x = seed;
         (0..len)

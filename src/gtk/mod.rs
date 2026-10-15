@@ -86,6 +86,9 @@ pub struct Ui {
     scroll_acc: Cell<f64>,
     drag_origin: Cell<(f64, f64)>,
     last_input: Cell<Instant>,
+    /// The caret's timer, only while it blinks: stopped once the caret has been still for `BLINK_STOP` or the window
+    /// is in the background, so an idle Slate doesn't wake up twice a second (`wake_blink` starts it again).
+    blink_timer: Cell<Option<glib::SourceId>>,
     polling: Cell<bool>,
     /// Whether the window's own widgets (menus, boxes) are styled dark.
     css_dark: Cell<Option<bool>>,
@@ -111,11 +114,19 @@ thread_local! {
     static UI: RefCell<Option<Rc<Ui>>> = const { RefCell::new(None) };
 }
 
-/// Set by SIGTERM, SIGHUP or SIGINT (the system stopping Slate): it writes the session and ends.
-static STOPPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
 pub fn get_ui() -> Option<Rc<Ui>> {
     UI.with(|u| u.borrow().clone())
+}
+
+/// The look at the open files on disk wakes the window this way: refreshed only when it found something.
+fn disk_notifier() -> Notify {
+    Arc::new(|| {
+        glib::idle_add_once(|| {
+            if let Some(ui) = get_ui() {
+                ui.poll_disk();
+            }
+        });
+    })
 }
 
 /// Background jobs wake the window through the main loop when they finish.
@@ -129,20 +140,67 @@ fn notifier() -> Notify {
     })
 }
 
+/// SIGTERM, SIGHUP or SIGINT (the system stopping Slate) write the session and end, on the main loop.
+fn stop_on_signals() {
+    use std::sync::atomic::{AtomicI32, Ordering};
+    static PIPE: AtomicI32 = AtomicI32::new(-1);
+    extern "C" fn on_signal(_: libc::c_int) {
+        // (only what's safe in a signal handler: a write, errno kept)
+        unsafe {
+            let errno = *libc::__errno_location();
+            let fd = PIPE.load(Ordering::Relaxed);
+            if fd >= 0 {
+                libc::write(fd, b"x".as_ptr().cast(), 1);
+            }
+            *libc::__errno_location() = errno;
+        }
+    }
+    let mut fds = [0; 2];
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return;
+    }
+    PIPE.store(fds[1], Ordering::Relaxed);
+    let read_end = fds[0];
+    let waiting = std::thread::Builder::new().name("slate-signals".into()).spawn(move || {
+        let mut b = [0u8; 1];
+        loop {
+            match unsafe { libc::read(read_end, b.as_mut_ptr().cast(), 1) } {
+                1 => break,
+                n if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted => continue,
+                _ => return,
+            }
+        }
+        glib::MainContext::default().invoke(|| {
+            if let Some(ui) = get_ui() {
+                ui.ending();
+                ui.closing.set(true);
+                ui.gtk_app.quit();
+            }
+        });
+    });
+    if waiting.is_err() {
+        return;
+    }
+    for signal in [libc::SIGTERM, libc::SIGHUP, libc::SIGINT] {
+        unsafe {
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = on_signal as extern "C" fn(libc::c_int) as usize;
+            sa.sa_flags = libc::SA_RESTART;
+            libc::sigemptyset(&mut sa.sa_mask);
+            libc::sigaction(signal, &sa, std::ptr::null_mut());
+        }
+    }
+}
+
 /// Adds a line to crash.log in the data folder.
 fn log_crash(what: &str) {
-    let dir = crate::settings::data_dir();
-    let _ = std::fs::create_dir_all(&dir);
     let now = unsafe {
         let t = libc::time(std::ptr::null_mut());
         let mut tm: libc::tm = std::mem::zeroed();
         libc::localtime_r(&t, &mut tm);
         format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec)
     };
-    use std::io::Write;
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("crash.log")) {
-        let _ = writeln!(f, "[{now}] Slate {}: {what}", env!("CARGO_PKG_VERSION"));
-    }
+    crate::settings::append_crash_log(&format!("[{now}] Slate {}: {what}\n", env!("CARGO_PKG_VERSION")));
 }
 
 /// What to hand GApplication for a file named on the command line: an absolute path (GIO reads a relative
@@ -456,6 +514,7 @@ pub fn window(application: &gtk4::Application, test: Option<Rc<testmode::Test>>)
 
     let style = make_style(&text.pango_context(), &settings);
     let mut app = App::new(settings, style, notifier(), system_dark());
+    app.disk_notify = Some(disk_notifier());
     session::restore(&mut app, test.is_none());
     if app.tabs.is_empty() {
         app.new_untitled();
@@ -493,6 +552,7 @@ pub fn window(application: &gtk4::Application, test: Option<Rc<testmode::Test>>)
         scroll_acc: Cell::new(0.0),
         drag_origin: Cell::new((0.0, 0.0)),
         last_input: Cell::new(Instant::now()),
+        blink_timer: Cell::new(None),
         polling: Cell::new(false),
         css_dark: Cell::new(None),
         closing: Cell::new(false),
@@ -508,26 +568,19 @@ pub fn window(application: &gtk4::Application, test: Option<Rc<testmode::Test>>)
     UI.with(|u| *u.borrow_mut() = Some(ui.clone()));
     connect(&ui, &prev, &next, &close_find, &replace_one, &replace_all, &notice_close);
     actions(&ui);
-    // timers: the caret, files changed by other programs, the session
-    glib::timeout_add_local(Duration::from_millis(BLINK_MS), || {
-        if let Some(ui) = get_ui() {
-            if STOPPED.swap(false, std::sync::atomic::Ordering::Relaxed) {
-                ui.ending();
-                ui.closing.set(true);
-                ui.gtk_app.quit();
-                return glib::ControlFlow::Break;
-            }
-            ui.blink();
-        }
-        glib::ControlFlow::Continue
-    });
+    // timers: the caret (while it blinks), files changed by other programs, the session
+    ui.wake_blink();
     glib::timeout_add_local(Duration::from_secs(2), || {
         if let Some(ui) = get_ui() {
-            // (and a message shown long enough makes way for the caret's place again)
-            ui.with(|a| {
+            // (and a message shown long enough makes way for the caret's place again: the window is refreshed only
+            // then, so an idle Slate doesn't redraw every 2 s)
+            if ui.guarded(|a| {
                 a.check_disk();
-                a.expire_flash();
-            });
+                a.expire_flash()
+            }) == Some(true)
+            {
+                ui.refresh();
+            }
         }
         glib::ControlFlow::Continue
     });
@@ -544,20 +597,10 @@ pub fn window(application: &gtk4::Application, test: Option<Rc<testmode::Test>>)
         }
         glib::ControlFlow::Continue
     });
-    // Stopped by the system (shutting down, a terminal closed): the session is written first (the caret's timer
-    // sees `STOPPED`).
+    // Stopped by the system (shutting down, a terminal closed): the session is written first. The signal handler only
+    // writes a byte to a pipe; a thread asleep on it hands the rest to the main loop (nothing looks for it meanwhile).
     if ui.test.is_none() {
-        extern "C" fn on_signal(_: libc::c_int) {
-            STOPPED.store(true, std::sync::atomic::Ordering::Relaxed);
-        }
-        for signal in [libc::SIGTERM, libc::SIGHUP, libc::SIGINT] {
-            unsafe {
-                let mut sa: libc::sigaction = std::mem::zeroed();
-                sa.sa_sigaction = on_signal as extern "C" fn(libc::c_int) as usize;
-                libc::sigemptyset(&mut sa.sa_mask);
-                libc::sigaction(signal, &sa, std::ptr::null_mut());
-            }
-        }
+        stop_on_signals();
     }
     ui.apply_theme();
     ui.text.grab_focus();
@@ -616,6 +659,7 @@ fn connect(ui: &Rc<Ui>, prev: &gtk4::Button, next: &gtk4::Button, close_find: &g
         if let Some(ui) = get_ui() {
             ui.im.focus_in();
             ui.with(|a| a.focused = true);
+            ui.wake_blink();
         }
     });
     focus.connect_leave(|_| {
@@ -845,6 +889,9 @@ fn connect(ui: &Rc<Ui>, prev: &gtk4::Button, next: &gtk4::Button, close_find: &g
     });
     ui.window.connect_is_active_notify(|_| {
         if let Some(ui) = get_ui() {
+            if ui.window.is_active() {
+                ui.wake_blink();
+            }
             ui.text.queue_draw();
         }
     });
@@ -1150,6 +1197,18 @@ impl Ui {
     }
 
     /// Runs `f` on the app, then shows what came of it.
+    /// The look at the open files on disk is done (every 2 s): the jobs are polled and the window refreshed only when it
+    /// found something.
+    fn poll_disk(&self) {
+        let found = self.guarded(|a| {
+            a.poll_disk();
+            std::mem::take(&mut a.disk_found)
+        });
+        if found != Some(false) {
+            self.poll();
+        }
+    }
+
     pub fn with<R>(&self, f: impl FnOnce(&mut App) -> R) -> Option<R> {
         let r = self.guarded(f);
         self.refresh();
@@ -1227,6 +1286,25 @@ impl Ui {
         if let Ok(mut a) = self.app.try_borrow_mut() {
             a.caret_on = true;
         }
+        self.wake_blink();
+    }
+
+    /// Starts the caret's timer if it isn't running (after input, or when the text gets the keyboard back).
+    fn wake_blink(&self) {
+        let running = self.blink_timer.take();
+        if running.is_some() {
+            self.blink_timer.set(running);
+            return;
+        }
+        let id = glib::timeout_add_local(Duration::from_millis(BLINK_MS), || match get_ui() {
+            Some(ui) if ui.blink() => glib::ControlFlow::Continue,
+            Some(ui) => {
+                ui.blink_timer.set(None);
+                glib::ControlFlow::Break
+            }
+            None => glib::ControlFlow::Break,
+        });
+        self.blink_timer.set(Some(id));
     }
 
     pub fn command(&self, cmd: Cmd) {
@@ -1509,22 +1587,21 @@ impl Ui {
         pop.popup();
     }
 
-    fn blink(&self) {
-        let Ok(mut a) = self.app.try_borrow_mut() else { return };
-        if !a.focused || !self.window.is_active() {
-            return;
-        }
-        if self.last_input.get().elapsed() > BLINK_STOP {
+    /// One blink of the caret; false when it stops (shown): still for `BLINK_STOP`, or the keyboard is elsewhere.
+    fn blink(&self) -> bool {
+        let Ok(mut a) = self.app.try_borrow_mut() else { return true };
+        if !a.focused || !self.window.is_active() || self.last_input.get().elapsed() > BLINK_STOP {
             if !a.caret_on {
                 a.caret_on = true;
                 drop(a);
                 self.text.queue_draw();
             }
-            return;
+            return false;
         }
         a.caret_on = !a.caret_on;
         drop(a);
         self.text.queue_draw();
+        true
     }
 
     /// Background work finished (or is still running: then again soon).

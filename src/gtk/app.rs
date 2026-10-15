@@ -265,6 +265,10 @@ pub struct App {
     pub theme: Theme,
     pub style: Style,
     pub notify: Notify,
+    /// What the look at the files on disk wakes when it's done (`Ui::poll_disk`: a refresh only if it found something).
+    pub disk_notify: Option<Notify>,
+    /// The last look at the files on disk found something to show.
+    pub disk_found: bool,
     pub find: Find,
     pub asks: Vec<Ask>,
     /// A message in the status bar (and whether it's bad news), shown for `FLASH_FOR` from `flash_at`.
@@ -322,6 +326,8 @@ impl App {
             settings,
             style,
             notify,
+            disk_notify: None,
+            disk_found: false,
             find: Find::default(),
             asks: Vec::new(),
             flash: None,
@@ -401,10 +407,13 @@ impl App {
     }
 
     /// Takes away a message that has shown long enough (the window's 2-second timer asks).
-    pub fn expire_flash(&mut self) {
+    /// Takes away a message shown for `FLASH_FOR`; returns whether it did (the window shows the caret's place again).
+    pub fn expire_flash(&mut self) -> bool {
         if self.flash.is_some() && self.flash_at.elapsed() >= FLASH_FOR {
             self.flash = None;
+            return true;
         }
+        false
     }
 
     fn make_tab(&mut self, doc: Document) -> Tab {
@@ -1641,16 +1650,19 @@ impl App {
                 TaskKind::Lines(op) => {
                     let mut buf = Vec::new();
                     let text = snap.slice(0, snap.len(), &mut buf);
-                    let (out, count) = lines::apply(op, text);
-                    let mut idx = IndexBuilder::new();
-                    idx.push(&out);
-                    let mut sink = match Sink::new(out.len() as u64) {
+                    let mut sink = match Sink::new(text.len() as u64) {
                         Ok(s) => s,
                         Err(e) => return TaskResult::Failed(format!("Couldn't create a temporary file: {e}")),
                     };
-                    if let Err(e) = std::io::Write::write_all(&mut sink, &out) {
-                        return TaskResult::Failed(format!("Couldn't write the result: {e}"));
-                    }
+                    let mut idx = IndexBuilder::new();
+                    let count = match lines::apply_to(op, text, &mut |piece| {
+                        idx.push(piece);
+                        std::io::Write::write_all(&mut sink, piece)
+                    }) {
+                        Ok(count) => count,
+                        Err(e) => return TaskResult::Failed(format!("Couldn't write the result: {e}")),
+                    };
+                    drop(buf);
                     match sink.finish(idx) {
                         Ok((src, nl)) => TaskResult::Content { src, nl, count },
                         Err(e) => TaskResult::Failed(format!("Couldn't write the result: {e}")),
@@ -2032,13 +2044,13 @@ impl App {
         if asks.is_empty() {
             return;
         }
-        let notify = self.notify.clone();
+        let notify = self.disk_notify.clone().unwrap_or_else(|| self.notify.clone());
         self.disk_job = Some(Job::spawn(0, notify, move |_| {
             asks.into_iter().map(|(id, p)| (id, fileio::disk_answer(&p).flatten())).collect()
         }));
     }
 
-    fn poll_disk(&mut self) -> bool {
+    pub fn poll_disk(&mut self) -> bool {
         let Some(job) = self.disk_job.as_mut() else { return false };
         let Some(found) = job.take() else { return true };
         self.disk_job = None;
@@ -2048,6 +2060,8 @@ impl App {
             if tab.busy() || tab.index.is_some() || now == tab.doc.disk || tab.seen_disk == Some(now) {
                 continue;
             }
+            self.disk_found = true;
+            let tab = &mut self.tabs[i];
             let name = tab.title();
             if now.is_none() {
                 tab.seen_disk = Some(now);

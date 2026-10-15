@@ -353,6 +353,13 @@ fn value(what: &str, test: &Test) -> String {
             format!("{l} | {}", r.join(" | "))
         }
         "title" => ui.window.title().map(|t| t.to_string()).unwrap_or_default(),
+        // (whether the caret's timer runs: it stops once the caret has been still a while)
+        "blink" => {
+            let timer = ui.blink_timer.take();
+            let on = timer.is_some();
+            ui.blink_timer.set(timer);
+            if on { "blinking" } else { "still" }.into()
+        }
         "tabs" => a.tabs.len().to_string(),
         "tabnames" => a.tabs.iter().map(|t| t.title()).collect::<Vec<_>>().join(", "),
         "lang" => tab.lang.label().to_string(),

@@ -103,7 +103,7 @@ the download.
 ### Linux and Raspberry Pi
 
 Slate runs on 64-bit Linux with GTK 4.8 or newer: Debian 12, Raspberry Pi OS 12 (Bookworm, on a Raspberry Pi 4 or
-5), Ubuntu 23.04 and newer, or similar. To install it, run this line in a terminal; it gets the package for your
+5), Ubuntu 24.04 and newer, or similar. To install it, run this line in a terminal; it gets the package for your
 computer from the latest release (into a new temporary file of your own) and installs it only if that worked:
 
 ```

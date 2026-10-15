@@ -243,6 +243,21 @@ fn sort_lines(lines: &mut Vec<Line>, text: &[u8]) {
 /// Line breaks come out as the kind most of the text uses. (Up to 4 GB and `COUNT_MAX` lines: the caller says so
 /// when it's more.)
 pub fn apply(op: LineOp, text: &[u8]) -> (Vec<u8>, u64) {
+    let mut out = Vec::with_capacity(text.len());
+    let count = apply_to(op, text, &mut |piece| {
+        out.extend_from_slice(piece);
+        Ok(())
+    })
+    .unwrap_or_default();
+    (out, count)
+}
+
+/// How much of the result `apply_to` hands on at a time (in tests a few bytes, so they go through many pieces).
+const PIECE: usize = if cfg!(test) { 16 } else { 4 << 20 };
+
+/// `apply`, handing the new text to `out` in pieces of a few MB as it's made: a big document's result goes on to a
+/// temp file without ever being in memory whole beside the text (which had a 400 MB file take 830 MB).
+pub fn apply_to(op: LineOp, text: &[u8], out: &mut dyn FnMut(&[u8]) -> std::io::Result<()>) -> std::io::Result<u64> {
     let ends_nl = text.last() == Some(&b'\n');
     let body = if ends_nl { &text[..text.len() - 1] } else { text };
     // CRLF if most line breaks are
@@ -296,17 +311,22 @@ pub fn apply(op: LineOp, text: &[u8]) -> (Vec<u8>, u64) {
         }
     }
     let eol: &[u8] = if crlf { b"\r\n" } else { b"\n" };
-    let mut out = Vec::with_capacity(text.len());
+    let mut piece = Vec::with_capacity(PIECE.min(text.len() + 2));
     for (k, l) in lines.iter().enumerate() {
         if k > 0 {
-            out.extend_from_slice(eol);
+            piece.extend_from_slice(eol);
         }
-        out.extend_from_slice(l.of(text));
+        piece.extend_from_slice(l.of(text));
+        if piece.len() >= PIECE {
+            out(&piece)?;
+            piece.clear();
+        }
     }
     if ends_nl && !lines.is_empty() {
-        out.extend_from_slice(eol);
+        piece.extend_from_slice(eol);
     }
-    (out, count)
+    out(&piece)?;
+    Ok(count)
 }
 
 /// Changes the letter case of `text`. Title Case starts each word with a capital.

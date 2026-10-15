@@ -117,6 +117,7 @@ fn idle(ms: u32) -> String {
                 WM_TIMER => format!("timer {}", msg.wParam.0),
                 super::actions::WM_APP_JOB => "job".into(),
                 super::actions::WM_APP_DISK => "disk".into(),
+                super::actions::WM_APP_GPU => "gpu".into(),
                 m => format!("{m:#06x}"),
             };
             *seen.entry(what).or_default() += 1;
@@ -777,6 +778,7 @@ pub fn run(args: &[String]) -> i32 {
     let hinst = register_class();
     let s = Settings { restore_session: false, ..Default::default() };
     let hwnd = create_window(hinst, &s);
+    super::gfx::early_window(hwnd);
     // (as Slate takes it when it starts)
     super::win::set_focus(hwnd);
     super::mark("window");

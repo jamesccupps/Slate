@@ -41,7 +41,10 @@ jobs:
     # APT_SIGNING_KEY belongs in this environment's secrets, the environment limited to main (repository settings).
     environment: apt
     steps:
+      # (the job's token isn't left in .git: nothing here pushes, and gh has its own)
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: The latest release's packages
         env:
