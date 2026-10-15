@@ -374,7 +374,13 @@ lighter one on dark), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate`, `$
     `GPU_GRACE` (40 ms) for the card's device, else draws with WARP (`on_warp_for_now`) and goes on to the card's at
     the paint after `WM_APP_GPU` (`switch_to_gpu`; `discard_target` lets go of the old swap chain at once: target
     unset, ClearState + Flush, as a window has one at a time). On an NVIDIA PC the first frame came at 82–98 ms
-    instead of 220–265 ms. The text view
+    instead of 220–265 ms. The window is shown cloaked (`win::cloak`, DWMWA_CLOAK) and uncloaked after its first
+    present (or by `TIMER_UNCLOAK` after 1 s): shown before it, its blank client area flashed white. A flip-model
+    frame presented while cloaked is dropped, so the first frames go through a bit-block-transfer swap chain
+    (`blt_now`; WARP's all of them), whose frames land in the window's own surface and stay there when it's let go of:
+    after the first frame `settle` makes a flip-model one on the same device (`next_dev`), and the switch from WARP
+    shows the last WARP frame until the card's first one. (The user checked it on a real screen, 0.12.3: test mode's
+    hidden windows can't show a flash.) The text view
     draws through its own `IDWriteTextRenderer` (`mod text_renderer`): only the glyph runs in view (and of a long run,
     only its glyphs in view), a row's runs in one font as one Direct2D run per color, the colors given at drawing
     time through each run's cluster map rather than set on the layout (emoji through

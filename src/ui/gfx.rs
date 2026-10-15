@@ -29,7 +29,8 @@ use windows::Win32::Graphics::Direct3D11::{
 };
 use windows::Win32::Graphics::Dxgi::{
     DXGI_ERROR_DEVICE_REMOVED, DXGI_ERROR_DEVICE_RESET, DXGI_MWA_NO_ALT_ENTER, DXGI_PRESENT, DXGI_SCALING_NONE,
-    DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG, DXGI_SWAP_EFFECT_FLIP_DISCARD, DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
+    DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG, DXGI_SWAP_EFFECT_DISCARD,
+    DXGI_SWAP_EFFECT_FLIP_DISCARD, DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
     DXGI_USAGE_RENDER_TARGET_OUTPUT, IDXGIDevice, IDXGIFactory2, IDXGISurface, IDXGISwapChain1,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_ALPHA_MODE_IGNORE, DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC};
@@ -136,6 +137,11 @@ pub struct Gfx {
     locale: HSTRING,
     /// The window is drawn with WARP until the graphics card's device is ready (`switch_to_gpu`).
     on_warp_for_now: bool,
+    /// The window's swap chain copies its frames into the window's own surface (bit-block transfer): for its first
+    /// frames, then a flip-model one (`settle`).
+    blt_now: bool,
+    /// The device the next window target is made on (going from the first frames' swap chain to a flip-model one).
+    next_dev: Option<ID3D11Device>,
     /// A frame was shown in the window (for `print:startup`'s first-frame mark).
     shown: bool,
 }
@@ -292,6 +298,8 @@ impl Gfx {
                 offscreen: false,
                 locale: user_locale(),
                 on_warp_for_now: false,
+                blt_now: false,
+                next_dev: None,
                 shown: false,
             })
         }
@@ -300,7 +308,7 @@ impl Gfx {
     /// The normal window target: a flip-model swap chain on a Direct3D 11 device (hardware, else WARP).
     fn create_flip(&mut self, hwnd: HWND, w: u32, h: u32, dpi: f32) -> windows::core::Result<WinTarget> {
         unsafe {
-            let dev = match early_device() {
+            let dev = match self.next_dev.take().map(|d| (d, self.on_warp_for_now)).or_else(early_device) {
                 Some((dev, for_now)) => {
                     if self.on_warp_for_now && !for_now {
                         super::mark("switched to the card's device");
@@ -329,12 +337,28 @@ impl Gfx {
                 AlphaMode: DXGI_ALPHA_MODE_IGNORE,
                 ..Default::default()
             };
-            let chain = match factory.CreateSwapChainForHwnd(&dev, hwnd, &desc, None, None) {
-                Ok(c) => c,
-                Err(_) => {
-                    desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
-                    factory.CreateSwapChainForHwnd(&dev, hwnd, &desc, None, None)?
-                }
+            // The first frames (and all of WARP's): a bit-block-transfer swap chain, whose frames are copied into the
+            // window's own surface. That shows while the window is kept off the screen (`win::cloak`), where a
+            // flip-model frame is dropped (the window came on white), and stays when the swap chain is let go of, so
+            // the window shows the last one until a flip-model one's first frame takes its place (a flip-model one's
+            // frames go with it: the window flashed white at the switch from WARP).
+            let blt = (!self.shown || self.on_warp_for_now).then(|| DXGI_SWAP_CHAIN_DESC1 {
+                BufferCount: 1,
+                Scaling: DXGI_SCALING_STRETCH,
+                SwapEffect: DXGI_SWAP_EFFECT_DISCARD,
+                ..desc
+            });
+            let blt_chain = blt.and_then(|b| factory.CreateSwapChainForHwnd(&dev, hwnd, &b, None, None).ok());
+            self.blt_now = blt_chain.is_some();
+            let chain = match blt_chain {
+                Some(c) => c,
+                None => match factory.CreateSwapChainForHwnd(&dev, hwnd, &desc, None, None) {
+                    Ok(c) => c,
+                    Err(_) => {
+                        desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+                        factory.CreateSwapChainForHwnd(&dev, hwnd, &desc, None, None)?
+                    }
+                },
             };
             let _ = factory.MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER);
             dc.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE);
@@ -452,22 +476,39 @@ impl Gfx {
 
     /// Drops the render target (after D2DERR_RECREATE_TARGET); the next paint makes a new one.
     pub fn discard_target(&mut self) {
+        drop(self.release_target());
+    }
+
+    /// Lets go of the window's target; returns its Direct3D device (to make the next one on).
+    fn release_target(&mut self) -> Option<ID3D11Device> {
         self.rt = None;
         self.brushes.borrow_mut().clear();
-        if let Some(WinTarget::Flip { dc, chain, dev, .. }) = self.win.take() {
-            // A window has one flip-model swap chain at a time, and Direct3D lets go of an old one only when its
-            // device's queued work is done: let go of it all now, so a new one can be made for the window right away.
-            unsafe {
-                dc.SetTarget(None);
-                drop(dc);
-                drop(chain);
-                if let Ok(ctx) = dev.GetImmediateContext() {
-                    ctx.ClearState();
-                    ctx.Flush();
-                }
+        self.generation += 1;
+        let Some(WinTarget::Flip { dc, chain, dev, .. }) = self.win.take() else { return None };
+        // A window has one swap chain at a time, and Direct3D lets go of an old one only when its device's queued work
+        // is done: let go of it all now, so a new one can be made for the window right away.
+        unsafe {
+            dc.SetTarget(None);
+            drop(dc);
+            drop(chain);
+            if let Ok(ctx) = dev.GetImmediateContext() {
+                ctx.ClearState();
+                ctx.Flush();
             }
         }
-        self.generation += 1;
+        Some(dev)
+    }
+
+    /// After a frame was shown: the first frames' bit-block-transfer swap chain makes way for a flip-model one on the
+    /// same device (WARP's stays until the card's device is ready: `switch_to_gpu`). Returns whether it did (paint
+    /// again then).
+    pub fn settle(&mut self) -> bool {
+        if !self.blt_now || self.on_warp_for_now || !self.shown {
+            return false;
+        }
+        self.blt_now = false;
+        self.next_dev = self.release_target();
+        true
     }
 
     /// The window was drawn with WARP while the graphics card's driver loaded, and the card's device is ready now:
@@ -476,6 +517,8 @@ impl Gfx {
         if !self.on_warp_for_now || !gpu_ready() {
             return false;
         }
+        self.blt_now = false;
+        self.next_dev = None;
         self.discard_target();
         true
     }

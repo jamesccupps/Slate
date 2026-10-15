@@ -102,6 +102,35 @@ pub fn dpi_of(hwnd: HWND) -> u32 {
     FORCED_DPI.with(|d| d.get()).unwrap_or_else(|| unsafe { windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd) }).max(96)
 }
 
+// ---- the first frame ----
+
+const DWMWA_CLOAK: DWMWINDOWATTRIBUTE = DWMWINDOWATTRIBUTE(13);
+
+/// The window `cloak` keeps off the screen (0: none).
+static CLOAKED: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+
+/// Keeps a window about to be shown off the screen until its first frame is drawn (`uncloak`): shown before it, its
+/// blank client area flashed white for a moment. It's shown all the same for Windows (painted, activated, on the
+/// taskbar), as Windows' own apps do it.
+pub fn cloak(hwnd: HWND) {
+    let on = BOOL(1);
+    if unsafe { DwmSetWindowAttribute(hwnd, DWMWA_CLOAK, &on as *const _ as _, 4) }.is_ok() {
+        CLOAKED.store(hwnd.0 as isize, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Puts the window `cloak` kept off the screen on it (after a frame was drawn, or a while after it was shown in any
+/// case). Returns whether there was one.
+pub fn uncloak() -> bool {
+    let h = CLOAKED.swap(0, std::sync::atomic::Ordering::Relaxed);
+    if h == 0 {
+        return false;
+    }
+    let off = BOOL(0);
+    let _ = unsafe { DwmSetWindowAttribute(HWND(h as *mut _), DWMWA_CLOAK, &off as *const _ as _, 4) };
+    true
+}
+
 // ---- dark mode ----
 
 const DWMWA_USE_IMMERSIVE_DARK_MODE: DWMWINDOWATTRIBUTE = DWMWINDOWATTRIBUTE(20);

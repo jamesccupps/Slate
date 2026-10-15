@@ -1055,6 +1055,13 @@ impl App {
             // The graphics device was lost (driver update, GPU reset...): start over with a fresh target.
             self.g.discard_target();
             self.invalidate();
+        } else {
+            // (the first frame is drawn: the window goes on the screen; and the first frames' swap chain makes way for
+            // a flip-model one, drawn on next)
+            let shown = win::uncloak();
+            if self.g.settle() || shown {
+                self.invalidate();
+            }
         }
         if !self.painted {
             self.painted = true;

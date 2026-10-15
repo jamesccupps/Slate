@@ -122,6 +122,14 @@ file you aren't allowed to change; no update by itself where Windows can't check
 valid Unicode kept; the apt repository without an expiry date; the .deb with checksums, a Debian-format copyright and
 a changelog. Details in the [0.12.2 release notes](release-notes-0.12.2.md).
 
+## 0.12.3: quicker to open, lighter on big files
+
+The window no longer waits for a slow graphics driver: its first frames are drawn in software (WARP) until the card's
+device is ready (on an NVIDIA PC the first frame at ~90 ms instead of ~250 ms), and it comes on the screen with its
+first frame drawn, without the white flash it always had. Sort and the other line tools write their result as they
+go (a 400 MB log sorted in 2.8 s instead of 4.5 s, in 490 MB instead of 830 MB). An idle Slate on Linux sleeps.
+Details in the [0.12.3 release notes](release-notes-0.12.3.md).
+
 ## Next
 
 1. **Accessibility: screen readers, the rest (M).** The text is read since 0.12.0 (checked in test mode and by a real
@@ -176,12 +184,6 @@ a changelog. Details in the [0.12.2 release notes](release-notes-0.12.2.md).
 - **A taskbar jump list** with the recent files (S).
 - **JSON structure panel:** keep an open array element open when elements are inserted before it (it's keyed by
   index today); while the panel is updating after an edit, clicks go to the row's old place (S).
-- **The first frame without waiting for the graphics driver (S–M): built, being tried on a real screen (October
-  2026).** Where the driver is slow to load (on an NVIDIA PC `D3D11CreateDevice` takes ~250 ms in a new process), the
-  first frame waited for it. Now the device thread makes a WARP device first (~5 ms), the first frame is drawn with it
-  when the card's device isn't there 40 ms later (on that PC: 82–98 ms after starting instead of 220–265 ms), and the
-  window goes on to the card's device as soon as it's ready. To check before release: no black or white frame at the
-  switch (else: keep the window cloaked until its first frame instead).
 - **Count all and Show only matching lines on several cores (M).** Both search a big file on one thread: 850 MB in
   0.35–0.45 s (a plain query is searched at several GB/s; reading the file from Windows' cache goes at 6 GB/s, faster
   still on more threads). Split into ranges searched side by side, the counts added (and the first 10,000 places kept

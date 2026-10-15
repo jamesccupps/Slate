@@ -1319,11 +1319,14 @@ pub fn run(raw: Vec<std::ffi::OsString>) -> i32 {
         a.update_title();
         a.timer(TIMER_DISK, 2000);
         a.timer(actions::TIMER_UPDATE, 8000);
+        // (off the screen until its first frame: `win::cloak`; shown by then in any case)
+        a.timer(actions::TIMER_UNCLOAK, 1000);
         a.restart_caret();
     }
     unsafe {
         DragAcceptFiles(hwnd, true);
         let maximized = s.window.is_some_and(|p| p.maximized);
+        win::cloak(hwnd);
         let _ = ShowWindow(hwnd, if maximized { SW_SHOWMAXIMIZED } else { SW_SHOWNORMAL });
         // Take the keyboard focus (SetFocus also activates the window), unless whoever started Slate asked for it
         // not to be activated.

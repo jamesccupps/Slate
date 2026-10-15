@@ -29,7 +29,7 @@ body:
     attributes:
       label: Slate version
       description: Help → About Slate
-      placeholder: "0.12.2"
+      placeholder: "0.12.3"
     validations:
       required: true
   - type: dropdown

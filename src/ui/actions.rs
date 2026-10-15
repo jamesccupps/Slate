@@ -64,6 +64,8 @@ pub const TIMER_COUNT: usize = 9;
 pub const TIMER_TIP: usize = 10;
 /// The typing has paused: the JSON/XML path bar and structure panel are worked out again (`Structure::waiting`).
 pub const TIMER_STRUCTURE: usize = 11;
+/// The window kept off the screen until its first frame (`win::cloak`) is shown by now in any case.
+pub const TIMER_UNCLOAK: usize = 12;
 
 const BIG_CLIPBOARD: u64 = 64 << 20;
 /// What the status bar says while a check for updates the user asked for runs.
@@ -3236,6 +3238,12 @@ impl App {
                 self.invalidate();
             }
             TIMER_TIP => self.show_tip(),
+            TIMER_UNCLOAK => {
+                self.kill_timer(id);
+                if win::uncloak() {
+                    self.invalidate();
+                }
+            }
             TIMER_JOBS => self.poll_jobs(),
             TIMER_DISK => {
                 self.check_disk();
