@@ -29,7 +29,7 @@ jobs:
       # link with the toolchain's own MinGW files (rust-mingw), whatever else the runner has on its PATH
       RUSTFLAGS: -Clink-self-contained=yes
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: The tag matches Cargo.toml's version
         if: startsWith(github.ref, 'refs/tags/v')
@@ -129,7 +129,7 @@ jobs:
           "$hash  Slate.exe" | Out-File -FilePath out\Slate.exe.sha256 -Encoding ascii -NoNewline
           Get-Content out\Slate.exe.sha256
 
-      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: Slate
           path: out/
@@ -147,9 +147,9 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: Slate
           path: out
@@ -189,7 +189,7 @@ jobs:
           "$hash  Slate.exe" | Out-File -FilePath out\Slate.exe.sha256 -Encoding ascii -NoNewline
           Get-Content out\Slate.exe.sha256
 
-      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: Slate
           path: out/
@@ -215,7 +215,7 @@ jobs:
           apt-get install -y --no-install-recommends ca-certificates curl git build-essential pkg-config libgtk-4-dev \
             xvfb xauth dbus-x11 fonts-dejavu-core
 
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Rust
         run: |
@@ -249,7 +249,7 @@ jobs:
           case "$GITHUB_REF" in refs/tags/v*) ;; *) version="$version~dev$GITHUB_RUN_NUMBER" ;; esac
           sh packaging/linux/package.sh target/release/Slate "$version" ${{ matrix.arch }} out
 
-      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: slate-linux-${{ matrix.arch }}
           path: out/
@@ -262,9 +262,9 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: out
           merge-multiple: true
