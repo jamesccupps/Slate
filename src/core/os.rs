@@ -207,6 +207,27 @@ mod imp {
         e.raw_os_error() == Some(2)
     }
 
+    /// Whether `e` says a folder on the way to `path` isn't there (ERROR_PATH_NOT_FOUND) on a disk of this PC that is
+    /// (a fixed disk, its drive there): unlike a network drive's, a USB stick's or a disk's that isn't attached, that
+    /// folder won't come back (a temp folder cleaned up, as Explorer's for a file opened from a zip; one deleted).
+    pub fn gone_from_local_disk(path: &Path, e: &io::Error) -> bool {
+        // (GetDriveTypeW's DRIVE_FIXED)
+        const DRIVE_FIXED: u32 = 3;
+        if e.raw_os_error() != Some(3) {
+            return false;
+        }
+        let Some(root) = path.ancestors().last() else { return false };
+        let mut w: Vec<u16> = root.as_os_str().encode_wide().collect();
+        if w.is_empty() {
+            return false;
+        }
+        if w.last() != Some(&u16::from(b'\\')) {
+            w.push(u16::from(b'\\'));
+        }
+        w.push(0);
+        unsafe { windows::Win32::Storage::FileSystem::GetDriveTypeW(PCWSTR(w.as_ptr())) == DRIVE_FIXED }
+    }
+
     /// Whether `e` says the name isn't one a file can have (ERROR_INVALID_NAME).
     pub fn is_bad_name(e: &io::Error) -> bool {
         e.raw_os_error() == Some(123)
@@ -318,6 +339,12 @@ mod imp {
     /// Whether `e` says the file or folder isn't found.
     pub fn is_not_found(e: &io::Error) -> bool {
         e.raw_os_error() == Some(libc::ENOENT)
+    }
+
+    /// (Windows only: on Linux a network share that isn't mounted leaves its folder there, empty, so a folder on the
+    /// way that isn't there may come back.)
+    pub fn gone_from_local_disk(_: &Path, _: &io::Error) -> bool {
+        false
     }
 
     /// Whether `e` says the name isn't one a file can have (on Unix any name is).

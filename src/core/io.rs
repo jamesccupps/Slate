@@ -74,19 +74,20 @@ pub fn disk_answer(path: &Path) -> Option<Option<DiskInfo>> {
     }
 }
 
-/// Whether `e` (from opening `path`) means the file isn't there any more: not found in a folder that is. A drive or
-/// folder that isn't there (a USB stick, a VHD that isn't attached, a share) may come back, so that doesn't count.
+/// Whether `e` (from opening `path`) means the file isn't there any more: not found in a folder that is, or (Windows)
+/// a folder on the way isn't there on a fixed disk of this PC (`os::gone_from_local_disk`). A drive or folder that
+/// isn't there otherwise (a USB stick, a VHD that isn't attached, a share) may come back, so that doesn't count.
 pub fn not_there(path: &Path, e: &io::Error) -> bool {
-    os::is_not_found(e) && path.parent().is_some_and(Path::is_dir)
+    (os::is_not_found(e) && path.parent().is_some_and(Path::is_dir)) || os::gone_from_local_disk(path, e)
 }
 
 /// Whether opening `path` failed (`e`) for something that may pass by itself: another program has the file, a
 /// network drive doesn't answer, a drive or folder isn't there (a USB stick that isn't plugged in).
 pub fn transient(path: &Path, e: &io::Error) -> bool {
-    if os::is_not_found(e) {
-        return !not_there(path, e);
+    if not_there(path, e) {
+        return false;
     }
-    os::is_transient(e)
+    os::is_not_found(e) || os::is_transient(e)
 }
 
 pub use os::free_space;
@@ -1198,7 +1199,17 @@ mod tests {
         assert!(!transient(&here, &os(2)) && not_there(&here, &os(2)));
         assert!(transient(&away, &os(2)) && !not_there(&away, &os(2)));
         #[cfg(windows)]
-        assert!(transient(&here, &os(3)) && transient(&here, &os(32)) && transient(&here, &os(53)));
+        assert!(transient(&here, &os(32)) && transient(&here, &os(53)));
+        // A folder on the way that isn't there (ERROR_PATH_NOT_FOUND): gone on this PC's own disk (the test folder's,
+        // a fixed one), waited for on a drive that isn't there (a USB stick that isn't plugged in).
+        #[cfg(windows)]
+        {
+            assert!(!transient(&away, &os(3)) && not_there(&away, &os(3)));
+            if let Some(letter) = (b'D'..=b'Z').rev().map(char::from).find(|l| !Path::new(&format!("{l}:\\")).exists()) {
+                let usb = PathBuf::from(format!("{letter}:\\notes\\x.txt"));
+                assert!(transient(&usb, &os(3)) && !not_there(&usb, &os(3)));
+            }
+        }
         #[cfg(windows)]
         assert!(!transient(&here, &os(5)));
         #[cfg(unix)]

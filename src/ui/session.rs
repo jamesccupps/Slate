@@ -2038,8 +2038,16 @@ mod tests {
         drop(d);
         // (as if the USB stick were pulled out: its folder isn't there)
         fs::remove_dir_all(&stick).unwrap();
-        assert!(matches!(restore_in(&dir, &name(&big)), Restored::Unreachable(_)));
-        assert_eq!(probe(&path), None);
+        // On Windows a folder on the way that isn't there on this PC's own disk won't come back (Explorer's temp folder
+        // for a file opened from a zip): gone, the added text back on its own. A drive that isn't there (a stick
+        // really pulled out) is still waited for: `io::tests::only_what_may_pass_by_itself_is_waited_for`.
+        if cfg!(windows) {
+            assert!(matches!(restore_in(&dir, &name(&big)), Restored::Recovered { there: false, .. }));
+            assert_eq!(probe(&path), Some(false));
+        } else {
+            assert!(matches!(restore_in(&dir, &name(&big)), Restored::Unreachable(_)));
+            assert_eq!(probe(&path), None);
+        }
         assert_eq!(probe(&dir.join("nothing.txt")), Some(false));
         let _ = fs::remove_dir_all(&dir);
     }

@@ -488,8 +488,10 @@ lighter one on dark), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate`, `$
   with the same sample hashes; otherwise the added text comes back on its own in a new tab, read from `<name>.data`
   where it is (and the files go into `damaged\`, kept 30 days), never laid over something else. A tab whose file
   doesn't answer (a share that's gone, a file another program holds, a drive or folder that isn't there: only "not
-  found" in a folder that is means gone) waits too and looks again, less often each time, as long as it's one of
-  those; until a tab is back, the session keeps its entry as read.
+  found" in a folder that is means gone, and on Windows also a folder on the way that isn't there on a fixed disk of
+  this PC, `os::gone_from_local_disk`: Explorer's temp folder of a file opened from a zip is cleaned up, and such a
+  tab waited for ever) waits too and looks again, less often each time, as long as it's one of those; until a tab is
+  back, the session keeps its entry as read.
 - One Slate per user session: a second start hands its files to the running one (to a window of Slate's class whose
   process runs as the same user with the same rights: `slate_window`). A Slate running as administrator
   is separate (its own lock, window class and session), as Windows doesn't let the two talk. A second start tries
