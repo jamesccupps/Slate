@@ -144,6 +144,13 @@ a changelog. Details in the [0.12.2 release notes](release-notes-0.12.2.md).
 
 ## Soon
 
+- **CSV and TSV** (S–M; the user asked, October 2026). Today they're plain text (colored, nothing more). **Check**
+  as for JSON and XML: a row with another number of fields than the header, a quote left open, a stray quote inside
+  a field, said with its line and column; the quoting as RFC 4180 has it (a field in quotes may hold the separator,
+  `""` and line breaks), the separator found from the first lines (`,` `;` tab `|`). **Sort by this column** (Format →
+  Sort lines by the caret's column: the header row stays on top, numbers and dates sorted as such, rows with line
+  breaks in quotes kept whole). The caret's column by its name in the status bar (`status`, field 9). All streaming
+  like the rest (the aim: a 400 MB CSV checked in about the time a search of it takes, ~0.2 s).
 - **Matching lines, more** (S each): a button in the find bar; the tab of lines following a log as it grows (filtering
   what's added); several searches at once (lines with any of them, highlighted each in a color).
 - `slate --read-only` from a command line (S: the files handed to a Slate that's running already would need it
@@ -186,8 +193,7 @@ a changelog. Details in the [0.12.2 release notes](release-notes-0.12.2.md).
   Orca (M; GTK 4.8 has no accessible text for a custom-drawn view: GTK 4.14's `GtkAccessibleText`).
 - **Maybe: a Markdown preview** (a rendered view next to the text, off by default) (M). Only if people ask for
   it: Slate is meant to stay quick and open anything, so it must cost nothing while it isn't used.
-- JSON and XML: **go to a path** typed in Go to line (`data[1203].name`, `/catalog/book[3]/title`) (S). CSV and TSV:
-  the caret's column by its name in the status bar, and **sort by this column** (S–M).
+- JSON and XML: **go to a path** typed in Go to line (`data[1203].name`, `/catalog/book[3]/title`) (S).
 - **EditorConfig** (`.editorconfig`: indentation, line endings, a final newline, the encoding) (S).
 - **A command palette** (Ctrl+Shift+P) over every command and setting (M; on Linux it would also be the settings
   window it hasn't got).
