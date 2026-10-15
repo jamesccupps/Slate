@@ -103,13 +103,15 @@ the download.
 ### Linux and Raspberry Pi
 
 Slate runs on 64-bit Linux with GTK 4.8 or newer: Debian 12, Raspberry Pi OS 12 (Bookworm, on a Raspberry Pi 4 or
-5), Ubuntu 23.04 and newer, or similar. To install it, run these two lines in a terminal; they get the package for
-your computer from the latest release:
+5), Ubuntu 23.04 and newer, or similar. To install it, run this line in a terminal; it gets the package for your
+computer from the latest release (into a new temporary file of your own) and installs it only if that worked:
 
 ```
-wget -O /tmp/slate.deb https://github.com/jamesccupps/Slate/releases/latest/download/slate-linux-$(dpkg --print-architecture).deb
-sudo apt install /tmp/slate.deb
+f=$(mktemp --suffix=.deb) && wget -O "$f" https://github.com/jamesccupps/Slate/releases/latest/download/slate-linux-$(dpkg --print-architecture).deb && chmod 644 "$f" && sudo apt install "$f"
 ```
+
+Slate is built for 64-bit systems only (`amd64` and `arm64`): on 32-bit Raspberry Pi OS (`dpkg --print-architecture`
+says `armhf`) the download stops with "404 Not Found".
 
 Or add Slate's apt repository yourself and install it by name, like any other package:
 

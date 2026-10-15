@@ -288,6 +288,7 @@ impl StableHasher {
 /// the same bytes (see `Source::same_as`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Identity {
+    #[serde(with = "super::os::json_path")]
     pub path: PathBuf,
     /// How much of the file the document reads (the file's size when it was opened).
     pub len: u64,

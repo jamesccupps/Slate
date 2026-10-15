@@ -16,6 +16,11 @@ on:
 permissions:
   contents: read
 
+# The Rust every build uses: a newer one is taken on purpose (raised here, and on the development PC with it), never
+# whatever "stable" happens to be on the day a tag is built.
+env:
+  RUST_VERSION: "1.99.0"
+
 jobs:
   build:
     name: Windows
@@ -42,8 +47,8 @@ jobs:
         shell: pwsh
         run: |
           # rust-mingw brings the toolchain's own linker libraries (crt2.o, libkernel32.a...)
-          rustup toolchain install stable-x86_64-pc-windows-gnu --profile minimal --component rust-mingw
-          rustup default stable-x86_64-pc-windows-gnu
+          rustup toolchain install "$($env:RUST_VERSION)-x86_64-pc-windows-gnu" --profile minimal --component rust-mingw
+          rustup default "$($env:RUST_VERSION)-x86_64-pc-windows-gnu"
 
       - name: Test
         run: cargo test --lib --locked
@@ -214,7 +219,7 @@ jobs:
 
       - name: Rust
         run: |
-          curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+          curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain "$RUST_VERSION"
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
 

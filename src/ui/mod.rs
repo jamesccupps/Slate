@@ -22,6 +22,8 @@ pub mod update;
 pub mod win;
 
 use std::cell::RefCell;
+use std::ffi::OsString;
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -533,7 +535,7 @@ fn handle(cell: &Cell, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<L
                 let len = unsafe { DragQueryFileW(drop, i, None) } as usize;
                 let mut buf = vec![0u16; len + 1];
                 unsafe { DragQueryFileW(drop, i, Some(&mut buf)) };
-                paths.push(PathBuf::from(String::from_utf16_lossy(&buf[..len])));
+                paths.push(PathBuf::from(OsString::from_wide(&buf[..len])));
             }
             unsafe { DragFinish(drop) };
             open_soon(cell, hwnd, paths);
@@ -556,8 +558,7 @@ fn handle(cell: &Cell, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<L
                 return Some(LRESULT(1));
             }
             let units = unsafe { std::slice::from_raw_parts(cds.lpData as *const u16, cds.cbData as usize / 2) };
-            let text = String::from_utf16_lossy(units);
-            let paths: Vec<PathBuf> = text.split('\n').filter(|s| !s.is_empty()).map(PathBuf::from).collect();
+            let paths = handed_over(units);
             // Answered at once; opening them (which can take a while on a slow share) comes right after.
             open_later(hwnd, paths, true);
             // (A test's hidden window stays out of the user's way.)
@@ -736,15 +737,26 @@ enum Running {
 /// own lock, window class and session.
 fn forward_to_running(paths: &[PathBuf]) -> Running {
     let lock = if win::elevated() { w!("Local\\Slate.SingleInstance.Admin") } else { w!("Local\\Slate.SingleInstance") };
-    let text = paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join("\n");
+    // (as Windows has them: a name needn't be valid Unicode)
+    let mut text: Vec<u16> = Vec::new();
+    for (k, p) in paths.iter().enumerate() {
+        if k > 0 {
+            text.push(b'\n' as u16);
+        }
+        text.extend(p.as_os_str().encode_wide());
+    }
     hand_over(lock, class(), &text, 100)
+}
+
+/// The files another Slate handed over (`forward_to_running`): one per line.
+fn handed_over(units: &[u16]) -> Vec<PathBuf> {
+    units.split(|&u| u == b'\n' as u16).filter(|s| !s.is_empty()).map(|s| PathBuf::from(OsString::from_wide(s))).collect()
 }
 
 /// `forward_to_running` with the lock and window class given (the tests use their own), trying `tries` times
 /// 100 ms apart: the running Slate may be starting (its window not there yet, or not ready for files) or closing
 /// (its window gone, its lock not yet), and then this one becomes the Slate.
-fn hand_over(lock: PCWSTR, class: PCWSTR, text: &str, tries: u32) -> Running {
-    let text: Vec<u16> = text.encode_utf16().collect();
+fn hand_over(lock: PCWSTR, class: PCWSTR, text: &[u16], tries: u32) -> Running {
     for _ in 0..tries {
         unsafe {
             match CreateMutexW(None, false, lock) {
@@ -906,7 +918,14 @@ pub fn restore(app: &mut App, paths: &[PathBuf]) {
     if app.settings.restore_session && !settings::guest() && watch && session::mark_restoring() {
         // The last start stopped while putting the tabs back, in a way no panic told: it would again. Set aside.
         let kept = session::put_aside();
-        app.flash(format!("Slate stopped while reopening last time's tabs. Their unsaved text is kept in {}.", kept.display()), true);
+        app.flash(
+            format!(
+                "Slate stopped while reopening last time's tabs. Their unsaved text is kept in {} for {} days.",
+                kept.display(),
+                session::DAMAGED_DAYS
+            ),
+            true,
+        );
     } else if app.settings.restore_session && !settings::guest() {
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| restore_session(app))) {
             Ok(id) => active_id = id,
@@ -917,7 +936,8 @@ pub fn restore(app: &mut App, paths: &[PathBuf]) {
                 let kept = session::put_aside();
                 app.flash(
                     format!(
-                        "Slate couldn't reopen last time's tabs (details in crash.log). Their unsaved text is kept in {}.",
+                        "Slate couldn't reopen last time's tabs (details in crash.log). Their unsaved text is kept in {} \
+                         for 30 days.",
                         kept.display()
                     ),
                     true,
@@ -1196,7 +1216,9 @@ pub fn place_tab(tab: &mut app::Tab, st: &session::SessionTab) {
     tab.view.bookmarks = marks;
 }
 
-pub fn run(args: Vec<String>) -> i32 {
+pub fn run(raw: Vec<std::ffi::OsString>) -> i32 {
+    // (switches as text; the files named kept exactly: a Windows name needn't be valid Unicode)
+    let args: Vec<String> = raw.iter().map(|a| a.to_string_lossy().into_owned()).collect();
     mark("run");
     std::panic::set_hook(Box::new(|info| log_crash(&info.to_string())));
     crash::install();
@@ -1221,26 +1243,35 @@ pub fn run(args: Vec<String>) -> i32 {
     // Started by an update: `--updated` (the version before watches this one start, ready to go back to itself),
     // or by 0.2.0's updater `--wait-for <pid>` (it ends first). `--update-failed <version>`: that version didn't
     // start, and this one is back.
-    let mut args = args;
+    let (mut args, mut raw) = (args, raw);
+    // (each switch taken out of both lists)
+    let mut take = |args: &mut Vec<String>, i: usize, n: usize| {
+        args.drain(i..(i + n).min(args.len()));
+        raw.drain(i..(i + n).min(raw.len()));
+    };
     let mut updated = false;
     if let Some(i) = args.iter().position(|a| a == "--wait-for") {
         if let Some(pid) = args.get(i + 1).and_then(|p| p.parse().ok()) {
             update::wait_for(pid);
         }
-        args.drain(i..(i + 2).min(args.len()));
+        take(&mut args, i, 2);
         updated = true;
     }
     if let Some(i) = args.iter().position(|a| a == "--updated") {
-        args.remove(i);
+        take(&mut args, i, 1);
         updated = true;
     }
     let mut update_failed = None;
     if let Some(i) = args.iter().position(|a| a == "--update-failed") {
         update_failed = Some(args.get(i + 1).cloned().unwrap_or_default());
-        args.drain(i..(i + 2).min(args.len()));
+        take(&mut args, i, 2);
     }
-    let paths: Vec<PathBuf> =
-        args.iter().filter(|a| !a.starts_with("--")).map(|a| std::path::absolute(a).unwrap_or_else(|_| PathBuf::from(a))).collect();
+    let paths: Vec<PathBuf> = raw
+        .iter()
+        .zip(&args)
+        .filter(|(_, a)| !a.starts_with("--"))
+        .map(|(r, _)| std::path::absolute(r).unwrap_or_else(|_| PathBuf::from(r)))
+        .collect();
     match forward_to_running(&paths) {
         Running::Took => return 0,
         Running::No => {}
@@ -1419,14 +1450,18 @@ mod tests {
         let class = HSTRING::from(format!("SlateTest.{}", std::process::id()));
         let (lock_w, class_w) = (PCWSTR(lock.as_ptr()), PCWSTR(class.as_ptr()));
         // none running: this one is the Slate, and holds the lock
-        assert!(matches!(hand_over(lock_w, class_w, "a.txt", 20), Running::No));
+        let wide = |s: &str| s.encode_utf16().collect::<Vec<u16>>();
+        // (names as Windows has them, also one that isn't valid Unicode)
+        let odd = [b'C' as u16, b':' as u16, 0xD800, b'\n' as u16, b'd' as u16];
+        assert_eq!(handed_over(&odd), [PathBuf::from(OsString::from_wide(&odd[..3])), PathBuf::from("d")]);
+        assert!(matches!(hand_over(lock_w, class_w, &wide("a.txt"), 20), Running::No));
         release_instance_lock();
         // one running, which isn't ready for files at first (its window is there before the rest of it)
         let held = unsafe { CreateMutexW(None, false, lock_w) }.unwrap();
         *ANSWERS.lock().unwrap() = vec![0, 0, 1];
         let (stop, quit) = std::sync::mpsc::channel();
         let other = another_slate(&class, quit);
-        assert!(matches!(hand_over(lock_w, class_w, "b.txt\nc.txt", 20), Running::Took));
+        assert!(matches!(hand_over(lock_w, class_w, &wide("b.txt\nc.txt"), 20), Running::Took));
         assert_eq!(*TOOK.lock().unwrap(), ["b.txt\nc.txt"]);
         // one that's closing: its window is gone, its lock still there for a moment; then this one is the Slate
         stop.send(()).unwrap();
@@ -1439,7 +1474,7 @@ mod tests {
             }
         });
         let start = Instant::now();
-        assert!(matches!(hand_over(lock_w, class_w, "d.txt", 20), Running::No));
+        assert!(matches!(hand_over(lock_w, class_w, &wide("d.txt"), 20), Running::No));
         assert!(start.elapsed() >= Duration::from_millis(250));
         closing.join().unwrap();
         release_instance_lock();

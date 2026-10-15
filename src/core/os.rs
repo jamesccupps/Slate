@@ -11,6 +11,81 @@ use super::source::{FileId, Stamp};
 
 pub use imp::*;
 
+/// Paths in JSON (the session): as text when they're Unicode, else as their units (Windows: UTF-16, elsewhere:
+/// bytes), as a name that isn't valid Unicode can't go into a JSON string (writing it would fail, and with it the
+/// whole session). For `#[serde(with = "…::json_path")]` on a `PathBuf`, `json_path::opt` on an `Option<PathBuf>`.
+pub mod json_path {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::path::{Path, PathBuf};
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(untagged)]
+    enum Repr {
+        Text(String),
+        Units(Vec<u32>),
+    }
+
+    fn repr(p: &Path) -> Repr {
+        match p.to_str() {
+            Some(s) => Repr::Text(s.to_string()),
+            None => Repr::Units(units(p)),
+        }
+    }
+
+    fn path<E: serde::de::Error>(r: Repr) -> Result<PathBuf, E> {
+        match r {
+            Repr::Text(s) => Ok(PathBuf::from(s)),
+            Repr::Units(u) => from_units(&u).ok_or_else(|| E::custom("not a file name")),
+        }
+    }
+
+    #[cfg(windows)]
+    fn units(p: &Path) -> Vec<u32> {
+        use std::os::windows::ffi::OsStrExt;
+        p.as_os_str().encode_wide().map(u32::from).collect()
+    }
+
+    #[cfg(windows)]
+    fn from_units(u: &[u32]) -> Option<PathBuf> {
+        use std::os::windows::ffi::OsStringExt;
+        let w: Option<Vec<u16>> = u.iter().map(|&x| u16::try_from(x).ok()).collect();
+        Some(std::ffi::OsString::from_wide(&w?).into())
+    }
+
+    #[cfg(unix)]
+    fn units(p: &Path) -> Vec<u32> {
+        use std::os::unix::ffi::OsStrExt;
+        p.as_os_str().as_bytes().iter().map(|&b| b as u32).collect()
+    }
+
+    #[cfg(unix)]
+    fn from_units(u: &[u32]) -> Option<PathBuf> {
+        use std::os::unix::ffi::OsStringExt;
+        let b: Option<Vec<u8>> = u.iter().map(|&x| u8::try_from(x).ok()).collect();
+        Some(std::ffi::OsString::from_vec(b?).into())
+    }
+
+    pub fn serialize<S: Serializer>(p: &PathBuf, s: S) -> Result<S::Ok, S::Error> {
+        repr(p).serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<PathBuf, D::Error> {
+        path(Repr::deserialize(d)?)
+    }
+
+    pub mod opt {
+        use super::*;
+
+        pub fn serialize<S: Serializer>(p: &Option<PathBuf>, s: S) -> Result<S::Ok, S::Error> {
+            p.as_deref().map(repr).serialize(s)
+        }
+
+        pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<PathBuf>, D::Error> {
+            Option::<Repr>::deserialize(d)?.map(path).transpose()
+        }
+    }
+}
+
 #[cfg(windows)]
 mod imp {
     use super::*;

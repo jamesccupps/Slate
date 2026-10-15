@@ -142,11 +142,41 @@ fn read_copy(path: &Path) -> io::Result<Vec<u8>> {
     fs::read(path)
 }
 
-/// Moves a damaged copy into `damaged/`, so it's neither restored nor deleted.
+/// Moves a damaged copy into `damaged/`, so it isn't restored (deleted `SET_ASIDE_DAYS` later: `prune`).
 fn set_aside(d: &Path, name: &str) {
     let _ = fs::create_dir_all(d.join("damaged"));
-    let _ = fs::rename(d.join(name), d.join("damaged").join(name));
+    let to = d.join("damaged").join(name);
+    if fs::rename(d.join(name), &to).is_ok() {
+        // (its time says when it was set aside)
+        let _ = OpenOptions::new().write(true).open(&to).and_then(|f| f.set_modified(SystemTime::now()));
+    }
     owned().remove(name);
+}
+
+/// How long what was set aside (`damaged/`, `crashed-<time>/`) is kept.
+const SET_ASIDE_DAYS: u64 = 30;
+
+/// Deletes copies set aside in `damaged/`, and sessions in `crashed-<time>/`, over `SET_ASIDE_DAYS` ago.
+fn prune_set_aside(d: &Path) {
+    let age = SET_ASIDE_DAYS * 24 * 3600;
+    let old = |t: SystemTime| t.elapsed().is_ok_and(|a| a.as_secs() > age);
+    if let Ok(rd) = fs::read_dir(d.join("damaged")) {
+        for e in rd.flatten() {
+            if e.metadata().and_then(|m| m.modified()).is_ok_and(old) && e.file_type().is_ok_and(|t| t.is_file()) {
+                let _ = fs::remove_file(e.path());
+            }
+        }
+    }
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |t| t.as_secs());
+    if let Ok(rd) = fs::read_dir(d) {
+        for e in rd.flatten() {
+            let name = e.file_name();
+            let made = name.to_str().and_then(|n| n.strip_prefix("crashed-")).and_then(|t| t.parse::<u64>().ok());
+            if made.is_some_and(|t| now.saturating_sub(t) > age) && e.file_type().is_ok_and(|t| t.is_dir()) {
+                let _ = fs::remove_dir_all(e.path());
+            }
+        }
+    }
 }
 
 /// Creates (or empties) `path` for writing, readable by this user only: it holds their text.
@@ -460,11 +490,16 @@ pub fn restore(app: &mut App, watch: bool) {
         return;
     }
     let d = dir();
+    prune_set_aside(&d);
     let marker = d.join("restoring");
     if watch && marker.exists() {
         let to = put_aside(&d);
         let _ = fs::remove_file(&marker);
-        app.flash(format!("Slate stopped while reopening last time's tabs. Their unsaved text is kept in {}.", to.display()), true);
+        let days = SET_ASIDE_DAYS;
+        app.flash(
+            format!("Slate stopped while reopening last time's tabs. Their unsaved text is kept in {} for {days} days.", to.display()),
+            true,
+        );
         return;
     }
     let s = load(&d);

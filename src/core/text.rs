@@ -831,6 +831,104 @@ pub fn char_len_at(bytes: &[u8]) -> usize {
     }
 }
 
+/// What's wrong with the character `CharCheck` stopped at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BadChar {
+    /// Bytes that aren't UTF-8.
+    NotUtf8,
+    /// A character XML doesn't allow (`xml_char`).
+    NotXml(char),
+}
+
+/// Checks text that comes in pieces (a character may be cut between two), for JSON's and XML's Check: that it's
+/// UTF-8, and for XML that every character is one XML allows. All of a piece at once (the standard library's UTF-8
+/// check, a pass that doesn't stop early for control characters, a search for U+FFFE and U+FFFF), so it costs
+/// little next to reading the markup.
+pub struct CharCheck {
+    xml: bool,
+    /// The start of a character the last piece ended in the middle of, and its offset.
+    carry: [u8; 4],
+    n: usize,
+    at: u64,
+}
+
+impl CharCheck {
+    pub fn new(xml: bool) -> CharCheck {
+        CharCheck { xml, carry: [0; 4], n: 0, at: 0 }
+    }
+
+    /// The first character of `data` (which starts at offset `base`) that isn't allowed, and where it starts (in
+    /// the piece before, for one cut between the two).
+    pub fn feed(&mut self, data: &[u8], base: u64) -> Option<(u64, BadChar)> {
+        let (mut data, mut base) = (data, base);
+        if self.n > 0 {
+            // the rest of the character the last piece ended with
+            let need = utf8_len(self.carry[0]);
+            let take = (need - self.n).min(data.len());
+            self.carry[self.n..self.n + take].copy_from_slice(&data[..take]);
+            self.n += take;
+            match std::str::from_utf8(&self.carry[..self.n]) {
+                Ok(s) => {
+                    self.n = 0;
+                    let c = s.chars().next().unwrap_or(' ');
+                    if self.xml && !xml_char(c) {
+                        return Some((self.at, BadChar::NotXml(c)));
+                    }
+                }
+                // (still cut short: a tiny piece)
+                Err(e) if e.error_len().is_none() => return None,
+                Err(_) => return Some((self.at, BadChar::NotUtf8)),
+            }
+            (data, base) = (&data[take..], base + take as u64);
+        }
+        let valid = match std::str::from_utf8(data) {
+            Ok(_) => data.len(),
+            Err(e) => {
+                let v = e.valid_up_to();
+                if e.error_len().is_some() {
+                    // (a character XML doesn't allow before it comes first)
+                    return self.scan(&data[..v], base).or(Some((base + v as u64, BadChar::NotUtf8)));
+                }
+                // a character cut at the end: the next piece has the rest
+                self.n = data.len() - v;
+                self.carry[..self.n].copy_from_slice(&data[v..]);
+                self.at = base + v as u64;
+                v
+            }
+        };
+        self.scan(&data[..valid], base)
+    }
+
+    /// After the last piece: a character the text ends in the middle of.
+    pub fn finish(&self) -> Option<(u64, BadChar)> {
+        (self.n > 0).then_some((self.at, BadChar::NotUtf8))
+    }
+
+    /// XML: the first character of `s` (UTF-8, whole characters) that XML doesn't allow.
+    fn scan(&self, s: &[u8], base: u64) -> Option<(u64, BadChar)> {
+        if !self.xml {
+            return None;
+        }
+        let control = |b: u8| b < 0x20 && b != b'\t' && b != b'\n' && b != b'\r';
+        // (a pass over all of it, which the compiler can do many bytes at a time; where, only when there is one)
+        let any = s.iter().fold(0u8, |a, &b| a | control(b) as u8);
+        let ctl = if any != 0 { s.iter().position(|&b| control(b)) } else { None };
+        // U+FFFE and U+FFFF: EF BF BE, EF BF BF
+        let nonchar = memchr::memmem::find_iter(s, b"\xEF\xBF").find(|&p| matches!(s.get(p + 2), Some(0xBE | 0xBF)));
+        let p = match (ctl, nonchar) {
+            (Some(a), Some(b)) => a.min(b),
+            (a, b) => a.or(b)?,
+        };
+        Some((base + p as u64, BadChar::NotXml(decode_char(&s[p..]).0)))
+    }
+}
+
+/// XML's `Char`: tab, line feed, carriage return and everything from U+0020 on, but U+FFFE and U+FFFF (surrogates
+/// aren't characters at all).
+pub fn xml_char(c: char) -> bool {
+    matches!(c, '\t' | '\n' | '\r' | '\u{20}'..='\u{FFFD}' | '\u{10000}'..)
+}
+
 /// Decodes one character at the start of `bytes` (invalid bytes decode as U+FFFD, length 1).
 pub fn decode_char(bytes: &[u8]) -> (char, usize) {
     let n = char_len_at(bytes);

@@ -484,18 +484,48 @@ fn remove_after_exit(exe: &Path) {
     // there (winget uninstall, then install) isn't the one deleted.
     let own = dir.join(format!("Slate.old-{}.exe", std::process::id()));
     let exe = if std::fs::rename(exe, &own).is_ok() { own } else { exe.to_path_buf() };
-    let (exe, dir) = (exe.display(), dir.display());
-    let script = format!(
-        "for /l %i in (1,1,30) do @(if exist \"{exe}\" (del /f /q \"{exe}\" 2>nul & ping -n 2 127.0.0.1 >nul)) & \
-         del /f /q \"{dir}\\Slate.old-*.exe\" \"{dir}\\Slate.update-*.exe\" 2>nul & rd \"{dir}\" 2>nul"
-    );
-    let system = std::env::var_os("SystemRoot").map_or(PathBuf::from(r"C:\Windows"), PathBuf::from);
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let _ = cleanup_command(&exe, dir).creation_flags(CREATE_NO_WINDOW).spawn();
+}
+
+/// The hidden `cmd` that deletes `exe`, the leftovers of updates beside it and the folder `dir`. The paths go in
+/// through environment variables, read with delayed expansion (`/v:on`, `!VAR!`): that happens after cmd has
+/// read the line and put in the loop's `%i`, so a `%`, `!`, `^`, `&` or `%i` in a folder's name is just a character.
+fn cleanup_command(exe: &Path, dir: &Path) -> std::process::Command {
+    use std::os::windows::process::CommandExt;
+    let script = "for /l %i in (1,1,30) do @(if exist \"!SLATE_EXE!\" (del /f /q \"!SLATE_EXE!\" 2>nul & \
+                  ping -n 2 127.0.0.1 >nul)) & del /f /q \"!SLATE_DIR!\\Slate.old-*.exe\" \"!SLATE_DIR!\\Slate.update-*.exe\" \
+                  2>nul & rd \"!SLATE_DIR!\" 2>nul";
+    let system = std::env::var_os("SystemRoot").map_or(PathBuf::from(r"C:\Windows"), PathBuf::from);
+    let mut c = std::process::Command::new(system.join(r"System32\cmd.exe"));
     // (cmd takes away the outer quotes)
-    let _ = std::process::Command::new(system.join(r"System32\cmd.exe"))
-        .raw_arg(format!("/d /c \"{script}\""))
-        .current_dir(&system)
-        .creation_flags(CREATE_NO_WINDOW)
-        .spawn();
+    c.raw_arg(format!("/d /v:on /c \"{script}\"")).env("SLATE_EXE", exe).env("SLATE_DIR", dir).current_dir(&system);
+    c
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cleanup_takes_any_folder_name_literally() {
+        // (a name cmd would otherwise read: a variable, the loop's own, an escape, a command separator)
+        let dir = std::env::temp_dir().join(format!("slate-cleanup {} %i 50% !x! ^a &b (c) %PATH%", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("Slate.old-1.exe");
+        for f in [&exe, &dir.join("Slate.update-2.exe")] {
+            std::fs::write(f, b"MZ").unwrap();
+        }
+        let done = cleanup_command(&exe, &dir).status().unwrap();
+        assert!(done.success() || !dir.exists());
+        assert!(!dir.exists(), "{} is still there", dir.display());
+        // a folder with something else in it stays
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&exe, b"MZ").unwrap();
+        std::fs::write(dir.join("notes.txt"), b"mine").unwrap();
+        cleanup_command(&exe, &dir).status().unwrap();
+        assert!(!exe.exists() && dir.join("notes.txt").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

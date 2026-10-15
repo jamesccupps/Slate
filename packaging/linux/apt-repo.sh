@@ -2,8 +2,9 @@
 # Makes Slate's apt repository from a release's .deb files: <out>/apt/{pool,dists/stable}, the Release file signed
 # with the key in $APT_SIGNING_KEY (ASCII-armored, no passphrase), and the keyring next to it. The Pages workflow
 # (.github/workflows/apt.yml) publishes <out> at https://jamesccupps.github.io/Slate/ (with the site's pages from
-# site/) when a release is published, and again every month: the Release file is valid for a year from signing
-# (Valid-Until), so apt never takes an old one for current, and each run signs it anew.
+# site/) when a release is published. The Release file has no Valid-Until: once nobody signed it again for a while,
+# an expiry would make `apt update` fail on every system with Slate (and so stop its other updates), which is worse
+# than what it guards against (an old index served again only keeps Slate at that version: apt doesn't downgrade).
 # Users' systems read it through /etc/apt/sources.list.d/slate.list, which the package itself adds:
 #   deb [signed-by=/usr/share/keyrings/slate-archive-keyring.gpg] https://jamesccupps.github.io/Slate/apt stable main
 #   packaging/linux/apt-repo.sh <dir with the .debs> <out dir>
@@ -39,7 +40,6 @@ apt-ftparchive \
     -o APT::FTPArchive::Release::Architectures="amd64 arm64 armhf i386" \
     -o APT::FTPArchive::Release::Components=main \
     -o APT::FTPArchive::Release::Description="Slate, a fast text editor for files of any size" \
-    -o APT::FTPArchive::Release::ValidTime=31536000 \
     release dists/stable > Release
 mv Release dists/stable/Release
 

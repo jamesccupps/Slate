@@ -57,6 +57,7 @@
   .brand h1 { margin: 0; font-size: 44px; font-weight: 600; letter-spacing: -0.5px; }
   .tagline { font-size: 22px; margin: 18px 0 6px; max-width: 640px; }
   .facts { color: #a9c6e2; margin: 0 0 26px; }
+  .facts small { display: block; font-size: 13px; opacity: .8; margin-top: 2px; }
   .actions { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
   .btn { display: inline-flex; align-items: center; gap: 10px; padding: 12px 22px; border-radius: 8px; font-weight: 600;
          text-decoration: none; background: #fff; color: #0d365c; font-size: 17px; }
@@ -99,7 +100,8 @@
   <div class="wrap">
     <div class="brand"><img src="images/icon-256.png" alt=""><h1>Slate</h1></div>
     <p class="tagline">A fast, simple text editor that opens files of any size.</p>
-    <p class="facts">An 810 MB JSON file on screen in 14 ms. All 435,571 matches of a search in it counted in 0.3 s.</p>
+    <p class="facts">An 810 MB JSON file on screen in 14 ms. All 435,571 matches of a search in it counted in 0.3 s.
+      <small>Measured on a PC with an NVMe drive, the file already in Windows' cache.</small></p>
     <div class="actions">
       <a class="btn" id="primary" href="https://github.com/jamesccupps/Slate/releases/latest/download/Slate.exe">Download for Windows <small id="primary-note">Slate.exe, signed</small></a>
       <a class="btn ghost" id="secondary" href="#linux">Linux and Raspberry Pi</a>
@@ -141,8 +143,8 @@
       <div class="card" id="linux">
         <h3>Linux and Raspberry Pi (64-bit)</h3>
         <p>In a terminal; the package adds Slate's apt repository, so <code>sudo apt upgrade</code> keeps it up to date:</p>
-        <div class="cmd"><button class="copy" type="button">Copy</button><pre>wget -O /tmp/slate.deb https://github.com/jamesccupps/Slate/releases/latest/download/slate-linux-$(dpkg --print-architecture).deb
-sudo apt install /tmp/slate.deb</pre></div>
+        <div class="cmd"><button class="copy" type="button">Copy</button><pre>f=$(mktemp --suffix=.deb) && wget -O "$f" https://github.com/jamesccupps/Slate/releases/latest/download/slate-linux-$(dpkg --print-architecture).deb && chmod 644 "$f" && sudo apt install "$f"</pre></div>
+        <p style="margin-top:8px;font-size:14px">64-bit only (amd64 and arm64): 32-bit Raspberry Pi OS (armhf) isn't supported.</p>
         <p style="margin-top:10px">Or add the repository yourself and install it by name:</p>
         <div class="cmd"><button class="copy" type="button">Copy</button><pre>sudo wget -O /usr/share/keyrings/slate-archive-keyring.gpg https://jamesccupps.github.io/Slate/apt/slate-archive-keyring.gpg
 echo "deb [signed-by=/usr/share/keyrings/slate-archive-keyring.gpg] https://jamesccupps.github.io/Slate/apt stable main" | sudo tee /etc/apt/sources.list.d/slate.list
@@ -167,7 +169,10 @@ sudo apt update && sudo apt install slate</pre></div>
   var ua = navigator.userAgent || "";
   var platform = (navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || "";
   var linux = /Linux|X11|CrOS/i.test(platform + " " + ua) && !/Android/i.test(ua);
-  var mac = /Mac/i.test(platform) && !/iPhone|iPad/i.test(ua);
+  // (an iPad says it's a Mac, but has a touch screen)
+  var phone = /Android|iPhone|iPad|iPod/i.test(ua) || (navigator.userAgentData && navigator.userAgentData.mobile) ||
+    (/Mac/i.test(platform) && navigator.maxTouchPoints > 1);
+  var mac = /Mac/i.test(platform) && !phone;
   var primary = document.getElementById("primary"), note = document.getElementById("primary-note");
   var secondary = document.getElementById("secondary");
   if (linux) {
@@ -176,6 +181,11 @@ sudo apt update && sudo apt install slate</pre></div>
     note.textContent = "apt, 64-bit";
     secondary.href = "https://github.com/jamesccupps/Slate/releases/latest/download/Slate.exe";
     secondary.textContent = "Windows";
+  } else if (phone) {
+    // (Slate.exe is no use on a phone: the release, to get it for a PC)
+    primary.href = "https://github.com/jamesccupps/Slate/releases/latest";
+    primary.firstChild.nodeValue = "Get Slate for your PC ";
+    note.textContent = "Windows and Linux";
   } else if (mac) {
     note.textContent = "Windows and Linux only for now";
   }
@@ -188,8 +198,22 @@ sudo apt update && sudo apt install slate</pre></div>
   // Copy buttons on the commands
   document.querySelectorAll("button.copy").forEach(function (b) {
     b.addEventListener("click", function () {
-      var text = b.parentNode.querySelector("pre").textContent.trim();
-      navigator.clipboard.writeText(text).then(function () { b.textContent = "Copied"; setTimeout(function () { b.textContent = "Copy"; }, 1500); });
+      var pre = b.parentNode.querySelector("pre");
+      var said = function (msg) { b.textContent = msg; setTimeout(function () { b.textContent = "Copy"; }, 2000); };
+      // (when the browser doesn't let the page copy: the text selected, to copy by hand)
+      var select = function () {
+        var r = document.createRange();
+        r.selectNodeContents(pre);
+        var s = window.getSelection();
+        s.removeAllRanges();
+        s.addRange(r);
+        said("Selected: copy it");
+      };
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(pre.textContent.trim()).then(function () { said("Copied"); }, select);
+      } else {
+        select();
+      }
     });
   });
 })();

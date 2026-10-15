@@ -3,9 +3,8 @@
 # APT_SIGNING_KEY (packaging/linux/apt-repo.sh). Installed packages add the repository
 # (/etc/apt/sources.list.d/slate.list), so apt upgrade brings the new version.
 # Runs when a release is published (on its tag, which Pages doesn't publish from, so it starts itself again on main),
-# when the page or its images change on main, and once a month: the repository's Release file is valid for a year
-# from signing (packaging/linux/apt-repo.sh), and each run signs it anew. (GitHub stops the monthly run after 60 days
-# without activity in the repository: then start it by hand, Actions > apt repository > Run workflow, within the year.)
+# and when the page, its images or the repository's scripts change on main. (The Release file doesn't expire, so
+# nothing has to be signed again on a schedule: packaging/linux/apt-repo.sh.)
 name: apt repository
 
 on:
@@ -14,8 +13,6 @@ on:
   push:
     branches: [main]
     paths: ["site/**", "docs/images/**", ".github/workflows/apt.yml", "packaging/linux/apt-repo.sh", "packaging/linux/slate-archive-keyring.gpg"]
-  schedule:
-    - cron: "23 5 7 * *"
   workflow_dispatch:
 
 permissions:

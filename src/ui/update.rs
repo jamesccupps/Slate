@@ -226,7 +226,7 @@ pub fn download(rel: &Release, ctx: &Ctx) -> Result<PathBuf, String> {
         let _ = fs::remove_file(&tmp);
         return Err(format!("Can't write to {} ({e})", dir.display()));
     }
-    if let Err(e) = same_publisher(signer_of(&me).as_ref(), signer_of(&tmp).as_ref()) {
+    if let Err(e) = same_publisher(&signer_of(&me), &signer_of(&tmp)) {
         let _ = fs::remove_file(&tmp);
         return Err(e);
     }
@@ -244,6 +244,18 @@ pub struct Signer {
     pub ids: Vec<String>,
 }
 
+/// What a file's Authenticode signature says on this PC.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Signature {
+    /// It has none (0.7.0 and older, a local build).
+    None,
+    /// It checks out here: who signed it.
+    Valid(Signer),
+    /// It has one that doesn't check out on this PC (a root certificate it doesn't have or doesn't trust, a policy,
+    /// a file changed since it was signed): WinVerifyTrust's answer.
+    Unverified(i32),
+}
+
 /// Identities besides the running exe's own that an update may be signed with. Artifact Signing's identity changes
 /// when it's validated again (a new name or address, a new account): add the new one's usage here one release before
 /// signing with it, so the copies out there take it.
@@ -252,25 +264,35 @@ const ALSO_TRUSTED: &[&str] = &[];
 /// An update has to come from the publisher this Slate came from: when the running exe's signature checks out on
 /// this PC, the download's must as well, by the same name and with every identity the running one's names (or by an
 /// identity in `ALSO_TRUSTED`). A Slate that isn't signed (0.7.0 and older, a local build) has nothing to compare
-/// with and goes by the checksum alone.
-pub fn same_publisher(current: Option<&Signer>, new: Option<&Signer>) -> Result<(), String> {
-    match (current, new) {
-        (None, _) => Ok(()),
-        (Some(a), Some(b)) if a.name == b.name && a.ids.iter().all(|id| b.ids.contains(id)) => Ok(()),
-        (Some(_), Some(b)) if b.ids.iter().any(|id| ALSO_TRUSTED.contains(&id.as_str())) => Ok(()),
-        (Some(a), Some(b)) if a.name == b.name => Err(format!(
+/// with and goes by the checksum alone. One that is signed but whose signature can't be checked on this PC
+/// doesn't update itself: the checksum alone comes from the same release, so it would take whatever that holds.
+pub fn same_publisher(current: &Signature, new: &Signature) -> Result<(), String> {
+    let a = match current {
+        Signature::None => return Ok(()),
+        Signature::Unverified(code) => {
+            return Err(format!(
+                "This Slate is signed, but Windows can't check its signature on this PC (0x{:08X}), so it doesn't \
+                 install updates by itself: download the new version from github.com/jamesccupps/Slate",
+                *code as u32
+            ));
+        }
+        Signature::Valid(a) => a,
+    };
+    match new {
+        Signature::Valid(b) if a.name == b.name && a.ids.iter().all(|id| b.ids.contains(id)) => Ok(()),
+        Signature::Valid(b) if b.ids.iter().any(|id| ALSO_TRUSTED.contains(&id.as_str())) => Ok(()),
+        Signature::Valid(b) if a.name == b.name => Err(format!(
             "The download is signed by {} with another identity than this Slate's, so it wasn't installed: download \
              the new version from github.com/jamesccupps/Slate",
             a.name
         )),
-        (Some(a), _) => Err(format!("The download isn't signed by {} like this Slate is, so it wasn't installed", a.name)),
+        _ => Err(format!("The download isn't signed by {} like this Slate is, so it wasn't installed", a.name)),
     }
 }
 
-/// Who a file is signed by, when its Authenticode signature checks out on this PC; None for a file that isn't signed
-/// or whose signature doesn't. Revocation isn't looked up online (the certificates last days; the signature's
-/// timestamp keeps it valid after).
-pub fn signer_of(path: &Path) -> Option<Signer> {
+/// What a file's Authenticode signature says on this PC (`Signature`). Revocation isn't looked up online (the
+/// certificates last days; the signature's timestamp keeps it valid after).
+pub fn signer_of(path: &Path) -> Signature {
     use windows::Win32::Foundation::{HWND, INVALID_HANDLE_VALUE};
     use windows::Win32::Security::Cryptography::{
         CERT_FIND_EXT_ONLY_ENHKEY_USAGE_FLAG, CERT_NAME_SIMPLE_DISPLAY_TYPE, CTL_USAGE, CertGetEnhancedKeyUsage,
@@ -296,8 +318,12 @@ pub fn signer_of(path: &Path) -> Option<Signer> {
     let mut action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
     let no_ui = HWND(INVALID_HANDLE_VALUE.0);
     let mut found = None;
+    // (TRUST_E_NOSIGNATURE: not signed at all)
+    const NO_SIGNATURE: i32 = 0x800B_0100_u32 as i32;
+    let answer;
     unsafe {
-        if WinVerifyTrust(no_ui, &mut action, &mut data as *mut _ as *mut _) == 0 {
+        answer = WinVerifyTrust(no_ui, &mut action, &mut data as *mut _ as *mut _);
+        if answer == 0 {
             let prov = WTHelperProvDataFromStateData(data.hWVTStateData);
             let signer = if prov.is_null() { std::ptr::null_mut() } else { WTHelperGetProvSignerFromChain(prov, 0, false, 0) };
             if !signer.is_null() && !(*signer).pasCertChain.is_null() {
@@ -329,7 +355,11 @@ pub fn signer_of(path: &Path) -> Option<Signer> {
         data.dwStateAction = WTD_STATEACTION_CLOSE;
         WinVerifyTrust(no_ui, &mut action, &mut data as *mut _ as *mut _);
     }
-    found
+    match (answer, found) {
+        (0, Some(s)) => Signature::Valid(s),
+        (NO_SIGNATURE, _) => Signature::None,
+        (code, _) => Signature::Unverified(code),
+    }
 }
 
 /// Whether Slate can replace itself where it is (not, say, in Program Files without administrator rights).
@@ -554,34 +584,40 @@ mod tests {
 
     #[test]
     fn updates_come_from_the_same_publisher() {
-        let signer = |name: &str, ids: &[&str]| Signer { name: name.into(), ids: ids.iter().map(|s| s.to_string()).collect() };
+        use Signature::{None as Unsigned, Unverified, Valid};
+        let signer = |name: &str, ids: &[&str]| Valid(Signer { name: name.into(), ids: ids.iter().map(|s| s.to_string()).collect() });
         let me = signer("James Cupps", &["1.3.6.1.4.1.311.97.5.6.7.8"]);
-        assert!(same_publisher(None, None).is_ok());
-        assert!(same_publisher(None, Some(&signer("Someone", &[]))).is_ok());
-        assert!(same_publisher(Some(&me), Some(&me)).is_ok());
+        assert!(same_publisher(&Unsigned, &Unsigned).is_ok());
+        assert!(same_publisher(&Unsigned, &signer("Someone", &[])).is_ok());
+        assert!(same_publisher(&me, &me).is_ok());
         // (a usage added later is fine; one missing isn't, and that's said)
         let more = signer("James Cupps", &["1.3.6.1.4.1.311.97.2.3.4.5", "1.3.6.1.4.1.311.97.5.6.7.8"]);
-        assert!(same_publisher(Some(&me), Some(&more)).is_ok());
-        let other = same_publisher(Some(&me), Some(&signer("James Cupps", &["1.3.6.1.4.1.311.97.9.9.9.9"])));
+        assert!(same_publisher(&me, &more).is_ok());
+        let other = same_publisher(&me, &signer("James Cupps", &["1.3.6.1.4.1.311.97.9.9.9.9"]));
         assert!(other.is_err_and(|e| e.contains("another identity")));
-        assert!(same_publisher(Some(&me), Some(&signer("Someone else", &me.ids.iter().map(|s| s.as_str()).collect::<Vec<_>>()))).is_err());
-        assert!(same_publisher(Some(&me), None).is_err());
+        assert!(same_publisher(&me, &signer("Someone else", &["1.3.6.1.4.1.311.97.5.6.7.8"])).is_err());
+        assert!(same_publisher(&me, &Unsigned).is_err());
+        assert!(same_publisher(&me, &Unverified(0x800B_0109_u32 as i32)).is_err());
         // a signer without such usages: the name alone, as before
-        assert!(same_publisher(Some(&signer("James Cupps", &[])), Some(&me)).is_ok());
+        assert!(same_publisher(&signer("James Cupps", &[]), &me).is_ok());
+        // signed, but not checked out here: no update by itself, whatever the download is
+        let here = same_publisher(&Unverified(0x800B_0109_u32 as i32), &me);
+        assert!(here.is_err_and(|e| e.contains("can't check its signature") && e.contains("0x800B0109")));
     }
 
     #[test]
     fn signers() {
         // The test program isn't signed. Signed Slate.exe files are tried when there are some: they must all be the
         // same publisher's (SLATE_SIGNED_EXE=<path>;<path>... cargo test --lib signers)
-        assert_eq!(signer_of(&std::env::current_exe().unwrap()), None);
+        assert_eq!(signer_of(&std::env::current_exe().unwrap()), Signature::None);
         if let Some(list) = std::env::var_os("SLATE_SIGNED_EXE") {
-            let signers: Vec<Signer> = std::env::split_paths(&list).map(|p| signer_of(&p).expect("signed")).collect();
+            let signers: Vec<Signature> = std::env::split_paths(&list).map(|p| signer_of(&p)).collect();
             for a in &signers {
-                assert_eq!(a.name, "James Cupps");
-                assert!(!a.ids.is_empty(), "{a:?}");
+                let Signature::Valid(s) = a else { panic!("not signed, or not checked out: {a:?}") };
+                assert_eq!(s.name, "James Cupps");
+                assert!(!s.ids.is_empty(), "{a:?}");
                 for b in &signers {
-                    assert!(same_publisher(Some(a), Some(b)).is_ok(), "{a:?} {b:?}");
+                    assert!(same_publisher(a, b).is_ok(), "{a:?} {b:?}");
                 }
             }
         }

@@ -42,6 +42,8 @@ pub const BACKUP_LIMIT: u64 = 64 << 20;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct SessionTab {
+    /// (a name that isn't valid Unicode as its UTF-16 units: `json_path`)
+    #[serde(default, with = "crate::core::os::json_path::opt")]
     pub path: Option<PathBuf>,
     #[serde(default)]
     pub untitled: u32,
@@ -581,11 +583,27 @@ fn set_aside_in(d: &Path, name: &str) {
 }
 
 /// How long what was set aside in `damaged\` is kept.
-const DAMAGED_DAYS: u64 = 30;
+pub const DAMAGED_DAYS: u64 = 30;
 
-/// Deletes what was set aside in `damaged\` over `DAMAGED_DAYS` ago.
+/// Deletes what was set aside in `damaged\`, and sessions set aside in `crashed-<time>\` (Slate stopped while
+/// putting them back: `put_aside`), over `DAMAGED_DAYS` ago.
 pub fn prune_damaged() {
-    prune_damaged_in(&dir().join("damaged"), Duration::from_secs(DAMAGED_DAYS * 24 * 3600));
+    let age = Duration::from_secs(DAMAGED_DAYS * 24 * 3600);
+    prune_damaged_in(&dir().join("damaged"), age);
+    prune_crashed_in(&dir(), age);
+}
+
+/// Deletes the `crashed-<time>` folders in `dir` from over `age` ago (the time in the name, when it was made).
+fn prune_crashed_in(dir: &Path, age: Duration) {
+    let Ok(rd) = fs::read_dir(dir) else { return };
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |t| t.as_secs());
+    for e in rd.flatten() {
+        let name = e.file_name();
+        let made = name.to_str().and_then(|n| n.strip_prefix("crashed-")).and_then(|t| t.parse::<u64>().ok());
+        if made.is_some_and(|t| now.saturating_sub(t) > age.as_secs()) && e.file_type().is_ok_and(|t| t.is_dir()) {
+            let _ = fs::remove_dir_all(e.path());
+        }
+    }
 }
 
 fn prune_damaged_in(dir: &Path, age: Duration) {
@@ -2175,6 +2193,18 @@ mod tests {
         prune_damaged_in(&dir, Duration::from_secs(DAMAGED_DAYS * 24 * 3600));
         assert!(!dir.join("old.pieces").exists());
         assert!(dir.join("new.pieces").exists());
+        // sessions set aside after a crash: by the time in their names
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        for t in [now - 40 * 24 * 3600, now - 3600] {
+            let name = format!("crashed-{t}");
+            fs::create_dir_all(dir.join(&name).join("sub")).unwrap();
+            fs::write(dir.join(&name).join("session.json"), b"{}").unwrap();
+        }
+        fs::create_dir_all(dir.join("crashed-x")).unwrap();
+        prune_crashed_in(&dir, Duration::from_secs(DAMAGED_DAYS * 24 * 3600));
+        assert!(!dir.join(format!("crashed-{}", now - 40 * 24 * 3600)).exists());
+        assert!(dir.join(format!("crashed-{}", now - 3600)).join("session.json").exists());
+        assert!(dir.join("crashed-x").exists());
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -2192,6 +2222,24 @@ mod tests {
         assert_eq!(back.replaces.as_deref(), Some("tab-before"));
         assert_eq!(back.tab.unwrap().path, Some(PathBuf::from(r"C:\x\big.log")));
         assert!(decode_pieces(&bytes[..bytes.len() - 1]).is_none());
+    }
+
+    #[test]
+    fn a_name_that_isnt_unicode_is_kept() {
+        use std::os::windows::ffi::OsStringExt;
+        // (a lone surrogate: Windows allows it in a name, JSON's strings can't hold it)
+        let odd = PathBuf::from(std::ffi::OsString::from_wide(&[b'C' as u16, b':' as u16, b'\\' as u16, 0xD800, b'x' as u16]));
+        for path in [Some(odd), Some(PathBuf::from(r"C:\é\notes.txt")), None] {
+            let st = SessionTab { path: path.clone(), ..SessionTab::untitled() };
+            let json = serde_json::to_string(&st).unwrap();
+            let back: SessionTab = serde_json::from_str(&json).unwrap();
+            assert_eq!(back.path, path, "{json}");
+        }
+        // what earlier versions wrote still reads (a plain string, or no path at all)
+        let old: SessionTab = serde_json::from_str(r#"{"path": "C:\\a.txt"}"#).unwrap();
+        assert_eq!(old.path, Some(PathBuf::from(r"C:\a.txt")));
+        let none: SessionTab = serde_json::from_str(r#"{"untitled": 2}"#).unwrap();
+        assert_eq!(none.path, None);
     }
 
     /// A tab with a big (over `BACKUP_LIMIT`) document over `dir/big.log` (zeros after a first line), indexed, with

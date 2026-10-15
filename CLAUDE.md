@@ -26,6 +26,9 @@ cargo test --lib
 
 - The `windows` crate is pinned to **0.58**: newer versions link through raw-dylib, which needs `dlltool` + an
   assembler that the GNU toolchain doesn't bundle.
+- CI builds with the Rust version in `.github/workflows/build.yml` (`RUST_VERSION`, 1.99.0, as on the development
+  PC): a newer one only on purpose, raised there and here together (`rustup update`), never whatever "stable" is on
+  the day a tag is built. (No `rust-toolchain.toml`: it would make every local build fetch a second toolchain.)
 - `build.rs` writes the resource object (manifest, icon, version info) itself; there is no rc.exe/windres.
 - `scripts/load-config.ps1 -Exe <exe>` runs after every release build (CI's, and `build.cmd`'s): GNU ld doesn't fill in
   the PE's load configuration, so the script points it at `_load_config_used` in `src/main.rs`, whose
@@ -72,14 +75,14 @@ icons) and a tarball, each with a `.sha256`.
    actions are pinned to commits (the version in a comment); Dependabot (`.github/dependabot.yml`) proposes newer
    ones monthly.
 4. Publishing the release runs `.github/workflows/apt.yml` (named "apt repository"; it also publishes the website, and
-   runs again when `site/` or `docs/images/` change on `main`, and monthly) (it starts itself again on `main`, as
+   runs again when `site/`, `docs/images/` or the apt scripts change on `main`) (it starts itself again on `main`, as
    GitHub Pages only publishes from there): `packaging/linux/apt-repo.sh` makes the apt repository from the latest
    release's `.deb`s, signed with `APT_SIGNING_KEY` (its job runs in the `apt` environment: the secret belongs
    there, the environment limited to `main`), and Pages (Source: GitHub Actions) publishes it at
-   `https://jamesccupps.github.io/Slate/apt` (suite `stable`, component `main`). The Release file is valid for a year
-   from signing (`Valid-Until`) and the monthly run signs it again; GitHub stops a schedule after 60 days without
-   activity in the repository, so then run it by hand (Actions → apt repository → Run workflow) within the year, or
-   every system's `apt update` refuses the repository. Every `.deb` brings the keyring
+   `https://jamesccupps.github.io/Slate/apt` (suite `stable`, component `main`). The Release file has no `Valid-Until`
+   (since 0.12.2; 0.9.1 to 0.12.1 signed it for a year, re-signed monthly): an expiry breaks `apt update` on every
+   system with Slate once nobody signs it again (GitHub stops schedules after 60 days without activity), which is
+   worse than an old index served again (it only keeps Slate at that version). Every `.deb` brings the keyring
    (`packaging/linux/slate-archive-keyring.gpg` → `/usr/share/keyrings/`) and adds
    `/etc/apt/sources.list.d/slate.list` when installed (removed with the package), so `apt upgrade` updates Slate.
    The private key's only other copy is on the development PC in `%USERPROFILE%\.slate-apt-key` (never in the
@@ -207,10 +210,14 @@ lighter one on dark), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate`, `$
     saying which line of the source each one is; `LineMap::through` maps a filter of a filter to the first text.
     400 MB, 809,820 lines kept: 0.3 s.
   - `json.rs` — one streaming tokenizer for pretty-print / minify / validate (JSON Lines OK), errors with offsets;
-    comments (JSONC) are refused with a message saying so.
+    comments (JSONC) are refused with a message saying so. Check (`Mode::Validate`) is stricter than Format: UTF-8
+    only, and several values only one per line. The characters are checked beside the parse, on a second thread
+    (`beside_chars` with `text::CharCheck`, the first error in file order wins), so Check takes no longer.
   - `xml.rs` — the same for XML (well-formedness check; markup separated only by whitespace with a line break goes
     on its own line, text is kept exactly, and nothing is added inside an element once it has text, so mixed content
     keeps its meaning; whitespace-only elements, spaces between elements on one line and `xml:space="preserve"` stay).
+    Check also wants XML's characters (`text::xml_char`, beside the parse as for JSON), character references to them,
+    the declaration only at offset 0, and a name after `<?`.
   - `lines.rs` — sort (natural: numbers with signs and decimals, case and accents ignored), remove duplicate / blank
     lines, trim line ends, change case. Lines are (start, length) pairs into the text (8 bytes each); a big sort runs
     on up to 8 threads (runs sorted side by side, then merged); whole documents up to 512 MB and `COUNT_MAX` (32 M)
@@ -276,7 +283,8 @@ lighter one on dark), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate`, `$
     only copies this Slate wrote or read are deleted, copies no tab names come back as tabs, names `tab-<time>-<pid>-<n>`
     and only `tab-…txt` read, written every 5 s on another thread when it changed and in place on closing (a write
     that fails leaves the tab's last copy listed, and closing then asks about every unsaved tab), a `restoring` mark
-    while the tabs are put back: still there at the next start, the session goes into `crashed-<time>/`),
+    while the tabs are put back: still there at the next start, the session goes into `crashed-<time>/`; that and
+    `damaged/` are deleted 30 days later),
     `testmode.rs` (`slate --test script` under Xvfb: commands at the top of the file; shots through
     `WidgetPaintable`). Not on Linux yet: the structure panel and path bar, show whitespace, bracket matching,
     overtype, high contrast, word counts, the Encoding / Indentation / Font menus, big unsaved documents in the
@@ -325,16 +333,21 @@ lighter one on dark), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate`, `$
     measures each lexer on the files in a folder.
   - `app.rs` state, layout and painting; `actions.rs` input, commands, background jobs, saving and closing;
     `editor.rs` the text view; `structure.rs` path bar + structure panel; `findbar.rs`; `session.rs` (tabs and
-    unsaved text kept between runs); `settings.rs` (data folder, portable mode); `install.rs` ("Open with" entries
+    unsaved text kept between runs; a path that isn't valid Unicode is kept as UTF-16 units, `os::json_path`, and
+    arguments, drops and handed-over paths stay `OsString`s); `settings.rs` (data folder, portable mode); `install.rs`
+    ("Open with" entries
     in HKCU, never for what Windows runs when it's double-clicked, `NOT_REGISTERED`: .bat, .cmd, .vbs, .js, .reg,
     .py…, nor .ts — registered, they made Windows ask how to open a .bat with only Slate offered, and 0.8.2 takes
     that back once at start, a choice of Slate for .bat/.cmd included; `Slate.exe --install` does the setup
     silently for winget and scripts; Help → Stop opening files with Slate… / `--unassociate` takes back the file
     part, every UserChoice naming Slate included, and Slate stays installed; `--uninstall --quiet` removes it all, the
-    installed copy too when it's the one running, by a hidden `cmd` once it has ended; CI runs all three on a
+    installed copy too when it's the one running, by a hidden `cmd` once it has ended (the paths in environment
+    variables read with `!`, `cleanup_command`, so no folder name is taken as a command); CI runs all three on a
     runner); `update.rs` (updates from GitHub releases: WinHTTP, SHA-256 check, from 0.8.1 the same
     publisher's signature when the running exe's own signature checks out (`signer_of`: WinVerifyTrust, no online
-    revocation lookup; the name, and from 0.9.1 the identity usages too), swap the exe, restart with
+    revocation lookup; the name, and from 0.9.1 the identity usages too; from 0.12.2 a running exe whose signature
+    Windows can't check, for any reason but "not signed", installs nothing by itself: `Signature::Unverified`), swap
+    the exe, restart with
     `--updated`, undone if the new one doesn't start); `crash.rs` (a minidump next to crash.log on a native crash,
     written by a thread waiting for it from the start; Help → Report a problem opens a filled-in GitHub issue form
     the user sends themselves; the version string with the commit, which build.rs passes in); `prompt.rs` (prompts
@@ -438,8 +451,8 @@ lighter one on dark), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate`, `$
 - The session (session.rs) holds that unsaved text, so: files are flushed to disk before they replace the old ones;
   reading is lenient (one bad tab or a value from a newer version loses nothing else; settings too); Slate deletes
   only backups it wrote or read itself (names it gives only: `slates_name`), and backups no tab refers to come back as
-  new tabs; restoring that crashes is caught and the session set aside, also a crash a panic doesn't tell (a
-  `restoring` mark, taken away at the first paint). While editing it's written on another thread; closing writes it
+  new tabs; restoring that crashes is caught and the session set aside (`crashed-<time>\`, deleted 30 days later,
+  as `damaged\` is), also a crash a panic doesn't tell (a `restoring` mark, taken away at the first paint). While editing it's written on another thread; closing writes it
   in place. A document that grew past 64 MiB keeps its last copy listed until its first list of pieces is written.
   Documents up to 64 MiB are backed up as a copy. Bigger ones as their pieces: `<name>.pieces` (the piece list, with
   the `Identity` of each file of the user's it reads: stamp, file id, sample hashes; rewritten when the text

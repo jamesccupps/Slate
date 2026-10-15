@@ -1,13 +1,17 @@
 //! Streaming JSON tools: pretty-print, minify and validate documents of any size in one pass (output goes to a
 //! writer, e.g. a temp file). Several top-level values in a row (JSON Lines / NDJSON) are accepted; each one
 //! goes on its own line. Comments (JSONC, like VS Code's settings) are refused with a message saying so, as
-//! formatting would have to drop or move them.
+//! formatting would have to drop or move them. Check (`Mode::Validate`) is stricter than formatting, which only
+//! lays out what's there: values after the first need a line each (JSON Lines), so `{"a":1}{"b":2}`, two documents
+//! run together, isn't called valid; and `run` checks that the text is UTF-8 (RFC 8259) on another thread meanwhile
+//! (`beside_chars`).
 
 use std::io::{self, Write};
 
 use super::buffer::Snapshot;
 use super::job::Ctx;
 use super::source::IndexBuilder;
+use super::text::{BadChar, CharCheck};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
@@ -67,6 +71,14 @@ pub const TOO_DEEP: &str = "It's nested more than 50,000 levels deep, which is m
 /// The message when the text has `//` or `/* */` comments, which plain JSON doesn't allow.
 pub const COMMENTS: &str = "It has comments (JSONC), which plain JSON doesn't allow";
 
+/// Check: bytes that aren't UTF-8 (in a string: anywhere else they're a mistake in the markup anyway).
+pub const NOT_UTF8: &str = "Bytes that aren't UTF-8 text (JSON is UTF-8)";
+
+const CONTROL: &str = "Line break or control character inside a string";
+
+/// Check: a second top-level value on the line of the first.
+pub const SAME_LINE: &str = "Another value on the same line (JSON has one value; JSON Lines, one per line)";
+
 /// Deeper levels aren't indented any further, so absurdly deep input can't turn into gigabytes of spaces.
 const MAX_INDENT: usize = 100;
 
@@ -87,8 +99,9 @@ pub struct Formatter<'w> {
     stats: Stats,
     pos: u64,
     io_err: Option<io::Error>,
-    /// Whitespace seen since the last top-level value ended.
+    /// Whitespace seen since the last top-level value ended, and a line break among it.
     gap: bool,
+    gap_nl: bool,
     /// The last top-level value was a number, true, false or null (which need a space before the next value).
     bare: bool,
     /// Where the `/` of `St::Slash` is, and the state before it.
@@ -128,6 +141,7 @@ impl<'w> Formatter<'w> {
             pos: 0,
             io_err: None,
             gap: false,
+            gap_nl: false,
             bare: false,
             slash_at: 0,
             before_slash: St::Value,
@@ -189,6 +203,7 @@ impl<'w> Formatter<'w> {
     fn value_start(&mut self) {
         if self.stack.is_empty() && self.pending_open.is_none() {
             self.gap = false;
+            self.gap_nl = false;
         }
         if let Some(c) = self.pending_open.take() {
             self.emit(&[c]);
@@ -252,7 +267,7 @@ impl<'w> Formatter<'w> {
                     let rest = &data[i..];
                     let j = memchr::memchr2(b'"', b'\\', rest).unwrap_or(rest.len());
                     if let Some(k) = rest[..j].iter().position(|&c| c < 0x20) {
-                        return Err(err(at + k as u64, "Line break or control character inside a string"));
+                        return Err(err(at + k as u64, CONTROL));
                     }
                     self.emit(&rest[..j]);
                     i += j;
@@ -331,6 +346,7 @@ impl<'w> Formatter<'w> {
                     if matches!(b, b' ' | b'\t' | b'\r' | b'\n') {
                         if self.stack.is_empty() {
                             self.gap = true;
+                            self.gap_nl |= b == b'\n';
                         }
                         i += 1;
                         continue;
@@ -410,7 +426,10 @@ impl<'w> Formatter<'w> {
                             self.st = if *self.stack.last().unwrap() { St::Key } else { St::Value };
                         }
                         (St::After, _) if self.stack.is_empty() && !(self.bare && !self.gap) => {
-                            // Another top-level value (JSON Lines).
+                            // Another top-level value (JSON Lines): Check wants each on a line of its own.
+                            if self.mode == Mode::Validate && !self.gap_nl {
+                                return Err(err(at, SAME_LINE));
+                            }
                             self.st = St::Value;
                             continue;
                         }
@@ -454,7 +473,7 @@ impl<'w> Formatter<'w> {
     }
 }
 
-/// Runs `mode` over the whole snapshot.
+/// Runs `mode` over the whole snapshot (Check: also that it's UTF-8, on another thread meanwhile).
 pub fn run<'w>(
     snap: &Snapshot,
     mode: Mode,
@@ -464,7 +483,57 @@ pub fn run<'w>(
     idx: Option<&'w mut IndexBuilder>,
     ctx: &Ctx,
 ) -> Result<Stats, JsonError> {
-    let mut f = Formatter::new(mode, indent, eol, w, idx);
+    let f = Formatter::new(mode, indent, eol, w, idx);
+    if mode != Mode::Validate {
+        return feed_all(snap, f, ctx);
+    }
+    let (r, bad) = beside_chars(snap, false, ctx, || feed_all(snap, f, ctx), |r| r.as_ref().err().map(|e| e.offset));
+    match (r, bad) {
+        (Err(e), Some((at, _))) if at < e.offset => Err(err(at, NOT_UTF8)),
+        (Ok(_), Some((at, _))) => Err(err(at, NOT_UTF8)),
+        (r, _) => r,
+    }
+}
+
+/// Check: runs `markup` (reading the text's markup) while another thread looks for the first character
+/// `CharCheck` refuses (`xml`: one XML doesn't allow, else bytes that aren't UTF-8), so it adds nothing to the time
+/// Check takes: as a pass of its own it added a tenth on JSON with many characters past ASCII. `stopped` says where
+/// `markup` stopped at a mistake (the other thread needn't look past it); the caller reports the first of the two.
+pub(crate) fn beside_chars<R>(
+    snap: &Snapshot,
+    xml: bool,
+    ctx: &Ctx,
+    markup: impl FnOnce() -> R,
+    stopped: impl FnOnce(&R) -> Option<u64>,
+) -> (R, Option<(u64, BadChar)>) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let stop = AtomicU64::new(u64::MAX);
+    std::thread::scope(|scope| {
+        let chars = scope.spawn(|| {
+            let mut check = CharCheck::new(xml);
+            let (mut pos, mut bad) = (0u64, None);
+            while bad.is_none() && pos < snap.len() && pos < stop.load(Ordering::Relaxed) && !ctx.cancelled() {
+                let end = (pos + (8 << 20)).min(snap.len());
+                let mut at = pos;
+                snap.chunks(pos, end, &mut |c| {
+                    bad = check.feed(c, at);
+                    at += c.len() as u64;
+                    bad.is_none()
+                });
+                pos = end;
+            }
+            if pos >= snap.len() { bad.or_else(|| check.finish()) } else { bad }
+        });
+        let r = markup();
+        if let Some(at) = stopped(&r) {
+            stop.store(at, Ordering::Relaxed);
+        }
+        let bad = chars.join().unwrap_or(None);
+        (r, bad)
+    })
+}
+
+fn feed_all(snap: &Snapshot, mut f: Formatter, ctx: &Ctx) -> Result<Stats, JsonError> {
     let mut pos = 0u64;
     let mut res = Ok(());
     while pos < snap.len() && res.is_ok() {
@@ -520,15 +589,46 @@ mod tests {
         let out = fmt(Mode::Minify, "{\"a\": 1}\n{\"a\": 2}\n\n[3]\n").unwrap();
         assert_eq!(out, "{\"a\":1}\n{\"a\":2}\n[3]");
         let mut f = Formatter::new(Mode::Validate, b"", b"\n", None, None);
-        f.feed(b"1 2 \"three\"").unwrap();
+        f.feed(b"1\n2\r\n  \"three\"").unwrap();
         assert_eq!(f.finish().unwrap().values, 3);
         // values glued together are mistakes, except after a string or a closing bracket
         for bad in ["01", "-01", "1-2", "truefalse", "0.5e3-1", "null1"] {
             assert!(fmt(Mode::Validate, bad).is_err(), "{bad}");
         }
-        for ok in ["{}{}", "[1][2]", "\"a\"\"b\"", "{\"a\":1}\n2"] {
+        for ok in ["{}\n{}", "[1]\r\n[2]", "\"a\"\n\"b\"", "{\"a\":1}\n2"] {
             assert!(fmt(Mode::Validate, ok).is_ok(), "{ok}");
         }
+        // Check: two values on one line are two documents run together, not JSON Lines (Format lays them out)
+        for (bad, at) in [("{}{}", 2), ("[1] [2]", 4), ("1 2", 2), ("\"a\"\"b\"", 3), ("{\"a\":1}\n{} {}", 11)] {
+            assert_eq!(fmt(Mode::Validate, bad).unwrap_err(), err(at, SAME_LINE), "{bad}");
+        }
+        assert_eq!(fmt(Mode::Minify, "{}{} [1]").unwrap(), "{}\n{}\n[1]");
+    }
+
+    #[test]
+    fn check_wants_utf8() {
+        let not = |at| err(at, NOT_UTF8);
+        for (bad, at) in [
+            (&b"\"\xff\""[..], 1),
+            (b"[\"ab\xc3\"]", 4),
+            (b"{\"k\xe9y\": 1}", 3),
+            (b"[\"\xed\xa0\x80\"]", 2),
+            (b"[\"\xf0\x9f\x98\"]", 2),
+            (b"\"caf\xc3", 4),
+        ] {
+            for step in [1, 2, 3, bad.len()] {
+                assert_eq!(fmt_in(Mode::Validate, bad, step).unwrap_err(), not(at), "{bad:?} in pieces of {step}");
+            }
+        }
+        // whole characters, wherever a piece ends
+        let good = "[\"é 日本 😀 \\u00e9\"]\n{\"ключ\": \"значение\"}".as_bytes();
+        for step in 1..=good.len() {
+            assert!(fmt_in(Mode::Validate, good, step).is_ok(), "in pieces of {step}");
+        }
+        // a mistake before the first byte that isn't UTF-8 is the one reported
+        assert_eq!(fmt_in(Mode::Validate, b"[1 \"\xff\"]", 64).unwrap_err().msg, "Expected ',' or ']', found '\"'");
+        // Format and Minify keep the bytes as they are
+        assert_eq!(fmt_in(Mode::Minify, b"[ \"\xff\" ]", 3).unwrap(), b"[\"\xff\"]");
     }
 
     #[test]
@@ -573,16 +673,16 @@ mod tests {
         assert_eq!(fmt(Mode::Minify, "{\"url\": \"http://x/*y*/\"}").unwrap(), "{\"url\":\"http://x/*y*/\"}");
     }
 
-    /// `input` run through `mode` in pieces of `step` bytes.
+    /// `input` run through `mode` in pieces of `step` bytes, as the app does it (`run`: Check looks at the
+    /// characters on another thread).
     fn fmt_in(mode: Mode, input: &[u8], step: usize) -> Result<Vec<u8>, JsonError> {
-        let mut out = Vec::new();
-        {
-            let mut f = Formatter::new(mode, b"\t", b"\r\n", Some(&mut out), None);
-            for c in input.chunks(step) {
-                f.feed(c)?;
-            }
-            f.finish()?;
+        let mut b = crate::core::buffer::Buffer::new();
+        for c in input.chunks(step.max(1)).rev() {
+            b.insert(0, c);
         }
+        let ctx = Ctx { cancel: Default::default(), progress: Default::default() };
+        let mut out = Vec::new();
+        run(&b.snapshot(), mode, b"\t", b"\r\n", Some(&mut out), None, &ctx)?;
         Ok(out)
     }
 

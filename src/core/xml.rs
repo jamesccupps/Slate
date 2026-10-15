@@ -10,7 +10,10 @@
 //! (`<a  x = "1" />` becomes `<a x="1"/>`); comments, CDATA, processing instructions and the DOCTYPE are copied
 //! as they are. Several top-level elements are accepted when formatting, not when checking. Besides the tags
 //! matching, the check catches `]]>` in text, `--` in comments and entities nothing defines (without a DOCTYPE
-//! only the five predefined ones exist).
+//! only the five predefined ones exist), that every character is one XML allows (UTF-8, no control characters but
+//! tab, line feed and carriage return, not U+FFFE or U+FFFF: `run` looks on another thread meanwhile,
+//! `json::beside_chars`; character references here) and the `<?xml ...?>` declaration only at the very start.
+//! Formatting only lays out what's there and lets those pass.
 
 use std::io::{self, Write};
 
@@ -18,6 +21,7 @@ use super::buffer::Snapshot;
 use super::job::Ctx;
 use super::json::Mode;
 use super::source::IndexBuilder;
+use super::text::{BadChar, xml_char};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct XmlError {
@@ -59,6 +63,8 @@ enum St {
     /// In a comment, CDATA section or processing instruction, until `end` (`-->`, `]]>`, `?>`); `run` = how many
     /// of the `-`, `]` or `?` before its `>` were just seen. `dtd`: inside the DOCTYPE.
     Body { end: &'static [u8], run: u8, dtd: bool },
+    /// The name a processing instruction starts with (`<?xml`, `<?xml-stylesheet`), `n` bytes of it so far.
+    PiName { n: u8 },
     /// In the DOCTYPE: `subset` = inside `[...]`, `quote` = the open quote (0 if none), `lt` = how much of `<!--`
     /// or `<?` was just seen in the subset.
     Doctype { subset: bool, quote: u8, lt: u8 },
@@ -113,6 +119,10 @@ pub struct Formatter<'w> {
     value: Vec<u8>,
     /// The name in the current entity reference (it must be one of the five predefined ones without a DOCTYPE).
     ref_name: Vec<u8>,
+    /// The value of the current character reference (`&#169;`), stopping past the last Unicode character.
+    ref_val: u32,
+    /// The start of the current processing instruction's name.
+    pi_name: [u8; 4],
     /// A DOCTYPE came first (it may declare other entities).
     doctype: bool,
     /// How many `]` the text seen last ended with (`]]>` is not allowed in text).
@@ -134,9 +144,22 @@ pub struct Formatter<'w> {
 }
 
 const BAD_BANG: &str = "Expected <!--, <![CDATA[ or <!DOCTYPE";
+/// Check: bytes that aren't UTF-8.
+pub const NOT_UTF8: &str =
+    "Bytes that aren't UTF-8 text (if the file is in another encoding, reopen it in that one: Format \u{2192} Encoding)";
+/// Check: an XML declaration that isn't at the very start.
+const LATE_DECLARATION: &str = "The XML declaration (<?xml ...?>) can only be at the very start of the file";
 const MAX_WS: usize = 1 << 20;
 /// Deeper elements aren't indented any further, so absurdly deep input can't turn into gigabytes of spaces.
 const MAX_INDENT: usize = 100;
+
+/// What Check says about a character it stopped at.
+fn bad_char(bad: BadChar) -> String {
+    match bad {
+        BadChar::NotUtf8 => NOT_UTF8.into(),
+        BadChar::NotXml(c) => format!("A character XML doesn't allow (U+{:04X})", c as u32),
+    }
+}
 
 fn err(offset: u64, msg: impl Into<String>) -> XmlError {
     XmlError { offset, msg: msg.into() }
@@ -220,6 +243,8 @@ impl<'w> Formatter<'w> {
             space: false,
             value: Vec::new(),
             ref_name: Vec::new(),
+            ref_val: 0,
+            pi_name: [0; 4],
             doctype: false,
             brackets: 0,
             mark: 0,
@@ -424,6 +449,7 @@ impl<'w> Formatter<'w> {
                             self.content(at)?;
                             self.ref_at = at;
                             self.ref_name.clear();
+                            self.ref_val = 0;
                             self.emit(b"&");
                             self.st = St::Ref { quote: 0, r: Ref::Start };
                         } else {
@@ -449,6 +475,7 @@ impl<'w> Formatter<'w> {
                             b'&' => {
                                 self.ref_at = at;
                                 self.ref_name.clear();
+                                self.ref_val = 0;
                                 self.emit(b"&");
                                 self.st = St::Ref { quote, r: Ref::Start };
                             }
@@ -579,6 +606,22 @@ impl<'w> Formatter<'w> {
                     if next == Some(Ref::Name) && self.ref_name.len() < 64 {
                         self.ref_name.push(b);
                     }
+                    // a character reference's value (Check: one of the characters XML allows)
+                    match next {
+                        Some(Ref::Dec) => self.ref_val = (self.ref_val * 10 + (b - b'0') as u32).min(0x11_0000),
+                        Some(Ref::Hex) => {
+                            let d = (b as char).to_digit(16).unwrap_or(0);
+                            self.ref_val = (self.ref_val * 16 + d).min(0x11_0000);
+                        }
+                        None if matches!(r, Ref::Dec | Ref::Hex)
+                            && self.mode == Mode::Validate
+                            && !char::from_u32(self.ref_val).is_some_and(xml_char) =>
+                        {
+                            let msg = format!("A reference to a character XML doesn't allow (U+{:04X})", self.ref_val);
+                            return Err(err(self.ref_at, msg));
+                        }
+                        _ => {}
+                    }
                     if next.is_none()
                         && r == Ref::Name
                         && !self.doctype
@@ -605,7 +648,7 @@ impl<'w> Formatter<'w> {
                     b'?' => {
                         self.markup(self.stack.len(), false);
                         self.emit(b"<?");
-                        self.st = St::Body { end: b"?>", run: 0, dtd: false };
+                        self.st = St::PiName { n: 0 };
                     }
                     b'!' => self.st = St::Bang,
                     _ if is_name_start(b) => self.start_tag(b)?,
@@ -642,6 +685,28 @@ impl<'w> Formatter<'w> {
                         self.markup(0, false);
                         self.emit(word);
                         self.st = St::Doctype { subset: false, quote: 0, lt: 0 };
+                    }
+                }
+                St::PiName { n } => {
+                    if is_name(b) && (n > 0 || is_name_start(b)) {
+                        if (n as usize) < self.pi_name.len() {
+                            self.pi_name[n as usize] = b;
+                        }
+                        self.emit(&[b]);
+                        self.st = St::PiName { n: n.saturating_add(1) };
+                    } else {
+                        // the name is over: Check wants one, and `<?xml` (any case) only at the very start
+                        if self.mode == Mode::Validate {
+                            let name = &self.pi_name[..(n as usize).min(4)];
+                            if n == 0 {
+                                return Err(err(self.mark, "Expected a name after \"<?\""));
+                            }
+                            if n == 3 && name.eq_ignore_ascii_case(b"xml") && (self.mark != 0 || name != b"xml") {
+                                return Err(err(self.mark, LATE_DECLARATION));
+                            }
+                        }
+                        self.st = St::Body { end: b"?>", run: 0, dtd: false };
+                        continue; // this byte again, in the instruction's body
                     }
                 }
                 St::Doctype { subset, quote, lt } => {
@@ -744,7 +809,7 @@ impl<'w> Formatter<'w> {
             St::Doctype { .. } | St::Body { dtd: true, .. } => Some("The DOCTYPE is never closed"),
             St::Body { end: b"-->", .. } => Some("The comment is never closed"),
             St::Body { end: b"]]>", .. } => Some("The CDATA section is never closed"),
-            St::Body { .. } => Some("The <?...?> tag is never closed"),
+            St::Body { .. } | St::PiName { .. } => Some("The <?...?> tag is never closed"),
             _ => Some("The file ends inside a tag"),
         };
         if let Some(msg) = msg {
@@ -768,7 +833,7 @@ impl<'w> Formatter<'w> {
     }
 }
 
-/// Runs `mode` over the whole snapshot.
+/// Runs `mode` over the whole snapshot (Check: also every character, on another thread meanwhile).
 pub fn run<'w>(
     snap: &Snapshot,
     mode: Mode,
@@ -778,7 +843,20 @@ pub fn run<'w>(
     idx: Option<&'w mut IndexBuilder>,
     ctx: &Ctx,
 ) -> Result<XmlStats, XmlError> {
-    let mut f = Formatter::new(mode, indent, eol, w, idx);
+    let f = Formatter::new(mode, indent, eol, w, idx);
+    if mode != Mode::Validate {
+        return feed_all(snap, f, ctx);
+    }
+    let markup = || feed_all(snap, f, ctx);
+    let (r, bad) = super::json::beside_chars(snap, true, ctx, markup, |r| r.as_ref().err().map(|e| e.offset));
+    match (r, bad) {
+        (Err(e), Some((at, b))) if at < e.offset => Err(err(at, bad_char(b))),
+        (Ok(_), Some((at, b))) => Err(err(at, bad_char(b))),
+        (r, _) => r,
+    }
+}
+
+fn feed_all(snap: &Snapshot, mut f: Formatter, ctx: &Ctx) -> Result<XmlStats, XmlError> {
     let mut pos = 0u64;
     let mut res = Ok(());
     while pos < snap.len() && res.is_ok() {
@@ -1038,6 +1116,58 @@ mod tests {
         assert!(fmt(Mode::Validate, "<!DOCTYPE a><a b=\"&amp;&#60;&#x3C;&ns:x-1;\">&lt;&#0123;&#xaF;</a>").is_ok());
         assert!(fmt(Mode::Validate, "<a>&lt;&gt;&amp;&quot;&apos; ]] > ]>]</a>").is_ok());
         assert!(fmt(Mode::Validate, "<a><!----><!-- a - b --></a>").is_ok());
+    }
+
+    /// `input` (any bytes, in pieces of `step` bytes) run through `mode` as the app does it (`run`).
+    fn run_bytes(mode: Mode, input: &[u8], step: usize) -> Result<XmlStats, XmlError> {
+        let mut b = crate::core::buffer::Buffer::new();
+        for c in input.chunks(step.max(1)).rev() {
+            b.insert(0, c);
+        }
+        let ctx = Ctx { cancel: Default::default(), progress: Default::default() };
+        run(&b.snapshot(), mode, b"  ", b"\n", None, None, &ctx)
+    }
+
+    #[test]
+    fn check_wants_the_characters_xml_allows() {
+        let char_err = |at, c: u32| err(at, format!("A character XML doesn't allow (U+{c:04X})"));
+        let ref_err = |at, c: u32| err(at, format!("A reference to a character XML doesn't allow (U+{c:04X})"));
+        for (src, want) in [
+            (&b"<a>\x01</a>"[..], char_err(3, 1)),
+            (b"<a b=\"x\x1f\"/>", char_err(7, 0x1F)),
+            (b"<a><!-- \x0b --></a>", char_err(8, 0xB)),
+            (b"<a>\xef\xbf\xbe</a>", char_err(3, 0xFFFE)),
+            (b"<a>caf\xc3\xa9 \xef\xbf\xbf</a>", char_err(9, 0xFFFF)),
+            (b"<a>\xff</a>", err(3, NOT_UTF8)),
+            (b"<a>\xed\xa0\x80</a>", err(3, NOT_UTF8)),
+            (b"<a>x\xe6\x97</a>", err(4, NOT_UTF8)),
+            (b"<a>&#0;</a>", ref_err(3, 0)),
+            (b"<a x='&#8;'/>", ref_err(6, 8)),
+            (b"<a>&#xD800;</a>", ref_err(3, 0xD800)),
+            (b"<a>&#xFFFE;</a>", ref_err(3, 0xFFFE)),
+            (b"<a>&#x110000;</a>", ref_err(3, 0x11_0000)),
+            (b"<a>&#99999999999999999999;</a>", ref_err(3, 0x11_0000)),
+            (b" <?xml version=\"1.0\"?><a/>", err(1, LATE_DECLARATION)),
+            (b"<a/><?xml version=\"1.0\"?>", err(4, LATE_DECLARATION)),
+            (b"<!-- c --><?xml version=\"1.0\"?><a/>", err(10, LATE_DECLARATION)),
+            (b"<?XML version=\"1.0\"?><a/>", err(0, LATE_DECLARATION)),
+            (b"<a><? x?></a>", err(3, "Expected a name after \"<?\"")),
+            // a mistake in the markup before it comes first
+            (b"<a></b>\x01", err(3, "Expected </a> but found </b>")),
+        ] {
+            for step in [1, 2, 3, src.len()] {
+                assert_eq!(run_bytes(Mode::Validate, src, step).unwrap_err(), want, "{src:?} in pieces of {step}");
+            }
+            // formatting lays out what's there: never stopped by a character
+            if let Err(e) = run_bytes(Mode::Pretty, src, 4) {
+                assert!(e.msg != NOT_UTF8 && !e.msg.contains("XML doesn't allow"), "{src:?} formatted: {}", e.msg);
+            }
+        }
+        let fine = "<?xml version=\"1.0\"?><?xml-stylesheet href=\"s.css\"?>\n<a b=\"\t\">\r\n é 日本 😀 \u{7f}\u{85}&#x9;&#xA;&#xD;\
+                    &#x20;&#xD7FF;&#xE000;&#xFFFD;&#x10000;&#x10FFFF;&#1114111;<?pi?></a>";
+        for step in 1..=fine.len() {
+            assert!(run_bytes(Mode::Validate, fine.as_bytes(), step).is_ok(), "in pieces of {step}");
+        }
     }
 
     #[test]

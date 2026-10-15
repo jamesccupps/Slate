@@ -389,7 +389,7 @@ impl std::fmt::Display for SaveError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             SaveError::Cancelled => write!(f, "Saving was cancelled."),
-            SaveError::ReadOnly => write!(f, "The file is read-only."),
+            SaveError::ReadOnly => write!(f, "The file is read-only, or you aren't allowed to change it."),
             SaveError::Lossy => write!(f, "Some characters can't be saved in ANSI."),
             SaveError::Changed => write!(
                 f,
@@ -700,7 +700,8 @@ mod place {
 
     /// Puts the written temp file (`file`, at `temp_path`) in place of `target` (see the module docs). Returns
     /// whether it's there, which file was written (after a POSIX rename, the one now at `target` must still be it),
-    /// and where the original went if ReplaceFile stopped halfway.
+    /// where the original went if ReplaceFile stopped halfway, and (never here: the usual reason, a file in use,
+    /// isn't one an error tells apart) why not.
     pub fn swap_in(
         file: File,
         temp_path: &Path,
@@ -708,7 +709,7 @@ mod place {
         replacing: bool,
         special: bool,
         dir: &Path,
-    ) -> (bool, Option<FileId>, Option<PathBuf>) {
+    ) -> (bool, Option<FileId>, Option<PathBuf>, Option<io::Error>) {
         let mut set_aside = None;
         if special {
             // ReplaceFile first: it keeps what the original has that a new file wouldn't (`special`)
@@ -718,16 +719,16 @@ mod place {
                 false
             });
             if replaced || set_aside.is_some() {
-                return (replaced, None, set_aside);
+                return (replaced, None, set_aside, None);
             }
             // It can't, there: saved all the same, as a new file, the usual way (a POSIX rename replaces a big file
             // Slate still reads; then a plain one).
             if let Ok(f) = OpenOptions::new().access_mode(DELETE | GENERIC_READ).share_mode(SHARE_READ_DELETE).open(verbatim(temp_path)) {
                 if posix_rename(&f, &verbatim(target)).is_ok() {
-                    return (true, stamp_of(&f).map(|s| s.1), None);
+                    return (true, stamp_of(&f).map(|s| s.1), None, None);
                 }
             }
-            return (move_file(temp_path, target), None, None);
+            return (move_file(temp_path, target), None, None, None);
         }
         let posix = posix_rename(&file, &verbatim(target)).is_ok();
         let written = posix.then(|| stamp_of(&file).map(|s| s.1)).flatten();
@@ -739,7 +740,7 @@ mod place {
                     set_aside = Some(backup);
                     false
                 }));
-        (renamed, written, set_aside)
+        (renamed, written, set_aside, None)
     }
 
     /// Whether the save leftover `name` (`.slate-save-…` or `.slate-bak-…`, its metadata `m`) may be deleted once
@@ -832,8 +833,8 @@ mod place {
     }
 
     /// Puts the written temp file (`file`, at `temp_path`) in place of `target`: a rename, atomic, and open files
-    /// keep reading the old one. Returns whether it's there, which file was written, and (never here) where an
-    /// original went.
+    /// keep reading the old one. Returns whether it's there, which file was written, (never here) where an original
+    /// went, and the rename's error.
     pub fn swap_in(
         file: File,
         temp_path: &Path,
@@ -841,15 +842,15 @@ mod place {
         _replacing: bool,
         _special: bool,
         dir: &Path,
-    ) -> (bool, Option<FileId>, Option<PathBuf>) {
-        if fs::rename(temp_path, target).is_err() {
-            return (false, None, None);
+    ) -> (bool, Option<FileId>, Option<PathBuf>, Option<io::Error>) {
+        if let Err(e) = fs::rename(temp_path, target) {
+            return (false, None, None, Some(e));
         }
         // (the rename itself on disk too, before the save counts as done)
         if let Ok(d) = File::open(dir) {
             let _ = d.sync_all();
         }
-        (true, stamp_of(&file).map(|s| s.1), None)
+        (true, stamp_of(&file).map(|s| s.1), None, None)
     }
 
     /// Whether the save leftover `name` may be deleted once the Slate that made it is gone.
@@ -1003,7 +1004,9 @@ pub fn save(
         if m.is_dir() {
             return Err(SaveError::Io("That is a folder, not a file.".into()));
         }
-        if m.permissions().readonly() {
+        // (Linux: also a file of someone else's in a folder this user may write, which a rename would replace,
+        // taking it over; Windows' `can_write` is the read-only test itself)
+        if m.permissions().readonly() || !os::can_write(&target) {
             return Err(SaveError::ReadOnly);
         }
     }
@@ -1067,17 +1070,23 @@ pub fn save(
     // drives) a plain rename, and if that can't replace the file because Slate still has it open, ReplaceFile.
     // (the original's permissions kept on the new file; where they can't be, ReplaceFile tries)
     let special = old.as_ref().is_some_and(|m| place::special(&target, m) || !place::keep_permissions(&target, &file, &temp_path));
-    let (renamed, written, set_aside) = place::swap_in(file, &temp_path, &target, old.is_some(), special, dir);
+    let (renamed, written, set_aside, why) = place::swap_in(file, &temp_path, &target, old.is_some(), special, dir);
     if !renamed {
         let _ = fs::remove_file(&temp_path);
-        return Err(SaveError::Io(match set_aside {
-            Some(b) => format!(
+        return Err(SaveError::Io(match (set_aside, why) {
+            (Some(b), _) => format!(
                 "Windows stopped Slate halfway through replacing the file: the original is now {}. Use Save As to \
                  keep your text.",
                 b.display()
             ),
-            None => "Slate couldn't put the new file in place of the old one (it may be in use). Try again, or use \
-                     Save As."
+            // (Linux: an open file never stops a rename, but in a shared folder like /tmp only a file's owner may
+            // replace it)
+            (None, Some(e)) if e.kind() == io::ErrorKind::PermissionDenied => "You aren't allowed to replace this \
+                file (in a shared folder, only its owner can). Use Save As to save your text somewhere else."
+                .into(),
+            (None, Some(e)) => format!("Slate couldn't put the new file in place of the old one ({e}). Use Save As."),
+            (None, None) => "Slate couldn't put the new file in place of the old one (it may be in use). Try again, or \
+                             use Save As."
                 .into(),
         }));
     }

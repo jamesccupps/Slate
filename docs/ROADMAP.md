@@ -114,6 +114,14 @@ smallest size), and what it found fixed: the tab strip keeps the tab you're on i
 Windows 11's apps use on each theme, status bar messages that went away too late (or, on Linux, never), the find bar's
 matches following the tab on Linux. Details in the [0.12.1 release notes](release-notes-0.12.1.md).
 
+## 0.12.2: the fourth audit
+
+Check as strict as JSON and XML are (UTF-8 and one value per line; XML's characters, character references and the
+declaration's place), with the characters checked on a second thread so it takes no longer; saving leaves alone a
+file you aren't allowed to change; no update by itself where Windows can't check Slate's signature; names that aren't
+valid Unicode kept; the apt repository without an expiry date; the .deb with checksums, a Debian-format copyright and
+a changelog. Details in the [0.12.2 release notes](release-notes-0.12.2.md).
+
 ## Next
 
 1. **Accessibility: screen readers, the rest (M).** The text is read since 0.12.0 (checked in test mode and by a real
