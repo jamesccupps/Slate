@@ -130,6 +130,13 @@ first frame drawn, without the white flash it always had. Sort and the other lin
 go (a 400 MB log sorted in 2.8 s instead of 4.5 s, in 490 MB instead of 830 MB). An idle Slate on Linux sleeps.
 Details in the [0.12.3 release notes](release-notes-0.12.3.md).
 
+## 0.12.4
+
+Windows: a tab of a file opened from inside a zip (Explorer's temp folder, cleaned up later) no longer waits for ever
+after a restart: a folder gone from the PC's own disk counts as gone. "Open files with Slate…" says that Windows asks
+once per kind of file, and afterwards which usual kinds open with Slate. Details in the
+[0.12.4 release notes](release-notes-0.12.4.md).
+
 ## Next
 
 1. **Accessibility: screen readers, the rest (M).** The text is read since 0.12.0 (checked in test mode and by a real
