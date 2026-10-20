@@ -4620,7 +4620,7 @@ pub fn run_cmd(cell: &Cell, cmd: Cmd) {
         Cmd::Open => {
             let (hwnd, dir) = {
                 let a = cell.borrow();
-                (a.hwnd, a.tab().doc.path.as_ref().and_then(|p| p.parent()).map(Path::to_path_buf))
+                (a.hwnd, a.tab().doc.path.as_ref().and_then(|p| p.parent()).map(Path::to_path_buf).or_else(|| recent_folder(&a)))
             };
             let paths = win::open_dialog(hwnd, dir.as_deref());
             if !paths.is_empty() {
@@ -4863,18 +4863,25 @@ fn ask_lossy(cell: &Cell, id: u64) {
     }
 }
 
+/// Where the Open and Save As boxes start for a tab without a file: the folder of the file opened or saved last (Open
+/// recent), unless it's one of Slate's own (its data or program folder); else (`win::start_in`) Documents.
+fn recent_folder(a: &App) -> Option<PathBuf> {
+    let own = |d: &Path| d.starts_with(data_dir()) || d.starts_with(super::install::install_dir());
+    a.settings.recent.iter().filter_map(|p| p.parent()).find(|d| !own(d)).map(Path::to_path_buf)
+}
+
 /// Saves tab `i` (asking for a name when needed). Returns false if the user cancelled or it can't be saved now.
 pub fn save_tab(cell: &Cell, i: usize, ask_name: bool, close_after: bool) -> bool {
-    let (id, path, title, hwnd) = {
+    let (id, path, title, hwnd, recent) = {
         let a = cell.borrow();
         let Some(t) = a.tabs.get(i) else { return false };
-        (t.id, t.doc.path.clone(), t.title(), a.hwnd)
+        (t.id, t.doc.path.clone(), t.title(), a.hwnd, recent_folder(&a))
     };
     let path = match path {
         Some(p) if !ask_name => p,
         other => {
             let name = if other.is_some() { title.clone() } else { format!("{title}.txt") };
-            let dir = other.as_ref().and_then(|p| p.parent()).map(Path::to_path_buf);
+            let dir = other.as_ref().and_then(|p| p.parent()).map(Path::to_path_buf).or(recent);
             match win::save_dialog(hwnd, &name, dir.as_deref()) {
                 Some(p) => p,
                 None => return false,

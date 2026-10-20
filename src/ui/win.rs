@@ -455,6 +455,32 @@ pub fn set_clipboard(hwnd: HWND, text: &[u8]) -> bool {
 
 // ---- file dialogs ----
 
+/// The user's Documents folder.
+pub fn documents_folder() -> Option<PathBuf> {
+    use windows::Win32::UI::Shell::{FOLDERID_Documents, KF_FLAG_DEFAULT, SHGetKnownFolderPath};
+    unsafe {
+        let p = SHGetKnownFolderPath(&FOLDERID_Documents, KF_FLAG_DEFAULT, None).ok()?;
+        let s = p.to_string().ok();
+        CoTaskMemFree(Some(p.0 as _));
+        s.map(PathBuf::from)
+    }
+}
+
+/// Opens a file dialog in `folder`, or (none given, or it isn't there) in Documents. Left to Windows, a new
+/// document's Save As opened wherever Slate was started from: the Start menu's shortcut starts it in its own program
+/// folder.
+fn start_in(dlg: &windows::Win32::UI::Shell::IFileDialog, folder: Option<&Path>) {
+    let item =
+        |d: &Path| unsafe { SHCreateItemFromParsingName::<_, _, IShellItem>(&HSTRING::from(d.as_os_str()), None) }.ok();
+    let mut start = folder.and_then(item);
+    if start.is_none() {
+        start = documents_folder().as_deref().and_then(item);
+    }
+    if let Some(start) = start {
+        let _ = unsafe { dlg.SetFolder(&start) };
+    }
+}
+
 fn item_path(item: &IShellItem) -> Option<PathBuf> {
     unsafe {
         let p: PWSTR = item.GetDisplayName(SIGDN_FILESYSPATH).ok()?;
@@ -491,11 +517,7 @@ pub fn open_dialog(hwnd: HWND, folder: Option<&Path>) -> Vec<PathBuf> {
         let _ = dlg.SetFileTypes(&specs);
         let opts = dlg.GetOptions().unwrap_or_default();
         let _ = dlg.SetOptions(opts | FOS_ALLOWMULTISELECT | FOS_FILEMUSTEXIST | FOS_FORCEFILESYSTEM);
-        if let Some(dir) = folder {
-            if let Ok(item) = SHCreateItemFromParsingName::<_, _, IShellItem>(&HSTRING::from(dir.as_os_str()), None) {
-                let _ = dlg.SetFolder(&item);
-            }
-        }
+        start_in(&dlg, folder);
         if dlg.Show(hwnd).is_err() {
             return Vec::new();
         }
@@ -524,11 +546,7 @@ pub fn save_dialog(hwnd: HWND, name: &str, folder: Option<&Path>) -> Option<Path
         if let Some(ext) = Path::new(name).extension() {
             let _ = dlg.SetDefaultExtension(&HSTRING::from(ext));
         }
-        if let Some(dir) = folder {
-            if let Ok(item) = SHCreateItemFromParsingName::<_, _, IShellItem>(&HSTRING::from(dir.as_os_str()), None) {
-                let _ = dlg.SetFolder(&item);
-            }
-        }
+        start_in(&dlg, folder);
         dlg.Show(hwnd).ok()?;
         let item = dlg.GetResult().ok()?;
         item_path(&item)
