@@ -19,7 +19,8 @@
 //!
 //! Lower level: `down:<x>,<y>` / `move:<x>,<y>` / `up:<x>,<y>` (left button, for drags; also where drag scrolling
 //! sees the pointer; `down:<x>,<y>,right` or `,middle` for the others), `leave` (WM_MOUSELEAVE), `wheelraw:<delta>`
-//! or `wheelraw:ctrl,<delta>` (one WM_MOUSEWHEEL; touchpads send small deltas), `char:<hex>[,<hex>…]` (WM_CHAR
+//! or `wheelraw:ctrl,<delta>` (one WM_MOUSEWHEEL over the text, or with `@<x>,<y>` over that point; touchpads send
+//! small deltas), `char:<hex>[,<hex>…]` (WM_CHAR
 //! through the window procedure, e.g. `char:d83d,de00`), `ime` (WM_IME_COMPOSITION, as typing in an IME), `altkey`
 //! (Alt pressed and released alone: WM_SYSCOMMAND SC_KEYMENU), `altgr:on|off` (pretend Ctrl+Alt+letter types a
 //! character, like AltGr on a Polish keyboard), `activate` / `deactivate` (WM_ACTIVATE), `cancelmode`
@@ -1108,6 +1109,11 @@ pub fn run(args: &[String]) -> i32 {
                 drain_pending(&cell);
             }
             "wheelraw" => {
+                // (`@x,y`: over that point, the tab strip say; else over the text)
+                let (arg, at) = match arg.split_once('@') {
+                    Some((a, p)) => (a, p.split_once(',').and_then(|(x, y)| Some((x.parse::<f32>().ok()?, y.parse::<f32>().ok()?)))),
+                    None => (arg, None),
+                };
                 let (ctrl, delta) = match arg.split_once(',') {
                     Some((m, d)) => (m == "ctrl", d),
                     None => (false, arg),
@@ -1115,7 +1121,7 @@ pub fn run(args: &[String]) -> i32 {
                 super::commands::FORCED_MODS.with(|m| m.set(Some((ctrl, false, false))));
                 {
                     let mut a = cell.borrow_mut();
-                    let (x, y) = (a.r_edit.x + 100.0, a.r_edit.y + 100.0);
+                    let (x, y) = at.unwrap_or((a.r_edit.x + 100.0, a.r_edit.y + 100.0));
                     a.on_wheel(delta.parse().unwrap_or(120), false, x, y);
                     a.hover = Hit::None;
                 }

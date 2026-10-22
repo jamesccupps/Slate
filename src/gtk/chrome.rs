@@ -327,13 +327,27 @@ pub fn paint_status(cr: &cairo::Context, ctx: &pango::Context, app: &App, width:
     let _ = cr.fill();
     let font = pango::FontDescription::from_string("Sans 9");
     let (left, right, bad) = status_texts(app);
+    let layouts: Vec<pango::Layout> = right.iter().map(|s| text_layout(ctx, &font, s, 400.0)).collect();
+    let widths: Vec<f64> = layouts.iter().map(|l| l.pixel_size().0 as f64).collect();
+    // In a narrow window things give way, the least needed first (as on Windows): the indentation, the line endings,
+    // the language. The caret's place keeps its room (a message gets as much).
+    let keep = (text_layout(ctx, &font, &left, 4000.0).pixel_size().0 as f64).min(180.0);
+    let mut shown = vec![true; right.len()];
+    for k in [0, 2, 1] {
+        let used: f64 = widths.iter().zip(&shown).filter(|(_, s)| **s).map(|(w, _)| w + 24.0).sum();
+        if keep <= width - 12.0 - used - 16.0 {
+            break;
+        }
+        if let Some(s) = shown.get_mut(k) {
+            *s = false;
+        }
+    }
     let mut items = Vec::new();
     let mut x = width - 12.0;
-    for (k, s) in right.iter().enumerate().rev() {
-        let l = text_layout(ctx, &font, s, 400.0);
-        let w = l.pixel_size().0 as f64;
+    for (k, l) in layouts.iter().enumerate().rev().filter(|(k, _)| shown[*k]) {
+        let w = widths[k];
         x -= w;
-        draw_text(cr, &l, x, height / 2.0, t.text_dim);
+        draw_text(cr, l, x, height / 2.0, t.text_dim);
         items.push((k, x - 8.0, w + 16.0));
         x -= 24.0;
     }

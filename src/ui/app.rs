@@ -487,10 +487,11 @@ pub struct App {
     pub gfx_generation: u64,
     /// Alt was pressed and released on its own: the menu bar has the keyboard, with this title highlighted.
     pub menu_armed: Option<usize>,
-    /// Mouse wheel movement not scrolled yet (in rows; touchpads send small steps), and for Ctrl+wheel zoom (in
-    /// wheel units).
+    /// Mouse wheel movement not scrolled yet (in rows; touchpads send small steps), for Ctrl+wheel zoom (in wheel
+    /// units), and over the tab strip (in tabs).
     pub wheel_rows: f32,
     pub wheel_zoom: i32,
+    pub wheel_tabs: f32,
     /// Copy or Cut with nothing selected put a whole line on the clipboard: its clipboard sequence number, so a paste
     /// of that line goes in as a line above the caret's.
     pub line_clip: Option<u32>,
@@ -598,6 +599,7 @@ impl App {
             menu_armed: None,
             wheel_rows: 0.0,
             wheel_zoom: 0,
+            wheel_tabs: 0.0,
             line_clip: None,
             flash_search: false,
             disk_job: None,
@@ -783,10 +785,17 @@ impl App {
             avail = (avail - 32.0).max(metrics::TAB_MIN_W);
         }
         let n = self.tabs.len().max(1) as f32;
-        let tw = (avail / n).clamp(metrics::TAB_MIN_W, metrics::TAB_MAX_W);
+        // When they don't all fit, as many whole tabs as fit share the room and the strip scrolls by whole tabs, so
+        // none shows cut off at the edge.
+        let tw = if overflow {
+            avail / (avail / metrics::TAB_MIN_W).floor().max(1.0)
+        } else {
+            (avail / n).clamp(metrics::TAB_MIN_W, metrics::TAB_MAX_W)
+        };
         let total = tw * self.tabs.len() as f32;
         let max_scroll = (total - avail).max(0.0);
-        self.tab_scroll = self.tab_scroll.clamp(0.0, max_scroll);
+        let scroll = if overflow { (self.tab_scroll / tw).round() * tw } else { self.tab_scroll };
+        self.tab_scroll = scroll.clamp(0.0, max_scroll);
         let top = super::gfx::snap(bar.y + 6.0, self.dpi as f32);
         let h = bar.bottom() - top;
         for i in 0..self.tabs.len() {

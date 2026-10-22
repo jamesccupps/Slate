@@ -264,7 +264,7 @@ pub fn run(args: Vec<std::ffi::OsString>) -> i32 {
     application.connect_open(|a, files, _| {
         let ui = window(a, None);
         let paths: Vec<PathBuf> = files.iter().filter_map(|f| f.path()).collect();
-        ui.with(|app| app.open_paths(&paths));
+        ui.with(|app| app.open_handed(&paths));
         ui.window.present();
     });
     application.connect_query_end(|_| {
@@ -1632,6 +1632,7 @@ impl Ui {
         self.css_dark.set(Some(dark));
         let css = format!(
             ".slate-bar {{ background-color: {frame}; padding: 6px 10px; border-bottom: 1px solid {border}; }}
+             .slate-bar button.toggle {{ min-width: 0; padding-left: 6px; padding-right: 6px; }}
              .slate-notice {{ background-color: {notice}; color: {text}; padding: 6px 12px; }}
              .slate-notice label {{ color: {text}; }}
              menubar {{ background-color: {frame}; color: {text}; }}
@@ -1993,6 +1994,9 @@ impl Ui {
     }
 
     fn ask(&self, ask: Ask) {
+        if matches!(ask, Ask::Shortcuts) {
+            return self.show_shortcuts();
+        }
         if let Some(test) = &self.test {
             test.asked.borrow_mut().push(format!("{ask:?}"));
             let answer = test.answers.borrow_mut().pop_front().unwrap_or_default();
@@ -2157,23 +2161,36 @@ impl Ui {
                 });
             }
             Ask::Print { .. } => print::run(self, None),
-            Ask::Shortcuts => {
-                self.with(|a| {
-                    // (the tab that shows them already, if there is one)
-                    let i = match a.tabs.iter().position(|t| t.title_override.as_deref() == Some("Keyboard shortcuts")) {
-                        Some(i) => i,
-                        None => {
-                            let i = a.add_text_tab(SHORTCUTS.as_bytes(), None, Some(Lang::Plain));
-                            a.tabs[i].doc.mark_saved();
-                            a.tabs[i].title_override = Some("Keyboard shortcuts".into());
-                            i
-                        }
-                    };
-                    a.activate(i);
-                    a.dirty_title = true;
-                });
-            }
+            Ask::Shortcuts => self.show_shortcuts(),
         }
+    }
+
+    /// Help → Keyboard shortcuts: in a tab of their own (nothing is asked, also in test mode).
+    fn show_shortcuts(&self) {
+        self.with(|a| {
+            // (the tab that shows them already, if there is one)
+            let i = match a.tabs.iter().position(|t| t.title_override.as_deref() == Some("Keyboard shortcuts")) {
+                Some(i) => i,
+                None => {
+                    // (an untouched empty tab gives way to them, as to a file opened)
+                    let blank = a.tabs.len() == 1 && a.tabs[0].is_blank();
+                    let mut i = a.add_text_tab(SHORTCUTS.as_bytes(), None, Some(Lang::Plain));
+                    a.tabs[i].doc.mark_saved();
+                    a.tabs[i].title_override = Some("Keyboard shortcuts".into());
+                    if blank {
+                        a.tabs.remove(0);
+                        a.active = 0;
+                        a.flash = None;
+                        a.find.found = None;
+                        i = 0;
+                    }
+                    i
+                }
+            };
+            a.activate(i);
+            a.dirty_title = true;
+            a.dirty_view = true;
+        });
     }
 
     /// What was answered (by the user, or by a test script).

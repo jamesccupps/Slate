@@ -239,6 +239,11 @@ impl Tab {
     pub fn saving(&self) -> bool {
         self.save.is_some()
     }
+
+    /// An untouched empty tab (a new window's): what's opened next takes its place.
+    pub fn is_blank(&self) -> bool {
+        self.doc.path.is_none() && self.doc.is_empty() && !self.doc.is_dirty() && !self.busy()
+    }
 }
 
 /// Find and replace.
@@ -474,6 +479,10 @@ impl App {
     /// Opens files (or switches to the tab that has one open already); an untouched empty tab gives way to the
     /// first.
     pub fn open_paths(&mut self, paths: &[PathBuf]) {
+        // (the tab shown changes: a message about the one before goes; see `open_handed`)
+        if !paths.is_empty() {
+            self.flash = None;
+        }
         for p in paths {
             // `notes.txt:120:5`: that file at line 120, when there's no file of that very name. The open finds out,
             // on another thread, as the file system isn't asked here: a network drive that doesn't answer would
@@ -490,10 +499,7 @@ impl App {
                 }
                 continue;
             }
-            let reuse = self.tabs.len() == 1 && {
-                let t = &self.tabs[0];
-                t.doc.path.is_none() && t.doc.is_empty() && !t.doc.is_dirty() && !t.busy()
-            };
+            let reuse = self.tabs.len() == 1 && self.tabs[0].is_blank();
             let mut doc = Document::new();
             doc.path = Some(p.clone());
             let mut tab = self.make_tab(doc);
@@ -517,6 +523,16 @@ impl App {
         }
         self.dirty_title = true;
         self.dirty_view = true;
+    }
+
+    /// Opens files named on a command line (Slate's own, or another start's handed over): a message from before stays
+    /// (what putting the session back said at the start), unless opening these says something itself.
+    pub fn open_handed(&mut self, paths: &[PathBuf]) {
+        let said = self.flash.take();
+        self.open_paths(paths);
+        if self.flash.is_none() {
+            self.flash = said;
+        }
     }
 
     /// View → Show only matching lines: the find bar's search (opened to type one), the lines in a tab of their own.
@@ -797,10 +813,10 @@ impl App {
                     return true;
                 }
                 self.flash(format!("Couldn't open {name}: {}", fileio::friendly_io(&e)), true);
-                // the tab goes (unless it's the only one)
+                // the tab goes (unless it's the only one); the tab shown stays shown
                 if self.tabs.len() > 1 {
                     self.tabs.remove(i);
-                    self.active = self.active.min(self.tabs.len() - 1);
+                    self.keep_shown(i);
                     return false;
                 }
                 let tab = &mut self.tabs[i];
@@ -999,17 +1015,24 @@ impl App {
         if self.tabs.is_empty() {
             self.new_untitled();
         }
-        if self.active > i || self.active >= self.tabs.len() {
-            self.active = self.active.saturating_sub(1).min(self.tabs.len() - 1);
-        }
+        self.keep_shown(i);
         self.session_dirty = true;
         self.dirty_title = true;
         self.dirty_view = true;
     }
 
+    /// Tab `removed` was taken out: the tab shown stays the one shown (the next, if it was that one).
+    fn keep_shown(&mut self, removed: usize) {
+        if self.active > removed || self.active >= self.tabs.len() {
+            self.active = self.active.saturating_sub(1).min(self.tabs.len() - 1);
+        }
+    }
+
     pub fn activate(&mut self, i: usize) {
         if i < self.tabs.len() && i != self.active {
             self.active = i;
+            // (a message belongs to the tab it was about: it stood where the caret's place shows)
+            self.flash = None;
             self.find.found = None;
             self.dirty_title = true;
             self.dirty_view = true;

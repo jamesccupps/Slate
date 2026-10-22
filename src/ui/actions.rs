@@ -68,6 +68,8 @@ pub const TIMER_STRUCTURE: usize = 11;
 pub const TIMER_UNCLOAK: usize = 12;
 
 const BIG_CLIPBOARD: u64 = 64 << 20;
+/// What the status bar says when the clipboard couldn't be written.
+const CLIPBOARD_BUSY: &str = "Couldn't use the clipboard (another program may be holding it).";
 /// What the status bar says while a check for updates the user asked for runs.
 const CHECKING: &str = "Checking for updates…";
 /// How the status bar's messages about a file whose lines are still being read start.
@@ -2346,7 +2348,7 @@ impl App {
         }
         let text = self.tab().doc.read(a, b);
         if !win::set_clipboard(self.hwnd, &text) {
-            self.flash("Couldn't use the clipboard (another program may be holding it).", true);
+            self.flash(CLIPBOARD_BUSY, true);
             return false;
         }
         // A whole line (nothing was selected): pasting it puts it back as a line.
@@ -3171,7 +3173,16 @@ impl App {
             return;
         }
         if self.r_tabs.contains(x, y) {
-            self.tab_scroll -= delta as f32 / 120.0 * 60.0;
+            // A tab per notch (the strip scrolls by whole tabs; a touchpad's small steps add up).
+            let tabs = -delta as f32 / 120.0;
+            if (self.wheel_tabs > 0.0) != (tabs > 0.0) {
+                self.wheel_tabs = 0.0;
+            }
+            self.wheel_tabs += tabs;
+            let n = self.wheel_tabs.trunc();
+            self.wheel_tabs -= n;
+            let tw = self.tab_rects.first().map_or(0.0, |r| r.0.w);
+            self.tab_scroll += n * tw;
             self.layout();
             self.invalidate();
             return;
@@ -3576,8 +3587,11 @@ impl App {
                 match p {
                     Some(p) if !p.is_empty() => {
                         let s = tab.structure.path_text(&p);
-                        win::set_clipboard(self.hwnd, s.as_bytes());
-                        self.flash(format!("Copied {s}"), false);
+                        if win::set_clipboard(self.hwnd, s.as_bytes()) {
+                            self.flash(format!("Copied {s}"), false);
+                        } else {
+                            self.flash(CLIPBOARD_BUSY, true);
+                        }
                     }
                     Some(_) => self.flash(format!("No {what} path here"), true),
                     None => self.flash(format!("Still reading the {what} structure — try again in a moment."), true),
@@ -3716,9 +3730,7 @@ impl App {
                 self.after_edit();
             }
             Cmd::SetEol(e) => {
-                if self.tab().doc.eol == e && !self.tab().doc.is_empty() {
-                    // still convert stray line endings
-                }
+                // (also to the same: stray line endings of the other kind are converted)
                 if self.tab().doc.is_empty() {
                     self.tab_mut().doc.eol = e;
                     self.invalidate();
@@ -3810,8 +3822,11 @@ impl App {
             }
             Cmd::CopyPath => {
                 if let Some(p) = self.tab().doc.path.clone() {
-                    win::set_clipboard(self.hwnd, p.to_string_lossy().as_bytes());
-                    self.flash("Path copied", false);
+                    if win::set_clipboard(self.hwnd, p.to_string_lossy().as_bytes()) {
+                        self.flash("Path copied", false);
+                    } else {
+                        self.flash(CLIPBOARD_BUSY, true);
+                    }
                 }
             }
             Cmd::OpenRecent(i) => {
@@ -4771,16 +4786,22 @@ pub fn run_cmd(cell: &Cell, cmd: Cmd) {
                 a.activate(i);
                 return;
             }
+            let blank = a.tabs.len() == 1 && a.tabs[0].is_blank();
             let mut doc = Document::from_text(SHORTCUTS.as_bytes());
             doc.eol = Eol::Lf;
-            let i = a.add_tab(doc);
+            let mut i = a.add_tab(doc);
+            // (an untouched empty tab gives way to them, as to a file opened)
+            if blank && i == 1 {
+                a.tabs.remove(0);
+                a.active = 0;
+                i = 0;
+            }
             let t = &mut a.tabs[i];
             t.title_override = Some(title.into());
             t.untitled = 0;
             // (a list to read: a key typed there by mistake doesn't make it a tab with unsaved changes)
             t.read_only = true;
-            a.update_title();
-            a.invalidate();
+            a.activate(i);
         }
         Cmd::MakeDefault => super::install::make_default(cell),
         Cmd::StopDefault => super::install::stop_default(cell),

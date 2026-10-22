@@ -285,7 +285,8 @@ lighter one on dark), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate`, `$
     rows of one height, colors drawn with the glyphs by `draw_row`: only those in view, each in its byte's color —
     color attributes made Pango shape minified JSON in thousands of pieces; wrapped rows hang under the indentation
     with a negative Pango indent), `chrome.rs` the tab strip and status bar (drawn like Windows'; the column and the
-    selection's size counted once per caret place and text), `session.rs` (`session.json` and a copy per unsaved tab
+    selection's size counted once per caret place and text; in a narrow window the indentation, the line endings and
+    the language give way first; a message stands where the caret's place does, and goes when another tab is shown), `session.rs` (`session.json` and a copy per unsaved tab
     up to 64 MiB; bigger ones are asked about; Windows' rules: lenient reading per tab and value, session.json.bak,
     only copies this Slate wrote or read are deleted, copies no tab names come back as tabs, names `tab-<time>-<pid>-<n>`
     and only `tab-…txt` read, written every 5 s on another thread when it changed and in place on closing (a write
@@ -366,7 +367,9 @@ lighter one on dark), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate`, `$
     controls, push buttons themed `DarkMode_Explorer` when dark, so the keyboard, screen readers and Ctrl+C work as in
     any dialog; `win::ask` falls back to a task dialog if it can't be made; text taller than the screen is cut to whole lines,
     Ctrl+C still copies all of it; WM_GETDPISCALEDSIZE sizes it for another monitor); `testmode.rs`; `uia.rs` (screen
-    readers: see Design decisions). Symbol-only
+    readers: see Design decisions). Tabs that don't all fit share the strip as whole tabs (as many as fit, a little
+    wider than `TAB_MIN_W`), and the strip scrolls by whole tabs (a wheel notch is one), so none shows cut off at the
+    edge (`App::place_tabs`). Symbol-only
     buttons, status bar items and tabs (their file's path) have tooltips: `win::Tip`, Windows' own tracking tooltip,
     made the first time one shows (never in test mode), its texts from `App::tip_text`.
   - `gfx.rs` — Direct2D drawing into a D3D11 **flip-model swap chain** (FLIP_DISCARD, then FLIP_SEQUENTIAL), with
@@ -545,7 +548,8 @@ lighter one on dark), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate`, `$
   prompts are never shown (they take answers from `answer:` lines and are listed by `print:asked`), nor are menus
   (`print:opened` lists them), the clipboard is a private one, and settings/session aren't written (unless
   `persist`, which needs `SLATE_DATA_DIR`). Mouse drags, raw wheel deltas, Alt, AltGr and window activation have
-  their own commands (`down:`/`move:`/`up:`, `wheelraw:`, `altkey`, `altgr:on`, `activate`…), and `contrast:on`
+  their own commands (`down:`/`move:`/`up:`, `wheelraw:` — over the text, or `wheelraw:<delta>@<x>,<y>` over a
+  point such as the tab strip —, `altkey`, `altgr:on`, `activate`…), and `contrast:on`
   pretends Windows' high contrast is on (`print:theme`, `print:syscaret`, `print:statusbar` check the results).
   Prompts are never shown, but `prompt:<file.png>|save` (or `update`, `info`) draws one into a picture.
   `SLATE_DATA_DIR` sets the data folder, `SLATE_TEST_LOG` the log file; `session:save|soon|restore` writes the
