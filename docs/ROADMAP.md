@@ -137,6 +137,14 @@ after a restart: a folder gone from the PC's own disk counts as gone. "Open file
 once per kind of file, and afterwards which usual kinds open with Slate. Details in the
 [0.12.4 release notes](release-notes-0.12.4.md).
 
+## 0.12.5
+
+A review of the whole program: Save as… and Open… for a new document start in the last folder used (or Documents);
+Windows' tab strip shows whole tabs only; Keyboard shortcuts takes the place of an empty new tab; Copy path says when
+the clipboard couldn't be used; Linux keeps the tab shown when a file can't be opened, and in a narrow window keeps
+the line and column in the status bar and room for the search box. Details in the
+[0.12.5 release notes](release-notes-0.12.5.md).
+
 ## Next
 
 1. **Accessibility: screen readers, the rest (M).** The text is read since 0.12.0 (checked in test mode and by a real
