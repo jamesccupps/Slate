@@ -19,10 +19,16 @@ Rust with the **GNU** toolchain is enough (no Visual Studio needed). On the deve
 `Slate.exe` to `dist\`, and deploys to the folder in `.install-dir` if there is one) or:
 
 ```
-set PATH=%USERPROFILE%\.cargo\bin;%USERPROFILE%\.rustup\toolchains\stable-x86_64-pc-windows-gnu\lib\rustlib\x86_64-pc-windows-gnu\bin\self-contained;%PATH%
+for /f "delims=" %s in ('rustc --print sysroot') do set SYSROOT=%s
+set PATH=%USERPROFILE%\.cargo\bin;%SYSROOT%\lib\rustlib\x86_64-pc-windows-gnu\bin\self-contained;%PATH%
 cargo build --release
 cargo test --lib
 ```
+
+The linker's folder is taken from `rustc --print sysroot`, not spelled `%USERPROFILE%\.rustup\…`: rustc passes its
+own C runtime and import libraries to that linker only when the `x86_64-w64-mingw32-gcc` found on the PATH lies
+inside its sysroot as rustc sees it, with links resolved. With `.rustup` a link to another drive, the linker found
+through the link path counted as someone else's and every link failed ("cannot find crt2.o").
 
 - The `windows` crate is pinned to **0.58**: newer versions link through raw-dylib, which needs `dlltool` + an
   assembler that the GNU toolchain doesn't bundle.

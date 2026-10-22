@@ -5,7 +5,11 @@ rem If a file named .install-dir exists next to this script, Slate is also deplo
 rem first line, in portable mode (settings, session and temp files kept in a "data" folder beside Slate.exe).
 setlocal
 set "HERE=%~dp0"
-set "PATH=%USERPROFILE%\.cargo\bin;%USERPROFILE%\.rustup\toolchains\stable-x86_64-pc-windows-gnu\lib\rustlib\x86_64-pc-windows-gnu\bin\self-contained;%PATH%"
+rem (The toolchain's own linker, from the folder rustc reports: it takes it as its own only from a path inside that
+rem folder, links resolved, so not through %USERPROFILE%\.rustup when that's a link to another drive.)
+set "SYSROOT="
+for /f "delims=" %%s in ('"%USERPROFILE%\.cargo\bin\rustc.exe" --print sysroot') do set "SYSROOT=%%s"
+set "PATH=%USERPROFILE%\.cargo\bin;%SYSROOT%\lib\rustlib\x86_64-pc-windows-gnu\bin\self-contained;%PATH%"
 cargo build --release --manifest-path "%HERE%Cargo.toml"
 if errorlevel 1 exit /b 1
 rem (Windows takes its DLLs from System32 only: see scripts\load-config.ps1)
