@@ -120,6 +120,16 @@ pub fn get_ui() -> Option<Rc<Ui>> {
     UI.with(|u| u.borrow().clone())
 }
 
+/// A file opened or saved goes in the desktop's recently used files too (GNOME's Recent, the file dialogs' list: what
+/// Windows' jump list is there). Not in test mode.
+pub fn note_recent(p: &std::path::Path) {
+    if get_ui().is_some_and(|u| u.test.is_some()) {
+        return;
+    }
+    let uri = gio::File::for_path(p).uri();
+    gtk4::RecentManager::default().add_item(&uri);
+}
+
 /// The look at the open files on disk wakes the window this way: refreshed only when it found something.
 fn disk_notifier() -> Notify {
     Arc::new(|| {

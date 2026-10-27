@@ -910,6 +910,7 @@ impl App {
             }
             if !reading_again {
                 self.settings.add_recent(&opened.path);
+                super::note_recent(&opened.path);
             }
         }
         match opened.loading {
@@ -1069,6 +1070,7 @@ impl App {
                 tab.notice_save_as = false;
                 let name = tab.title();
                 self.settings.add_recent(&st.path);
+                super::note_recent(&st.path);
                 self.session_dirty = true;
                 if saved.lossy && st.encoding == Encoding::Ansi {
                     self.flash("Some characters can't be stored in ANSI and were saved as \"?\".", true);

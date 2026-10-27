@@ -650,6 +650,7 @@ impl App {
                 self.layout();
             }
             self.settings.add_recent(&path);
+            super::jumplist::update(self.settings.recent.clone());
             // (once for files opened together)
             if !self.tabs.iter().any(|t| matches!(t.load_job, Some(Load::Read(_)))) {
                 self.settings.save();
@@ -1535,6 +1536,7 @@ impl App {
                     });
                 }
                 self.settings.add_recent(&st.path);
+                super::jumplist::update(self.settings.recent.clone());
                 self.session_dirty = true;
                 if saved.lossy {
                     // (only when the user said so) The tab keeps the real characters: never close it now, nor the
@@ -4093,6 +4095,7 @@ impl App {
             Cmd::ClearRecent => {
                 self.settings.recent.clear();
                 self.settings.save();
+                super::jumplist::update(Vec::new());
             }
             Cmd::ReportProblem => {
                 // GitHub's issue form, filled in: the user sees it all, and sends it (or doesn't) themselves.

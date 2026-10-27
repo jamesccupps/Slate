@@ -12,6 +12,7 @@ pub use crate::highlight;
 pub use crate::settings;
 pub use crate::theme;
 pub mod install;
+pub mod jumplist;
 pub mod print;
 pub mod prompt;
 pub mod session;
@@ -1400,6 +1401,8 @@ pub fn run(raw: Vec<std::ffi::OsString>) -> i32 {
         a.update_title();
         a.timer(TIMER_DISK, 2000);
         a.timer(actions::TIMER_UPDATE, 8000);
+        // (the taskbar's list of recent files, as they are now: one taken off it elsewhere, say)
+        jumplist::update(a.settings.recent.clone());
         // (off the screen until its first frame: `win::cloak`; shown by then in any case)
         a.timer(actions::TIMER_UNCLOAK, 1000);
         a.restart_caret();
