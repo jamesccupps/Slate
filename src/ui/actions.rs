@@ -2546,11 +2546,14 @@ impl App {
     // ---- find bar ----
 
     pub fn open_find(&mut self, mode: BarMode) {
+        let again = self.find.open && self.find.mode != BarMode::GoTo;
         self.find.open = true;
         self.find.mode = mode;
         let sel = self.tab().view.sel;
-        if mode != BarMode::GoTo {
-            self.find.sel_before = (!sel.is_empty()).then(|| (sel.start(), sel.end()));
+        let selected = (!sel.is_empty()).then(|| (sel.start(), sel.end()));
+        // (Ctrl+F again while the search's match is selected: what the user selected stays)
+        if mode != BarMode::GoTo && !(again && selected.is_some() && selected == self.find.last_match) {
+            self.find.sel_before = selected;
         }
         let tab = self.tab();
         if mode == BarMode::GoTo {

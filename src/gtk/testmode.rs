@@ -4,7 +4,8 @@
 //! and settings and the session aren't written unless `persist` (which needs `SLATE_DATA_DIR`).
 //!
 //! Commands: `size:1000x700`, `theme:dark|light`, `open:<path>`, `type:<text>` (`\n`, `\t` allowed), `key:<combo>`
-//! (`ctrl+shift+k`, `enter`, `pagedown`, `f3`), `cmd:<action>` (a menu action's name: `save`, `json-format`...),
+//! (`ctrl+shift+k`, `enter`, `pagedown`, `f3`), `findkey:<combo>` / `replacekey:<combo>` (in the find or replace
+//! box: `up`, `alt+s`), `cmd:<action>` (a menu action's name: `save`, `json-format`...),
 //! `find:<text>`, `replace:<text>`, `goto:<line>`, `answer:save,dont,cancel` (or a path for Open and Save as),
 //! `lang:<name>`, `set:wrap=true` (also `line_numbers`, `font_size`), `wait:<ms>`, `jobs` (wait for background
 //! work), `shot:<file.png>`, `print:<what>` (`text`, `sel`, `status`, `title`, `tabs`, `lang`, `asked`,
@@ -201,6 +202,18 @@ async fn script(lines: Vec<String>, test: Rc<Test>) -> i32 {
                     failures += 1;
                 }
             },
+            // a key in the find or the replace box (history, Alt+S...)
+            "findkey" | "replacekey" => match combo(arg) {
+                Some((k, m, _)) => {
+                    if !ui.entry_key_for_test(op == "findkey", k, m) {
+                        log(&mut out, format!("{op} {arg}: nothing does that"));
+                    }
+                }
+                None => {
+                    log(&mut out, format!("unknown key {arg}"));
+                    failures += 1;
+                }
+            },
             "cmd" => match commands().into_iter().find(|(n, _, _)| *n == arg) {
                 Some((_, cmd, _)) => ui.command(cmd),
                 None => {
@@ -389,6 +402,10 @@ fn value(what: &str, test: &Test) -> String {
         "notice" => tab.notice.clone().unwrap_or_default(),
         // `--wait`s noted: their tabs
         "waits" => format!("{:?}", a.waits.iter().map(|(_, ids)| ids.len()).collect::<Vec<_>>()),
+        // the find and replace boxes, and Find in selection's range
+        "findtext" => format!("{:?} / {:?} / scope {:?}", ui.find_entry.text(), ui.replace_entry.text(), tab.view.scope),
+        // the searches kept (newest first) and where Up and Down are in them
+        "history" => format!("{:?} at {:?}", a.settings.find_history, a.find.history_at),
         "readonly" => (tab.read_only || tab.filter.is_some()).to_string(),
         // (the lines bookmarked, 1-based)
         "bookmarks" => tab.view.bookmarks.iter().filter_map(|&b| tab.doc.line_of(b)).map(|l| (l + 1).to_string()).collect::<Vec<_>>().join(","),

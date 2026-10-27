@@ -688,7 +688,7 @@ pub fn window(application: &gtk4::Application, test: Option<Rc<testmode::Test>>)
         test,
     });
     UI.with(|u| *u.borrow_mut() = Some(ui.clone()));
-    connect(&ui, &prev, &next, &close_find, &replace_one, &replace_all, &notice_close);
+    connect(&ui, &prev, &next, &lines_btn, &close_find, &replace_one, &replace_all, &notice_close);
     actions(&ui);
     // timers: the caret (while it blinks), files changed by other programs, the session
     ui.wake_blink();
@@ -730,7 +730,7 @@ pub fn window(application: &gtk4::Application, test: Option<Rc<testmode::Test>>)
     ui
 }
 
-fn connect(ui: &Rc<Ui>, prev: &gtk4::Button, next: &gtk4::Button, close_find: &gtk4::Button, replace_one: &gtk4::Button, replace_all: &gtk4::Button, notice_close: &gtk4::Button) {
+fn connect(ui: &Rc<Ui>, prev: &gtk4::Button, next: &gtk4::Button, lines_btn: &gtk4::Button, close_find: &gtk4::Button, replace_one: &gtk4::Button, replace_all: &gtk4::Button, notice_close: &gtk4::Button) {
     // drawing
     ui.text.set_draw_func(|area, cr, w, h| {
         if let Some(ui) = get_ui() {
@@ -936,35 +936,9 @@ fn connect(ui: &Rc<Ui>, prev: &gtk4::Button, next: &gtk4::Button, close_find: &g
     });
     let entry_keys = |entry: &gtk4::Entry, find: bool| {
         let k = gtk4::EventControllerKey::new();
-        k.connect_key_pressed(move |c, keyval, _, state| {
-            let Some(ui) = get_ui() else { return glib::Propagation::Proceed };
-            let plain = !state.intersects(gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::ALT_MASK);
-            match keyval {
-                // the searches (or replacements) before, newest first
-                gdk::Key::Up | gdk::Key::Down if plain => {
-                    let step = ui.with(|a| a.history_step(find, keyval == gdk::Key::Up)).flatten();
-                    if let (Some((text, at)), Some(entry)) = (step, c.widget().and_downcast::<gtk4::Entry>()) {
-                        entry.set_text(&text);
-                        entry.select_region(0, -1);
-                        ui.with(|a| a.find.history_at = at);
-                    }
-                    glib::Propagation::Stop
-                }
-                gdk::Key::s | gdk::Key::S if state.contains(gdk::ModifierType::ALT_MASK) => {
-                    ui.sel_btn.set_active(!ui.sel_btn.is_active());
-                    glib::Propagation::Stop
-                }
-                gdk::Key::Escape => {
-                    ui.with(|a| a.exec(Cmd::CloseFind));
-                    ui.text.grab_focus();
-                    glib::Propagation::Stop
-                }
-                gdk::Key::Return | gdk::Key::KP_Enter if state.contains(gdk::ModifierType::SHIFT_MASK) => {
-                    ui.with(|a| a.exec(Cmd::FindPrev));
-                    glib::Propagation::Stop
-                }
-                _ => glib::Propagation::Proceed,
-            }
+        k.connect_key_pressed(move |c, keyval, _, state| match (get_ui(), c.widget().and_downcast::<gtk4::Entry>()) {
+            (Some(ui), Some(entry)) => ui.entry_key(&entry, find, keyval, state),
+            _ => glib::Propagation::Proceed,
         });
         entry.add_controller(k);
     };
@@ -1345,6 +1319,42 @@ impl Ui {
     /// Test mode: a key as if pressed in the text.
     pub fn key_for_test(&self, keyval: gdk::Key, state: gdk::ModifierType) -> bool {
         self.key(keyval, state)
+    }
+
+    /// Test mode: a key as if pressed in the find box (`find`) or the replace box.
+    pub fn entry_key_for_test(&self, find: bool, keyval: gdk::Key, state: gdk::ModifierType) -> bool {
+        let entry = if find { &self.find_entry } else { &self.replace_entry };
+        matches!(self.entry_key(entry, find, keyval, state), glib::Propagation::Stop)
+    }
+
+    /// A key in the find box (`find`) or the replace box that does more than type.
+    fn entry_key(&self, entry: &gtk4::Entry, find: bool, keyval: gdk::Key, state: gdk::ModifierType) -> glib::Propagation {
+        let plain = !state.intersects(gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::ALT_MASK);
+        match keyval {
+            // the searches (or replacements) before, newest first
+            gdk::Key::Up | gdk::Key::Down if plain => {
+                if let Some((text, at)) = self.with(|a| a.history_step(find, keyval == gdk::Key::Up)).flatten() {
+                    entry.set_text(&text);
+                    entry.select_region(0, -1);
+                    self.with(|a| a.find.history_at = at);
+                }
+                glib::Propagation::Stop
+            }
+            gdk::Key::s | gdk::Key::S if state.contains(gdk::ModifierType::ALT_MASK) => {
+                self.sel_btn.set_active(!self.sel_btn.is_active());
+                glib::Propagation::Stop
+            }
+            gdk::Key::Escape => {
+                self.with(|a| a.exec(Cmd::CloseFind));
+                self.text.grab_focus();
+                glib::Propagation::Stop
+            }
+            gdk::Key::Return | gdk::Key::KP_Enter if state.contains(gdk::ModifierType::SHIFT_MASK) => {
+                self.with(|a| a.exec(Cmd::FindPrev));
+                glib::Propagation::Stop
+            }
+            _ => glib::Propagation::Proceed,
+        }
     }
 
     pub fn find_entry_for_test(&self) -> &gtk4::Entry {

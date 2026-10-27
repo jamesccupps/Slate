@@ -605,7 +605,9 @@ lighter one on dark), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate`, `$
   checks Format XML, Toggle comment and `name:line:col`, writes a session and puts it back, so it needs
   `SLATE_DATA_DIR` set to an empty folder. Linux's test mode also has `session:soon` (written on another thread),
   `print:session` (the session folder's files), `print:notice` and `print:blink` (whether the caret's timer runs:
-  it stops after `BLINK_STOP` or with the window in the background, so an idle Slate sleeps).
+  it stops after `BLINK_STOP` or with the window in the background, so an idle Slate sleeps), and
+  `findkey:<combo>` / `replacekey:<combo>` (a key in the find or replace box: `up`, `alt+s`; `key:` goes to the
+  text).
 - Measuring: `t:<label>` marks; `print:startup` (each startup step in ms since the process was created: `warp`,
   `device`, `first frame` or `first frame (WARP)` and the switch; a hidden test window gets no WM_PAINT, so the
   switch shows at the harness's next paint), `SLATE_INDEX_FILE=<file> cargo test --release --lib index_speed --

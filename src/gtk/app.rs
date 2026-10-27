@@ -1492,12 +1492,17 @@ impl App {
                 tab.view.sel = Sel::new(0, tab.doc.len());
             }
             Cmd::Find | Cmd::Replace => {
+                let again = self.find.open;
                 self.find.open = true;
                 self.find.replace = cmd == Cmd::Replace;
+                let sel = self.tab().view.sel;
+                let selected = (!sel.is_empty()).then(|| (sel.start(), sel.end()));
+                // (Ctrl+F again while the search's match is selected: what the user selected stays)
+                if !(again && selected.is_some() && selected == self.find.last_match) {
+                    self.find.sel_before = selected;
+                }
                 // the selection (one line of it) is what to find
                 let tab = self.tab();
-                let sel = tab.view.sel;
-                self.find.sel_before = (!sel.is_empty()).then(|| (sel.start(), sel.end()));
                 if !sel.is_empty() && sel.end() - sel.start() < 512 {
                     let t = tab.doc.read(sel.start(), sel.end());
                     if !t.contains(&b'\n') {
@@ -1513,7 +1518,13 @@ impl App {
                 edit::remember(&mut self.settings.find_history, &self.find.query.text.clone());
                 self.tabs[self.active].view.scope = None;
             }
-            Cmd::FindNext | Cmd::FindPrev => self.find_step(cmd == Cmd::FindNext),
+            Cmd::FindNext | Cmd::FindPrev => {
+                // (what searching as you type finds isn't kept: only a search gone on with)
+                if self.find.matcher.is_some() {
+                    edit::remember(&mut self.settings.find_history, &self.find.query.text);
+                }
+                self.find_step(cmd == Cmd::FindNext);
+            }
             Cmd::ReplaceOne => self.replace_one(),
             Cmd::ReplaceAll => self.start_task(TaskKind::ReplaceAll),
             Cmd::GotoLine => self.asks.push(Ask::GotoLine),
@@ -2219,7 +2230,6 @@ impl App {
             }
             return;
         }
-        edit::remember(&mut self.settings.find_history, &self.find.query.text);
         let (a, b) = self.search_range();
         let tab = &self.tabs[self.active];
         let sel = tab.view.sel;
@@ -2288,9 +2298,11 @@ impl App {
     }
 
     fn replace_one(&mut self) {
-        if !self.editable() {
+        if !self.editable() || self.find.matcher.is_none() {
             return;
         }
+        edit::remember(&mut self.settings.replace_history, &self.find.replacement);
+        edit::remember(&mut self.settings.find_history, &self.find.query.text);
         let Some(m) = self.find.matcher.as_ref() else { return };
         let tab = &self.tabs[self.active];
         let sel = tab.view.sel;
