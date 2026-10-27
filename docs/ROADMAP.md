@@ -145,6 +145,14 @@ the clipboard couldn't be used; Linux keeps the tab shown when a file can't be o
 the line and column in the status bar and room for the search box. Details in the
 [0.12.5 release notes](release-notes-0.12.5.md).
 
+## 0.13.0
+
+The first round of the *Soon* list (the user, October 2026: "do the soon items"): CSV and TSV Check, Sort by this
+column and the column's name in the status bar; invisible and look-alike characters shown; View → Character at the
+caret; Find in selection, a search history, `\n` and `\t` in regular expression replacements, a button for Show only
+matching lines; `slate --read-only`, `slate --wait` and `slate -`; the taskbar's jump list (Linux: the desktop's
+recent files). Details in the [0.13.0 release notes](release-notes-0.13.0.md).
+
 ## Next
 
 1. **Accessibility: screen readers, the rest (M).** The text is read since 0.12.0 (checked in test mode and by a real
@@ -167,22 +175,8 @@ the line and column in the status bar and room for the search box. Details in th
 
 ## Soon
 
-- **CSV and TSV** (S–M; the user asked, October 2026). Today they're plain text (colored, nothing more). **Check**
-  as for JSON and XML: a row with another number of fields than the header, a quote left open, a stray quote inside
-  a field, said with its line and column; the quoting as RFC 4180 has it (a field in quotes may hold the separator,
-  `""` and line breaks), the separator found from the first lines (`,` `;` tab `|`). **Sort by this column** (Format →
-  Sort lines by the caret's column: the header row stays on top, numbers and dates sorted as such, rows with line
-  breaks in quotes kept whole). The caret's column by its name in the status bar (`status`, field 9). All streaming
-  like the rest (the aim: a 400 MB CSV checked in about the time a search of it takes, ~0.2 s).
-- **Matching lines, more** (S each): a button in the find bar; the tab of lines following a log as it grows (filtering
-  what's added); several searches at once (lines with any of them, highlighted each in a color).
-- `slate --read-only` from a command line (S: the files handed to a Slate that's running already would need it
-  too).
-- **The character at the caret** (S): its code point and bytes (`U+00E9 é · C3 A9`) from the status bar's encoding.
-- **Invisible and look-alike characters shown** (S): zero-width and non-breaking spaces, a byte order mark inside the
-  text, and the bidirectional controls of the "Trojan Source" trick, as symbols, as control characters are already.
-- **`slate --wait` and standard input** (S): `--wait` returns when the tab closes (Slate as git's editor);
-  `some-command | slate -` opens the output in a new tab.
+- **Matching lines, more** (S each): the tab of lines following a log as it grows (filtering what's added); several
+  searches at once (lines with any of them, highlighted each in a color).
 - **Page setup** (M): margins, the text at the top and bottom of the pages, printing without colors (Print itself
   came in 0.10.0).
 - **Print preview** (M; the user asked, October 2026): File → Print preview… opens Slate's own window with the pages
@@ -192,11 +186,10 @@ the line and column in the status bar and room for the search box. Details in th
   does; filling its preview would mean Windows' newer printing method, whose preview Microsoft documents for Store apps
   only. The older dialog never had a preview.) On Linux, check GTK's print dialog first: its Preview button may already
   work with Slate's `GtkPrintOperation`.
-- **Find:** in the selection, a history, `\n` and `\t` in regex replacements, find in all open tabs (S–M).
+- **Find in all open tabs** (S–M).
 - **Editing:** column (Alt+drag) selection (S). Drag and drop of text (M).
 - **Spell check** like Notepad's (M). **Inline IME composition** for Chinese, Japanese and Korean (M).
 - **Tabs in the title bar**, like Windows 11 Notepad, to save space (M).
-- **A taskbar jump list** with the recent files (S).
 - **JSON structure panel:** keep an open array element open when elements are inserted before it (it's keyed by
   index today); while the panel is updating after an edit, clicks go to the row's old place (S).
 - **Count all and Show only matching lines on several cores (M).** Both search a big file on one thread: 850 MB in

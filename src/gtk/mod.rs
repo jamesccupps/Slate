@@ -1319,6 +1319,9 @@ const SHORTCUTS: &str = "Slate keyboard shortcuts
   Ctrl+F / Ctrl+H          Find / replace
   F3 / Shift+F3            Next / previous match (in the find box: Enter / Shift+Enter)
   Ctrl+Alt+Enter           Replace all
+  Alt+S                    Find in selection (in the find box)
+  Up / Down                The searches (or replacements) before (in the find box)
+  \\n  \\t                 A line break, a tab, in a regular expression's replacement
   Esc                      Close the find bar
   Alt+L                    Show only the lines with a match, in a tab of their own
                            (Enter or a double-click there goes to the line in the file)

@@ -218,7 +218,8 @@ lighter one on dark), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate`, `$
     Show only matching lines, Alt+L) streams the lines a match starts in (or, inverted, the others) into a `Sink`,
     with a `LineMap` (runs of lines that follow each other in both: one entry per kept stretch, at most `RUNS_MAX`)
     saying which line of the source each one is; `LineMap::through` maps a filter of a filter to the first text.
-    400 MB, 809,820 lines kept: 0.3 s.
+    400 MB, 809,820 lines kept: 0.3 s. Find in selection searches a range: `count_in`, `replace_all_to`'s `range`
+    (a match running out of it isn't in it), find next/previous between its ends (the apps: `search_range`).
   - `json.rs` — one streaming tokenizer for pretty-print / minify / validate (JSON Lines OK), errors with offsets;
     comments (JSONC) are refused with a message saying so. Check (`Mode::Validate`) is stricter than Format: UTF-8
     only, and several values only one per line. The characters are checked beside the parse, on a second thread
@@ -234,6 +235,17 @@ lighter one on dark), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate`, `$
     lines. A `\r` is part of a line break only before a `\n` (a lone one at the very end is text). `apply_to` hands
     the result on in 4 MB pieces (big documents: straight into the `Sink`, never whole in memory beside the text;
     a 400 MB log's Sort peaked at 830 MB before, 490 MB since, and went from 4.5 to 2.8 s).
+  - `csv.rs` — CSV and TSV: Check (RFC 4180's quoting; every row as many fields as the first, a quote left open,
+    a stray quote in a field that isn't in quotes — TSV has no quoting rules, so there a quote is text unless it
+    starts a field — or something after a closing quote, with where), streaming and jumping from one special byte to
+    the next, a row without quotes counted at once (`bytecount`): 303 MB in ~0.18 s. The separator: the language's
+    (`;` for "CSV (semicolons)", a tab for TSV), plain CSV's from its first rows (`sniff`, of `,` `;` tab `|`).
+    `sort_by_column` (Format → Sort by this column: rows kept whole, line breaks in quotes too; dates `m/d/y` or
+    `d/m/y` by value as the system writes them, `os::day_first`, worked out once per row; numbers and text by
+    `natural_cmp`; empty fields last; the first row on top when it reads as a header: none of its fields a number or
+    a date, `has_header`), on several threads (`lines::par_sort_by`), equal rows in their order. `field_at` gives
+    the caret's field (the status bar names its column from the header: `edit::csv_field`).
+    `SLATE_CSV_FILE=<file> cargo test --release --lib csv_speed -- --ignored --nocapture` times Check and a sort.
   - `jsonnav.rs` — lazy JSON structure: the children of one container (lists over 100,000 keep every 64th child
     and rescan between them; lists of containers inside a scanned one already over 1024), the path at an offset
     (`data[1203].name`), previews. Comments are skipped; in a file cut short, open containers end at its end. A scan
@@ -259,7 +271,11 @@ lighter one on dark), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate`, `$
     decide `io::looks_binary`, which for UTF-16 means a zero character), UTF-16/ANSI codecs (UTF-16 halves without
     their other half and an odd last byte read as U+FFFD and are counted in `Document::bad_units`; ANSI = the system
     code page, Windows-1252 under the UTF-8 code page option; single-byte code pages through tables made once from
-    Windows' own conversions), display decoding (control chars → symbols), char classes.
+    Windows' own conversions), display decoding (`display_char`, both apps and printing: control chars → symbols;
+    characters with no width that change what a text means — zero-width space, word joiner, a byte order mark
+    inside the text, soft hyphen — → ▯; the bidirectional controls of "Trojan Source" → ⇄, so they don't reorder
+    the text on screen; the zero-width joiner and non-joiner stay, emoji and scripts need them; `is_odd_space` for
+    Show whitespace's ⌴ on non-breaking and other look-alike spaces), char classes.
   - `src/print.rs` (shared, beside `core`) — printing's layout: rows of a fixed number of columns (a row ends at a
     space where it can, a word longer than a row is cut; tabs to stops counted from the line's start; control
     characters as their symbols; East Asian wide characters two columns), colored by the lexers as in the editor
@@ -378,6 +394,10 @@ lighter one on dark), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate`, `$
     edge (`App::place_tabs`). Symbol-only
     buttons, status bar items and tabs (their file's path) have tooltips: `win::Tip`, Windows' own tracking tooltip,
     made the first time one shows (never in test mode), its texts from `App::tip_text`.
+  - `jumplist.rs` — the taskbar button's jump list: Open recent's files in a "Recent" category
+    (`ICustomDestinationList`, written on another thread whenever the list changes and at the start, never in test
+    mode or a guest window; files the user took off the list stay off, as Windows refuses a list that has them).
+    On Linux the same files go in GTK's `RecentManager` (`gtk::note_recent`).
   - `gfx.rs` — Direct2D drawing into a D3D11 **flip-model swap chain** (FLIP_DISCARD, then FLIP_SEQUENTIAL), with
     `ID2D1HwndRenderTarget` only as a fallback: on a PC with a Parsec virtual display adapter the HWND target reported
     "occluded" and drew nothing. Device loss → `discard_target()` and paint again.
@@ -505,6 +525,19 @@ lighter one on dark), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate`, `$
   this PC, `os::gone_from_local_disk`: Explorer's temp folder of a file opened from a zip is cleaned up, and such a
   tab waited for ever) waits too and looks again, less often each time, as long as it's one of those; until a tab is
   back, the session keeps its entry as read.
+- Command line: `slate --read-only <files>`, `slate --wait <files>` (returns once the tabs opened for it are all
+  closed, or the Slate that has them ends: git's `core.editor`; with no Slate running one is started first, so
+  closing the tabs and not the whole window ends the wait) and `slate -` (standard input in a new unsaved tab). On
+  Windows a second start hands these over with `COPYDATA_OPEN2` (`?read-only`, `?wait=<event>`, `?text=<file>` lines
+  before the files: no file name starts with `?`; a Slate before 0.13.0 doesn't take it, so the one starting opens a
+  window of its own): `--wait` makes a named event `Local\Slate.Wait.<pid>.<time>` and waits on it and on the
+  running Slate's process; the running one sets it when the last of those tabs closes (`App::waits`, `tab_gone`; a
+  tab a duplicate open replaced passes its wait on; closing the window sets them all), and only events with that
+  prefix. Standard input's text goes in `slate-stdin-<pid>-<time>.txt` in Slate's temp folder, which the running
+  one reads and deletes (no other file). On Linux the same as the open request's hint
+  (`slate:read-only;wait=<token>;text=<token>;`, `gtk::run_request`, `App::open_hinted`) with the text and a wait
+  file in the data folder's `handed` folder: the waiting start polls until the wait file is gone or no Slate owns
+  the application's D-Bus name (`NameHasOwner`).
 - One Slate per user session: a second start hands its files to the running one (to a window of Slate's class whose
   process runs as the same user with the same rights: `slate_window`). A Slate running as administrator
   is separate (its own lock, window class and session), as Windows doesn't let the two talk. A second start tries
@@ -542,7 +575,7 @@ lighter one on dark), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate`, `$
 
 ## Testing
 
-- `cargo test --lib` — all unit tests, the UI's included (~240, ~5 s).
+- `cargo test --lib` — all unit tests, the UI's included (~260, ~5 s).
 - Hostile files: `cargo test --release --lib fuzz -- --ignored --nocapture` (`src/fuzz.rs`) sends random and mutated
   text through every lexer, JSON and XML Check/Format and the structure scans; a panic is reported with its input, a
   step stuck for 10 s (a file that would freeze the window) stops the run and saves the input to
@@ -555,7 +588,10 @@ lighter one on dark), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate`, `$
   (`print:opened` lists them), the clipboard is a private one, and settings/session aren't written (unless
   `persist`, which needs `SLATE_DATA_DIR`). Mouse drags, raw wheel deltas, Alt, AltGr and window activation have
   their own commands (`down:`/`move:`/`up:`, `wheelraw:` — over the text, or `wheelraw:<delta>@<x>,<y>` over a
-  point such as the tab strip —, `altkey`, `altgr:on`, `activate`…), and `contrast:on`
+  point such as the tab strip —, `altkey`, `altgr:on`, `activate`…), `request:<lines, | between>` hands files over
+  as a second start with `--read-only` / `--wait` / `-` does (`waitevent:<name>` makes the event, `print:waits`
+  shows the waits and whether it's set), `print:findtext` the find bar's boxes and Find in selection's range, and
+  `contrast:on`
   pretends Windows' high contrast is on (`print:theme`, `print:syscaret`, `print:statusbar` check the results).
   Prompts are never shown, but `prompt:<file.png>|save` (or `update`, `info`) draws one into a picture.
   `SLATE_DATA_DIR` sets the data folder, `SLATE_TEST_LOG` the log file; `session:save|soon|restore` writes the

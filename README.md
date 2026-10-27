@@ -20,7 +20,9 @@ JSON file opens instantly, scrolls smoothly, and can be searched, edited, format
 - Tabs that come back after a restart, including unsaved changes (like Windows 11 Notepad), for big files too (on
   Linux, up to 64 MB). Work is never lost silently: anything that can't be kept is asked about, and Windows won't
   shut down over it without asking.
-- Find and replace with match case, whole word and regular expressions; fast on huge files.
+- Find and replace with match case, whole word and regular expressions; fast on huge files. Find in selection
+  (Alt+S), the last searches and replacements with Up and Down, and `\n` / `\t` in a regular expression's
+  replacement for a line break or a tab.
 - Show only the lines that match a search (or the ones that don't), in a tab of their own with each line's number in
   the file; Enter or a double-click goes to that line in the file. 809,820 lines out of a 400 MB log in 0.3 s.
 - Bookmarks (Ctrl+F2, then F2 / Shift+F2 to go from one to the next), kept with the tabs; read-only tabs (File → Read
@@ -34,17 +36,27 @@ JSON file opens instantly, scrolls smoothly, and can be searched, edited, format
   (iCalendar, vCard) and Visual Studio solutions. Block comments and multi-line strings are followed correctly.
 - Line tools: sort lines (`file2` before `file10`), remove duplicate or blank lines, trim spaces at line ends;
   UPPERCASE / lowercase / Title Case; comment or uncomment lines with Ctrl+/; duplicate, delete and move lines.
+- CSV and TSV: check (every row as many fields as the first, quotes where they may be, with the line and column of
+  a mistake; a 300 MB file in about 0.2 s), sort the rows by the caret's column (numbers and dates by value, the
+  header row staying on top, rows with line breaks in quotes kept whole), and the column's name in the status bar.
 - JSON and XML: format (pretty-print), minify and check, also for JSON Lines; a path bar showing where the caret
   is (`data › [1203] › name`, `catalog › book[3] › title`; copy it as a JSON path or XPath) and a structure panel to
   browse objects, arrays and elements, fast on huge files.
 - Print (Ctrl+P): the file or the selection, in its colors, with line numbers (when they're shown) and page numbers;
   long lines go on in the next row, breaking between words. *Microsoft Print to PDF* (Windows) and *Print to File*
   (Linux) make a PDF.
-- Go to line (`slate notes.txt:120` opens a file at a line), word wrap, line numbers, show whitespace, the matching
+- Characters you can't see are shown: control characters as symbols (␀, ␛…), zero-width ones and a byte order mark
+  inside the text as ▯, the bidirectional controls of the "Trojan Source" trick as ⇄ (they don't reorder the text on
+  screen); Show whitespace marks non-breaking and other look-alike spaces. *View → Character at the caret* says
+  what one is (`é  U+00E9  ·  UTF-8: C3 A9`).
+- From a command line: `slate notes.txt:120` opens a file at a line, `slate --read-only file` opens it read only,
+  `slate --wait file` returns once its tab is closed (`git config --global core.editor "slate --wait"`), and
+  `some-command | slate -` opens what it prints in a new tab.
+- Go to line, word wrap, line numbers, show whitespace, the matching
   bracket highlighted, overtype, zoom, dark and light themes (follows Windows, or switch with the sun/moon button).
   With Windows' high contrast on, Slate uses its colors, and Magnifier follows the text cursor.
 - Reopen closed tabs (Ctrl+Shift+T), close the other, the saved or all tabs, and a list of all tabs when they don't
-  fit. The status bar counts words and characters, and shows the language, line endings, encoding and indentation:
+  fit. The files opened last are on the taskbar button's menu (on Linux, in the desktop's recent files). The status bar counts words and characters, and shows the language, line endings, encoding and indentation:
   click one to change it.
 - Detects and keeps the encoding (UTF-8, UTF-8 with BOM, UTF-16, ANSI) and line endings (CRLF / LF). Saving as ANSI
   asks first if some characters would turn into "?".
@@ -81,6 +93,7 @@ The usual ones work as in Notepad (Ctrl+N, O, S, F, H, G, Z, Y, A, X, C, V), plu
 | Shift+Alt+F | Format JSON or XML |
 | F3 / Shift+F3 | Next / previous match |
 | Alt+L | Show only the lines with a match |
+| Alt+S (in the find box) | Find in selection |
 | Ctrl+F2 / F2 / Shift+F2 | Bookmark the line / next / previous bookmark |
 | Alt+Z | Word wrap |
 | Ctrl+Plus / Ctrl+Minus / Ctrl+0 | Zoom in / out / reset |
