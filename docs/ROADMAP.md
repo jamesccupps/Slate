@@ -278,8 +278,8 @@ the line and column in the status bar and room for the search box. Details in th
   undone if it fails), and a setting a newer version wrote that this one can't read should survive this one saving
   (it matters when an update is undone) (S each).
 - Restart after Windows restarts for an update, with the tabs back, as Notepad does (`RegisterApplicationRestart`)
-  (S). A new version that hangs while starting should be undone like one that fails (S). A cap on `crash.log`'s size
-  (S). A file handed to a Slate that answers too late (after 10 s) opens in both windows (S).
+  (S). A new version that hangs while starting should be undone like one that fails (S). A file handed to a Slate
+  that answers too late (after 10 s) opens in both windows (S).
 - Size: of the 3.4 MB, regex's Unicode tables are 380 KB. Without the age, boolean-property and break tables
   (`\p{Age=…}`, `\p{Alphabetic}`, `\p{Emoji}`, grapheme/word/sentence break classes) it's 155 KB smaller; without
   general categories and scripts too (`\p{L}`, `\p{Greek}`), 240 KB. Case-insensitive search in every language and
@@ -297,9 +297,7 @@ start and heavier, and turn it into another IDE. Slate is the editor that opens 
   and test-mode commands for the timers (S). (The smoke test writes a session and puts it back.)
 - Test on what the development PC doesn't have: a FAT/exFAT drive, a Chinese/Japanese/Korean system locale, the
   "Use UTF-8 worldwide" option, a high-DPI second monitor and a taskbar on the side (S each).
-- Check on a real screen what the window shows before its first frame (nothing is painted until the graphics device
-  is there, a quarter of a second on a PC with a slow driver: see *Soon*), and whether switching the theme with the
-  find bar open repaints its boxes (S).
+- Check on a real screen whether switching the theme with the find bar open repaints its boxes (S).
 - Install: the registry keys, ProgID and data folder are all named just "Slate": decide on final names before many
   people install it, since renaming later needs a migration.
 
