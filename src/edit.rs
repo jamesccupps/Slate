@@ -1482,6 +1482,44 @@ pub fn nothing_to_clean(op: LineOp) -> &'static str {
     }
 }
 
+// ---- find and replace ----
+
+/// The replacement as typed: in a regular expression's, `\n` is a line break (`eol`: the document's kind), `\t` a
+/// tab, `\r` a carriage return and `\\` a backslash; any other `\` stays as it is. Plain text is taken as it is.
+pub fn replacement(typed: &str, regex: bool, eol: &[u8]) -> Vec<u8> {
+    if !regex || !typed.contains('\\') {
+        return typed.as_bytes().to_vec();
+    }
+    let b = typed.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match (b[i], b.get(i + 1)) {
+            (b'\\', Some(b'n')) => out.extend_from_slice(eol),
+            (b'\\', Some(b't')) => out.push(b'\t'),
+            (b'\\', Some(b'r')) => out.push(b'\r'),
+            (b'\\', Some(b'\\')) => out.push(b'\\'),
+            (c, _) => {
+                out.push(c);
+                i += 1;
+                continue;
+            }
+        }
+        i += 2;
+    }
+    out
+}
+
+/// Adds `query` to the front of a search history (Up and Down in the find box go through it), once, at most 20.
+pub fn remember(history: &mut Vec<String>, query: &str) {
+    if query.is_empty() || query.len() > 1000 {
+        return;
+    }
+    history.retain(|h| h != query);
+    history.insert(0, query.to_string());
+    history.truncate(20);
+}
+
 // ---- the character at the caret ----
 
 /// The names of characters that look like nothing, or like another (`text::display_char` shows most as ▯ or ⇄).
@@ -1632,6 +1670,17 @@ pub fn csv_valid(d: csv::Dialect, s: csv::Stats) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replacements_as_typed() {
+        assert_eq!(replacement(r"a\nb\tc\\n\x$1", true, b"\r\n"), b"a\r\nb\tc\\n\\x$1");
+        assert_eq!(replacement(r"a\nb", false, b"\n"), br"a\nb");
+        assert_eq!(replacement(r"end\", true, b"\n"), br"end\");
+        let mut h = vec!["b".to_string(), "a".to_string()];
+        remember(&mut h, "a");
+        remember(&mut h, "");
+        assert_eq!(h, ["a", "b"]);
+    }
 
     #[test]
     fn the_character_at_a_place() {

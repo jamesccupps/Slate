@@ -349,6 +349,9 @@ impl App {
             return;
         }
         let t = self.tabs.remove(i);
+        if !self.waits.is_empty() {
+            self.tab_gone(t.id);
+        }
         if let (Some(path), Some(_), None) = (&t.doc.path, t.doc.disk, &t.title_override) {
             self.closed_tabs.retain(|c| &c.path != path);
             self.closed_tabs.push(ClosedTab { path: path.clone(), caret: t.view.sel.caret, top: t.view.top });
@@ -405,6 +408,80 @@ impl App {
         let a = self.active;
         self.activate(a);
         super::keep_message(self, said);
+    }
+
+    /// Opens what a command line asks for: its text from standard input in a new tab, its files (as
+    /// `open_command_line`), read only if asked, and with `--wait` notes the tabs, so the Slate waiting hears when
+    /// they're all closed.
+    pub fn open_request(&mut self, paths: &[PathBuf], o: &Opts) {
+        if *o == Opts::default() {
+            self.open_command_line(paths);
+            return;
+        }
+        let before: Vec<u64> = self.tabs.iter().map(|t| t.id).collect();
+        if let Some(text) = &o.text {
+            let blank = self.tabs.len() == 1 && self.tabs[0].is_blank();
+            let mut doc = Document::from_text(text);
+            doc.eol = crate::core::text::detect_eol(&text[..text.len().min(64 << 10)]);
+            doc.mark_dirty();
+            let i = self.add_tab(doc);
+            if blank && i == 1 {
+                self.tabs.remove(0);
+                self.active = 0;
+                // ("Untitled", the blank one's name, is free now)
+                self.tabs[0].untitled = 1;
+            }
+        }
+        if !paths.is_empty() {
+            self.open_command_line(paths);
+        }
+        // (the tabs of those files: new ones, and ones that had them open already)
+        let wanted: Vec<PathBuf> = paths
+            .iter()
+            .map(|p| std::path::absolute(p).unwrap_or_else(|_| p.clone()))
+            .map(|p| line_suffix(&p).map_or(p.clone(), |s| s.0))
+            .collect();
+        let ids: Vec<u64> = self
+            .tabs
+            .iter()
+            .filter(|t| !before.contains(&t.id) || wanted.iter().any(|p| has_file(t, p, None)))
+            .map(|t| t.id)
+            .collect();
+        if o.read_only {
+            for t in self.tabs.iter_mut().filter(|t| ids.contains(&t.id)) {
+                t.read_only = true;
+            }
+            self.layout();
+        }
+        if let Some(name) = &o.wait {
+            if ids.is_empty() {
+                signal_wait(name);
+            } else {
+                self.waits.push((name.clone(), ids));
+            }
+        }
+        self.session_dirty = true;
+        self.invalidate();
+    }
+
+    /// Tab `id` closed: a `--wait` all of whose tabs are closed now is told.
+    fn tab_gone(&mut self, id: u64) {
+        for (_, ids) in self.waits.iter_mut() {
+            ids.retain(|&t| t != id);
+        }
+        self.waits.retain(|(name, ids)| {
+            if ids.is_empty() {
+                signal_wait(name);
+            }
+            !ids.is_empty()
+        });
+    }
+
+    /// Every `--wait` is told (the window is closing).
+    pub fn end_waits(&mut self) {
+        for (name, _) in std::mem::take(&mut self.waits) {
+            signal_wait(name.as_str());
+        }
     }
 
     /// Opens files in new tabs. Each is read on another thread (a network drive can take long to answer); its tab
@@ -547,6 +624,11 @@ impl App {
             let canon = opened.canon.as_deref();
             if let Some(other) = self.tabs.iter().find(|t| t.id != id && has_file(t, &path, canon)).map(|t| t.id) {
                 let goto = self.tabs[i].goto.take();
+                // (a `--wait` for this tab waits for that one)
+                for (_, ids) in self.waits.iter_mut().filter(|(_, ids)| ids.contains(&id)) {
+                    ids.retain(|&t| t != id);
+                    ids.push(other);
+                }
                 self.remove_tab(i);
                 if let Some(k) = self.tabs.iter().position(|t| t.id == other) {
                     self.tabs[k].goto = goto.or(self.tabs[k].goto);
@@ -1550,6 +1632,7 @@ impl App {
                 // (bookmarks stay on their lines where the lines stay what they were; elsewhere they go)
                 let marks = matches!(task.kind, TaskKind::Eol(_) | TaskKind::ReplaceAll)
                     .then(|| crate::edit::marks_as_lines(&tab.view.bookmarks, &tab.doc));
+                let (scope, old_len) = (tab.view.scope, tab.doc.len());
                 tab.doc.begin(EditKind::Other, sel);
                 tab.doc.replace_all_with(src, nl);
                 let keep_place = matches!(task.kind, TaskKind::ReplaceAll | TaskKind::Lines(_) | TaskKind::SortColumn { .. });
@@ -1561,6 +1644,10 @@ impl App {
                 tab.doc.end(new_sel);
                 tab.view.sel = new_sel;
                 tab.view.sync(&mut tab.doc);
+                tab.view.scope = match task.kind {
+                    TaskKind::ReplaceAll => scope.map(|(a, b)| (a, (b + new_len).saturating_sub(old_len).max(a))),
+                    _ => None,
+                };
                 tab.view.bookmarks = marks.map_or_else(Vec::new, |l| crate::edit::marks_at_lines(&l, &tab.doc));
                 if let TaskKind::Eol(e) = task.kind {
                     tab.doc.eol = e;
@@ -1738,7 +1825,13 @@ impl App {
         }
         let query = self.find.query.text.clone();
         let indent = vec![b' '; self.settings.json_indent as usize];
-        let replacement = FindBar::text_of(self.find.replace_edit);
+        let typed = FindBar::text_of(self.find.replace_edit);
+        let replacement = crate::edit::replacement(&typed, self.find.query.regex, self.tab().doc.eol.as_bytes());
+        if kind == TaskKind::ReplaceAll {
+            crate::edit::remember(&mut self.settings.replace_history, &typed);
+            crate::edit::remember(&mut self.settings.find_history, &self.find.query.text);
+        }
+        let scope = self.tab().view.scope;
         let matcher = self.find.matcher.clone();
         let tab = &mut self.tabs[self.active];
         if tab.task.is_some() {
@@ -1898,7 +1991,7 @@ impl App {
                         Err(e) => return TaskResult::Failed(format!("Couldn't create a temporary file: {e}")),
                     };
                     let mut idx = IndexBuilder::new();
-                    match m.replace_all_to(&snap, replacement.as_bytes(), &mut sink, &mut idx, ctx) {
+                    match m.replace_all_to(&snap, &replacement, &mut sink, &mut idx, scope, ctx) {
                         Ok(count) => match sink.finish(idx) {
                             Ok((src, nl)) => TaskResult::Content { src, nl, count },
                             Err(e) => TaskResult::Failed(format!("Couldn't write the result: {e}")),
@@ -2340,6 +2433,7 @@ impl App {
     }
 
     pub fn select_match(&mut self, s: u64, e: u64) {
+        self.find.last_match = Some((s, e));
         let tab = self.tab_mut();
         tab.view.sel = Sel::new(s, e);
         tab.view.upstream = false;
@@ -2452,8 +2546,11 @@ impl App {
     pub fn open_find(&mut self, mode: BarMode) {
         self.find.open = true;
         self.find.mode = mode;
+        let sel = self.tab().view.sel;
+        if mode != BarMode::GoTo {
+            self.find.sel_before = (!sel.is_empty()).then(|| (sel.start(), sel.end()));
+        }
         let tab = self.tab();
-        let sel = tab.view.sel;
         if mode == BarMode::GoTo {
             self.find.goto_hint = match tab.doc.line_count() {
                 Some(n) => format!("1 – {}", group(n)),
@@ -2482,6 +2579,11 @@ impl App {
 
     pub fn close_find(&mut self) {
         self.find.open = false;
+        crate::edit::remember(&mut self.settings.find_history, &self.find.query.text);
+        self.find.history_at = None;
+        if self.tab_mut().view.scope.take().is_some() {
+            self.tab_mut().search = Search::default();
+        }
         self.layout();
         win::set_focus(self.hwnd);
         self.restart_caret();
@@ -2493,6 +2595,7 @@ impl App {
         let text = FindBar::text_of(self.find.find_edit);
         let changed = text != self.find.query.text;
         self.find.query.text = text;
+        self.find.history_at = None;
         self.find.compile();
         if changed {
             self.clear_search_flash();
@@ -2513,14 +2616,16 @@ impl App {
     /// As you type, select the first match at or after where the search started.
     fn live_search(&mut self) {
         let Some(m) = self.find.matcher.clone() else { return };
-        let origin = self.find.origin.unwrap_or(self.tab().view.sel.start());
+        let (a, b) = self.search_range();
+        let origin = self.find.origin.unwrap_or(self.tab().view.sel.start()).clamp(a, b);
         let len = self.tab().doc.len();
         if len > m.sync_limit() {
             self.find_async(m, origin, true, true);
             return;
         }
         let doc = &self.tab().doc;
-        let r = m.find_fwd(doc, origin, len, None).or_else(|| m.find_fwd(doc, 0, origin, None));
+        let inside = |r: Option<(u64, u64)>| r.filter(|x| x.1 <= b);
+        let r = inside(m.find_fwd(doc, origin, b, None)).or_else(|| inside(m.find_fwd(doc, a, origin, None)));
         if let Some((s, e)) = r {
             self.select_match(s, e);
         }
@@ -2529,18 +2634,19 @@ impl App {
     /// `live`: the search as you type (see `FindJob`).
     fn find_async(&mut self, m: Arc<Matcher>, from: u64, forward: bool, live: bool) {
         let notify = self.notify.clone();
+        let (a, b) = self.search_range();
         let tab = self.tab_mut();
         let snap = tab.doc.snapshot();
         let (version, sel) = (tab.doc.version, tab.view.sel);
         let job = Job::spawn(snap.len(), notify, move |ctx| {
-            let len = snap.len();
+            let inside = |r: Option<(u64, u64)>| r.filter(|x| x.1 <= b);
             if forward {
-                m.find_fwd(&snap, from, len, Some(ctx)).map(|(s, e)| (s, e, false)).or_else(|| {
-                    m.find_fwd(&snap, 0, from, Some(ctx)).map(|(s, e)| (s, e, true))
+                inside(m.find_fwd(&snap, from, b, Some(ctx))).map(|(s, e)| (s, e, false)).or_else(|| {
+                    inside(m.find_fwd(&snap, a, from, Some(ctx))).map(|(s, e)| (s, e, true))
                 })
             } else {
-                m.find_back(&snap, 0, from, Some(ctx)).map(|(s, e)| (s, e, false)).or_else(|| {
-                    m.find_back(&snap, from, len, Some(ctx)).map(|(s, e)| (s, e, true))
+                m.find_back(&snap, a, from, Some(ctx)).map(|(s, e)| (s, e, false)).or_else(|| {
+                    inside(m.find_back(&snap, from, b, Some(ctx))).map(|(s, e)| (s, e, true))
                 })
             }
         });
@@ -2590,15 +2696,17 @@ impl App {
             self.flash_search(self.find.error.clone().unwrap_or_default(), true);
             return;
         };
+        crate::edit::remember(&mut self.settings.find_history, &self.find.query.text);
+        let (a, b) = self.search_range();
         let tab = self.tab();
         let sel = tab.view.sel;
         let len = tab.doc.len();
-        let mut from = if forward { sel.end() } else { sel.start() };
+        let mut from = (if forward { sel.end() } else { sel.start() }).clamp(a, b);
         // Don't find the same empty match again.
-        if sel.is_empty() && forward && from < len && m.is_match_at(&tab.doc, from, from) {
+        if sel.is_empty() && forward && from < b && m.is_match_at(&tab.doc, from, from) {
             from = tab.doc.next_char(from);
         }
-        self.find.origin = Some(if forward { sel.end() } else { sel.start() });
+        self.find.origin = Some(from);
         if !forward {
             if let Some(r) = self.counted_previous(from) {
                 self.found_next(r);
@@ -2610,12 +2718,77 @@ impl App {
             return;
         }
         let doc = &self.tab().doc;
+        let inside = |r: Option<(u64, u64)>| r.filter(|x| x.1 <= b);
         let r = if forward {
-            m.find_fwd(doc, from, len, None).map(|x| (x, false)).or_else(|| m.find_fwd(doc, 0, from, None).map(|x| (x, true)))
+            inside(m.find_fwd(doc, from, b, None)).map(|x| (x, false)).or_else(|| inside(m.find_fwd(doc, a, from, None)).map(|x| (x, true)))
         } else {
-            m.find_back(doc, 0, from, None).map(|x| (x, false)).or_else(|| m.find_back(doc, from, len, None).map(|x| (x, true)))
+            m.find_back(doc, a, from, None).map(|x| (x, false)).or_else(|| inside(m.find_back(doc, from, b, None)).map(|x| (x, true)))
         };
         self.found_next(r);
+    }
+
+    /// Where the find bar searches in the tab shown: its Find in selection range, else the whole text.
+    fn search_range(&self) -> (u64, u64) {
+        let tab = self.tab();
+        let len = tab.doc.len();
+        tab.view.scope.map_or((0, len), |(a, b)| (a.min(len), b.min(len).max(a.min(len))))
+    }
+
+    /// Find in selection (Alt+S) on or off: on, the find bar searches what's selected (and goes on searching it as
+    /// it's edited) until it's closed or this is turned off.
+    fn toggle_in_sel(&mut self) {
+        let (before, last) = (self.find.sel_before, self.find.last_match);
+        let tab = self.tab_mut();
+        if tab.view.scope.take().is_none() {
+            let sel = tab.view.sel;
+            let selected = (!sel.is_empty()).then(|| (sel.start(), sel.end()));
+            // (the match searching as you type selected isn't what the user selected)
+            let range = if selected.is_some() && selected != last { selected } else { before.or(selected) };
+            let Some((a, b)) = range.filter(|r| r.1 <= tab.doc.len()) else {
+                self.flash("Select the text to search in first.", true);
+                return;
+            };
+            tab.view.scope = Some((a, b));
+            self.find.origin = Some(a);
+        }
+        self.tab_mut().search = Search::default();
+        self.clear_search_flash();
+        self.live_search();
+        self.schedule_count();
+        self.invalidate();
+    }
+
+    /// Up and Down in a find bar box: the searches (or replacements) before, newest first; past the newest, what
+    /// was typed.
+    fn history_step(&mut self, edit: HWND, older: bool) {
+        let find = edit == self.find.find_edit;
+        let hist = if find { &self.settings.find_history } else { &self.settings.replace_history };
+        let typed = FindBar::text_of(edit);
+        let at = match (self.find.history_at, older) {
+            // (one the box has already is skipped)
+            (None, true) => (0..hist.len()).find(|&i| hist[i] != typed),
+            (None, false) => return,
+            (Some(i), true) => Some((i + 1).min(hist.len().saturating_sub(1))),
+            (Some(0), false) => None,
+            (Some(i), false) => Some(i - 1),
+        };
+        if at.is_none() && self.find.history_at.is_none() {
+            return;
+        }
+        if self.find.history_at.is_none() {
+            self.find.history_typed = typed;
+        }
+        let hist = if find { &self.settings.find_history } else { &self.settings.replace_history };
+        let text = match at {
+            Some(i) => hist.get(i).cloned().unwrap_or_default(),
+            None => self.find.history_typed.clone(),
+        };
+        FindBar::set_text(edit, &text);
+        FindBar::select_all(edit);
+        if find {
+            self.on_find_changed();
+        }
+        self.find.history_at = at;
     }
 
     pub fn schedule_count(&mut self) {
@@ -2633,6 +2806,7 @@ impl App {
             tab.search = Search::default();
             return;
         };
+        let (a, b) = self.search_range();
         let q = &self.find.query;
         let notify = self.notify.clone();
         let tab = &mut self.tabs[self.active];
@@ -2644,7 +2818,7 @@ impl App {
         tab.search.found = None;
         tab.search.marks = None;
         let snap = tab.doc.snapshot();
-        tab.search.job = Some(Job::spawn(snap.len(), notify, move |ctx| search::count_all(&m, &snap, ctx)));
+        tab.search.job = Some(Job::spawn(snap.len(), notify, move |ctx| search::count_in(&m, &snap, a, b, ctx)));
         self.timer(TIMER_JOBS, 100);
     }
 
@@ -2675,7 +2849,10 @@ impl App {
         if !self.editable() {
             return;
         }
-        let repl = FindBar::text_of(self.find.replace_edit);
+        let typed = FindBar::text_of(self.find.replace_edit);
+        crate::edit::remember(&mut self.settings.replace_history, &typed);
+        crate::edit::remember(&mut self.settings.find_history, &self.find.query.text);
+        let repl = crate::edit::replacement(&typed, self.find.query.regex, self.tab().doc.eol.as_bytes());
         let tab = self.tab_mut();
         let sel = tab.view.sel;
         if !sel.is_empty() && sel.end() - sel.start() < (16 << 20) {
@@ -2684,7 +2861,7 @@ impl App {
                 let hs = sel.start().saturating_sub(64);
                 let hay = tab.doc.read(hs, (sel.end() + 64).min(tab.doc.len()));
                 let mut out = Vec::new();
-                m.expand(&hay, (sel.start() - hs) as usize, repl.as_bytes(), &mut out);
+                m.expand(&hay, (sel.start() - hs) as usize, &repl, &mut out);
                 tab.doc.seal();
                 tab.view.sel = editor::replace_selection(&mut tab.doc, sel, &out, EditKind::Other);
                 tab.doc.seal();
@@ -2746,6 +2923,8 @@ impl App {
             Part::ReplaceOne => self.replace_one(),
             Part::ReplaceAll => self.start_task(TaskKind::ReplaceAll),
             Part::Go => self.go_to_line_from_bar(),
+            Part::InSel => self.toggle_in_sel(),
+            Part::Filter => self.filter_lines(false),
         }
     }
 
@@ -2776,7 +2955,12 @@ impl App {
                 self.close_find();
                 true
             }
+            VK_UP | VK_DOWN if !m.ctrl && !m.alt && edit != self.find.goto_edit => {
+                self.history_step(edit, k == VK_UP);
+                true
+            }
             VK_TAB if !m.ctrl => {
+                self.find.history_at = None;
                 // With the replace box, between the two boxes (Esc goes back to the text, where a habitual second Tab
                 // would type over the match selected there).
                 if self.find.mode == BarMode::Replace {
@@ -2795,6 +2979,7 @@ impl App {
                     VK_C => Some(Part::Case),
                     VK_W => Some(Part::Word),
                     VK_R => Some(Part::Regex),
+                    VK_S => Some(Part::InSel),
                     _ => None,
                 };
                 if let Some(p) = part {
@@ -4377,6 +4562,20 @@ fn line_suffix(p: &Path) -> Option<(PathBuf, u64, Option<u64>)> {
     Some((p.with_file_name(base), line, col))
 }
 
+/// Tells the Slate waiting with `--wait` (its event: only one of Slate's names) that its tabs are closed.
+pub fn signal_wait(name: &str) {
+    use windows::Win32::System::Threading::{EVENT_MODIFY_STATE, OpenEventW, SetEvent};
+    if !name.starts_with("Local\\Slate.Wait.") {
+        return;
+    }
+    unsafe {
+        if let Ok(h) = OpenEventW(EVENT_MODIFY_STATE, false, &HSTRING::from(name)) {
+            let _ = SetEvent(h);
+            let _ = windows::Win32::Foundation::CloseHandle(h);
+        }
+    }
+}
+
 fn unix_now() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
@@ -5131,6 +5330,7 @@ pub fn close_window(cell: &Cell) {
             return;
         }
         a.save_window_placement();
+        a.end_waits();
         if restore {
             a.save_session();
         } else {

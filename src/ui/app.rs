@@ -268,6 +268,17 @@ pub enum Goto {
     Place { caret: u64, top: u64 },
 }
 
+/// What a command line asks for besides its files: `slate --read-only`, `--wait` (the starting Slate returns once
+/// the tabs opened for it are closed: Slate as git's editor), `-` (text from standard input, in a new tab).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Opts {
+    pub read_only: bool,
+    /// `--wait`: the event (`Local\Slate.Wait.…`, in this session) set once the tabs opened for it are closed.
+    pub wait: Option<String>,
+    /// Text from standard input.
+    pub text: Option<Vec<u8>>,
+}
+
 /// A tab closed with File → Close (or Ctrl+W...), for Reopen closed tab: its file and where it was in it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ClosedTab {
@@ -509,6 +520,8 @@ pub struct App {
     pub overtype: bool,
     /// Tabs closed recently (with a file), the last one closed last; Ctrl+Shift+T opens them again.
     pub closed_tabs: Vec<ClosedTab>,
+    /// `slate --wait`: an event to set once all of its tabs are closed (`Opts::wait`).
+    pub waits: Vec<(String, Vec<u64>)>,
     /// The printer and its settings chosen last (File → Print).
     pub print_last: super::print::Last,
     /// The button listing all tabs, at the end of the tab strip (zero size while all tabs fit).
@@ -613,6 +626,7 @@ impl App {
             disk_job: None,
             overtype: false,
             closed_tabs: Vec::new(),
+            waits: Vec::new(),
             print_last: Default::default(),
             tablist_rect: Rect::default(),
             doc_counts: None,
@@ -992,6 +1006,8 @@ impl App {
                 Hit::Find(Part::Next) => "Next match (F3)",
                 Hit::Find(Part::Close) => "Close (Esc)",
                 Hit::Find(Part::ReplaceAll) => "Replace all (Ctrl+Alt+Enter)",
+                Hit::Find(Part::InSel) => "Find in selection (Alt+S)",
+                Hit::Find(Part::Filter) => "Show only matching lines, in a tab of their own (Alt+L)",
                 Hit::Status(StatusItem::Position) => "Go to line (Ctrl+G)",
                 Hit::Status(StatusItem::Zoom) => "Reset zoom (Ctrl+0)",
                 Hit::Status(StatusItem::Eol) => "Line endings",
@@ -1064,6 +1080,7 @@ impl App {
         let hover_part = if let Hit::Find(p) = self.hover { Some(p) } else { None };
         let pressed = hover_part.is_some() && self.down == self.hover;
         let (ui, icons) = (&self.fonts.ui, &self.fonts.icons_small);
+        self.find.in_sel = self.tab().view.scope.is_some();
         self.find.paint(&self.g, &self.theme, self.r_find, ui, icons, hover_part, pressed, focused_edit);
         self.paint_notice();
         self.paint_editor(focused_edit.is_none());
@@ -1410,6 +1427,9 @@ impl App {
             if b - a < 4 << 20 {
                 let bytes = tab.doc.read(a, b);
                 matches = m.matches_in(&bytes, a, 5000);
+            }
+            if let Some((a, b)) = tab.view.scope {
+                matches.retain(|&(s, e)| s >= a && e <= b);
             }
         }
         // (no caret or current line in a tab whose text is still coming)

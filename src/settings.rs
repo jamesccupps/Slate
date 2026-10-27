@@ -53,6 +53,9 @@ pub struct Settings {
     pub last_update_check: u64,
     /// A version whose update didn't start on this PC (and was undone): not offered again by the daily check.
     pub failed_update: String,
+    /// The last searches and replacements, newest first (Up and Down in the find bar's boxes).
+    pub find_history: Vec<String>,
+    pub replace_history: Vec<String>,
     /// Settings this version doesn't know (written by a newer one), kept for it.
     #[serde(flatten)]
     pub other: serde_json::Map<String, serde_json::Value>,
@@ -80,6 +83,8 @@ impl Default for Settings {
             check_updates: true,
             last_update_check: 0,
             failed_update: String::new(),
+            find_history: Vec::new(),
+            replace_history: Vec::new(),
             other: serde_json::Map::new(),
         }
     }

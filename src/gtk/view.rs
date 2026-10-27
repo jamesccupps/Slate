@@ -210,6 +210,8 @@ pub struct View {
     pub drag: Option<Drag>,
     /// The starts of the lines bookmarked, in order (`edit::toggle_mark`); they follow edits (`sync`).
     pub bookmarks: Vec<u64>,
+    /// Find in selection: the part of the text the find bar searches (drawn faintly); it follows edits (`sync`).
+    pub scope: Option<(u64, u64)>,
     cache: HashMap<u64, CacheEntry>,
     cache_bytes: usize,
     tick: u64,
@@ -302,6 +304,7 @@ impl View {
             keys: HashMap::new(),
             keys_version: u64::MAX,
             bookmarks: Vec::new(),
+            scope: None,
         }
     }
 
@@ -312,6 +315,9 @@ impl View {
         let mut moved = false;
         for (k, c) in doc.take_changes().iter().enumerate() {
             crate::edit::map_marks(&mut self.bookmarks, c);
+            if let Some((a, b)) = self.scope {
+                self.scope = Some((c.map(a), c.map(b)));
+            }
             moved = true;
             if k >= self.hl.seen {
                 self.hl.edited(c.at);
@@ -853,6 +859,11 @@ impl View {
             }
             let _ = cr.fill();
         };
+        if let Some((a, b)) = self.scope {
+            for r in rows.iter() {
+                fill(cr, r, a, b, t.hover, false);
+            }
+        }
         for (a, b) in matches {
             for r in rows.iter() {
                 fill(cr, r, *a, *b, t.match_bg, false);

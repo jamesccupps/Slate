@@ -166,6 +166,14 @@ async fn script(lines: Vec<String>, test: Rc<Test>) -> i32 {
                 ui.with(|a| a.open_paths(&[p]));
                 settle(10).await;
             }
+            // what another start hands over with `--read-only`, `--wait`, `-`: the hint, then the files (`|` between)
+            "request" => {
+                let mut parts = arg.split('|');
+                let hint = parts.next().unwrap_or_default().to_string();
+                let paths: Vec<PathBuf> = parts.map(PathBuf::from).collect();
+                ui.with(|a| a.open_hinted(&paths, &hint));
+                settle(10).await;
+            }
             "type" => {
                 for c in unescape(arg).chars() {
                     let mut b = [0u8; 4];
@@ -379,6 +387,8 @@ fn value(what: &str, test: &Test) -> String {
             v.join(" ")
         }
         "notice" => tab.notice.clone().unwrap_or_default(),
+        // `--wait`s noted: their tabs
+        "waits" => format!("{:?}", a.waits.iter().map(|(_, ids)| ids.len()).collect::<Vec<_>>()),
         "readonly" => (tab.read_only || tab.filter.is_some()).to_string(),
         // (the lines bookmarked, 1-based)
         "bookmarks" => tab.view.bookmarks.iter().filter_map(|&b| tab.doc.line_of(b)).map(|l| (l + 1).to_string()).collect::<Vec<_>>().join(","),

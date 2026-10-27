@@ -68,7 +68,11 @@ pub fn class() -> PCWSTR {
         CLASS
     }
 }
-const COPYDATA_OPEN: usize = 0x51A7E;
+pub(crate) const COPYDATA_OPEN: usize = 0x51A7E;
+/// Files with what the command line asked for besides them (`app::Opts`): lines starting with `?` (no file name
+/// can) say it — `?read-only`, `?wait=<event>`, `?text=<file>` (standard input, written to a file Slate deletes once
+/// read). A Slate from before 0.13.0 doesn't take these: the one starting then opens a window of its own.
+pub(crate) const COPYDATA_OPEN2: usize = 0x51A7F;
 
 thread_local! {
     static APP: RefCell<Option<Cell>> = const { RefCell::new(None) };
@@ -153,8 +157,8 @@ pub fn drain_pending(cell: &Cell) {
                 // Files first: an Exit queued meanwhile would close the window before they're in it. (In a tab,
                 // they're kept in the session like the rest.)
                 let late = LATE_FILES.with(|l| std::mem::take(&mut *l.borrow_mut()));
-                for (paths, args) in late {
-                    if args { a.open_command_line(&paths) } else { a.open_paths(&paths) }
+                for (paths, args, opts) in late {
+                    if args { a.open_request(&paths, &opts) } else { a.open_paths(&paths) }
                 }
                 (!a.pending.is_empty()).then(|| a.pending.remove(0))
             }
@@ -169,8 +173,8 @@ pub fn drain_pending(cell: &Cell) {
 
 thread_local! {
     /// Files dropped on the window or sent by another Slate while the app was busy; opened right after.
-    /// (and whether they're from a command line: another Slate's)
-    static LATE_FILES: RefCell<Vec<(Vec<PathBuf>, bool)>> = const { RefCell::new(Vec::new()) };
+    /// (and whether they're from a command line: another Slate's, with what it asked for besides them)
+    static LATE_FILES: RefCell<Vec<(Vec<PathBuf>, bool, app::Opts)>> = const { RefCell::new(Vec::new()) };
     /// The window is being closed (`Closing`).
     static CLOSING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
@@ -195,16 +199,16 @@ impl Drop for Closing {
 fn open_soon(cell: &Cell, hwnd: HWND, paths: Vec<PathBuf>) {
     match cell.try_borrow_mut() {
         Ok(mut a) => a.open_paths(&paths),
-        Err(_) => open_later(hwnd, paths, false),
+        Err(_) => open_later(hwnd, paths, false, app::Opts::default()),
     }
 }
 
 /// Opens `paths` with the next message.
-fn open_later(hwnd: HWND, paths: Vec<PathBuf>, args: bool) {
-    if paths.is_empty() {
+fn open_later(hwnd: HWND, paths: Vec<PathBuf>, args: bool, opts: app::Opts) {
+    if paths.is_empty() && opts.text.is_none() && opts.wait.is_none() {
         return;
     }
-    LATE_FILES.with(|l| l.borrow_mut().push((paths, args)));
+    LATE_FILES.with(|l| l.borrow_mut().push((paths, args, opts)));
     unsafe {
         let _ = PostMessageW(hwnd, WM_APP_JOB, WPARAM(0), LPARAM(0));
     }
@@ -505,6 +509,8 @@ fn handle(cell: &Cell, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<L
             if let Ok(mut a) = cell.try_borrow_mut() {
                 if code == EN_CHANGE && id == findbar::ID_FIND {
                     a.on_find_changed();
+                } else if code == EN_CHANGE && id == findbar::ID_REPLACE {
+                    a.find.history_at = None;
                 } else if code == EN_SETFOCUS || code == EN_KILLFOCUS {
                     a.invalidate();
                 }
@@ -538,7 +544,7 @@ fn handle(cell: &Cell, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<L
         }
         WM_COPYDATA => {
             let cds = unsafe { &*(lp.0 as *const COPYDATASTRUCT) };
-            if cds.dwData != COPYDATA_OPEN {
+            if cds.dwData != COPYDATA_OPEN && cds.dwData != COPYDATA_OPEN2 {
                 return None;
             }
             // Closing (asking about unsaved changes, or saving for it): not taken, as the window may be gone in a
@@ -553,9 +559,9 @@ fn handle(cell: &Cell, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<L
                 return Some(LRESULT(1));
             }
             let units = unsafe { std::slice::from_raw_parts(cds.lpData as *const u16, cds.cbData as usize / 2) };
-            let paths = handed_over(units);
+            let (paths, opts) = if cds.dwData == COPYDATA_OPEN2 { handed_over2(units) } else { (handed_over(units), app::Opts::default()) };
             // Answered at once; opening them (which can take a while on a slow share) comes right after.
-            open_later(hwnd, paths, true);
+            open_later(hwnd, paths, true, opts);
             // (A test's hidden window stays out of the user's way.)
             if !win::testing() {
                 unsafe {
@@ -729,25 +735,78 @@ pub fn release_instance_lock() {
 enum Running {
     /// No: this one is the Slate.
     No,
-    /// Yes, and it opened the files.
-    Took,
+    /// Yes, and it opened the files (its process id).
+    Took(u32),
     /// Yes, but it didn't answer (busy or hung).
     Busy,
 }
 
-/// If Slate is already running, hands it the files. A Slate running as administrator is a separate one, with its
-/// own lock, window class and session.
-fn forward_to_running(paths: &[PathBuf]) -> Running {
-    let lock = if win::elevated() { w!("Local\\Slate.SingleInstance.Admin") } else { w!("Local\\Slate.SingleInstance") };
+/// If Slate is already running, hands it the files (and what else the command line asks for: `extra`, the lines of
+/// `COPYDATA_OPEN2`). A Slate running as administrator is a separate one, with its own lock, window class and session.
+fn forward_to_running(paths: &[PathBuf], extra: &[String], tries: u32) -> Running {
+    let lock = instance_lock();
     // (as Windows has them: a name needn't be valid Unicode)
     let mut text: Vec<u16> = Vec::new();
+    for line in extra {
+        text.extend(line.encode_utf16());
+        text.push(b'\n' as u16);
+    }
     for (k, p) in paths.iter().enumerate() {
         if k > 0 {
             text.push(b'\n' as u16);
         }
         text.extend(p.as_os_str().encode_wide());
     }
-    hand_over(lock, class(), &text, 100)
+    let kind = if extra.is_empty() { COPYDATA_OPEN } else { COPYDATA_OPEN2 };
+    hand_over_as(lock, class(), &text, kind, tries)
+}
+
+fn instance_lock() -> PCWSTR {
+    if win::elevated() { w!("Local\\Slate.SingleInstance.Admin") } else { w!("Local\\Slate.SingleInstance") }
+}
+
+/// `COPYDATA_OPEN2`: the files, and what else was asked for (`?` lines). Standard input's text is read from the file
+/// named (one Slate wrote in the temp folder: nothing else is read or deleted).
+fn handed_over2(units: &[u16]) -> (Vec<PathBuf>, app::Opts) {
+    let mut opts = app::Opts::default();
+    let mut paths = Vec::new();
+    for line in units.split(|&u| u == b'\n' as u16).filter(|s| !s.is_empty()) {
+        if line.first() != Some(&(b'?' as u16)) {
+            paths.push(PathBuf::from(OsString::from_wide(line)));
+            continue;
+        }
+        let s = String::from_utf16_lossy(&line[1..]);
+        if s == "read-only" {
+            opts.read_only = true;
+        } else if let Some(name) = s.strip_prefix("wait=") {
+            opts.wait = Some(name.to_string());
+        } else if let Some(file) = s.strip_prefix("text=") {
+            let p = PathBuf::from(file);
+            let ours = p.parent() == Some(settings::temp_dir().as_path())
+                && p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("slate-stdin-"));
+            if ours {
+                opts.text = Some(std::fs::read(&p).unwrap_or_default());
+                let _ = std::fs::remove_file(&p);
+            }
+        }
+    }
+    (paths, opts)
+}
+
+/// `slate --wait`: waits until the Slate that took the files sets `event` (their tabs are all closed), or ends.
+fn wait_for_tabs(event: windows::Win32::Foundation::HANDLE, pid: u32) {
+    use windows::Win32::System::Threading::{INFINITE, OpenProcess, PROCESS_SYNCHRONIZE, WaitForMultipleObjects};
+    unsafe {
+        match OpenProcess(PROCESS_SYNCHRONIZE, false, pid) {
+            Ok(p) => {
+                let _ = WaitForMultipleObjects(&[event, p], false, INFINITE);
+                let _ = windows::Win32::Foundation::CloseHandle(p);
+            }
+            Err(_) => {
+                let _ = windows::Win32::System::Threading::WaitForSingleObject(event, INFINITE);
+            }
+        }
+    }
 }
 
 /// The files another Slate handed over (`forward_to_running`): one per line.
@@ -758,7 +817,13 @@ fn handed_over(units: &[u16]) -> Vec<PathBuf> {
 /// `forward_to_running` with the lock and window class given (the tests use their own), trying `tries` times
 /// 100 ms apart: the running Slate may be starting (its window not there yet, or not ready for files) or closing
 /// (its window gone, its lock not yet), and then this one becomes the Slate.
+#[cfg(test)]
 fn hand_over(lock: PCWSTR, class: PCWSTR, text: &[u16], tries: u32) -> Running {
+    hand_over_as(lock, class, text, COPYDATA_OPEN, tries)
+}
+
+/// `hand_over` with the kind of message (`COPYDATA_OPEN` or `COPYDATA_OPEN2`).
+fn hand_over_as(lock: PCWSTR, class: PCWSTR, text: &[u16], kind: usize, tries: u32) -> Running {
     for _ in 0..tries {
         unsafe {
             match CreateMutexW(None, false, lock) {
@@ -776,7 +841,7 @@ fn hand_over(lock: PCWSTR, class: PCWSTR, text: &[u16], tries: u32) -> Running {
             }
             if let Some(h) = slate_window(class) {
                 let cds = COPYDATASTRUCT {
-                    dwData: COPYDATA_OPEN,
+                    dwData: kind,
                     cbData: (text.len() * 2) as u32,
                     lpData: text.as_ptr() as *mut _,
                 };
@@ -795,7 +860,7 @@ fn hand_over(lock: PCWSTR, class: PCWSTR, text: &[u16], tries: u32) -> Running {
                     Some(&mut res),
                 );
                 if sent.0 != 0 && res != 0 {
-                    return Running::Took;
+                    return Running::Took(pid);
                 }
                 // Busy or hung, its window still there: a window of its own. The window gone meanwhile, or not
                 // ready for files yet: look again.
@@ -913,7 +978,7 @@ pub fn make_app(hwnd: HWND) -> Cell {
 }
 
 /// Puts back the tabs from last time, then opens `paths`.
-pub fn restore(app: &mut App, paths: &[PathBuf]) {
+pub fn restore(app: &mut App, paths: &[PathBuf], opts: &app::Opts) {
     let mut active_id = None;
     // (not in a test: its windows draw offscreen)
     let watch = !app.g.offscreen && settings::persist();
@@ -947,8 +1012,8 @@ pub fn restore(app: &mut App, paths: &[PathBuf]) {
             }
         }
     }
-    if !paths.is_empty() {
-        app.open_command_line(paths);
+    if !paths.is_empty() || opts.text.is_some() {
+        app.open_request(paths, opts);
     } else if let Some(id) = active_id {
         if let Some(i) = app.tabs.iter().position(|t| t.id == id) {
             // (what restoring had to say stays: it isn't about the tab shown before)
@@ -1268,14 +1333,30 @@ pub fn run(raw: Vec<std::ffi::OsString>) -> i32 {
         update_failed = Some(args.get(i + 1).cloned().unwrap_or_default());
         take(&mut args, i, 2);
     }
+    // `--read-only`, `--wait` and `-` (standard input): `app::Opts`.
+    let mut opts = app::Opts::default();
+    if let Some(i) = args.iter().position(|a| a == "--read-only") {
+        take(&mut args, i, 1);
+        opts.read_only = true;
+    }
+    let wait = args.iter().position(|a| a == "--wait");
+    if let Some(i) = wait {
+        take(&mut args, i, 1);
+    }
+    if let Some(i) = args.iter().position(|a| a == "-") {
+        take(&mut args, i, 1);
+        let mut text = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut std::io::stdin(), &mut text);
+        opts.text = Some(text);
+    }
     let paths: Vec<PathBuf> = raw
         .iter()
         .zip(&args)
         .filter(|(_, a)| !a.starts_with("--"))
         .map(|(r, _)| std::path::absolute(r).unwrap_or_else(|_| PathBuf::from(r)))
         .collect();
-    match forward_to_running(&paths) {
-        Running::Took => return 0,
+    match hand_over_request(&paths, &opts, wait.is_some()) {
+        Running::Took(_) => return 0,
         Running::No => {}
         Running::Busy => settings::GUEST.store(true, std::sync::atomic::Ordering::Relaxed),
     }
@@ -1294,7 +1375,7 @@ pub fn run(raw: Vec<std::ffi::OsString>) -> i32 {
     let cell = make_app(hwnd);
     {
         let mut a = cell.borrow_mut();
-        restore(&mut a, &paths);
+        restore(&mut a, &paths, &opts);
         // (Ahead of what restoring had to say, which stays.)
         let said = a.flash.take();
         let mut first = None;
@@ -1348,6 +1429,91 @@ pub fn run(raw: Vec<std::ffi::OsString>) -> i32 {
         update::restart();
     }
     code
+}
+
+/// Hands the files and what the command line asked for besides them to a running Slate (`forward_to_running`).
+/// Standard input's text goes in a file in the temp folder, which that Slate reads and deletes. `--wait`: a Slate is
+/// started first when none runs (so closing the tabs, not the whole window, ends the wait), and this one returns once
+/// that Slate says their tabs are closed, or has ended. Took: there's nothing more for this one to do.
+fn hand_over_request(paths: &[PathBuf], opts: &app::Opts, wait: bool) -> Running {
+    use windows::Win32::System::Threading::CreateEventW;
+    if !wait && opts.text.is_none() && !opts.read_only {
+        return forward_to_running(paths, &[], 100);
+    }
+    let mut extra = Vec::new();
+    if opts.read_only {
+        extra.push("?read-only".to_string());
+    }
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    let pid = unsafe { GetCurrentProcessId() };
+    let mut text_file = None;
+    if let Some(text) = &opts.text {
+        let p = settings::temp_dir().join(format!("slate-stdin-{pid}-{stamp}.txt"));
+        if std::fs::write(&p, text).is_ok() {
+            extra.push(format!("?text={}", p.display()));
+            text_file = Some(p);
+        }
+    }
+    let mut event = None;
+    if wait {
+        let name = format!("Local\\Slate.Wait.{pid}.{stamp}");
+        if let Ok(h) = unsafe { CreateEventW(None, true, false, &windows::core::HSTRING::from(name.as_str())) } {
+            extra.push(format!("?wait={name}"));
+            event = Some(h);
+        }
+    }
+    let mut r = forward_to_running(paths, &extra, 100);
+    if matches!(r, Running::No) && event.is_some() {
+        // No Slate runs: one is started (without these files), and they go to it once it's there.
+        release_instance_lock();
+        let started = std::env::current_exe().ok().is_some_and(|exe| {
+            use std::os::windows::process::CommandExt;
+            const DETACHED_PROCESS: u32 = 0x8;
+            std::process::Command::new(exe)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .creation_flags(DETACHED_PROCESS)
+                .spawn()
+                .is_ok()
+        });
+        if started {
+            // Once its window is there (it takes the lock before making it: asking for the lock sooner, this one
+            // would get it again), for up to 20 s.
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            while slate_window(class()).is_none() && std::time::Instant::now() < until {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            r = forward_to_running(paths, &extra, 100);
+            if let Running::No = r {
+                // (it didn't come up after all: this one is the Slate)
+                return r;
+            }
+        } else {
+            r = forward_to_running(paths, &[], 100);
+        }
+    }
+    match (&r, event) {
+        (Running::Took(pid), Some(h)) => {
+            wait_for_tabs(h, *pid);
+            unsafe {
+                let _ = windows::Win32::Foundation::CloseHandle(h);
+            }
+        }
+        (Running::Took(_), None) => {}
+        (_, h) => {
+            // (not taken: this one opens them itself; nothing to wait for but its own window)
+            if let Some(h) = h {
+                unsafe {
+                    let _ = windows::Win32::Foundation::CloseHandle(h);
+                }
+            }
+            if let Some(p) = text_file {
+                let _ = std::fs::remove_file(p);
+            }
+        }
+    }
+    r
 }
 
 pub fn message_loop(cell: &Cell, hwnd: HWND) -> i32 {
@@ -1467,7 +1633,7 @@ mod tests {
         *ANSWERS.lock().unwrap() = vec![0, 0, 1];
         let (stop, quit) = std::sync::mpsc::channel();
         let other = another_slate(&class, quit);
-        assert!(matches!(hand_over(lock_w, class_w, &wide("b.txt\nc.txt"), 20), Running::Took));
+        assert!(matches!(hand_over(lock_w, class_w, &wide("b.txt\nc.txt"), 20), Running::Took(_)));
         assert_eq!(*TOOK.lock().unwrap(), ["b.txt\nc.txt"]);
         // one that's closing: its window is gone, its lock still there for a moment; then this one is the Slate
         stop.send(()).unwrap();

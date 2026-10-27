@@ -477,15 +477,18 @@ impl Matcher {
         }
     }
 
-    /// Writes the text of `snap` with every match replaced. Returns the number of replacements.
+    /// Writes the text of `snap` with every match replaced (`range`: only those inside it, Find in selection).
+    /// Returns the number of replacements.
     pub fn replace_all_to(
         &self,
         snap: &Snapshot,
         replacement: &[u8],
         w: &mut dyn Write,
         idx: &mut IndexBuilder,
+        range: Option<(u64, u64)>,
         ctx: &Ctx,
     ) -> io::Result<u64> {
+        let (from, to) = range.map_or((0, snap.len()), |(a, b)| (a.min(snap.len()), b.min(snap.len())));
         let mut count = 0u64;
         let mut copied = 0u64;
         let mut err: Option<io::Error> = None;
@@ -510,9 +513,11 @@ impl Matcher {
             });
             e.map_or(Ok(()), Err)
         };
-        self.windows(snap, 0, snap.len(), Some(ctx), self.sizes(snap.len(), true), &mut |hay, hs, hit| {
+        self.windows(snap, from, to, Some(ctx), self.sizes(snap.len(), true), &mut |hay, hs, hit| {
             let r = match hit {
                 Hit::Done(upto) => copy(hay, hs, copied, upto, w, idx).map(|_| copied = copied.max(upto)),
+                // (one running out of the range isn't in it)
+                Hit::Match(_, e) if e > to => Ok(()),
                 Hit::Match(s, e) => copy(hay, hs, copied, s, w, idx).and_then(|_| {
                     buf.clear();
                     self.expand(hay, (s - hs) as usize, replacement, &mut buf);
@@ -804,9 +809,17 @@ pub struct Found {
 pub const MAX_POSITIONS: usize = 1_000_000;
 
 pub fn count_all(m: &Matcher, snap: &Snapshot, ctx: &Ctx) -> Found {
+    count_in(m, snap, 0, snap.len(), ctx)
+}
+
+/// `count_all` of the matches inside `[from, to)` (Find in selection).
+pub fn count_in(m: &Matcher, snap: &Snapshot, from: u64, to: u64, ctx: &Ctx) -> Found {
     let mut found = Found::default();
-    m.windows(snap, 0, snap.len(), Some(ctx), m.sizes(snap.len(), true), &mut |_, _, hit| {
-        if let Hit::Match(s, e) = hit {
+    let to = to.min(snap.len());
+    m.windows(snap, from.min(to), to, Some(ctx), m.sizes(snap.len(), true), &mut |_, _, hit| {
+        if let Hit::Match(s, e) = hit
+            && e <= to
+        {
             found.count += 1;
             if found.positions.len() < MAX_POSITIONS {
                 found.positions.push((s, e));
@@ -1068,6 +1081,20 @@ mod tests {
     }
 
     #[test]
+    fn counting_and_replacing_inside_a_range() {
+        let text = b"foo bar foo bar foo";
+        let snap = fragmented(text);
+        let m = Matcher::new(&q("foo")).unwrap();
+        let c = |a, b| count_in(&m, &snap, a, b, &ctx()).positions;
+        assert_eq!(c(0, 19), [(0, 3), (8, 11), (16, 19)]);
+        // a match running out of the range isn't in it
+        assert_eq!(c(1, 18), [(8, 11)]);
+        let mut out = Vec::new();
+        let n = m.replace_all_to(&snap, b"X", &mut out, &mut IndexBuilder::new(), Some((4, 19)), &ctx()).unwrap();
+        assert_eq!((n, out.as_slice()), (2, &b"foo bar X bar X"[..]));
+    }
+
+    #[test]
     fn windows_find_what_the_whole_text_has() {
         // seams everywhere (tiny windows, and a tiny overlap in tests): the same matches as one search of it all
         let words = ["foo", "bar", "Foo", "é", "É", "\r\n", "\n", " ", "x", "aaaa", "\t", "foobar", "1.5", "日本", "\r"];
@@ -1129,7 +1156,7 @@ mod tests {
             // Count all and Replace all: exact while no match is longer than their overlap (1500 in tests)
             assert_eq!(count_all(&m, &snap, &ctx()).positions, want, "{pat}");
             let mut out = Vec::new();
-            let n = m.replace_all_to(&snap, b"\"\"", &mut out, &mut IndexBuilder::new(), &ctx()).unwrap();
+            let n = m.replace_all_to(&snap, b"\"\"", &mut out, &mut IndexBuilder::new(), None, &ctx()).unwrap();
             assert_eq!(n, want.len() as u64);
             assert!(out == replaced(&m, &text, &want, b"\"\""), "{pat}");
         }
@@ -1200,7 +1227,7 @@ mod tests {
             want.extend_from_slice(&text[at..]);
             let mut out = Vec::new();
             let mut idx = IndexBuilder::new();
-            let n = m.replace_all_to(&snap, repl.as_bytes(), &mut out, &mut idx, &ctx()).unwrap();
+            let n = m.replace_all_to(&snap, repl.as_bytes(), &mut out, &mut idx, None, &ctx()).unwrap();
             assert_eq!(n, found.len() as u64, "{pat}");
             assert!(out == want, "{pat}");
             assert_eq!(idx.newlines(), bytecount::count(&want, b'\n') as u64);
@@ -1229,7 +1256,7 @@ mod tests {
         let m = Matcher::new(&Query { regex: true, ..q(r"(\w)=(\d+)") }).unwrap();
         let mut out = Vec::new();
         let mut idx = IndexBuilder::new();
-        let n = m.replace_all_to(&snap, b"$2:$1", &mut out, &mut idx, &ctx()).unwrap();
+        let n = m.replace_all_to(&snap, b"$2:$1", &mut out, &mut idx, None, &ctx()).unwrap();
         assert_eq!(n, 3);
         assert_eq!(out, b"1:a, 22:b\n333:c");
         assert_eq!(idx.newlines(), 1);
@@ -1239,7 +1266,7 @@ mod tests {
         let mut b = Buffer::from_source(snap, 2);
         let snap = b.snapshot();
         let mut out = Vec::new();
-        m.replace_all_to(&snap, b"> ", &mut out, &mut IndexBuilder::new(), &ctx()).unwrap();
+        m.replace_all_to(&snap, b"> ", &mut out, &mut IndexBuilder::new(), None, &ctx()).unwrap();
         assert_eq!(out, b"> x\n> y\n> ");
     }
 

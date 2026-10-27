@@ -14,7 +14,7 @@
 //! `wheel:<rows>`, `wait:<ms>`, `jobs` (wait for background work), `checkdisk` (look for files changed on disk,
 //! as the window does every 2 s; then `jobs`), `shot:<file.png>`, `print:<what>`
 //! (`text`, `sel`, `status`, `lines`, `title`, `top`, `find`, `tabs`, `dirty`, `asked`, `clipboard`, `window`,
-//! `saving`, `busy`: what `jobs` waits for, `mem`: private bytes and working set), `expect:<what>=<value>`, `answer:save,dont,cancel` (answers for the next prompts, which are never
+//! `saving`, `findtext`: the find bar's boxes and Find in selection's range, `busy`: what `jobs` waits for, `mem`: private bytes and working set), `expect:<what>=<value>`, `answer:save,dont,cancel` (answers for the next prompts, which are never
 //! shown in this mode; `asked` lists the prompts so far), `set:restore_session=true` (also `font=<family>`).
 //!
 //! Lower level: `down:<x>,<y>` / `move:<x>,<y>` / `up:<x>,<y>` (left button, for drags; also where drag scrolling
@@ -76,6 +76,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use super::app::{Cell, Hit};
+
+thread_local! {
+    /// `waitevent:`: the event a `--wait` request sets.
+    static WAIT_EVENT: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
+}
 use super::commands::Cmd;
 use super::findbar::FindBar;
 use super::gfx::offscreen_pixel_format;
@@ -703,6 +708,20 @@ fn describe(cell: &Cell, what: &str) -> String {
             a.update_find_status();
             a.find.status.clone()
         }
+        // `--wait`s noted (their tabs), and whether the event `waitevent:` made is set
+        "waits" => {
+            let set = WAIT_EVENT.with(|w| w.get()) != 0 && unsafe {
+                windows::Win32::System::Threading::WaitForSingleObject(windows::Win32::Foundation::HANDLE(WAIT_EVENT.with(|w| w.get()) as *mut _), 0)
+            } == windows::Win32::Foundation::WAIT_OBJECT_0;
+            format!("{:?}, event {}", a.waits.iter().map(|(_, ids)| ids.len()).collect::<Vec<_>>(), if set { "set" } else { "not set" })
+        }
+        // (the find bar's boxes, and Find in selection's range)
+        "findtext" => format!(
+            "{:?} / {:?} / scope {:?}",
+            FindBar::text_of(a.find.find_edit),
+            FindBar::text_of(a.find.replace_edit),
+            a.tab().view.scope
+        ),
         "readonly" => (a.tab().read_only || a.tab().filter.is_some()).to_string(),
         // (the lines bookmarked, 1-based)
         "bookmarks" => {
@@ -1082,7 +1101,7 @@ pub fn run(args: &[String]) -> i32 {
                         a.settings.restore_session = true;
                         a.tabs.clear();
                         a.active = 0;
-                        super::restore(&mut a, &[]);
+                        super::restore(&mut a, &[], &Default::default());
                     }
                 }
                 out.push_str(&format!("session {arg}: {:.1} ms\n", t.elapsed().as_secs_f64() * 1000.0));
@@ -1215,6 +1234,24 @@ pub fn run(args: &[String]) -> i32 {
                     }
                 }
             }
+            // what another Slate hands over with `--read-only`, `--wait`, `-`: the lines of `COPYDATA_OPEN2`, `|` between
+            // them (`?read-only|?wait=Local\Slate.Wait.x|C:\a.txt`); `waitevent:<name>` makes the event a `--wait` sets
+            "request" => {
+                use windows::Win32::Foundation::{LPARAM, WPARAM};
+                use windows::Win32::System::DataExchange::COPYDATASTRUCT;
+                use windows::Win32::UI::WindowsAndMessaging::{SendMessageW, WM_COPYDATA};
+                let text: Vec<u16> = arg.replace('|', "
+").encode_utf16().collect();
+                let cds = COPYDATASTRUCT { dwData: super::COPYDATA_OPEN2, cbData: (text.len() * 2) as u32, lpData: text.as_ptr() as *mut _ };
+                let took = unsafe { SendMessageW(hwnd, WM_COPYDATA, WPARAM(0), LPARAM(&cds as *const _ as isize)) };
+                out.push_str(&format!("request: {}
+", if took.0 != 0 { "taken" } else { "not taken" }));
+                pump(&cell, 0);
+            }
+            "waitevent" => unsafe {
+                let h = windows::Win32::System::Threading::CreateEventW(None, true, false, &windows::core::HSTRING::from(arg));
+                WAIT_EVENT.with(|w| w.set(h.map_or(0, |h| h.0 as isize)));
+            },
             "copydata" => {
                 use windows::Win32::Foundation::{LPARAM, WPARAM};
                 use windows::Win32::System::DataExchange::COPYDATASTRUCT;

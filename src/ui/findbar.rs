@@ -49,6 +49,10 @@ pub enum Part {
     ReplaceOne,
     ReplaceAll,
     Go,
+    /// Find in selection (Alt+S).
+    InSel,
+    /// Show only matching lines (Alt+L).
+    Filter,
 }
 
 pub struct FindBar {
@@ -65,6 +69,16 @@ pub struct FindBar {
     pub origin: Option<u64>,
     pub status: String,
     pub status_bad: bool,
+    /// Find in selection is on in the tab shown (its view has a `scope`).
+    pub in_sel: bool,
+    /// What was selected when the bar opened, and the match the search selected last: Find in selection takes the
+    /// first while what's selected is that match (searching as you type selects one).
+    pub sel_before: Option<(u64, u64)>,
+    pub last_match: Option<(u64, u64)>,
+    /// Up and Down in a box go through its history: where they are in it (None: the text typed, kept in
+    /// `history_typed` meanwhile).
+    pub history_at: Option<usize>,
+    pub history_typed: String,
     pub goto_hint: String,
     pub parts: Vec<(Part, Rect)>,
     pub inputs: Vec<(HWND, Rect)>,
@@ -113,6 +127,11 @@ impl FindBar {
             origin: None,
             status: String::new(),
             status_bad: false,
+            in_sel: false,
+            sel_before: None,
+            last_match: None,
+            history_at: None,
+            history_typed: String::new(),
             goto_hint: String::new(),
             parts: Vec::new(),
             inputs: Vec::new(),
@@ -280,24 +299,26 @@ impl FindBar {
         }
         self.parts.push((Part::Expand, Rect::new(x, y, 22.0, box_h)));
         x += 26.0;
-        // what the box and the match count after it can have, before the previous / next buttons
-        let room = (close.x - 8.0 - (2.0 * btn + 2.0) - 14.0 - x).max(0.0);
+        // what the box and the match count after it can have, before the previous / next / matching lines buttons
+        let room = (close.x - 8.0 - (3.0 * btn + 4.0) - 14.0 - x).max(0.0);
         self.status_w = 124f32.min(room - 140.0).max(0.0);
         let box_w = (r.w * 0.42).clamp(220.0, 460.0).min(room - self.status_w).max(120.0);
         let b = snap_box(Rect::new(x, y, box_w, box_h));
         self.inputs.push((self.find_edit, b));
         // Toggles sit inside the box on the right.
         let tw = 26.0;
-        let tx = b.right() - 3.0 * tw - 2.0;
+        let tx = b.right() - 4.0 * tw - 2.0;
         self.parts.push((Part::Case, Rect::new(tx, y + 2.0, tw, box_h - 4.0)));
         self.parts.push((Part::Word, Rect::new(tx + tw, y + 2.0, tw, box_h - 4.0)));
         self.parts.push((Part::Regex, Rect::new(tx + 2.0 * tw, y + 2.0, tw, box_h - 4.0)));
+        self.parts.push((Part::InSel, Rect::new(tx + 3.0 * tw, y + 2.0, tw, box_h - 4.0)));
         place(self.find_edit, Rect::new(b.x + 4.0, b.y, tx - b.x - 6.0, b.h));
         show(self.find_edit, true);
         show(self.goto_edit, false);
         x = b.right() + 10.0 + self.status_w + 4.0;
         self.parts.push((Part::Prev, Rect::new(x, y, btn, box_h)));
         self.parts.push((Part::Next, Rect::new(x + btn + 2.0, y, btn, box_h)));
+        self.parts.push((Part::Filter, Rect::new(x + 2.0 * (btn + 2.0), y, btn, box_h)));
         self.parts.push((Part::Close, close));
         if self.mode == Mode::Replace {
             let y2 = y + row_h - 6.0;
@@ -357,6 +378,7 @@ impl FindBar {
                 Part::Case => self.query.match_case,
                 Part::Word => self.query.whole_word,
                 Part::Regex => self.query.regex,
+                Part::InSel => self.in_sel,
                 _ => false,
             };
             if on {
@@ -378,6 +400,9 @@ impl FindBar {
                     g.hline(cx - 7.0, cx + 7.0, b.bottom() - 6.0, true, color);
                 }
                 Part::Regex => g.text(".*", ui, *b, color, Align::Center),
+                // (a box of dashes: the selection)
+                Part::InSel => g.text("\u{E8B3}", icons, *b, color, Align::Center),
+                Part::Filter => g.text("\u{E71C}", icons, *b, t.text_dim, Align::Center),
                 Part::Prev => g.text("\u{E70E}", icons, *b, t.text_dim, Align::Center),
                 Part::Next => g.text("\u{E70D}", icons, *b, t.text_dim, Align::Center),
                 Part::Close => g.text("\u{E711}", icons, *b, t.text_dim, Align::Center),

@@ -372,6 +372,8 @@ pub struct View {
     ws_clusters: Vec<(Rc<SegLayout>, Rc<Vec<(u32, f32, f32)>>)>,
     /// The starts of the lines bookmarked, in order (`edit::toggle_mark`); they follow edits (`sync`).
     pub bookmarks: Vec<u64>,
+    /// Find in selection: the part of the text the find bar searches (drawn faintly); it follows edits (`sync`).
+    pub scope: Option<(u64, u64)>,
 }
 
 impl Default for View {
@@ -403,6 +405,7 @@ impl View {
             bracket: None,
             ws_clusters: Vec::new(),
             bookmarks: Vec::new(),
+            scope: None,
         }
     }
 
@@ -442,6 +445,9 @@ impl View {
         for (k, c) in changes.iter().enumerate() {
             self.top = c.map(self.top);
             crate::edit::map_marks(&mut self.bookmarks, c);
+            if let Some((a, b)) = self.scope {
+                self.scope = Some((c.map(a), c.map(b)));
+            }
             moved = true;
             if k >= self.hl.seen {
                 self.hl.edited(c.at);
@@ -1054,6 +1060,11 @@ impl View {
         let clip = Rect::new(text.x - 2.0, text.y, text.w + 2.0, text.h);
         g.push_clip(clip);
         let ox = geom.text_x - self.scroll_x;
+
+        // Find in selection: the part searched.
+        if let Some((a, b)) = self.scope {
+            self.fill_range(cx, a, b, ox, t.hover, true);
+        }
 
         // Current row highlight.
         if sel.is_empty() && focused {

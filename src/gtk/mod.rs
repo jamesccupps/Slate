@@ -70,6 +70,8 @@ pub struct Ui {
     case_btn: gtk4::ToggleButton,
     word_btn: gtk4::ToggleButton,
     regex_btn: gtk4::ToggleButton,
+    /// Find in selection (Alt+S).
+    sel_btn: gtk4::ToggleButton,
     notice: gtk4::Box,
     notice_label: gtk4::Label,
     /// The notice's Save as… button (after a save that failed).
@@ -254,6 +256,10 @@ pub fn run(args: Vec<std::ffi::OsString>) -> i32 {
         return testmode::run(&args);
     }
     std::panic::set_hook(Box::new(|info| log_crash(&info.to_string())));
+    // `--read-only`, `--wait` and `-` (standard input): `run_request`
+    let mut args = args;
+    let mut flag = |f: &str| args.iter().position(|a| a == f).map(|i| args.remove(i)).is_some();
+    let (read_only, wait, stdin) = (flag("--read-only"), flag("--wait"), flag("-"));
     let application = gtk4::Application::builder().application_id(APP_ID).flags(gio::ApplicationFlags::HANDLES_OPEN).build();
     // (logging out: the session manager asks, `query-end`)
     application.set_register_session(true);
@@ -261,10 +267,10 @@ pub fn run(args: Vec<std::ffi::OsString>) -> i32 {
         let ui = window(a, None);
         ui.window.present();
     });
-    application.connect_open(|a, files, _| {
+    application.connect_open(|a, files, hint| {
         let ui = window(a, None);
         let paths: Vec<PathBuf> = files.iter().filter_map(|f| f.path()).collect();
-        ui.with(|app| app.open_handed(&paths));
+        ui.with(|app| app.open_hinted(&paths, hint));
         ui.window.present();
     });
     application.connect_query_end(|_| {
@@ -272,9 +278,109 @@ pub fn run(args: Vec<std::ffi::OsString>) -> i32 {
             ui.ending();
         }
     });
+    if read_only || wait || stdin {
+        return run_request(&application, args, read_only, wait, stdin);
+    }
     let cwd = shell_dir();
     let argv: Vec<String> = std::iter::once("slate".to_string()).chain(args.into_iter().map(|a| open_arg(a, cwd.as_deref()))).collect();
     if application.run_with_args(&argv) == glib::ExitCode::SUCCESS { 0 } else { 1 }
+}
+
+/// Whether a D-Bus name has an owner on the session bus (Slate's application id: a Slate runs).
+fn name_has_owner(name: &str) -> bool {
+    let Ok(c) = gio::bus_get_sync(gio::BusType::Session, gio::Cancellable::NONE) else { return false };
+    c.call_sync(
+        Some("org.freedesktop.DBus"),
+        "/org/freedesktop/DBus",
+        "org.freedesktop.DBus",
+        "NameHasOwner",
+        Some(&(name,).to_variant()),
+        Some(glib::VariantTy::new("(b)").unwrap()),
+        gio::DBusCallFlags::NONE,
+        2000,
+        gio::Cancellable::NONE,
+    )
+    .ok()
+    .and_then(|v| v.get::<(bool,)>())
+    .is_some_and(|(b,)| b)
+}
+
+/// `slate --read-only`, `--wait`, `-`: the files go to the Slate running with what else was asked as the open's hint
+/// (`slate:read-only;wait=<token>;text=<token>;`, see `App::open_hinted`); standard input's text in a file in the data
+/// folder's `handed` folder, which that Slate reads and deletes. `--wait` starts a Slate first when none runs (so
+/// closing the tabs, not the whole window, ends the wait) and returns once the wait file is gone (their tabs are
+/// closed) or no Slate runs any more. When none runs (and none could be started), this one is the Slate.
+fn run_request(application: &gtk4::Application, args: Vec<std::ffi::OsString>, read_only: bool, wait: bool, stdin: bool) -> i32 {
+    let cwd = shell_dir();
+    let mut files: Vec<gio::File> = args
+        .iter()
+        .filter(|a| !a.to_string_lossy().starts_with("--"))
+        .map(|a| {
+            let p = PathBuf::from(a);
+            gio::File::for_path(match &cwd {
+                Some(d) if p.is_relative() => d.join(p),
+                _ => p,
+            })
+        })
+        .collect();
+    let handed = crate::settings::data_dir().join("handed");
+    let _ = std::fs::create_dir_all(&handed);
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    let token = format!("{}-{stamp}", std::process::id());
+    let mut hint = String::from("slate:");
+    if read_only {
+        hint.push_str("read-only;");
+    }
+    if stdin {
+        let mut text = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut std::io::stdin(), &mut text);
+        let p = handed.join(format!("stdin-{token}.txt"));
+        if std::fs::write(&p, &text).is_ok() {
+            files.push(gio::File::for_path(&p));
+            hint.push_str(&format!("text={token};"));
+        }
+    }
+    let wait_file = handed.join(format!("wait-{token}"));
+    let waiting = wait && std::fs::write(&wait_file, b"").is_ok();
+    if waiting {
+        hint.push_str(&format!("wait={token};"));
+        if !name_has_owner(APP_ID) {
+            // No Slate runs: one is started (without these), and they go to it once it's there.
+            let started = std::env::current_exe().ok().is_some_and(|exe| {
+                std::process::Command::new(exe)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .is_ok()
+            });
+            let until = Instant::now() + Duration::from_secs(20);
+            while started && !name_has_owner(APP_ID) && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
+    if application.register(gio::Cancellable::NONE).is_err() {
+        return 1;
+    }
+    if application.is_remote() {
+        application.open(&files, &hint);
+        if let Some(c) = application.dbus_connection() {
+            let _ = c.flush_sync(gio::Cancellable::NONE);
+        }
+        if waiting {
+            while wait_file.exists() && name_has_owner(APP_ID) {
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            let _ = std::fs::remove_file(&wait_file);
+        }
+        return 0;
+    }
+    // This one is the Slate: it opens them itself (nothing to wait for but its own window).
+    let _ = std::fs::remove_file(&wait_file);
+    let hint = hint.replace(&format!("wait={token};"), "");
+    application.open(&files, &hint);
+    if application.run_with_args(&["slate"]) == glib::ExitCode::SUCCESS { 0 } else { 1 }
 }
 
 /// GTK doesn't keep a native dialog alive while it's shown: dropped when the function showing it returns, its file
@@ -441,13 +547,18 @@ pub fn window(application: &gtk4::Application, test: Option<Rc<testmode::Test>>)
     let case_btn = text_toggle("Aa", "Match case");
     let word_btn = text_toggle("ab", "Whole word");
     let regex_btn = text_toggle(".*", "Regular expression");
+    let sel_btn = gtk4::ToggleButton::new();
+    sel_btn.set_icon_name("edit-select-all-symbolic");
+    sel_btn.set_tooltip_text(Some("Find in selection (Alt+S)"));
+    sel_btn.add_css_class("flat");
+    let lines_btn = icon_button("view-list-symbolic", "Show only matching lines, in a tab of their own (Alt+L)");
     let find_count = gtk4::Label::new(None);
     find_count.add_css_class("dim-label");
     let prev = icon_button("go-up-symbolic", "Previous match (Shift+F3)");
     let next = icon_button("go-down-symbolic", "Next match (F3)");
     let close_find = icon_button("window-close-symbolic", "Close (Esc)");
     let find_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
-    for w in [find_entry.upcast_ref::<gtk4::Widget>(), case_btn.upcast_ref(), word_btn.upcast_ref(), regex_btn.upcast_ref(), find_count.upcast_ref(), prev.upcast_ref(), next.upcast_ref(), close_find.upcast_ref()] {
+    for w in [find_entry.upcast_ref::<gtk4::Widget>(), case_btn.upcast_ref(), word_btn.upcast_ref(), regex_btn.upcast_ref(), sel_btn.upcast_ref(), find_count.upcast_ref(), prev.upcast_ref(), next.upcast_ref(), lines_btn.upcast_ref(), close_find.upcast_ref()] {
         find_row.append(w);
     }
     let replace_entry = gtk4::Entry::builder().placeholder_text("Replace with").hexpand(true).build();
@@ -538,6 +649,7 @@ pub fn window(application: &gtk4::Application, test: Option<Rc<testmode::Test>>)
         case_btn,
         word_btn,
         regex_btn,
+        sel_btn,
         notice,
         notice_label,
         notice_save_as,
@@ -771,6 +883,7 @@ fn connect(ui: &Rc<Ui>, prev: &gtk4::Button, next: &gtk4::Button, close_find: &g
                 let t = e.text().to_string();
                 ui.with(|a| {
                     a.find.query.text = t;
+                    a.find.history_at = None;
                     a.query_changed();
                     a.find_as_you_type();
                 });
@@ -799,11 +912,38 @@ fn connect(ui: &Rc<Ui>, prev: &gtk4::Button, next: &gtk4::Button, close_find: &g
             }
         });
     }
-    let entry_keys = |entry: &gtk4::Entry| {
+    ui.sel_btn.connect_toggled(|_| {
+        if let Some(ui) = get_ui() {
+            if !ui.syncing.get() {
+                ui.with(|a| a.toggle_in_sel());
+            }
+        }
+    });
+    lines_btn.connect_clicked(|_| {
+        if let Some(ui) = get_ui() {
+            ui.with(|a| a.exec(Cmd::FilterLines(false)));
+        }
+    });
+    let entry_keys = |entry: &gtk4::Entry, find: bool| {
         let k = gtk4::EventControllerKey::new();
-        k.connect_key_pressed(|_, keyval, _, state| {
+        k.connect_key_pressed(move |c, keyval, _, state| {
             let Some(ui) = get_ui() else { return glib::Propagation::Proceed };
+            let plain = !state.intersects(gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::ALT_MASK);
             match keyval {
+                // the searches (or replacements) before, newest first
+                gdk::Key::Up | gdk::Key::Down if plain => {
+                    let step = ui.with(|a| a.history_step(find, keyval == gdk::Key::Up)).flatten();
+                    if let (Some((text, at)), Some(entry)) = (step, c.widget().and_downcast::<gtk4::Entry>()) {
+                        entry.set_text(&text);
+                        entry.select_region(0, -1);
+                        ui.with(|a| a.find.history_at = at);
+                    }
+                    glib::Propagation::Stop
+                }
+                gdk::Key::s | gdk::Key::S if state.contains(gdk::ModifierType::ALT_MASK) => {
+                    ui.sel_btn.set_active(!ui.sel_btn.is_active());
+                    glib::Propagation::Stop
+                }
                 gdk::Key::Escape => {
                     ui.with(|a| a.exec(Cmd::CloseFind));
                     ui.text.grab_focus();
@@ -818,13 +958,16 @@ fn connect(ui: &Rc<Ui>, prev: &gtk4::Button, next: &gtk4::Button, close_find: &g
         });
         entry.add_controller(k);
     };
-    entry_keys(&ui.find_entry);
-    entry_keys(&ui.replace_entry);
+    entry_keys(&ui.find_entry, true);
+    entry_keys(&ui.replace_entry, false);
     ui.replace_entry.connect_changed(|e| {
         if let Some(ui) = get_ui() {
             if !ui.syncing.get() {
                 let t = e.text().to_string();
-                ui.with(|a| a.find.replacement = t);
+                ui.with(|a| {
+                    a.find.replacement = t;
+                    a.find.history_at = None;
+                });
             }
         }
     });
@@ -1747,6 +1890,7 @@ impl Ui {
         self.case_btn.set_active(a.find.query.match_case);
         self.word_btn.set_active(a.find.query.whole_word);
         self.regex_btn.set_active(a.find.query.regex);
+        self.sel_btn.set_active(a.tab().view.scope.is_some());
         let count = match (&a.find.error, &a.find.found) {
             (Some(e), _) => e.clone(),
             (None, Some((_, f))) if f.count == 0 => "No results".into(),
@@ -2000,6 +2144,9 @@ impl Ui {
         // (an orderly end: a start that never drew its window doesn't count as one that crashed while restoring)
         if self.test.is_none() {
             session::restored();
+        }
+        if let Ok(mut a) = self.app.try_borrow_mut() {
+            a.end_waits();
         }
         self.closing.set(true);
         self.window.close();

@@ -279,6 +279,13 @@ pub struct Find {
     /// The tab the last count was for.
     count_tab: u64,
     find_job: Option<(u64, bool, Sel, Job<Option<(u64, u64)>>)>,
+    /// Up and Down in a box go through its history: where they are in it (None: the text typed, kept in
+    /// `history_typed` meanwhile).
+    pub history_at: Option<usize>,
+    history_typed: String,
+    /// What was selected when the bar opened, and the match the search selected last (see `toggle_in_sel`).
+    sel_before: Option<(u64, u64)>,
+    last_match: Option<(u64, u64)>,
 }
 
 pub struct App {
@@ -330,6 +337,8 @@ pub struct App {
     pub sel_cache: std::cell::Cell<Option<(u64, u64, u64, u64)>>,
     /// CSV and TSV: the caret's field as the status bar says it, for (tab, document version, caret).
     pub field_cache: std::cell::RefCell<Option<((u64, u64, u64), Option<String>)>>,
+    /// `slate --wait`: a wait file to delete once all of its tabs are closed (`open_hinted`).
+    pub waits: Vec<(PathBuf, Vec<u64>)>,
 }
 
 fn now_text() -> String {
@@ -378,6 +387,7 @@ impl App {
             col_cache: Default::default(),
             sel_cache: Default::default(),
             field_cache: Default::default(),
+            waits: Vec::new(),
         };
         app.apply_theme();
         app
@@ -553,6 +563,89 @@ impl App {
         self.open_paths(paths);
         if self.flash.is_none() {
             self.flash = said;
+        }
+    }
+
+    /// What another start handed over with a hint (`slate:read-only;wait=<token>;text=<token>;`: `mod::run_request`):
+    /// standard input's text in a new tab (its file in the data folder's `handed` folder, read and deleted), the files
+    /// read only if asked, and `--wait`'s tabs noted (its wait file goes once they're all closed: `tab_gone`). Any
+    /// other hint: the files as they are.
+    pub fn open_hinted(&mut self, paths: &[PathBuf], hint: &str) {
+        let Some(rest) = hint.strip_prefix("slate:") else { return self.open_handed(paths) };
+        let (mut read_only, mut wait, mut text) = (false, None, None);
+        for part in rest.split(';') {
+            match part.split_once('=') {
+                Some(("wait", t)) => wait = Some(t.to_string()),
+                Some(("text", t)) => text = Some(t.to_string()),
+                _ if part == "read-only" => read_only = true,
+                _ => {}
+            }
+        }
+        let handed = crate::settings::data_dir().join("handed");
+        // (a token is `<pid>-<time>`: nothing that names a file outside that folder)
+        let ours = |t: &String| !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit() || b == b'-');
+        let text_file = text.filter(ours).map(|t| handed.join(format!("stdin-{t}.txt")));
+        let before: Vec<u64> = self.tabs.iter().map(|t| t.id).collect();
+        let files: Vec<PathBuf> = paths.iter().filter(|p| Some(*p) != text_file.as_ref()).cloned().collect();
+        let said = self.flash.take();
+        if let Some(f) = &text_file {
+            if let Ok(bytes) = std::fs::read(f) {
+                let blank = self.tabs.len() == 1 && self.tabs[0].is_blank();
+                let i = self.add_text_tab(&bytes, None, None);
+                self.active = i;
+                if blank {
+                    self.remove_tab(0);
+                }
+            }
+            let _ = std::fs::remove_file(f);
+        }
+        if !files.is_empty() {
+            self.open_paths(&files);
+        }
+        if self.flash.is_none() {
+            self.flash = said;
+        }
+        let ids: Vec<u64> = self
+            .tabs
+            .iter()
+            .filter(|t| !before.contains(&t.id) || t.doc.path.as_ref().is_some_and(|p| files.contains(p)))
+            .map(|t| t.id)
+            .collect();
+        if read_only {
+            for t in self.tabs.iter_mut().filter(|t| ids.contains(&t.id)) {
+                t.read_only = true;
+            }
+        }
+        if let Some(w) = wait.filter(ours) {
+            let file = handed.join(format!("wait-{w}"));
+            if ids.is_empty() {
+                let _ = std::fs::remove_file(&file);
+            } else {
+                self.waits.push((file, ids));
+            }
+        }
+        self.session_dirty = true;
+        self.dirty_title = true;
+        self.dirty_view = true;
+    }
+
+    /// Tab `id` closed: a `--wait` all of whose tabs are closed now is told (its wait file goes).
+    fn tab_gone(&mut self, id: u64) {
+        for (_, ids) in self.waits.iter_mut() {
+            ids.retain(|&t| t != id);
+        }
+        self.waits.retain(|(file, ids)| {
+            if ids.is_empty() {
+                let _ = std::fs::remove_file(file);
+            }
+            !ids.is_empty()
+        });
+    }
+
+    /// Every `--wait` is told (the window is closing).
+    pub fn end_waits(&mut self) {
+        for (file, _) in std::mem::take(&mut self.waits) {
+            let _ = std::fs::remove_file(file);
         }
     }
 
@@ -785,6 +878,12 @@ impl App {
         if opened.loading.is_ok() {
             let dup = opened.canon.as_ref().and_then(|c| self.tabs.iter().position(|t| t.id != id && t.canon.as_ref() == Some(c)));
             if let Some(k) = dup {
+                // (a `--wait` for this tab waits for that one)
+                let other = self.tabs[k].id;
+                for (_, ids) in self.waits.iter_mut().filter(|(_, ids)| ids.contains(&id)) {
+                    ids.retain(|&t| t != id);
+                    ids.push(other);
+                }
                 let goto = self.tabs[i].goto.take().filter(|_| self.tabs[i].doc.path.as_deref() != Some(opened.path.as_path()));
                 self.tabs.remove(i);
                 let k = if k > i { k - 1 } else { k };
@@ -838,6 +937,7 @@ impl App {
                 if self.tabs.len() > 1 {
                     self.tabs.remove(i);
                     self.keep_shown(i);
+                    self.tab_gone(id);
                     return false;
                 }
                 let tab = &mut self.tabs[i];
@@ -1026,6 +1126,9 @@ impl App {
 
     pub fn remove_tab(&mut self, i: usize) {
         let tab = self.tabs.remove(i);
+        if !self.waits.is_empty() {
+            self.tab_gone(tab.id);
+        }
         if let Some(p) = tab.doc.path.clone() {
             self.closed.retain(|q| q != &p);
             self.closed.push(p);
@@ -1392,6 +1495,7 @@ impl App {
                 // the selection (one line of it) is what to find
                 let tab = self.tab();
                 let sel = tab.view.sel;
+                self.find.sel_before = (!sel.is_empty()).then(|| (sel.start(), sel.end()));
                 if !sel.is_empty() && sel.end() - sel.start() < 512 {
                     let t = tab.doc.read(sel.start(), sel.end());
                     if !t.contains(&b'\n') {
@@ -1403,6 +1507,9 @@ impl App {
             Cmd::CloseFind => {
                 self.find.open = false;
                 self.find.found = None;
+                self.find.history_at = None;
+                edit::remember(&mut self.settings.find_history, &self.find.query.text.clone());
+                self.tabs[self.active].view.scope = None;
             }
             Cmd::FindNext | Cmd::FindPrev => self.find_step(cmd == Cmd::FindNext),
             Cmd::ReplaceOne => self.replace_one(),
@@ -1663,7 +1770,13 @@ impl App {
             },
             _ => None,
         };
-        let replacement = self.find.replacement.clone().into_bytes();
+        let replacement = edit::replacement(&self.find.replacement, self.find.query.regex, self.tab().doc.eol.as_bytes());
+        if kind == TaskKind::ReplaceAll {
+            let typed = self.find.replacement.clone();
+            edit::remember(&mut self.settings.replace_history, &typed);
+            edit::remember(&mut self.settings.find_history, &self.find.query.text.clone());
+        }
+        let scope = self.tab().view.scope;
         let tab = &mut self.tabs[self.active];
         if tab.task.is_some() {
             self.flash("Still working on the previous task (Esc cancels it).", true);
@@ -1776,7 +1889,7 @@ impl App {
                         Err(e) => return TaskResult::Failed(format!("Couldn't create a temporary file: {e}")),
                     };
                     let mut idx = IndexBuilder::new();
-                    match m.replace_all_to(&snap, &replacement, &mut sink, &mut idx, ctx) {
+                    match m.replace_all_to(&snap, &replacement, &mut sink, &mut idx, scope, ctx) {
                         Ok(count) => match sink.finish(idx) {
                             Ok((src, nl)) => TaskResult::Content { src, nl, count },
                             Err(e) => TaskResult::Failed(format!("Couldn't write the result: {e}")),
@@ -1871,6 +1984,7 @@ impl App {
                 // (bookmarks stay on their lines where the lines stay what they were; elsewhere they go)
                 let marks =
                     matches!(kind, TaskKind::Eol(_) | TaskKind::ReplaceAll).then(|| edit::marks_as_lines(&tab.view.bookmarks, &tab.doc));
+                let (scope, old_len) = (tab.view.scope, tab.doc.len());
                 tab.doc.begin(EditKind::Other, sel);
                 tab.doc.replace_all_with(src, nl);
                 let keep = matches!(kind, TaskKind::ReplaceAll | TaskKind::Lines(_) | TaskKind::Eol(_) | TaskKind::SortColumn { .. });
@@ -1883,6 +1997,11 @@ impl App {
                 tab.doc.seal();
                 tab.view.sel = new_sel;
                 tab.view.sync(&mut tab.doc);
+                // (Find in selection: Replace all's range ends where its replacements end; anything else ends it)
+                tab.view.scope = match kind {
+                    TaskKind::ReplaceAll => scope.map(|(a, b)| (a, (b + new_len).saturating_sub(old_len).max(a))),
+                    _ => None,
+                };
                 tab.view.bookmarks = marks.map_or_else(Vec::new, |l| edit::marks_at_lines(&l, &tab.doc));
                 if let Some((_, top)) = places {
                     tab.view.top = top.and_then(|p| tab.doc.offset_of_place(p)).unwrap_or(0);
@@ -1957,6 +2076,60 @@ impl App {
     // ---- find ----
 
     /// The query changed (typed in the find box, or an option): the matcher again, and a count of the matches.
+    /// Where the find bar searches in the tab shown: its Find in selection range, else the whole text.
+    fn search_range(&self) -> (u64, u64) {
+        let tab = self.tab();
+        let len = tab.doc.len();
+        tab.view.scope.map_or((0, len), |(a, b)| (a.min(len), b.min(len).max(a.min(len))))
+    }
+
+    /// Find in selection on or off (Alt+S): on, the find bar searches what's selected until it's closed.
+    pub fn toggle_in_sel(&mut self) {
+        let (before, last) = (self.find.sel_before, self.find.last_match);
+        let tab = &mut self.tabs[self.active];
+        if tab.view.scope.take().is_none() {
+            let sel = tab.view.sel;
+            let selected = (!sel.is_empty()).then(|| (sel.start(), sel.end()));
+            // (the match searching as you type selected isn't what the user selected)
+            let range = if selected.is_some() && selected != last { selected } else { before.or(selected) };
+            let Some((a, b)) = range.filter(|r| r.1 <= tab.doc.len()) else {
+                self.flash("Select the text to search in first.", true);
+                self.dirty_view = true;
+                return;
+            };
+            tab.view.scope = Some((a, b));
+            tab.view.sel = Sel::at(a);
+        }
+        self.query_changed();
+        self.find_as_you_type();
+    }
+
+    /// Up and Down in a find bar box: the text the box gets (the searches or replacements before, newest first; past
+    /// the newest, empty), and where that is in the history (set once the box has it: `Find::history_at`).
+    pub fn history_step(&mut self, find: bool, older: bool) -> Option<(String, Option<usize>)> {
+        let hist = if find { &self.settings.find_history } else { &self.settings.replace_history };
+        let typed = if find { self.find.query.text.clone() } else { self.find.replacement.clone() };
+        let at = match (self.find.history_at, older) {
+            // (one the box has already is skipped)
+            (None, true) => (0..hist.len()).find(|&i| hist[i] != typed),
+            (None, false) => return None,
+            (Some(i), true) => Some((i + 1).min(hist.len().saturating_sub(1))),
+            (Some(0), false) => None,
+            (Some(i), false) => Some(i - 1),
+        };
+        if at.is_none() && self.find.history_at.is_none() {
+            return None;
+        }
+        let text = match at {
+            Some(i) => hist.get(i).cloned().unwrap_or_default(),
+            None => self.find.history_typed.clone(),
+        };
+        if self.find.history_at.is_none() {
+            self.find.history_typed = typed;
+        }
+        Some((text, at))
+    }
+
     pub fn query_changed(&mut self) {
         self.find.found = None;
         self.find.count_job = None;
@@ -1977,11 +2150,12 @@ impl App {
     fn start_count(&mut self) {
         let Some(m) = self.find.matcher.clone() else { return };
         let notify = self.notify.clone();
+        let (a, b) = self.search_range();
         let tab = &mut self.tabs[self.active];
         let snap: Snapshot = tab.doc.snapshot();
         let version = tab.doc.version;
         self.find.count_tab = tab.id;
-        self.find.count_job = Some((version, Job::spawn(snap.len(), notify, move |ctx| search::count_all(&m, &snap, ctx))));
+        self.find.count_job = Some((version, Job::spawn(snap.len(), notify, move |ctx| search::count_in(&m, &snap, a, b, ctx))));
     }
 
     /// While the find bar is open, the matches are counted (and marked) in the tab shown: again in another tab, or
@@ -2043,15 +2217,19 @@ impl App {
             }
             return;
         }
+        edit::remember(&mut self.settings.find_history, &self.find.query.text);
+        let (a, b) = self.search_range();
         let tab = &self.tabs[self.active];
         let sel = tab.view.sel;
         let len = tab.doc.len();
+        let (end, start) = (sel.end().clamp(a, b), sel.start().clamp(a, b));
         let m = self.find.matcher.as_ref().unwrap();
+        let inside = move |r: Option<(u64, u64)>| r.filter(|x| x.1 <= b);
         if len <= m.sync_limit() {
             let hit = if fwd {
-                m.find_fwd(&tab.doc, sel.end(), len, None).or_else(|| m.find_fwd(&tab.doc, 0, sel.end(), None))
+                inside(m.find_fwd(&tab.doc, end, b, None)).or_else(|| inside(m.find_fwd(&tab.doc, a, end, None)))
             } else {
-                m.find_back(&tab.doc, 0, sel.start(), None).or_else(|| m.find_back(&tab.doc, sel.start(), len, None))
+                m.find_back(&tab.doc, a, start, None).or_else(|| inside(m.find_back(&tab.doc, start, b, None)))
             };
             self.found(hit, fwd);
             return;
@@ -2063,9 +2241,9 @@ impl App {
         let version = tab.doc.version;
         let job = Job::spawn(len, notify, move |ctx| {
             if fwd {
-                m.find_fwd(&snap, sel.end(), len, Some(ctx)).or_else(|| m.find_fwd(&snap, 0, sel.end(), Some(ctx)))
+                inside(m.find_fwd(&snap, end, b, Some(ctx))).or_else(|| inside(m.find_fwd(&snap, a, end, Some(ctx))))
             } else {
-                m.find_back(&snap, 0, sel.start(), Some(ctx)).or_else(|| m.find_back(&snap, sel.start(), len, Some(ctx)))
+                m.find_back(&snap, a, start, Some(ctx)).or_else(|| inside(m.find_back(&snap, start, b, Some(ctx))))
             }
         });
         self.find.find_job = Some((version, fwd, sel, job));
@@ -2089,6 +2267,7 @@ impl App {
     fn found(&mut self, hit: Option<(u64, u64)>, fwd: bool) {
         match hit {
             Some((a, b)) => {
+                self.find.last_match = Some((a, b));
                 let tab = &mut self.tabs[self.active];
                 let wrapped = if fwd { a < tab.view.sel.end() } else { b > tab.view.sel.start() };
                 tab.view.sel = Sel::new(a, b);
@@ -2116,7 +2295,8 @@ impl App {
         if !sel.is_empty() && m.is_match_at(&tab.doc, sel.start(), sel.end()) {
             let hay = tab.doc.read(sel.start(), (sel.end() + 4096).min(tab.doc.len()));
             let mut out = Vec::new();
-            m.expand(&hay, 0, self.find.replacement.as_bytes(), &mut out);
+            let repl = edit::replacement(&self.find.replacement, self.find.query.regex, tab.doc.eol.as_bytes());
+            m.expand(&hay, 0, &repl, &mut out);
             let tab = &mut self.tabs[self.active];
             tab.view.sel = edit::replace_selection(&mut tab.doc, sel, &out, EditKind::Other);
             tab.doc.seal();
