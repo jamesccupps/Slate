@@ -253,6 +253,16 @@ mod imp {
             _ => None,
         }
     }
+
+    /// Whether dates are written day first (31/12/2026), from Windows' short date order (LOCALE_IDATE: 0 month,
+    /// day, year; 1 day, month, year; 2 year first).
+    pub fn day_first() -> bool {
+        use windows::Win32::Globalization::GetLocaleInfoEx;
+        const LOCALE_IDATE: u32 = 0x21;
+        let mut buf = [0u16; 4];
+        let n = unsafe { GetLocaleInfoEx(PCWSTR::null(), LOCALE_IDATE, Some(&mut buf)) };
+        n > 0 && buf[0] == u16::from(b'1')
+    }
 }
 
 #[cfg(unix)]
@@ -376,6 +386,13 @@ mod imp {
             ) => true,
             _ => matches!(e.kind(), io::ErrorKind::TimedOut | io::ErrorKind::Interrupted),
         }
+    }
+
+    /// Whether dates are written day first (31/12/2026), from the locale's name (LC_ALL, LC_TIME, LANG): month first
+    /// only in the United States' English (and where the locale says nothing).
+    pub fn day_first() -> bool {
+        let locale = ["LC_ALL", "LC_TIME", "LANG"].iter().find_map(|v| std::env::var(v).ok().filter(|s| !s.is_empty()));
+        locale.is_some_and(|l| !(l.starts_with("en_US") || l == "C" || l.starts_with("C.") || l == "POSIX"))
     }
 
     /// Why a read failed, in a few words, where it's about the file rather than the system's own message.

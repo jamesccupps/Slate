@@ -959,15 +959,44 @@ pub fn decode_char_before(bytes: &[u8]) -> (char, usize) {
     decode_char(&bytes[len - 1..])
 }
 
-/// Visible stand-in for characters that would otherwise be invisible or break the layout.
+/// Visible stand-in for characters that would otherwise be invisible or break the layout: control characters (␀,
+/// ␛…), line separators; characters with no width that change what a text means or how it reads (a zero-width space,
+/// a word joiner, a byte order mark inside the text, a soft hyphen) as ▯; and the bidirectional controls of the
+/// "Trojan Source" trick (marks, embeddings, overrides, isolates) as ⇄, which also stops them reordering the text
+/// after them on screen. The zero-width joiner and non-joiner stay: emoji and several scripts need them.
 pub fn display_char(c: char) -> char {
     match c {
         '\t' => '\t',
         '\u{0}'..='\u{1F}' => char::from_u32(0x2400 + c as u32).unwrap(),
         '\u{7F}' => '\u{2421}',
         '\u{85}' | '\u{2028}' | '\u{2029}' => '\u{2424}',
+        INVISIBLE_A..=INVISIBLE_Z if is_invisible(c) => '\u{25AF}',
+        BIDI_A..=BIDI_Z if is_bidi_control(c) => '\u{21C4}',
         _ => c,
     }
+}
+
+// (the ranges `display_char` looks in first: most characters are past them, or before)
+const INVISIBLE_A: char = '\u{AD}';
+const INVISIBLE_Z: char = '\u{FEFF}';
+const BIDI_A: char = '\u{61C}';
+const BIDI_Z: char = '\u{2069}';
+
+/// A character with no width that changes what a text means: a zero-width space, a word joiner, a byte order mark
+/// (inside the text: one at its start is the file's), a soft hyphen, the Mongolian vowel separator.
+pub fn is_invisible(c: char) -> bool {
+    matches!(c, '\u{AD}' | '\u{180E}' | '\u{200B}' | '\u{2060}' | '\u{FEFF}')
+}
+
+/// A space that looks like an ordinary one but isn't: non-breaking (also narrow), the fixed-width spaces of
+/// typography, the ideographic space. Show whitespace marks them apart from spaces.
+pub fn is_odd_space(c: char) -> bool {
+    matches!(c, '\u{A0}' | '\u{1680}' | '\u{2000}'..='\u{200A}' | '\u{202F}' | '\u{205F}' | '\u{3000}')
+}
+
+/// A bidirectional control: the marks (LRM, RLM, ALM), embeddings and overrides (LRE…RLO, PDF), isolates (LRI…PDI).
+pub fn is_bidi_control(c: char) -> bool {
+    matches!(c, '\u{61C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
 }
 
 /// Decodes UTF-8 for display. Invalid bytes become U+FFFD (one per byte) and control characters visible symbols.
@@ -1296,6 +1325,15 @@ mod tests {
         assert!(!enc.lossy);
         let (_, lossy) = utf8_to_ansi("emoji 🌍".as_bytes());
         assert!(lossy);
+    }
+
+    #[test]
+    fn invisible_characters_are_shown() {
+        let shown = |s: &str| s.chars().map(display_char).collect::<String>();
+        assert_eq!(shown("a\u{200B}b\u{FEFF}c\u{AD}"), "a\u{25AF}b\u{25AF}c\u{25AF}");
+        assert_eq!(shown("if x\u{202E} \u{2066}y\u{2069}"), "if x\u{21C4} \u{21C4}y\u{21C4}");
+        // joiners, non-breaking and other spaces, and ordinary text stay
+        assert_eq!(shown("👨\u{200D}👩 क\u{200C}ष a\u{A0}b é ∑"), "👨\u{200D}👩 क\u{200C}ष a\u{A0}b é ∑");
     }
 
     #[test]

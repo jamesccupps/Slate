@@ -1200,8 +1200,9 @@ impl View {
         out
     }
 
-    /// Faint dots for spaces, arrows for tabs, and after each line a mark for its line break (↵ for CRLF, ↓ for
-    /// LF), on what's on screen. Without word wrap a row is a whole segment (up to 8 KiB, mostly off to the side): only
+    /// Faint dots for spaces, arrows for tabs, ⌴ for spaces that only look like spaces (non-breaking and the like:
+    /// `text::is_odd_space`), and after each line a mark for its line break (↵ for CRLF, ↓ for LF), on what's on
+    /// screen. Without word wrap a row is a whole segment (up to 8 KiB, mostly off to the side): only
     /// the part in view is looked at, with x positions from each layout's clusters (kept while it stays on screen).
     fn paint_whitespace(&mut self, cx: &Ctx, ox: f32) {
         let g = cx.g;
@@ -1248,6 +1249,16 @@ impl View {
                             g.line(a, mid, b, mid, color, 1.0);
                             g.line(b - head, mid - head, b, mid, color, 1.0);
                             g.line(b - head, mid + head, b, mid, color, 1.0);
+                        }
+                        Some(&lead) if lead >= 0xC2 && w > 3.0 => {
+                            let at = (r.seg.start + r.lay.rel_of(pos) - a) as usize;
+                            if bytes.get(at..).is_some_and(|b| crate::core::text::is_odd_space(crate::core::text::decode_char(b).0)) {
+                                let (a, b) = (x0 + w * 0.2, x0 + w * 0.8);
+                                let (y, up) = (mid + row_h * 0.16, row_h * 0.12);
+                                g.line(a, y, b, y, color, 1.0);
+                                g.line(a, y - up, a, y, color, 1.0);
+                                g.line(b, y - up, b, y, color, 1.0);
+                            }
                         }
                         _ => {}
                     }

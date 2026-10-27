@@ -84,13 +84,16 @@ pub enum TaskKind {
     Print,
     /// Show only matching lines (false), or the lines without a match (true).
     Filter(bool),
+    /// CSV or TSV: the rows sorted by field `col` (from 0), Z to A when `desc`, the first row on top when `header`.
+    SortColumn { col: usize, desc: bool, d: crate::core::csv::Dialect, header: bool },
 }
 
-/// The structured formats Slate can format and check.
+/// The structured formats Slate can format and check (CSV and TSV: check only).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Fmt {
     Json,
     Xml,
+    Csv(crate::core::csv::Dialect),
 }
 
 impl Fmt {
@@ -98,6 +101,7 @@ impl Fmt {
         match self {
             Fmt::Json => "JSON",
             Fmt::Xml => "XML",
+            Fmt::Csv(d) => d.name(),
         }
     }
 }
@@ -377,6 +381,8 @@ pub enum StatusItem {
     Overtype,
     /// "Read only" for a tab that is; a click makes it editable.
     ReadOnly,
+    /// CSV and TSV: the caret's field, by its column's name ("status (4)").
+    Field,
 }
 
 /// Where updating Slate is at (see `update.rs`).
@@ -519,6 +525,8 @@ pub struct App {
     pub tip_gone: Option<Instant>,
     /// The caret's line and column, as the status bar last worked them out.
     pub caret_place: CaretPlace,
+    /// CSV and TSV: the status bar's text for the caret's field, for (tab, document version, caret).
+    pub csv_field: Option<((u64, u64, u64), Option<String>)>,
 }
 
 pub use crate::settings::ZOOM_STEPS;
@@ -614,6 +622,7 @@ impl App {
             tip: win::Tip::new(hwnd),
             tip_gone: None,
             caret_place: CaretPlace::default(),
+            csv_field: None,
         };
         app.apply_theme();
         app
@@ -989,6 +998,7 @@ impl App {
                 Hit::Status(StatusItem::Encoding) => "Encoding",
                 Hit::Status(StatusItem::Lang) => "Language",
                 Hit::Status(StatusItem::Indent) => "Indentation",
+                Hit::Status(StatusItem::Field) => "The caret's column (Format → Sort by this column)",
                 Hit::Status(StatusItem::Overtype) => "Typing replaces characters (Insert turns it off)",
                 Hit::Status(StatusItem::ReadOnly) if self.tab().filter.is_some() => {
                     "Lines of another tab: Enter or a double-click goes to one there"
@@ -1515,7 +1525,7 @@ impl App {
             pos = pos_short;
             pos_w = w(&pos);
         }
-        for less in [StatusItem::Indent, StatusItem::Eol, StatusItem::Lang] {
+        for less in [StatusItem::Indent, StatusItem::Eol, StatusItem::Lang, StatusItem::Field] {
             if too_wide(pos_w, &item_ws, right_w) {
                 if let Some(k) = items.iter().position(|(i, _)| *i == less) {
                     items.remove(k);
@@ -1558,8 +1568,28 @@ impl App {
     }
 
     /// What the status bar says.
+    /// CSV and TSV: the status bar's text for the caret's field, worked out once per caret place.
+    fn csv_field_now(&mut self) -> Option<String> {
+        let tab = &self.tabs[self.active];
+        if !matches!(tab.lang, Lang::Csv | Lang::CsvSemi | Lang::Tsv) || !tab.doc.is_ready() {
+            return None;
+        }
+        let key = (tab.id, tab.doc.version, tab.view.sel.caret);
+        if let Some((k, text)) = &self.csv_field {
+            if *k == key {
+                return text.clone();
+            }
+        }
+        let text = crate::edit::csv_dialect(tab.lang, &tab.doc)
+            .and_then(|d| crate::edit::csv_field(&tab.doc, d, tab.view.sel.caret))
+            .map(|(col, name)| crate::edit::csv_field_text(col, name.as_deref()));
+        self.csv_field = Some((key, text.clone()));
+        text
+    }
+
     pub fn status_items(&mut self) -> StatusTexts {
         let counts = self.doc_counts_now();
+        let field = self.csv_field_now();
         let sel_counts = self.selection_counts();
         let place = {
             let tab = &self.tabs[self.active];
@@ -1583,6 +1613,9 @@ impl App {
         }
         if let UpdateState::Available(r) = &self.update {
             items.push((StatusItem::Update, format!("Update to {}", r.version)));
+        }
+        if let Some(f) = field {
+            items.push((StatusItem::Field, f));
         }
         items.push((StatusItem::Indent, indent));
         items.push((StatusItem::Lang, tab.lang.label().to_string()));
@@ -1708,6 +1741,7 @@ impl App {
                 TaskKind::Eol(_) => "Converting line endings".into(),
                 TaskKind::Lines(LineOp::SortAsc | LineOp::SortDesc) => "Sorting lines".into(),
                 TaskKind::Lines(_) => "Cleaning up lines".into(),
+                TaskKind::SortColumn { .. } => "Sorting rows".into(),
                 TaskKind::Print => "Printing".into(),
                 TaskKind::Filter(_) => "Finding the lines".into(),
             };

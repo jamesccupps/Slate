@@ -92,6 +92,10 @@ pub enum Cmd {
     JsonIndent(u32),
     ToggleComment,
     Lines(LineOp),
+    /// CSV and TSV: the rows sorted by the caret's column (Z to A: true).
+    SortByColumn(bool),
+    /// View → Character at the caret: its code point and bytes in the status bar.
+    CharInfo,
     Case(CaseOp),
     SetEol(Eol),
     SaveEncoding(Encoding),

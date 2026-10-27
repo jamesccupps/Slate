@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::core::buffer::Snapshot;
+use crate::core::csv;
 use crate::core::document::{Change, Document, EditKind, Sel};
 use crate::core::io::MEM_LIMIT;
 use crate::core::job::Ctx;
@@ -1481,9 +1482,175 @@ pub fn nothing_to_clean(op: LineOp) -> &'static str {
     }
 }
 
+// ---- the character at the caret ----
+
+/// The names of characters that look like nothing, or like another (`text::display_char` shows most as ▯ or ⇄).
+fn char_name(c: char) -> Option<&'static str> {
+    Some(match c {
+        '\t' => "tab",
+        '\n' => "line feed (LF)",
+        '\r' => "carriage return (CR)",
+        ' ' => "space",
+        '\u{A0}' => "non-breaking space",
+        '\u{AD}' => "soft hyphen",
+        '\u{1680}' => "Ogham space mark",
+        '\u{180E}' => "Mongolian vowel separator",
+        '\u{2000}'..='\u{200A}' => "typographic space",
+        '\u{200B}' => "zero-width space",
+        '\u{200C}' => "zero-width non-joiner",
+        '\u{200D}' => "zero-width joiner",
+        '\u{200E}' => "left-to-right mark",
+        '\u{200F}' => "right-to-left mark",
+        '\u{2028}' => "line separator",
+        '\u{2029}' => "paragraph separator",
+        '\u{202A}' => "left-to-right embedding",
+        '\u{202B}' => "right-to-left embedding",
+        '\u{202C}' => "pop directional formatting",
+        '\u{202D}' => "left-to-right override",
+        '\u{202E}' => "right-to-left override",
+        '\u{202F}' => "narrow non-breaking space",
+        '\u{205F}' => "medium mathematical space",
+        '\u{2060}' => "word joiner",
+        '\u{2066}' => "left-to-right isolate",
+        '\u{2067}' => "right-to-left isolate",
+        '\u{2068}' => "first strong isolate",
+        '\u{2069}' => "pop directional isolate",
+        '\u{3000}' => "ideographic space",
+        '\u{FEFF}' => "byte order mark (zero-width no-break space)",
+        '\u{FFFD}' => "replacement character",
+        '\u{61C}' => "Arabic letter mark",
+        c if c.is_control() => "control character",
+        _ => return None,
+    })
+}
+
+/// The character at `pos` as View → Character at the caret says it: `é  U+00E9  ·  UTF-8: C3 A9`, with a name for
+/// one that looks like nothing or like another, and its bytes in the document's encoding (UTF-16's in the file's
+/// order; "not in ANSI" for one that encoding can't hold). A byte that isn't UTF-8 text says so. None at the end.
+pub fn char_info(doc: &Document, pos: u64, enc: text::Encoding) -> Option<String> {
+    use text::Encoding;
+    let bytes = doc.read(pos, (pos + 4).min(doc.len()));
+    let first = *bytes.first()?;
+    let n = text::char_len_at(&bytes);
+    let Some(c) = (n > 0).then(|| std::str::from_utf8(&bytes[..n]).ok().and_then(|s| s.chars().next())).flatten() else {
+        return Some(format!("Byte {first:02X}: not UTF-8 text"));
+    };
+    let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02X}")).collect::<Vec<_>>().join(" ");
+    let utf8 = &bytes[..n];
+    let shown = match char_name(c) {
+        Some(name) if c.is_control() || c.is_whitespace() || text::is_invisible(c) || text::is_bidi_control(c) || c >= '\u{200B}' && c <= '\u{200F}' => name.to_string(),
+        Some(name) => format!("{c}  {name}"),
+        None => c.to_string(),
+    };
+    let coded = match enc {
+        Encoding::Utf8 | Encoding::Utf8Bom => format!("UTF-8: {}", hex(utf8)),
+        Encoding::Utf16Le | Encoding::Utf16Be => {
+            let mut units = [0u16; 2];
+            let b: Vec<u8> = c
+                .encode_utf16(&mut units)
+                .iter()
+                .flat_map(|u| if enc == Encoding::Utf16Le { u.to_le_bytes() } else { u.to_be_bytes() })
+                .collect();
+            format!("{}: {}", enc.label(), hex(&b))
+        }
+        Encoding::Ansi => match text::utf8_to_ansi(utf8) {
+            (_, true) => "not in ANSI (saving in ANSI makes it \"?\")".to_string(),
+            (b, false) => format!("ANSI: {}", hex(&b)),
+        },
+    };
+    // (a Windows line break is two characters)
+    let crlf = if c == '\r' && bytes.get(1) == Some(&b'\n') { ", before a line feed: a Windows line break (CRLF)" } else { "" };
+    Some(format!("{shown}  U+{:04X}  ·  {coded}{crlf}", c as u32))
+}
+
+// ---- CSV and TSV ----
+
+/// How much of a CSV document's start is read for its separator and its first row.
+const CSV_HEAD: u64 = 64 << 10;
+
+/// A CSV or TSV document's dialect: the separator its language says ("CSV (semicolons)", TSV), plain CSV's found from
+/// its first lines (`csv::sniff`); None for other languages.
+pub fn csv_dialect(lang: Lang, doc: &Document) -> Option<csv::Dialect> {
+    match lang {
+        Lang::Tsv => Some(csv::Dialect::tsv()),
+        Lang::CsvSemi => Some(csv::Dialect::csv(b';')),
+        Lang::Csv => Some(csv::Dialect::csv(csv::sniff(&doc.read(0, doc.len().min(CSV_HEAD))))),
+        _ => None,
+    }
+}
+
+/// A CSV document's first row (as much of it as its first 64 KiB hold) and whether it's a header.
+pub fn csv_header(doc: &Document, d: csv::Dialect) -> (Vec<u8>, bool) {
+    let head = doc.read(0, doc.len().min(CSV_HEAD));
+    let row = csv::first_row(&head, d).to_vec();
+    let header = csv::has_header(&row, d);
+    (row, header)
+}
+
+/// The name of column `col` (from 0) in a header row, if it has one there.
+pub fn csv_column_name(row: &[u8], d: csv::Dialect, col: usize) -> Option<String> {
+    let f = csv::fields(row, d, col + 1).into_iter().nth(col)?;
+    let name = String::from_utf8_lossy(f.trim_ascii()).into_owned();
+    (!name.is_empty()).then(|| if name.chars().count() > 30 { name.chars().take(29).collect::<String>() + "…" } else { name })
+}
+
+/// The caret's field in a CSV or TSV document: its number (from 0), and its column's name when the first row is a
+/// header. None when the caret is over 1 MiB into its line (not read for the status bar).
+pub fn csv_field(doc: &Document, d: csv::Dialect, caret: u64) -> Option<(usize, Option<String>)> {
+    let ls = doc.line_start_of(caret);
+    if caret - ls > 1 << 20 {
+        return None;
+    }
+    let col = csv::field_at(&doc.read(ls, caret), d);
+    let (row, header) = csv_header(doc, d);
+    Some((col, if header { csv_column_name(&row, d, col) } else { None }))
+}
+
+/// The status bar's text for the caret's field: "status (4)", or "Field 4" without a header.
+pub fn csv_field_text(col: usize, name: Option<&str>) -> String {
+    match name {
+        Some(n) => format!("{n} ({})", col + 1),
+        None => format!("Field {}", col + 1),
+    }
+}
+
+/// What Sort by this column says when it's done.
+pub fn csv_sorted(rows: u64, col: usize, name: Option<&str>, header: bool) -> String {
+    let by = match name {
+        Some(n) => format!("“{n}”"),
+        None => format!("field {}", col + 1),
+    };
+    let rest = if header { " (the header row stays on top)" } else { "" };
+    format!("Sorted {} by {by}{rest}", plural(rows, "row", "rows"))
+}
+
+/// What Check says about a valid CSV or TSV file.
+pub fn csv_valid(d: csv::Dialect, s: csv::Stats) -> String {
+    format!("Valid {}: {} of {}", d.name(), plural(s.rows, "row", "rows"), plural(s.fields as u64, "field", "fields"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_character_at_a_place() {
+        use crate::core::text::Encoding;
+        let doc = Document::from_text("aé\u{202E}😀\u{A0}\r\n\u{93}".as_bytes());
+        let info = |pos, enc| char_info(&doc, pos, enc);
+        assert_eq!(info(0, Encoding::Utf8).unwrap(), "a  U+0061  ·  UTF-8: 61");
+        assert_eq!(info(1, Encoding::Utf16Le).unwrap(), "é  U+00E9  ·  UTF-16 LE: E9 00");
+        assert_eq!(info(3, Encoding::Utf8).unwrap(), "right-to-left override  U+202E  ·  UTF-8: E2 80 AE");
+        assert_eq!(info(6, Encoding::Utf16Be).unwrap(), "😀  U+1F600  ·  UTF-16 BE: D8 3D DE 00");
+        assert_eq!(info(10, Encoding::Utf8).unwrap(), "non-breaking space  U+00A0  ·  UTF-8: C2 A0");
+        assert!(info(12, Encoding::Utf8).unwrap().ends_with("a Windows line break (CRLF)"));
+        assert!(info(1, Encoding::Ansi).unwrap().starts_with("é  U+00E9  ·  ANSI:"));
+        assert_eq!(info(0, Encoding::Ansi).unwrap(), "a  U+0061  ·  ANSI: 61");
+        assert!(info(3, Encoding::Ansi).unwrap().contains("not in ANSI"));
+        assert_eq!(info(doc.len(), Encoding::Utf8), None);
+        let bad = Document::from_text(b"\x93x");
+        assert_eq!(char_info(&bad, 0, Encoding::Utf8).unwrap(), "Byte 93: not UTF-8 text");
+    }
 
     #[test]
     fn bookmarks_follow_edits_and_stay_at_line_starts() {

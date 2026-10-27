@@ -24,6 +24,7 @@ use windows::core::{HSTRING, PCWSTR, w};
 use crate::core::document::{Document, EditKind, Sel};
 use crate::core::io::{self as fileio, Loading, SaveError};
 use crate::core::job::{Job, Notify};
+use crate::core::csv;
 use crate::core::json::{self, Mode as JsonMode};
 use crate::core::lines::{self, CaseOp, LineOp};
 use crate::core::xml;
@@ -1537,6 +1538,10 @@ impl App {
                         return;
                     }
                 }
+                if matches!(task.kind, TaskKind::SortColumn { .. }) && count == 0 {
+                    self.flash("The rows are already in that order", false);
+                    return;
+                }
                 let sel = tab.view.sel;
                 let new_len = src.len();
                 // (line endings: the caret and the view stay on their lines; an offset kept as it was could be
@@ -1547,7 +1552,7 @@ impl App {
                     .then(|| crate::edit::marks_as_lines(&tab.view.bookmarks, &tab.doc));
                 tab.doc.begin(EditKind::Other, sel);
                 tab.doc.replace_all_with(src, nl);
-                let keep_place = matches!(task.kind, TaskKind::ReplaceAll | TaskKind::Lines(_));
+                let keep_place = matches!(task.kind, TaskKind::ReplaceAll | TaskKind::Lines(_) | TaskKind::SortColumn { .. });
                 let new_sel = match places {
                     Some((caret, _)) => Sel::at(caret.and_then(|p| tab.doc.offset_of_place(p)).unwrap_or(0)),
                     None if keep_place => Sel::at(sel.caret.min(new_len)),
@@ -1571,6 +1576,10 @@ impl App {
                     TaskKind::ReplaceAll => format!("Replaced {}", plural(count, "match", "matches")),
                     TaskKind::Eol(e) => format!("Line endings changed to {} ({})", e.short(), plural(count, "line", "lines")),
                     TaskKind::Lines(op) => lines_done(op, count),
+                    TaskKind::SortColumn { col, d, header, .. } => {
+                        let name = header.then(|| crate::edit::csv_column_name(&crate::edit::csv_header(&tab.doc, d).0, d, col)).flatten();
+                        crate::edit::csv_sorted(count, col, name.as_deref(), header)
+                    }
                     TaskKind::Validate(_) | TaskKind::Print | TaskKind::Filter(_) => String::new(),
                 };
                 if matches!(task.kind, TaskKind::Format(_)) {
@@ -1776,6 +1785,7 @@ impl App {
                     let r = match f {
                         Fmt::Json => json::run(&snap, mode, &indent, &eol, w, ix, ctx).map(|_| ()).map_err(|e| (e.offset, e.msg)),
                         Fmt::Xml => xml::run(&snap, mode, &indent, &eol, w, ix, ctx).map(|_| ()).map_err(|e| (e.offset, e.msg)),
+                        Fmt::Csv(_) => return TaskResult::Failed("CSV and TSV files aren't formatted.".into()),
                     };
                     match r {
                         Ok(()) => match sink.finish(idx) {
@@ -1808,6 +1818,7 @@ impl App {
                     Fmt::Xml => xml::run(&snap, JsonMode::Validate, b"", b"\n", None, None, ctx)
                         .map(|s| format!("Valid XML: {} (nesting depth {})", plural(s.elements, "element", "elements"), s.max_depth))
                         .map_err(|e| (e.offset, e.msg)),
+                    Fmt::Csv(d) => csv::check(&snap, d, ctx).map(|s| crate::edit::csv_valid(d, s)).map_err(|e| (e.offset, e.msg)),
                 };
                 match r {
                     Ok(msg) => TaskResult::Valid(msg),
@@ -1841,6 +1852,37 @@ impl App {
                     drop(buf);
                     match sink.finish(idx) {
                         Ok((src, nl)) => TaskResult::Content { src, nl, count },
+                        Err(e) => TaskResult::Failed(format!("Couldn't write the result: {e}")),
+                    }
+                }))
+            }
+            TaskKind::SortColumn { col, desc, d, header } => {
+                if len > LINES_MAX || line_count > lines::COUNT_MAX {
+                    self.flash("Sorting works for files up to 512 MB and 32 million lines.", true);
+                    return;
+                }
+                let day_first = crate::core::os::day_first();
+                Job::spawn(len, notify, move |ctx| guarded(&snap, || {
+                    let mut buf = Vec::new();
+                    let text = snap.slice(0, snap.len(), &mut buf);
+                    if ctx.cancelled() {
+                        return TaskResult::Cancelled;
+                    }
+                    let mut sink = match Sink::new(text.len() as u64) {
+                        Ok(s) => s,
+                        Err(e) => return TaskResult::Failed(format!("Couldn't create a temporary file: {e}")),
+                    };
+                    let mut idx = IndexBuilder::new();
+                    let sorted = match csv::sort_by_column(text, d, col, desc, day_first, header, &mut |piece| {
+                        idx.push(piece);
+                        sink.write_all(piece)
+                    }) {
+                        Ok(s) => s,
+                        Err(e) => return TaskResult::Failed(format!("Couldn't write the result: {e}")),
+                    };
+                    drop(buf);
+                    match sink.finish(idx) {
+                        Ok((src, nl)) => TaskResult::Content { src, nl, count: sorted.rows },
                         Err(e) => TaskResult::Failed(format!("Couldn't write the result: {e}")),
                     }
                 }))
@@ -3634,9 +3676,14 @@ impl App {
                 self.apply_theme();
             }
             Cmd::Format | Cmd::Minify | Cmd::Validate => {
-                let f = match self.tab().lang {
+                let tab = self.tab();
+                let f = match tab.lang {
                     Lang::Json => Fmt::Json,
                     Lang::Xml => Fmt::Xml,
+                    Lang::Csv | Lang::CsvSemi | Lang::Tsv if cmd == Cmd::Validate => match crate::edit::csv_dialect(tab.lang, &tab.doc) {
+                        Some(d) => Fmt::Csv(d),
+                        None => return,
+                    },
                     _ => {
                         self.flash("Formatting works for JSON and XML files (the language is in the status bar).", true);
                         return;
@@ -3647,6 +3694,30 @@ impl App {
                     Cmd::Minify => TaskKind::Minify(f),
                     _ => TaskKind::Validate(f),
                 });
+            }
+            Cmd::CharInfo => {
+                let tab = self.tab();
+                match crate::edit::char_info(&tab.doc, tab.view.sel.caret, tab.doc.encoding) {
+                    Some(s) => self.flash(s, false),
+                    None => self.flash("The caret is at the end of the text: no character there.", false),
+                }
+            }
+            Cmd::SortByColumn(desc) => {
+                let tab = self.tab();
+                let Some(d) = crate::edit::csv_dialect(tab.lang, &tab.doc) else {
+                    self.flash("Sort by this column works in CSV and TSV files (the language is in the status bar).", true);
+                    return;
+                };
+                if !tab.doc.is_ready() {
+                    self.flash("Still reading the file's lines — try again in a moment.", true);
+                    return;
+                }
+                let Some((col, _)) = crate::edit::csv_field(&tab.doc, d, tab.view.sel.caret) else {
+                    self.flash("Put the caret in the column to sort by (nearer its line's start).", true);
+                    return;
+                };
+                let (_, header) = crate::edit::csv_header(&tab.doc, d);
+                self.start_task(TaskKind::SortColumn { col, desc, d, header });
             }
             Cmd::ToggleComment => {
                 let tab = self.tab();
@@ -4045,6 +4116,7 @@ impl App {
                     check(Cmd::ToggleWrap, "&Word wrap", "Alt+Z", s.wrap),
                     check(Cmd::ToggleLineNumbers, "&Line numbers", "", s.line_numbers),
                     check(Cmd::ToggleWhitespace, "Show w&hitespace", "", s.show_whitespace),
+                    item(Cmd::CharInfo, "&Character at the caret", ""),
                     Item::Sep,
                     item(Cmd::FilterLines(false), "Show only &matching lines", "Alt+L"),
                     item(Cmd::FilterLines(true), "Show lines &not matching", ""),
@@ -4087,6 +4159,13 @@ impl App {
                     Lang::Xml => Some("XML"),
                     _ => None,
                 };
+                if matches!(tab.lang, Lang::Csv | Lang::CsvSemi | Lang::Tsv) {
+                    let what = if tab.lang == Lang::Tsv { "TSV" } else { "CSV" };
+                    v.push(item(Cmd::Validate, &format!("Chec&k {what}"), ""));
+                    v.push(item(Cmd::SortByColumn(false), "Sort by this column, &A to Z", ""));
+                    v.push(item(Cmd::SortByColumn(true), "Sort by this column, &Z to A", ""));
+                    v.push(Item::Sep);
+                }
                 if let Some(f) = f {
                     v.push(item(Cmd::Format, &format!("&Format {f}"), "Shift+Alt+F"));
                     v.push(item(Cmd::Minify, &format!("&Minify {f}"), ""));
@@ -4482,6 +4561,13 @@ pub fn run(cell: &Cell, d: Deferred) {
                     v.push(item(Cmd::Format, &format!("&Format {f}"), "Shift+Alt+F"));
                     v.push(item(Cmd::Validate, &format!("Chec&k {f}"), ""));
                 }
+                if matches!(tab.lang, Lang::Csv | Lang::CsvSemi | Lang::Tsv) {
+                    let what = if tab.lang == Lang::Tsv { "TSV" } else { "CSV" };
+                    v.push(Item::Sep);
+                    v.push(item(Cmd::Validate, &format!("Chec&k {what}"), ""));
+                    v.push(item(Cmd::SortByColumn(false), "Sort by this col&umn, A to Z", ""));
+                    v.push(item(Cmd::SortByColumn(true), "Sort by this colum&n, Z to A", ""));
+                }
                 if tab.lang == Lang::Json {
                     v.push(item(Cmd::CopyJsonPath, "Copy JSON pat&h", ""));
                 } else if tab.lang == Lang::Xml {
@@ -4552,7 +4638,14 @@ pub fn run(cell: &Cell, d: Deferred) {
                 let rect = a.status_rects.iter().find(|(k, _)| *k == item_kind).map(|(_, r)| *r).unwrap_or_default();
                 let items = match item_kind {
                     StatusItem::Lang => a.lang_items(),
-                    StatusItem::Encoding => a.encoding_items(),
+                    StatusItem::Encoding => {
+                        // (what the caret is on, first: the encoding's bytes for it)
+                        let t = a.tab();
+                        let info = crate::edit::char_info(&t.doc, t.view.sel.caret, t.doc.encoding);
+                        let mut v: Vec<Item> = info.map(|i| vec![enabled(Cmd::CharInfo, &i.replace('&', "&&"), "", false), Item::Sep]).unwrap_or_default();
+                        v.extend(a.encoding_items());
+                        v
+                    }
                     StatusItem::Indent => a.indent_items(),
                     StatusItem::Eol => {
                         let e = a.tab().doc.eol;

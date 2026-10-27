@@ -197,9 +197,14 @@ fn line_order(a: &[u8], b: &[u8]) -> Ordering {
     natural_cmp(a, b).then_with(|| a.cmp(b))
 }
 
-/// Sorts `lines` in `line_order`, on several threads for many lines: runs sorted side by side, then merged.
+/// Sorts `lines` in `line_order`, on several threads for many lines (`par_sort_by`).
 fn sort_lines(lines: &mut Vec<Line>, text: &[u8]) {
-    let cmp = |a: &Line, b: &Line| line_order(a.of(text), b.of(text));
+    par_sort_by(lines, |a: &Line, b: &Line| line_order(a.of(text), b.of(text)));
+}
+
+/// Sorts `lines` by `cmp`, on several threads for many: runs sorted side by side, then merged. Not stable: an order
+/// that must keep equal items as they were says so itself (CSV's rows compare their places last).
+pub(crate) fn par_sort_by<T: Copy + Send + Sync>(lines: &mut Vec<T>, cmp: impl Fn(&T, &T) -> Ordering + Copy + Send + Sync) {
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(8);
     if threads < 2 || lines.len() < 200_000 {
         lines.sort_unstable_by(cmp);

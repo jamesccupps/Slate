@@ -949,10 +949,14 @@ fn commands() -> Vec<(&'static str, Cmd, &'static [&'static str])> {
         ("json-format", Cmd::JsonFormat, &[]),
         ("json-minify", Cmd::JsonMinify, &[]),
         ("json-check", Cmd::JsonCheck, &[]),
+        ("csv-check", Cmd::CsvCheck, &[]),
+        ("csv-sort", Cmd::CsvSort(false), &[]),
+        ("csv-sort-desc", Cmd::CsvSort(true), &[]),
         ("xml-format", Cmd::XmlFormat, &[]),
         ("xml-minify", Cmd::XmlMinify, &[]),
         ("xml-check", Cmd::XmlCheck, &[]),
         ("wrap", Cmd::Wrap, &["<Alt>z"]),
+        ("char-info", Cmd::CharInfo, &[]),
         ("line-numbers", Cmd::LineNumbers, &[]),
         ("zoom-in", Cmd::ZoomIn, &["<Control>plus", "<Control>equal", "<Control>KP_Add"]),
         ("zoom-out", Cmd::ZoomOut, &["<Control>minus", "<Control>KP_Subtract"]),
@@ -1035,7 +1039,7 @@ fn actions(ui: &Rc<Ui>) {
 /// Menu items shown only while their action is on: JSON's and XML's for those files (as on Windows), and Help's
 /// Open files with Slate… or Stop opening files with Slate…, whichever applies (`Ui::sync_menu`).
 const SHOWN_WHEN_ON: &[&str] =
-    &["json-format", "json-minify", "json-check", "xml-format", "xml-minify", "xml-check", "make-default", "stop-default"];
+    &["json-format", "json-minify", "json-check", "xml-format", "xml-minify", "xml-check", "csv-check", "csv-sort", "csv-sort-desc", "make-default", "stop-default"];
 
 fn section(items: &[(&str, &str)]) -> gio::Menu {
     let commands = commands();
@@ -1084,7 +1088,7 @@ fn menu_model(recent: &gio::Menu) -> gio::Menu {
     edit.append_section(None, &section(&[("Time/date", "date-time")]));
     bar.append_submenu(Some("_Edit"), &edit);
     let view = gio::Menu::new();
-    view.append_section(None, &section(&[("Word wrap", "wrap"), ("Line numbers", "line-numbers")]));
+    view.append_section(None, &section(&[("Word wrap", "wrap"), ("Line numbers", "line-numbers"), ("Character at the caret", "char-info")]));
     view.append_section(None, &section(&[("Show only matching lines", "filter-lines"), ("Show lines not matching", "filter-lines-not")]));
     view.append_section(None, &section(&[("Zoom in", "zoom-in"), ("Zoom out", "zoom-out"), ("Reset zoom", "zoom-reset")]));
     let theme = section(&[("Use system setting", "theme-system"), ("Light", "theme-light"), ("Dark", "theme-dark")]);
@@ -1093,6 +1097,10 @@ fn menu_model(recent: &gio::Menu) -> gio::Menu {
     let format = gio::Menu::new();
     format.append_section(None, &section(&[("Format JSON", "json-format"), ("Minify JSON", "json-minify"), ("Check JSON", "json-check")]));
     format.append_section(None, &section(&[("Format XML", "xml-format"), ("Minify XML", "xml-minify"), ("Check XML", "xml-check")]));
+    format.append_section(
+        None,
+        &section(&[("Check CSV / TSV", "csv-check"), ("Sort by this column, A to Z", "csv-sort"), ("Sort by this column, Z to A", "csv-sort-desc")]),
+    );
     let rest = gio::Menu::new();
     rest.append_submenu(Some("Language"), &lang_menu());
     rest.append_submenu(Some("Line endings"), &eol_menu());
@@ -1804,6 +1812,7 @@ impl Ui {
         self.set_action_state("set-lang", tab.lang.label().to_variant());
         // JSON's and XML's items only for those files; Open files or Stop opening files with Slate, whichever applies
         let default = self.is_default.get();
+        let csv = matches!(tab.lang, Lang::Csv | Lang::CsvSemi | Lang::Tsv);
         let on = [
             ("json-format", tab.lang == Lang::Json),
             ("json-minify", tab.lang == Lang::Json),
@@ -1811,6 +1820,9 @@ impl Ui {
             ("xml-format", tab.lang == Lang::Xml),
             ("xml-minify", tab.lang == Lang::Xml),
             ("xml-check", tab.lang == Lang::Xml),
+            ("csv-check", csv),
+            ("csv-sort", csv),
+            ("csv-sort-desc", csv),
             ("make-default", !default),
             ("stop-default", default),
         ];

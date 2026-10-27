@@ -16,7 +16,7 @@ use crate::core::job::{Job, Notify};
 use crate::core::search::{self, Found, Matcher, Query};
 use crate::core::source::IndexBuilder;
 use crate::core::text::{Encoding, Eol};
-use crate::core::{json, lines, xml};
+use crate::core::{csv, json, lines, xml};
 use crate::edit::{self, Indent, Sink};
 use crate::highlight::Lang;
 use crate::settings::{Settings, ThemeMode, ZOOM_STEPS};
@@ -94,10 +94,15 @@ pub enum Cmd {
     JsonFormat,
     JsonMinify,
     JsonCheck,
+    CsvCheck,
+    /// The rows sorted by the caret's column (Z to A: true).
+    CsvSort(bool),
     XmlFormat,
     XmlMinify,
     XmlCheck,
     Wrap,
+    /// View → Character at the caret: its code point and bytes in the status bar.
+    CharInfo,
     LineNumbers,
     ZoomIn,
     ZoomOut,
@@ -161,6 +166,10 @@ enum TaskKind {
     Eol(Eol),
     /// Show only matching lines (false), or the lines without a match (true).
     Filter(bool),
+    /// CSV or TSV: Check.
+    CsvCheck(csv::Dialect),
+    /// CSV or TSV: the rows sorted by field `col` (from 0), Z to A when `desc`, the first row on top when `header`.
+    SortColumn { col: usize, desc: bool, d: csv::Dialect, header: bool },
 }
 
 struct Task {
@@ -240,6 +249,15 @@ impl Tab {
         self.save.is_some()
     }
 
+    /// CSV and TSV: the caret's field ("status (4)") for the status bar.
+    pub fn field_text(&self) -> Option<String> {
+        if !matches!(self.lang, Lang::Csv | Lang::CsvSemi | Lang::Tsv) || !self.doc.is_ready() {
+            return None;
+        }
+        let d = edit::csv_dialect(self.lang, &self.doc)?;
+        edit::csv_field(&self.doc, d, self.view.sel.caret).map(|(col, name)| edit::csv_field_text(col, name.as_deref()))
+    }
+
     /// An untouched empty tab (a new window's): what's opened next takes its place.
     pub fn is_blank(&self) -> bool {
         self.doc.path.is_none() && self.doc.is_empty() && !self.doc.is_dirty() && !self.busy()
@@ -310,6 +328,8 @@ pub struct App {
     /// characters), counted once for each.
     pub col_cache: std::cell::Cell<Option<(u64, u64, u64)>>,
     pub sel_cache: std::cell::Cell<Option<(u64, u64, u64, u64)>>,
+    /// CSV and TSV: the caret's field as the status bar says it, for (tab, document version, caret).
+    pub field_cache: std::cell::RefCell<Option<((u64, u64, u64), Option<String>)>>,
 }
 
 fn now_text() -> String {
@@ -357,6 +377,7 @@ impl App {
             disk_job: None,
             col_cache: Default::default(),
             sel_cache: Default::default(),
+            field_cache: Default::default(),
         };
         app.apply_theme();
         app
@@ -1438,6 +1459,34 @@ impl App {
             Cmd::JsonFormat => self.start_task(TaskKind::Json(json::Mode::Pretty)),
             Cmd::JsonMinify => self.start_task(TaskKind::Json(json::Mode::Minify)),
             Cmd::JsonCheck => self.start_task(TaskKind::Json(json::Mode::Validate)),
+            Cmd::CharInfo => {
+                let tab = self.tab();
+                match edit::char_info(&tab.doc, tab.view.sel.caret, tab.doc.encoding) {
+                    Some(s) => self.flash(s, false),
+                    None => self.flash("The caret is at the end of the text: no character there.", false),
+                }
+            }
+            Cmd::CsvCheck => match edit::csv_dialect(self.tab().lang, &self.tab().doc) {
+                Some(d) => self.start_task(TaskKind::CsvCheck(d)),
+                None => self.flash("Check works for JSON, XML, CSV and TSV files (the language is in the status bar).", true),
+            },
+            Cmd::CsvSort(desc) => {
+                let tab = self.tab();
+                let Some(d) = edit::csv_dialect(tab.lang, &tab.doc) else {
+                    self.flash("Sort by this column works in CSV and TSV files (the language is in the status bar).", true);
+                    return;
+                };
+                if !tab.doc.is_ready() {
+                    self.flash("Still reading the file's lines — try again in a moment.", true);
+                    return;
+                }
+                let Some((col, _)) = edit::csv_field(&tab.doc, d, tab.view.sel.caret) else {
+                    self.flash("Put the caret in the column to sort by (nearer its line's start).", true);
+                    return;
+                };
+                let (_, header) = edit::csv_header(&tab.doc, d);
+                self.start_task(TaskKind::SortColumn { col, desc, d, header });
+            }
             Cmd::XmlFormat => self.start_task(TaskKind::Xml(json::Mode::Pretty)),
             Cmd::XmlMinify => self.start_task(TaskKind::Xml(json::Mode::Minify)),
             Cmd::Format => match self.tab().lang {
@@ -1595,8 +1644,10 @@ impl App {
 
     fn start_task(&mut self, kind: TaskKind) {
         let notify = self.notify.clone();
-        let changes =
-            !matches!(kind, TaskKind::Json(json::Mode::Validate) | TaskKind::Xml(json::Mode::Validate) | TaskKind::Filter(_));
+        let changes = !matches!(
+            kind,
+            TaskKind::Json(json::Mode::Validate) | TaskKind::Xml(json::Mode::Validate) | TaskKind::Filter(_) | TaskKind::CsvCheck(_)
+        );
         if changes && !self.editable() {
             return;
         }
@@ -1622,12 +1673,13 @@ impl App {
         let version = tab.doc.version;
         let eol = tab.doc.eol.as_bytes().to_vec();
         let len = snap.len();
-        if let TaskKind::Lines(_) = kind {
+        if let TaskKind::Lines(_) | TaskKind::SortColumn { .. } = kind {
             if len > LINES_MAX || tab.doc.line_count().unwrap_or(0) > lines::COUNT_MAX {
                 self.flash("Sorting and cleaning up lines works for files up to 512 MB and 32 million lines.", true);
                 return;
             }
         }
+        let day_first = crate::core::os::day_first();
         let job = Job::spawn(len, notify, move |ctx| {
             guarded(&snap, || match kind {
                 TaskKind::Json(mode) | TaskKind::Xml(mode) if mode != json::Mode::Validate => {
@@ -1670,6 +1722,32 @@ impl App {
                     Err(_) if ctx.cancelled() => TaskResult::Cancelled,
                     Err(e) => TaskResult::FormatError { offset: e.offset, msg: e.msg },
                 },
+                TaskKind::CsvCheck(d) => match csv::check(&snap, d, ctx) {
+                    Ok(s) => TaskResult::Valid(edit::csv_valid(d, s)),
+                    Err(_) if ctx.cancelled() => TaskResult::Cancelled,
+                    Err(e) => TaskResult::FormatError { offset: e.offset, msg: e.msg },
+                },
+                TaskKind::SortColumn { col, desc, d, header } => {
+                    let mut buf = Vec::new();
+                    let text = snap.slice(0, snap.len(), &mut buf);
+                    let mut sink = match Sink::new(text.len() as u64) {
+                        Ok(s) => s,
+                        Err(e) => return TaskResult::Failed(format!("Couldn't create a temporary file: {e}")),
+                    };
+                    let mut idx = IndexBuilder::new();
+                    let sorted = match csv::sort_by_column(text, d, col, desc, day_first, header, &mut |piece| {
+                        idx.push(piece);
+                        std::io::Write::write_all(&mut sink, piece)
+                    }) {
+                        Ok(s) => s,
+                        Err(e) => return TaskResult::Failed(format!("Couldn't write the result: {e}")),
+                    };
+                    drop(buf);
+                    match sink.finish(idx) {
+                        Ok((src, nl)) => TaskResult::Content { src, nl, count: sorted.rows },
+                        Err(e) => TaskResult::Failed(format!("Couldn't write the result: {e}")),
+                    }
+                }
                 TaskKind::Lines(op) => {
                     let mut buf = Vec::new();
                     let text = snap.slice(0, snap.len(), &mut buf);
@@ -1772,6 +1850,10 @@ impl App {
                         return;
                     }
                 }
+                if matches!(kind, TaskKind::SortColumn { .. }) && count == 0 {
+                    self.flash("The rows are already in that order", false);
+                    return;
+                }
                 self.session_dirty = true;
                 self.dirty_title = true;
                 if let TaskKind::Eol(e) = kind {
@@ -1791,7 +1873,7 @@ impl App {
                     matches!(kind, TaskKind::Eol(_) | TaskKind::ReplaceAll).then(|| edit::marks_as_lines(&tab.view.bookmarks, &tab.doc));
                 tab.doc.begin(EditKind::Other, sel);
                 tab.doc.replace_all_with(src, nl);
-                let keep = matches!(kind, TaskKind::ReplaceAll | TaskKind::Lines(_) | TaskKind::Eol(_));
+                let keep = matches!(kind, TaskKind::ReplaceAll | TaskKind::Lines(_) | TaskKind::Eol(_) | TaskKind::SortColumn { .. });
                 let new_sel = match places {
                     Some((caret, _)) => Sel::at(caret.and_then(|p| tab.doc.offset_of_place(p)).unwrap_or(0)),
                     None if keep => Sel::at(sel.caret.min(new_len)),
@@ -1812,6 +1894,10 @@ impl App {
                 let msg = match kind {
                     TaskKind::ReplaceAll => format!("Replaced {}", edit::plural(count, "match", "matches")),
                     TaskKind::Lines(op) => edit::lines_done(op, count),
+                    TaskKind::SortColumn { col, d, header, .. } => {
+                        let name = header.then(|| edit::csv_column_name(&edit::csv_header(&tab.doc, d).0, d, col)).flatten();
+                        edit::csv_sorted(count, col, name.as_deref(), header)
+                    }
                     TaskKind::Eol(e) => format!("Line endings changed to {} ({})", e.short(), edit::plural(count, "line", "lines")),
                     TaskKind::Json(json::Mode::Minify) | TaskKind::Xml(json::Mode::Minify) => "Minified".into(),
                     _ => "Formatted".into(),
@@ -1848,6 +1934,7 @@ impl App {
                 let (what, check) = match kind {
                     TaskKind::Xml(m) => ("XML", m == json::Mode::Validate),
                     TaskKind::Json(m) => ("JSON", m == json::Mode::Validate),
+                    TaskKind::CsvCheck(d) => (d.name(), true),
                     _ => ("JSON", false),
                 };
                 // (nested deeper than Slate follows isn't invalid)

@@ -278,6 +278,17 @@ pub fn status_texts(app: &App) -> (String, Vec<String>, bool) {
             Some(l) => format!("Ln {}, Col {}", crate::edit::group(l), crate::edit::group(col)),
             None => format!("Col {}", crate::edit::group(col)),
         };
+        // CSV and TSV: the caret's field, worked out once per caret place
+        let key = (tab.id, doc.version, pos);
+        let cached = app.field_cache.borrow().as_ref().filter(|(k, _)| *k == key).map(|(_, f)| f.clone());
+        let field = cached.unwrap_or_else(|| {
+            let f = tab.field_text();
+            *app.field_cache.borrow_mut() = Some((key, f.clone()));
+            f
+        });
+        if let Some(f) = field {
+            s.push_str(&format!("  ·  {f}"));
+        }
         if !sel.is_empty() {
             let n = sel.end() - sel.start();
             if n <= 4 << 20 {

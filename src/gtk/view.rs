@@ -254,7 +254,8 @@ pub fn display_text(bytes: &[u8]) -> (String, Vec<u32>) {
         } else {
             let n = text::char_len_at(&bytes[i..]).max(1);
             match std::str::from_utf8(&bytes[i..i + n]).ok().and_then(|s| s.chars().next()) {
-                Some(c) => (c, n),
+                // (line separators and invisible characters as their symbols, as on Windows)
+                Some(c) => (text::display_char(c), n),
                 None => ('\u{FFFD}', 1),
             }
         };
