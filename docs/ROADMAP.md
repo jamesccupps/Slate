@@ -163,6 +163,15 @@ that follows its file as it grows; Count all, Show only matching lines, Sort and
 cores; the JSON structure panel keeping open array elements open when elements are put before them, and its clicks
 going to the right place while it catches up. Details in the [0.14.0 release notes](release-notes-0.14.0.md).
 
+## 0.15.0
+
+The third round of the *Soon* list: spell check like Notepad's (Windows' own spell checker; Enchant on Linux), only
+the words on screen and only prose (plain text, Markdown's, comments in code), with suggestions, Add to dictionary
+and Ignore on the right-click menu; input methods' compositions drawn in the text at the cursor (IMM32 on Windows,
+GTK's preedit on Linux); the tabs in the title bar, as in Windows 11's Notepad (Windows: Slate's own frame and window
+buttons, with Snap layouts; Linux: the strip and the desktop's window buttons as GTK's title bar). Details in the
+[0.15.0 release notes](release-notes-0.15.0.md).
+
 ## Next
 
 1. **Accessibility: screen readers, the rest (M).** The text is read since 0.12.0 (checked in test mode and by a real
@@ -185,8 +194,8 @@ going to the right place while it catches up. Details in the [0.14.0 release not
 
 ## Soon
 
-- **Spell check** like Notepad's (M). **Inline IME composition** for Chinese, Japanese and Korean (M).
-- **Tabs in the title bar**, like Windows 11 Notepad, to save space (M).
+Nothing waiting: the *Soon* list of 0.13.0 is done (0.13.0, 0.14.0, 0.15.0). The next picks come from *Next* and
+*Later*.
 
 ## Later
 

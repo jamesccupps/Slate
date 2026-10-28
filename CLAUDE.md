@@ -314,6 +314,20 @@ lighter one on dark), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate`, `$
     `Last` while Slate runs, the margins in the settings) and Print (on to `print_tab`); the window is never
     narrower than its bar (`min_width`: narrower, Page setup slid under Print and Close). On Linux it's GTK's (`PrintOperationAction::Preview`: the desktop's
     previewer), and File → Page setup GTK's dialog (`print_run_page_setup_dialog_async`, kept while Slate runs).
+  - `src/spell.rs` (shared, beside `core`) — spell check: which words of the rows on screen are checked
+    (`words_in`: all of plain text, Markdown's prose — not code blocks, `markdown_code`, inline code or links —,
+    comments in code; never data files; a word is letters with apostrophes inside, not next to a digit, `_`, `/`,
+    `\` or `@`, not dotted like `file.txt`, not a link's scheme, not `#tag`/`$var`, no capital after the first
+    letter, at least two letters, no scripts from Hebrew on), and `Speller` (each word asked about once, up to
+    100,000 remembered). The checking is the system's: `ui/spell.rs` (ISpellChecker in Windows' language, else
+    its language without the region, else English; ~25 ms to make, so it's made by `TIMER_SPELL` 300 ms after the
+    first paint that wants it, test mode too: its scripts run `timer:13`; ~8 µs a new word) and `gtk/spell.rs`
+    (Enchant 2 loaded with dlopen, the session's language from `LC_ALL`/`LC_MESSAGES`/`LANG`; the .deb recommends
+    `libenchant-2-2` and `hunspell-en-us`; without them `Spelling::Unavailable` and nothing is marked). Add to
+    dictionary goes into the user's own dictionary, which other programs share (test mode only ignores). The word
+    the caret is at the end of isn't marked while the text has the keyboard (being typed); tabs that can't be
+    edited aren't checked. The right-click menu's first items: up to 5 suggestions (`Cmd::Suggestion`, applied only
+    while the document's version is the one the menu was opened on), Add to dictionary, Ignore.
   - `job.rs` — background jobs with progress/cancel, notify the UI by posting a window message (on Linux: an idle
     callback on GLib's main loop).
 - `src/gtk/` — the Linux app (GTK 4): `mod.rs` the window (menu bar from a `gio::Menu`, actions with accelerators
@@ -391,7 +405,8 @@ lighter one on dark), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate`, `$
     syntax tables say). `SLATE_HL_SAMPLES=<folder> cargo test --release --lib lexer_speed -- --ignored --nocapture`
     measures each lexer on the files in a folder.
   - `app.rs` state, layout and painting; `actions.rs` input, commands, background jobs, saving and closing;
-    `editor.rs` the text view; `structure.rs` path bar + structure panel; `findbar.rs`; `session.rs` (tabs and
+    `editor.rs` the text view; `structure.rs` path bar + structure panel; `findbar.rs`; `ime.rs` (input methods
+    through IMM32: see Design decisions); `spell.rs` (Windows' spell checker); `session.rs` (tabs and
     unsaved text kept between runs; a path that isn't valid Unicode is kept as UTF-16 units, `os::json_path`, and
     arguments, drops and handed-over paths stay `OsString`s); `settings.rs` (data folder, portable mode); `install.rs`
     ("Open with" entries
@@ -619,6 +634,36 @@ lighter one on dark), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate`, `$
   goes past the system's drag distance (SM_CXDRAG; GTK's `gtk-dnd-drag-threshold`), `View::drop_at` drawn as a caret
   in the accent color; let go, the text moves there (with Ctrl, a copy) as one undo step (`drop_text`). A press that
   doesn't move puts the caret there. Only inside Slate (not to or from other programs).
+- Input methods (Chinese, Japanese, Korean; `edit::Composing`, `View::composing`, both apps): what's being composed
+  is never in the document (no undo step, nothing for the session, searches or screen readers); the caret's segment
+  is laid out with it put in at the caret, its units mapped to the caret's byte so everything after maps as before
+  (`SegLayout::composing`, GTK's `Lay::composing`; one layout of its own, `composed`, not in the cache), its clauses
+  underlined (the one being converted thicker) and the caret at the input method's cursor. Windows (`ui/ime.rs`):
+  WM_IME_SETCONTEXT drops ISC_SHOWUICOMPOSITIONWINDOW, WM_IME_STARTCOMPOSITION isn't passed on (no Windows
+  composition window), WM_IME_COMPOSITION reads GCS_COMPSTR/COMPATTR/COMPCLAUSE/CURSORPOS and types GCS_RESULTSTR
+  as keys do (and isn't passed on either: that would send it again as WM_IME_CHAR), the candidate list goes under
+  the clause being converted (CFS_EXCLUDE). Starting a composition deletes the selection, as typing would; a
+  read-only tab cancels it. A click while composing types what shows first, where the caret is, then cancels the
+  input method's copy (CPS_CANCEL), at the top of `handle` outside the App's borrow; keys are left to the input
+  method (one may end a syllable itself with its result still on the way: finishing on the key too typed it twice).
+  Linux: GTK's preedit signals (preedit-start/changed/end; attributes to clauses in `view::composing_of`, a
+  background marking the clause being converted); a click resets the input context first, as GtkTextView does.
+- Tabs in the title bar (`Settings::tabs_in_title_bar`, View → Tabs in the title bar, on by default; Windows'
+  title bar in high contrast). Windows: `CUSTOM_FRAME` (a thread-local, as WM_NCCALCSIZE comes while the window is
+  made, before there's an App, and while it's borrowed; `wndproc` answers it before looking for the App) takes the
+  caption off (`calc_frame`: DefWindowProc's rectangle, its top put back; maximized, in by the frame, which reaches
+  past the screen). WM_NCHITTEST (`frame_hit`): the top edge (SM_CYFRAME) resizes unless maximized, the window's
+  buttons (`App::caption_rects`, 46 DIPs each at the strip's end, drawn by Slate in the theme, close red under the
+  mouse, dimmed while the window isn't active) answer HTMINBUTTON/HTMAXBUTTON/HTCLOSE (so Windows 11 shows Snap
+  layouts over maximize), the strip's empty room HTCAPTION (Windows moves the window, maximizes on a double-click,
+  shows its menu on a right-click: the strip's old double-click for a new tab is only without the title bar). Their
+  WM_NCLBUTTONDOWN/UP aren't passed on (DefWindowProc would draw Windows' old buttons); hover by WM_NCMOUSEMOVE and
+  TME_NONCLIENT leave; WM_NCACTIVATE goes on with -1 (nothing to draw again). `place_tabs` keeps 3 buttons and
+  `DRAG_MIN` free. Switching it on or off (`sync_frame`, also when high contrast changes) is `Deferred::Frame`:
+  SetWindowPos with SWP_FRAMECHANGED outside the App's borrow. Linux: GTK makes a window's title bar as it's shown,
+  so the setting counts from the next start: the strip and `gtk4::WindowControls` (the desktop's own buttons, in its
+  order) are `set_titlebar`'s widget; on the strip's empty room a drag starts `Toplevel::begin_move` (past the drag
+  threshold), a double-click maximizes or restores, a right-click shows the window menu (`show_window_menu`).
 - Find next and previous through all open tabs (the find box's All tabs toggle, Alt+A; `App::find_in_tabs`): on to
   this tab's end, then the other tabs in order, then the rest of this one; a tab of matching lines or one whose text
   isn't there yet is passed over, Find in selection keeps to the selection, and Find previous still takes a match
@@ -655,7 +700,16 @@ lighter one on dark), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate`, `$
   to PDF, or as it shows without a printer), `previewrun:<steps, | between>` File → Print preview run for real
   with its window hidden (the default printer, the layout's job, the bar's clicks and keys: `preview::Script`; Page
   setup's dialog is never shown, nor is Print's), `print:printer` (`default` when Windows' default printer is
-  found, as the preview looks for it), `set:print_colors=false` (and
+  found, as the preview looks for it), `imemsg:start|comp|<text>|<cursor>|<attributes>|<clause starts>|result|<text>|end`
+  (an input method's messages through the window procedure, with what IMM32 would have: `ime::FAKE`;
+  `print:composing`), `clickraw:<x>,<y>` (a click's messages through the window procedure, in pixels: `click:` calls
+  the App directly), `rmenu:<x>,<y>[|<label>]` (the text's menu at a point, an item chosen by its label;
+  `print:popupitems` lists the last popup's items), `print:wrong` (the words spelled wrong on screen, a frame drawn
+  first) and `print:speller` (the checker's language; `timer:13` makes it), `nchit:` / `ncmove:` / `ncclick:<x>,<y>`
+  (client DIPs: WM_NCHITTEST, the mouse over it, a click on a window button; the buttons are only noted in
+  `print:asked`, as they'd show the hidden window or end the test; a press on the caption or an edge isn't sent, as
+  Windows' moving would follow the real mouse), `ncleave`, `ncactivate:0|1` and `print:frame` (title bar tabs or
+  standard, and where the client area starts), `set:print_colors=false` (and
   `print_line_numbers`, `print_header`, `print_margins=l,t,r,b`), `down:`/`move:`/`up:` with `,alt` or `,ctrl`
   held (a column selection, a copy dropped), and
   `contrast:on`
@@ -674,7 +728,9 @@ lighter one on dark), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate`, `$
   `print:session` (the session folder's files), `print:notice` and `print:blink` (whether the caret's timer runs:
   it stops after `BLINK_STOP` or with the window in the background, so an idle Slate sleeps), and
   `findkey:<combo>` / `replacekey:<combo>` (a key in the find or replace box: `up`, `alt+s`; `key:` goes to the
-  text), `down:<x>,<y>[,alt]` / `move:<x>,<y>` / `up:[ctrl]` (the left button in the text, the gutter included),
+  text), `imemsg:start|pre|<text>|<cursor>|<clauses>|commit|<text>|end` (the input method's signals on the window's
+  input context; `pre` as GTK gives a preedit), `rmenu:<x>,<y>[|<label>]` (the text's menu's spelling part),
+  `print:wrong`, `print:speller`, `down:<x>,<y>[,alt]` / `move:<x>,<y>` / `up:[ctrl]` (the left button in the text, the gutter included),
   `set:print_colors=false` and the other print options.
 - Measuring: `t:<label>` marks; `print:startup` (each startup step in ms since the process was created: `warp`,
   `device`, `first frame` or `first frame (WARP)` and the switch; a hidden test window gets no WM_PAINT, so the

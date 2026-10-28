@@ -26,6 +26,12 @@ JSON file opens instantly, scrolls smoothly, and can be searched, edited, format
   `\t` in a regular expression's replacement for a line break or a tab.
 - Column selection (Alt+drag, Shift+Alt+arrows: type, paste and delete on every line) and dragging selected text
   to another place (with Ctrl, a copy).
+- Spell check, like Notepad's: words spelled wrong get a wavy red line, in plain text, Markdown's prose and comments
+  in code (not names, links, numbers or data files); right-click one for suggestions, Add to dictionary or Ignore.
+  It's Windows' own spell checker, in Windows' language (on Linux, Enchant, which Slate's package brings along when
+  it can). *View → Spell check* turns it off.
+- Input methods for Chinese, Japanese and Korean: what's being composed shows right in the text at the cursor, in
+  the theme's colors, its clauses underlined.
 - Show only the lines that match a search (or the ones that don't, or any of the highlighted ones), in a tab of
   their own with each line's number in the file; Enter or a double-click goes to that line in the file, and it
   follows a log as it grows. 809,820 lines out of a 400 MB log in 0.23 s.
@@ -60,7 +66,8 @@ JSON file opens instantly, scrolls smoothly, and can be searched, edited, format
 - Go to line, word wrap, line numbers, show whitespace, the matching
   bracket highlighted, overtype, zoom, dark and light themes (follows Windows, or switch with the sun/moon button).
   With Windows' high contrast on, Slate uses its colors, and Magnifier follows the text cursor.
-- Reopen closed tabs (Ctrl+Shift+T), close the other, the saved or all tabs, and a list of all tabs when they don't
+- Tabs in the title bar, as in Windows 11's Notepad (*View → Tabs in the title bar* puts them back under it).
+  Reopen closed tabs (Ctrl+Shift+T), close the other, the saved or all tabs, and a list of all tabs when they don't
   fit. The files opened last are on the taskbar button's menu (on Linux, in the desktop's recent files). The status bar counts words and characters, and shows the language, line endings, encoding and indentation:
   click one to change it.
 - Detects and keeps the encoding (UTF-8, UTF-8 with BOM, UTF-16, ANSI) and line endings (CRLF / LF). Saving as ANSI
