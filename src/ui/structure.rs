@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-use crate::core::document::Document;
+use crate::core::document::{Change, Document};
 use crate::core::job::{Ctx, Job, Notify};
 use crate::core::jsonnav::{self, Children, Chunked, Kind, Step};
 use crate::core::xmlnav;
@@ -121,6 +121,48 @@ pub struct Structure {
     edited: Option<(u64, std::time::Instant)>,
     /// An XML document's root element was opened when the tree was first shown.
     root_opened: bool,
+    /// The edits since `rows` were worked out (`edited`), to find their places in the text now: a click on a row
+    /// goes there while the rows are being made again, and what was open is found again by its place (open array
+    /// elements are known by their index, which an element inserted before them changes); `rows_lost`: too many to
+    /// follow.
+    since_rows: Vec<Change>,
+    rows_lost: bool,
+    /// What was open (and selected, and opened by a reveal), by where it is in the text now, while the rows are made
+    /// again after an edit (`reopen`).
+    reopen: Option<Reopen>,
+}
+
+/// Open rows found again by their place after an edit (`Structure::reopen`).
+#[derive(Default)]
+struct Reopen {
+    /// Values by their start.
+    values: HashSet<u64>,
+    /// Ranges by their container's start and the indexes they hold.
+    ranges: HashSet<(u64, u64, u64)>,
+    selected: Option<u64>,
+    revealed: HashSet<u64>,
+}
+
+/// Where a node starting at `pos` starts after `c` (text inserted right before it moves it); None: its start is gone.
+fn start_after(pos: u64, c: &Change) -> Option<u64> {
+    if pos < c.at {
+        Some(pos)
+    } else if pos >= c.at + c.del && (pos > c.at || c.del == 0) {
+        Some(pos - c.del + c.ins)
+    } else {
+        None
+    }
+}
+
+/// Where a node ending at `pos` ends after `c` (text inserted right after it doesn't move it); None: its end is gone.
+fn end_after(pos: u64, c: &Change) -> Option<u64> {
+    if pos <= c.at {
+        Some(pos)
+    } else if pos >= c.at + c.del {
+        Some(pos - c.del + c.ins)
+    } else {
+        None
+    }
 }
 
 fn bucket_size(n: u64) -> u64 {
@@ -198,6 +240,89 @@ impl Structure {
     /// Whether the tree rows are for the text as it is now (see `rows_version`).
     pub fn rows_current(&self, doc: &Document) -> bool {
         self.rows_version == doc.version
+    }
+
+    /// The text changed (`Tab::sync_view` hands on every change, in order).
+    pub fn edited(&mut self, changes: &[Change]) {
+        if changes.is_empty() || self.rows.is_empty() {
+            return;
+        }
+        if let Some(r) = &mut self.reopen {
+            for c in changes {
+                r.values = r.values.iter().filter_map(|&p| start_after(p, c)).collect();
+                r.ranges = r.ranges.iter().filter_map(|&(p, a, b)| Some((start_after(p, c)?, a, b))).collect();
+                r.revealed = r.revealed.iter().filter_map(|&p| start_after(p, c)).collect();
+                r.selected = r.selected.and_then(|p| start_after(p, c));
+            }
+        }
+        if !self.rows_lost {
+            self.since_rows.extend_from_slice(changes);
+            // (typing for minutes while the rows wait: they get no older than that)
+            if self.since_rows.len() > 10_000 {
+                self.since_rows.clear();
+                self.rows_lost = true;
+            }
+        }
+    }
+
+    /// Where a row's value (`start..end` when the rows were made) is in the text now; None: changed too much.
+    pub fn place_now(&self, doc: &Document, start: u64, end: u64) -> Option<(u64, u64)> {
+        if self.rows_current(doc) {
+            return Some((start, end));
+        }
+        if self.rows_lost {
+            return None;
+        }
+        let s = self.since_rows.iter().try_fold(start, |p, c| start_after(p, c))?;
+        let e = self.since_rows.iter().try_fold(end, |p, c| end_after(p, c))?;
+        (s < e && e <= doc.len()).then_some((s, e))
+    }
+
+    /// Before the rows are made again after an edit: what's open in them (and selected, and opened by a reveal),
+    /// taken out of `expanded` and noted by where it is now, so the same values open again wherever they moved
+    /// (`add` puts them back by their new keys).
+    fn note_reopen(&mut self) {
+        if self.since_rows.is_empty() || self.rows_lost || self.reopen.is_some() {
+            return;
+        }
+        let since = &self.since_rows;
+        let now = |p: u64| since.iter().try_fold(p, |p, c| start_after(p, c));
+        let mut r = Reopen::default();
+        // the container start of each depth on the way (a range's rows are inside it)
+        let mut containers: Vec<Option<u64>> = Vec::new();
+        for row in &self.rows {
+            containers.truncate(row.depth as usize);
+            match row.key {
+                NodeKey::Value(k) => {
+                    containers.push(Some(row.start));
+                    // (one whose start was edited keeps its key: Format replaces the whole text, and the paths stay)
+                    let Some(p) = now(row.start) else { continue };
+                    if row.expanded {
+                        self.expanded.remove(&row.key);
+                        r.values.insert(p);
+                        if self.revealed.contains(&row.key) {
+                            r.revealed.insert(p);
+                        }
+                    }
+                    if self.selected == Some(NodeKey::Value(k)) {
+                        (self.selected, r.selected) = (None, Some(p));
+                    }
+                }
+                NodeKey::Bucket(id, a, b) => {
+                    // (a range of the top level keeps its key: the top's id doesn't change)
+                    let container = containers.last().copied().flatten();
+                    containers.push(container);
+                    if row.expanded && id != TOP
+                        && let Some(p) = container.and_then(now)
+                    {
+                        self.expanded.remove(&row.key);
+                        r.ranges.insert((p, a, b));
+                    }
+                }
+            }
+        }
+        self.revealed.retain(|k| matches!(k, NodeKey::Bucket(TOP, ..)) || self.expanded.contains(k));
+        self.reopen = Some(r);
     }
 
     /// Whether the path bar is for the text as it is now.
@@ -392,6 +517,7 @@ impl Structure {
             return;
         }
         self.rows_dirty = false;
+        self.note_reopen();
         let Some(top) = self.ensure(doc, None, doc.len(), None, notify) else {
             self.rows_dirty = true;
             return;
@@ -421,6 +547,10 @@ impl Structure {
         self.add(doc, notify, open, TOP, &list, 0, n, 0, &mut out);
         self.rows = out;
         self.rows_version = doc.version;
+        (self.since_rows, self.rows_lost) = (Vec::new(), false);
+        if !self.rows_dirty {
+            self.reopen = None;
+        }
     }
 
     /// Adds the rows of children `a..b` of the container at `open` (whose node id is `id`).
@@ -443,6 +573,11 @@ impl Structure {
             while s < b {
                 let e = (s + size).min(b);
                 let key = NodeKey::Bucket(id, s, e);
+                if let (Some(r), Some(o)) = (&mut self.reopen, open)
+                    && r.ranges.remove(&(o, s, e))
+                {
+                    self.expanded.insert(key);
+                }
                 let expanded = self.expanded.contains(&key);
                 let start = list.get(&*doc, s).map_or(0, |c| c.first());
                 let end = list.get(&*doc, e - 1).map_or(start, |c| c.end);
@@ -483,6 +618,18 @@ impl Structure {
             };
             let child = self.child_id(id, name.as_deref(), i);
             let key = NodeKey::Value(child);
+            if let Some(r) = &mut self.reopen {
+                // (open before the edit, wherever it is now)
+                if r.values.remove(&c.start) {
+                    self.expanded.insert(key);
+                    if r.revealed.remove(&c.start) {
+                        self.revealed.push(key);
+                    }
+                }
+                if r.selected == Some(c.start) {
+                    (r.selected, self.selected) = (None, Some(key));
+                }
+            }
             let expandable = kind.is_container();
             let expanded = expandable && self.expanded.contains(&key);
             let size = c.end - c.start;
@@ -796,6 +943,51 @@ mod tests {
         s.rows(&mut d, &n);
         assert!(row(&s, "data").unwrap().expanded);
         assert_eq!(row(&s, "[1]").unwrap().start, d.len() - 11);
+    }
+
+    #[test]
+    fn an_open_element_stays_open_when_one_is_put_before_it() {
+        let n = notify();
+        let mut d = Document::from_text(br#"{"data": [{"id": 1}, {"id": 2, "tags": ["a"]}], "end": 0}"#);
+        let mut s = Structure::default();
+        let sync = |s: &mut Structure, d: &mut Document| s.edited(&d.take_changes());
+        s.rows(&mut d, &n);
+        s.toggle(row(&s, "data").unwrap().key);
+        s.rows(&mut d, &n);
+        s.toggle(row(&s, "[1]").unwrap().key);
+        s.rows(&mut d, &n);
+        s.toggle(row(&s, "tags").unwrap().key);
+        s.rows(&mut d, &n);
+        let old = row(&s, "[1]").unwrap();
+        // an element put before them all
+        edit(&mut d, 10, br#"{"id": 0}, "#);
+        sync(&mut s, &mut d);
+        // while the rows are the old ones, a click on one goes to where its value is now
+        assert!(!s.rows_current(&d));
+        let (a, b) = s.place_now(&d, old.start, old.end).unwrap();
+        assert_eq!(&d.read(a, b)[..8], br#"{"id": 2"#);
+        s.mark_dirty();
+        s.rows(&mut d, &n);
+        let labels: Vec<(String, bool)> = s.rows.iter().map(|r| (r.label.clone(), r.expanded)).collect();
+        let want = [("data", true), ("[0]", false), ("[1]", false), ("[2]", true), ("id", false), ("tags", true), ("[0]", false), ("end", false)];
+        assert_eq!(labels, want.map(|(l, e)| (l.to_string(), e)));
+        // Format: the whole text replaced, what's open stays open by its path
+        d.begin(EditKind::Other, Sel::at(0));
+        let all = d.read(0, d.len());
+        d.delete(0, d.len());
+        d.insert(0, &all);
+        d.end(Sel::at(0));
+        sync(&mut s, &mut d);
+        s.mark_dirty();
+        s.rows(&mut d, &n);
+        assert_eq!(s.rows.iter().map(|r| (r.label.clone(), r.expanded)).collect::<Vec<_>>(), want.map(|(l, e)| (l.to_string(), e)));
+        // the element it was before is gone: its rows go nowhere
+        let gone = row(&s, "[1]").unwrap();
+        d.begin(EditKind::Other, Sel::at(gone.start));
+        d.delete(gone.start, gone.end);
+        d.end(Sel::at(gone.start));
+        sync(&mut s, &mut d);
+        assert_eq!(s.place_now(&d, gone.start + 1, gone.end), None);
     }
 
     #[test]

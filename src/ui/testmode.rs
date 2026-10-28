@@ -39,6 +39,9 @@
 //! (`uia::command`), and `print:uia`, `uia-line`, `uia-word`, `uia-char`, `uia-para`, `uia-sel`, `uia-range`,
 //! `uia-rects`, `uia-events` show what a client gets (`uia::describe`).
 //!
+//! The JSON and XML structure panel: `print:rows` (its rows, `+` open, `*` selected), `row:<n>` (a click on row `n`),
+//! `rowopen:<n>` (on its arrow).
+//!
 //! Also: `args:<path>` (open it as if named on the command line: a missing file becomes a new one), `lang:<name>`
 //! (pick the language), `hit:<x>,<y>` / `hover:<x>,<y>` (what's at a point / move the mouse
 //! there), `scrollto:<0..1>`, `endsession` (what a Windows shutdown asks), `t:<label>` (a timing mark), `temp:<dir>`,
@@ -734,6 +737,17 @@ fn describe(cell: &Cell, what: &str) -> String {
             Some(f) => (0..f.map.lines.min(50)).filter_map(|l| f.map.source(l)).map(|l| (l + 1).to_string()).collect::<Vec<_>>().join(","),
             None => "none".into(),
         },
+        // (the structure panel's rows as last worked out: `+` open, `*` selected; `(old)` before an edit)
+        "rows" => {
+            let tab = a.tab();
+            let s = &tab.structure;
+            let rows: Vec<String> = s
+                .rows
+                .iter()
+                .map(|r| format!("{}{}{}", r.label, if r.expanded { "+" } else { "" }, if s.selected == Some(r.key) { "*" } else { "" }))
+                .collect();
+            format!("{}{}", if s.rows_current(&tab.doc) { "" } else { "(old) " }, rows.join(" "))
+        }
         // (the JSON or XML path bar, as last worked out)
         "path" => {
             let s = &a.tab().structure;
@@ -1190,6 +1204,11 @@ pub fn run(args: &[String]) -> i32 {
                     _ => (WM_CANCELMODE, 0),
                 };
                 unsafe { SendMessageW(hwnd, m, WPARAM(w), LPARAM(0)) };
+            }
+            // a click on the structure panel's row (its arrow: `rowopen:`)
+            "row" | "rowopen" => {
+                cell.borrow_mut().struct_click(arg.parse().unwrap_or(0), op == "rowopen", false);
+                drain_pending(&cell);
             }
             "timer" => {
                 let id: usize = arg.parse().unwrap_or(0);

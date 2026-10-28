@@ -147,8 +147,7 @@ fn with_app<R>(f: impl FnOnce(&mut App) -> Result<R>) -> Result<R> {
 /// The index of tab `id`, its view brought up to date with its document's edits (and the ranges with them).
 fn tab_index(a: &mut App, id: u64) -> Result<usize> {
     let i = a.tabs.iter().position(|t| t.id == id).ok_or_else(unavailable)?;
-    let t = &mut a.tabs[i];
-    t.view.sync(&mut t.doc);
+    a.tabs[i].sync_view();
     Ok(i)
 }
 

@@ -1645,7 +1645,7 @@ impl App {
                 };
                 tab.doc.end(new_sel);
                 tab.view.sel = new_sel;
-                tab.view.sync(&mut tab.doc);
+                tab.sync_view();
                 tab.view.scope = match task.kind {
                     TaskKind::ReplaceAll => scope.map(|(a, b)| (a, (b + new_len).saturating_sub(old_len).max(a))),
                     _ => None,
@@ -2102,7 +2102,7 @@ impl App {
         }
         let tab = &mut self.tabs[self.active];
         tab.discard = false;
-        tab.view.sync(&mut tab.doc);
+        tab.sync_view();
         tab.view.upstream = false;
         tab.view.want_x = None;
         tab.search.found = None;
@@ -3666,7 +3666,7 @@ impl App {
                     tab.view.sel = sel;
                     tab.view.upstream = false;
                     // (An edit out of view comes back into the middle of it, not at its edge.)
-                    tab.view.sync(&mut tab.doc);
+                    tab.sync_view();
                     self.reveal_caret(true);
                     self.after_edit();
                 }
@@ -4163,21 +4163,21 @@ impl App {
         }
     }
 
-    fn struct_click(&mut self, i: usize, chevron: bool, double: bool) {
+    pub(super) fn struct_click(&mut self, i: usize, chevron: bool, double: bool) {
         let Some(row) = self.tab().structure.rows.get(i).cloned() else { return };
         if row.expandable && (chevron || double) {
             self.tab_mut().structure.toggle(row.key);
         }
         if !chevron && row.end > row.start {
-            // Rows from before a change point into the old text.
-            if !self.tab().structure.rows_current(&self.tab().doc) {
+            // (rows from before a change: their places in the text now)
+            let Some((start, end)) = self.tab().structure.place_now(&self.tab().doc, row.start, row.end) else {
                 self.flash("The structure is being updated after your change — try again in a moment.", false);
                 self.invalidate();
                 return;
-            }
+            };
             self.tab_mut().structure.selected = Some(row.key);
             let container = row.kind.is_none_or(|k| k.is_container());
-            self.jump_to_value(row.start, row.end, container);
+            self.jump_to_value(start, end, container);
         }
         self.invalidate();
     }

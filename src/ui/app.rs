@@ -288,6 +288,12 @@ pub struct ClosedTab {
 }
 
 impl Tab {
+    /// The view brought up to the document's edits, and the JSON or XML structure told about them.
+    pub fn sync_view(&mut self) {
+        let changes = self.view.sync(&mut self.doc);
+        self.structure.edited(&changes);
+    }
+
     pub fn new(id: u64, doc: Document) -> Tab {
         Tab {
             id,
@@ -1379,6 +1385,8 @@ impl App {
         let panel = self.r_struct.w > 0.0;
         let notify = self.notify.clone();
         let tab = &mut self.tabs[self.active];
+        // (every edit told to the structure before its rows are made again)
+        tab.sync_view();
         let caret = tab.view.sel.caret;
         tab.structure.set_lang(tab.lang);
         if tab.structure.waiting(&tab.doc) {
@@ -1415,7 +1423,7 @@ impl App {
         let (hwnd, k) = (self.hwnd, self.dpi as f32 / 96.0);
         let matcher = if self.find.open && self.find.mode != findbar::Mode::GoTo { self.find.matcher.clone() } else { None };
         let tab = &mut self.tabs[self.active];
-        tab.view.sync(&mut tab.doc);
+        tab.sync_view();
         let line_map = tab.filter.as_ref().map(|f| &*f.map);
         let cx = Ctx { doc: &tab.doc, g: &self.g, style: &self.style, theme: &self.theme, lang: tab.lang, geom, line_map };
         tab.view.layout_rows(&cx);

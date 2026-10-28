@@ -17,7 +17,7 @@ use windows::Win32::Graphics::DirectWrite::{
     IDWriteTextLayout,
 };
 
-use crate::core::document::{Document, Sel};
+use crate::core::document::{Change, Document, Sel};
 use crate::core::text;
 
 pub use crate::edit::*;
@@ -438,7 +438,8 @@ impl View {
     }
 
     /// Applies the document's change log to the scroll position, the bookmarks and screen readers' text ranges.
-    pub fn sync(&mut self, doc: &mut Document) {
+    /// Returns the changes (for the JSON structure: `Tab::sync_view`).
+    pub fn sync(&mut self, doc: &mut Document) -> Vec<Change> {
         let mut moved = false;
         let changes = doc.take_changes();
         super::uia::follow(doc.id(), &changes);
@@ -461,6 +462,7 @@ impl View {
         self.top = self.top.min(doc.len());
         self.sel.anchor = self.sel.anchor.min(doc.len());
         self.sel.caret = self.sel.caret.min(doc.len());
+        changes
     }
 
     // ---- segments ----
