@@ -55,6 +55,8 @@ pub enum Part {
     Filter,
     /// Find next and previous go on through every open tab (Alt+A).
     AllTabs,
+    /// Keep this search highlighted in every tab (Alt+H).
+    Highlight,
 }
 
 pub struct FindBar {
@@ -305,7 +307,7 @@ impl FindBar {
         self.parts.push((Part::Expand, Rect::new(x, y, 22.0, box_h)));
         x += 26.0;
         // what the box and the match count after it can have, before the previous / next / matching lines buttons
-        let room = (close.x - 8.0 - (3.0 * btn + 4.0) - 14.0 - x).max(0.0);
+        let room = (close.x - 8.0 - (4.0 * btn + 6.0) - 14.0 - x).max(0.0);
         self.status_w = 124f32.min(room - 140.0).max(0.0);
         let box_w = (r.w * 0.42).clamp(220.0, 460.0).min(room - self.status_w).max(120.0);
         let b = snap_box(Rect::new(x, y, box_w, box_h));
@@ -325,6 +327,7 @@ impl FindBar {
         self.parts.push((Part::Prev, Rect::new(x, y, btn, box_h)));
         self.parts.push((Part::Next, Rect::new(x + btn + 2.0, y, btn, box_h)));
         self.parts.push((Part::Filter, Rect::new(x + 2.0 * (btn + 2.0), y, btn, box_h)));
+        self.parts.push((Part::Highlight, Rect::new(x + 3.0 * (btn + 2.0), y, btn, box_h)));
         self.parts.push((Part::Close, close));
         if self.mode == Mode::Replace {
             let y2 = y + row_h - 6.0;
@@ -412,6 +415,8 @@ impl FindBar {
                 // (windows one over the other: the tabs)
                 Part::AllTabs => g.text("\u{E7C4}", icons, *b, color, Align::Center),
                 Part::Filter => g.text("\u{E71C}", icons, *b, t.text_dim, Align::Center),
+                // (a highlighter)
+                Part::Highlight => g.text("\u{E7E6}", icons, *b, t.text_dim, Align::Center),
                 Part::Prev => g.text("\u{E70E}", icons, *b, t.text_dim, Align::Center),
                 Part::Next => g.text("\u{E70D}", icons, *b, t.text_dim, Align::Center),
                 Part::Close => g.text("\u{E711}", icons, *b, t.text_dim, Align::Center),

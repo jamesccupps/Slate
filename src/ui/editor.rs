@@ -1007,7 +1007,7 @@ impl View {
 
     /// Paints the rows from the last `layout_rows` (call it first). `overtype`: the caret marks the character that
     /// typing replaces.
-    pub fn paint(&mut self, cx: &Ctx, focused: bool, caret_on: bool, matches: &[(u64, u64)], overtype: bool) {
+    pub fn paint(&mut self, cx: &Ctx, focused: bool, caret_on: bool, matches: &[(u64, u64)], marks: &[(u64, u64, u32)], overtype: bool) {
         let g = cx.g;
         let t = cx.theme;
         let geom = cx.geom;
@@ -1075,7 +1075,11 @@ impl View {
             }
         }
 
-        // Search matches, then the selection on top (unless the selection is the current match).
+        // Highlighted searches, the search's matches, then the selection on top (unless the selection is the current
+        // match).
+        for &(ms, me, color) in marks {
+            self.fill_range(cx, ms, me, ox, color, false);
+        }
         let mut sel_is_match = false;
         for &(ms, me) in matches {
             let current = ms == sel.start() && me == sel.end();

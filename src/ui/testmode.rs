@@ -196,6 +196,7 @@ fn cmd_of(name: &str) -> Option<Cmd> {
         "CloseTab" => Cmd::CloseTab,
         "Exit" => Cmd::Exit,
         "PrintPreview" => Cmd::PrintPreview,
+        "ClearHighlights" => Cmd::ClearHighlights,
         "CheckUpdates" => Cmd::CheckUpdates,
         "Undo" => Cmd::Undo,
         "Redo" => Cmd::Redo,

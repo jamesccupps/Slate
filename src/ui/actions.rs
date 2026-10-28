@@ -1881,7 +1881,7 @@ impl App {
 
     /// View → Show only matching lines: the find bar's search (opened to type one), the lines in a tab of their own.
     fn filter_lines(&mut self, invert: bool) {
-        if self.find.matcher.is_none() {
+        if self.find.matcher.is_none() && self.highlights.is_empty() {
             match self.find.error.clone() {
                 Some(e) => self.flash(e, true),
                 None => {
@@ -1913,7 +1913,23 @@ impl App {
             crate::edit::remember(&mut self.settings.find_history, &self.find.query.text);
         }
         let scope = self.tab().view.scope;
-        let matcher = self.find.matcher.clone();
+        let mut matcher = self.find.matcher.clone();
+        let mut query = query;
+        // (with highlighted searches, the lines with any of them, or with this one)
+        if matches!(kind, TaskKind::Filter(_)) && !self.highlights.is_empty() {
+            let mut qs: Vec<crate::core::search::Query> = self.highlights.iter().map(|(q, _)| q.clone()).collect();
+            if matcher.is_some() && !qs.contains(&self.find.query) {
+                qs.push(self.find.query.clone());
+            }
+            match Matcher::any(&qs) {
+                Ok(m) => matcher = Some(Arc::new(m)),
+                Err(e) => {
+                    self.flash(e, true);
+                    return;
+                }
+            }
+            query = qs.iter().map(|q| q.text.as_str()).collect::<Vec<_>>().join("” or “");
+        }
         let tab = &mut self.tabs[self.active];
         if tab.task.is_some() {
             self.flash("Still working on the previous task (Esc cancels it).", true);
@@ -2873,6 +2889,24 @@ impl App {
         }
     }
 
+    /// The find box's Highlight (Alt+H): the search kept highlighted in every tab in a color of its own, or, when it
+    /// is already, no more.
+    fn toggle_highlight(&mut self) {
+        let Some(m) = self.find.matcher.clone() else {
+            self.flash_search("Type the search to highlight first.", true);
+            return;
+        };
+        let q = self.find.query.clone();
+        if let Some(i) = self.highlights.iter().position(|(h, _)| *h == q) {
+            self.highlights.remove(i);
+            self.flash_search(format!("“{}” isn't highlighted any more", q.text), false);
+        } else {
+            self.highlights.push((q.clone(), m));
+            self.flash_search(format!("“{}” is highlighted in every tab (Show only matching lines keeps the lines with any of them)", q.text), false);
+        }
+        self.invalidate();
+    }
+
     /// Where the find bar searches in the tab shown: its Find in selection range, else the whole text.
     fn search_range(&self) -> (u64, u64) {
         let tab = self.tab();
@@ -3075,6 +3109,7 @@ impl App {
                 self.find.all_tabs = !self.find.all_tabs;
                 self.invalidate();
             }
+            Part::Highlight => self.toggle_highlight(),
         }
     }
 
@@ -3131,6 +3166,7 @@ impl App {
                     VK_R => Some(Part::Regex),
                     VK_S => Some(Part::InSel),
                     VK_A => Some(Part::AllTabs),
+                    VK_H => Some(Part::Highlight),
                     _ => None,
                 };
                 if let Some(p) = part {
@@ -3901,6 +3937,10 @@ impl App {
                 }
             }
             Cmd::FilterLines(invert) => self.filter_lines(invert),
+            Cmd::ClearHighlights => {
+                self.highlights.clear();
+                self.invalidate();
+            }
             Cmd::ToggleBookmark => {
                 let tab = self.tab_mut();
                 let caret = tab.view.sel.caret;
@@ -4458,6 +4498,7 @@ impl App {
                     Item::Sep,
                     item(Cmd::FilterLines(false), "Show only &matching lines", "Alt+L"),
                     item(Cmd::FilterLines(true), "Show lines &not matching", ""),
+                    enabled(Cmd::ClearHighlights, "Clear &highlights", "", !self.highlights.is_empty()),
                 ];
                 if lang.has_structure() {
                     let what = if lang == Lang::Xml { "XML" } else { "JSON" };

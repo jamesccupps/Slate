@@ -143,21 +143,40 @@ fn is_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
+/// The regex a query is: its text (escaped unless it's a regex), whole words when asked.
+fn pattern(q: &Query) -> String {
+    let mut pat = if q.regex { q.text.clone() } else { regex::escape(&q.text) };
+    if q.whole_word {
+        if q.regex {
+            pat = format!(r"\b(?:{pat})\b");
+        } else {
+            let first = q.text.chars().next().is_some_and(is_word_char);
+            let last = q.text.chars().last().is_some_and(is_word_char);
+            pat = format!("{}{pat}{}", if first { r"\b" } else { "" }, if last { r"\b" } else { "" });
+        }
+    }
+    pat
+}
+
 impl Matcher {
+    /// What matches any of `queries` (each with its own options): one regex of them all (Show only matching lines
+    /// with highlighted searches). One query: `new`.
+    pub fn any(queries: &[Query]) -> Result<Matcher, String> {
+        match queries {
+            [] => Err("Nothing to find".into()),
+            [q] => Matcher::new(q),
+            _ => {
+                let pat: Vec<String> = queries.iter().map(|q| format!("(?{}:{})", if q.match_case { "-i" } else { "i" }, pattern(q))).collect();
+                Matcher::new(&Query { text: pat.join("|"), match_case: true, whole_word: false, regex: true })
+            }
+        }
+    }
+
     pub fn new(q: &Query) -> Result<Matcher, String> {
         if q.text.is_empty() {
             return Err("Nothing to find".into());
         }
-        let mut pat = if q.regex { q.text.clone() } else { regex::escape(&q.text) };
-        if q.whole_word {
-            if q.regex {
-                pat = format!(r"\b(?:{pat})\b");
-            } else {
-                let first = q.text.chars().next().is_some_and(is_word_char);
-                let last = q.text.chars().last().is_some_and(is_word_char);
-                pat = format!("{}{pat}{}", if first { r"\b" } else { "" }, if last { r"\b" } else { "" });
-            }
-        }
+        let pat = pattern(q);
         let re = RegexBuilder::new(&pat)
             .case_insensitive(!q.match_case)
             .multi_line(true)
@@ -1420,6 +1439,23 @@ mod tests {
             at = next_at(text, (x.start(), x.end()));
         }
         v
+    }
+
+    #[test]
+    fn several_searches_at_once() {
+        // each with its own options: "error" ignoring case, "Warn" matching case, "a.b" as a regex, "ok" as a word
+        let qs = [
+            q("error"),
+            Query { match_case: true, ..q("Warn") },
+            Query { regex: true, match_case: true, ..q("a.b") },
+            Query { whole_word: true, ..q("ok") },
+        ];
+        let m = Matcher::any(&qs).unwrap();
+        let text = b"ERROR warn Warn axb a.b okay ok";
+        let got: Vec<&[u8]> = m.matches_in(text, 0, 10).iter().map(|&(s, e)| &text[s as usize..e as usize]).collect();
+        assert_eq!(got, [&b"ERROR"[..], b"Warn", b"axb", b"a.b", b"ok"]);
+        assert!(Matcher::any(&[]).is_err());
+        assert!(Matcher::any(&[Query { regex: true, ..q("(") }, q("x")]).is_err());
     }
 
     #[test]

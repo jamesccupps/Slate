@@ -550,6 +550,9 @@ pub struct App {
     pub waits: Vec<(String, Vec<u64>)>,
     /// The printer and its settings chosen last (File → Print).
     pub print_last: super::print::Last,
+    /// Searches kept highlighted in every tab, each in a color of its own (the find box's Highlight, Alt+H), in the
+    /// order they were added.
+    pub highlights: Vec<(crate::core::search::Query, Arc<crate::core::search::Matcher>)>,
     /// The button listing all tabs, at the end of the tab strip (zero size while all tabs fit).
     pub tablist_rect: Rect,
     /// Characters and words of a document (tab id, document version), and a count running on another thread.
@@ -654,6 +657,7 @@ impl App {
             closed_tabs: Vec::new(),
             waits: Vec::new(),
             print_last: Default::default(),
+            highlights: Vec::new(),
             tablist_rect: Rect::default(),
             doc_counts: None,
             count_job: None,
@@ -1034,6 +1038,7 @@ impl App {
                 Hit::Find(Part::ReplaceAll) => "Replace all (Ctrl+Alt+Enter)",
                 Hit::Find(Part::InSel) => "Find in selection (Alt+S)",
                 Hit::Find(Part::AllTabs) => "Find next and previous go through all open tabs (Alt+A)",
+                Hit::Find(Part::Highlight) => "Highlight this search in every tab, in a color of its own (Alt+H; again: take it away)",
                 Hit::Find(Part::Filter) => "Show only matching lines, in a tab of their own (Alt+L)",
                 Hit::Status(StatusItem::Position) => "Go to line (Ctrl+G)",
                 Hit::Status(StatusItem::Zoom) => "Reset zoom (Ctrl+0)",
@@ -1448,14 +1453,20 @@ impl App {
         let line_map = tab.filter.as_ref().map(|f| &*f.map);
         let cx = Ctx { doc: &tab.doc, g: &self.g, style: &self.style, theme: &self.theme, lang: tab.lang, geom, line_map };
         tab.view.layout_rows(&cx);
-        // Matches on screen (searched directly; cheap for a screenful of text).
-        let mut matches = Vec::new();
-        if let (Some(m), Some(first), Some(last)) = (matcher, tab.view.rows.first(), tab.view.rows.last()) {
+        // Matches on screen, and the highlighted searches' (searched directly; cheap for a screenful of text).
+        let (mut matches, mut marks) = (Vec::new(), Vec::new());
+        if let (Some(first), Some(last)) = (tab.view.rows.first(), tab.view.rows.last()) {
             let a = first.start.saturating_sub(256);
             let b = (last.end + 256).min(tab.doc.len());
-            if b - a < 4 << 20 {
+            if (matcher.is_some() || !self.highlights.is_empty()) && b - a < 4 << 20 {
                 let bytes = tab.doc.read(a, b);
-                matches = m.matches_in(&bytes, a, 5000);
+                if let Some(m) = &matcher {
+                    matches = m.matches_in(&bytes, a, 5000);
+                }
+                for (k, (_, m)) in self.highlights.iter().enumerate() {
+                    let color = self.theme.marks[k % self.theme.marks.len()];
+                    marks.extend(m.matches_in(&bytes, a, 5000).into_iter().map(|(s, e)| (s, e, color)));
+                }
             }
             if let Some((a, b)) = tab.view.scope {
                 matches.retain(|&(s, e)| s >= a && e <= b);
@@ -1464,7 +1475,7 @@ impl App {
         // (no caret or current line in a tab whose text is still coming)
         let coming = tab.text_coming();
         let editor_focused = focused && self.focused && coming.is_none();
-        tab.view.paint(&cx, editor_focused, caret_on, &matches, self.overtype);
+        tab.view.paint(&cx, editor_focused, caret_on, &matches, &marks, self.overtype);
         if editor_focused {
             // The hidden system caret goes where Slate's is (Magnifier and screen readers follow that one). While the
             // caret is scrolled out of view there's none, so they don't stay on a place it has left.

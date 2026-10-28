@@ -127,6 +127,8 @@ pub enum Cmd {
     /// View → Show only matching lines (false) / lines not matching (true): the find bar's search, the lines in a tab
     /// of their own.
     FilterLines(bool),
+    /// No search highlighted any more (the find bar's Highlight).
+    ClearHighlights,
     /// Bookmarks: the caret's line marked or not (Ctrl+F2), the next and previous (F2, Shift+F2), none.
     ToggleBookmark,
     NextBookmark,
@@ -347,6 +349,9 @@ pub struct App {
     pub restyle: bool,
     next_id: u64,
     disk_job: Option<Job<Vec<(u64, Option<crate::core::document::DiskInfo>)>>>,
+    /// Searches kept highlighted in every tab, each in a color of its own (the find bar's Highlight, Alt+H), in the
+    /// order they were added.
+    pub highlights: Vec<(Query, Matcher)>,
     /// The status bar's column (document version, caret, column) and selection size (version, start, end,
     /// characters), counted once for each.
     pub col_cache: std::cell::Cell<Option<(u64, u64, u64)>>,
@@ -400,6 +405,7 @@ impl App {
             restyle: false,
             next_id: 1,
             disk_job: None,
+            highlights: Vec::new(),
             col_cache: Default::default(),
             sel_cache: Default::default(),
             field_cache: Default::default(),
@@ -668,7 +674,7 @@ impl App {
 
     /// View → Show only matching lines: the find bar's search (opened to type one), the lines in a tab of their own.
     fn filter_lines(&mut self, invert: bool) {
-        if self.find.matcher.is_none() {
+        if self.find.matcher.is_none() && self.highlights.is_empty() {
             match self.find.error.clone() {
                 Some(e) => self.flash(e, true),
                 None => {
@@ -1766,6 +1772,10 @@ impl App {
                 }
             }
             Cmd::FilterLines(invert) => self.filter_lines(invert),
+            Cmd::ClearHighlights => {
+                self.highlights.clear();
+                self.dirty_view = true;
+            }
             Cmd::ToggleBookmark => {
                 let tab = &mut self.tabs[self.active];
                 let caret = tab.view.sel.caret;
@@ -1855,8 +1865,23 @@ impl App {
             return;
         }
         let indent = vec![b' '; self.settings.json_indent as usize];
-        let query = self.find.query.text.clone();
+        let mut query = self.find.query.text.clone();
         let matcher = match kind {
+            // (with highlighted searches, the lines with any of them, or with this one)
+            TaskKind::Filter(_) if !self.highlights.is_empty() => {
+                let mut qs: Vec<Query> = self.highlights.iter().map(|(q, _)| q.clone()).collect();
+                if self.find.matcher.is_some() && !qs.contains(&self.find.query) {
+                    qs.push(self.find.query.clone());
+                }
+                query = qs.iter().map(|q| q.text.as_str()).collect::<Vec<_>>().join("” or “");
+                match Matcher::any(&qs) {
+                    Ok(m) => Some(m),
+                    Err(e) => {
+                        self.flash(e, true);
+                        return;
+                    }
+                }
+            }
             TaskKind::ReplaceAll | TaskKind::Filter(_) => match self.find.matcher.clone() {
                 Some(m) => Some(m),
                 None => {
@@ -2496,6 +2521,41 @@ impl App {
     }
 
     /// Matches on screen: from the count when it's done for this text.
+    /// The highlighted searches' matches in `[a, b)` of the tab shown (searched directly: a screenful), each with its
+    /// color.
+    pub fn visible_marks(&self, a: u64, b: u64) -> Vec<(u64, u64, u32)> {
+        let tab = self.tab();
+        let (a, b) = (a.saturating_sub(256), (b + 256).min(tab.doc.len()));
+        if self.highlights.is_empty() || b <= a || b - a >= 4 << 20 {
+            return Vec::new();
+        }
+        let bytes = tab.doc.read(a, b);
+        let mut out = Vec::new();
+        for (k, (_, m)) in self.highlights.iter().enumerate() {
+            let color = self.theme.marks[k % self.theme.marks.len()];
+            out.extend(m.matches_in(&bytes, a, 5000).into_iter().map(|(s, e)| (s, e, color)));
+        }
+        out
+    }
+
+    /// The find bar's Highlight (Alt+H): the search kept highlighted in every tab in a color of its own, or, when it
+    /// is already, no more.
+    pub fn toggle_highlight(&mut self) {
+        let Some(m) = self.find.matcher.clone() else {
+            self.flash("Type the search to highlight first.", true);
+            return;
+        };
+        let q = self.find.query.clone();
+        if let Some(i) = self.highlights.iter().position(|(h, _)| *h == q) {
+            self.highlights.remove(i);
+            self.flash(format!("“{}” isn't highlighted any more", q.text), false);
+        } else {
+            self.highlights.push((q.clone(), m));
+            self.flash(format!("“{}” is highlighted in every tab (Show only matching lines keeps the lines with any of them)", q.text), false);
+        }
+        self.dirty_view = true;
+    }
+
     pub fn visible_matches(&self, a: u64, b: u64) -> Vec<(u64, u64)> {
         let tab = self.tab();
         match &self.find.found {

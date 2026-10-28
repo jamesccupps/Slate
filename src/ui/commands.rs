@@ -60,6 +60,8 @@ pub enum Cmd {
     /// View → Show only matching lines (false) / lines not matching (true): the find bar's search, the lines in a tab
     /// of their own.
     FilterLines(bool),
+    /// View → Clear highlights: no search highlighted any more (the find box's Highlight).
+    ClearHighlights,
     /// Bookmarks: the caret's line marked or not (Ctrl+F2), the next and previous (F2, Shift+F2), none.
     ToggleBookmark,
     NextBookmark,

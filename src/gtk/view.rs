@@ -813,7 +813,7 @@ impl View {
     /// Draws the rows: the current line, the selection, find matches, the text, the caret. `ox`: where the text
     /// starts (after the gutter).
     #[allow(clippy::too_many_arguments)]
-    pub fn paint(&mut self, cx: &Ctx, cr: &cairo::Context, ox: f64, focused: bool, caret_on: bool, matches: &[(u64, u64)]) {
+    pub fn paint(&mut self, cx: &Ctx, cr: &cairo::Context, ox: f64, focused: bool, caret_on: bool, matches: &[(u64, u64)], marks: &[(u64, u64, u32)]) {
         self.layout_rows(cx);
         let t = cx.theme;
         let row_h = cx.style.row_h;
@@ -862,6 +862,12 @@ impl View {
         if let Some((a, b)) = self.scope {
             for r in rows.iter() {
                 fill(cr, r, a, b, t.hover, false);
+            }
+        }
+        // the highlighted searches, then this one's matches
+        for (a, b, color) in marks {
+            for r in rows.iter() {
+                fill(cr, r, *a, *b, *color, false);
             }
         }
         for (a, b) in matches {

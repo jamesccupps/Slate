@@ -570,13 +570,14 @@ pub fn window(application: &gtk4::Application, test: Option<Rc<testmode::Test>>)
     tabs_btn.set_tooltip_text(Some("Find next and previous go through all open tabs (Alt+A)"));
     tabs_btn.add_css_class("flat");
     let lines_btn = icon_button("view-list-symbolic", "Show only matching lines, in a tab of their own (Alt+L)");
+    let marks_btn = icon_button("document-edit-symbolic", "Highlight this search in every tab, in a color of its own (Alt+H; again: take it away)");
     let find_count = gtk4::Label::new(None);
     find_count.add_css_class("dim-label");
     let prev = icon_button("go-up-symbolic", "Previous match (Shift+F3)");
     let next = icon_button("go-down-symbolic", "Next match (F3)");
     let close_find = icon_button("window-close-symbolic", "Close (Esc)");
     let find_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
-    for w in [find_entry.upcast_ref::<gtk4::Widget>(), case_btn.upcast_ref(), word_btn.upcast_ref(), regex_btn.upcast_ref(), sel_btn.upcast_ref(), tabs_btn.upcast_ref(), find_count.upcast_ref(), prev.upcast_ref(), next.upcast_ref(), lines_btn.upcast_ref(), close_find.upcast_ref()] {
+    for w in [find_entry.upcast_ref::<gtk4::Widget>(), case_btn.upcast_ref(), word_btn.upcast_ref(), regex_btn.upcast_ref(), sel_btn.upcast_ref(), tabs_btn.upcast_ref(), find_count.upcast_ref(), prev.upcast_ref(), next.upcast_ref(), lines_btn.upcast_ref(), marks_btn.upcast_ref(), close_find.upcast_ref()] {
         find_row.append(w);
     }
     let replace_entry = gtk4::Entry::builder().placeholder_text("Replace with").hexpand(true).build();
@@ -698,7 +699,7 @@ pub fn window(application: &gtk4::Application, test: Option<Rc<testmode::Test>>)
         test,
     });
     UI.with(|u| *u.borrow_mut() = Some(ui.clone()));
-    connect(&ui, &prev, &next, &lines_btn, &close_find, &replace_one, &replace_all, &notice_close);
+    connect(&ui, &prev, &next, &lines_btn, &marks_btn, &close_find, &replace_one, &replace_all, &notice_close);
     actions(&ui);
     // timers: the caret (while it blinks), files changed by other programs, the session
     ui.wake_blink();
@@ -740,7 +741,8 @@ pub fn window(application: &gtk4::Application, test: Option<Rc<testmode::Test>>)
     ui
 }
 
-fn connect(ui: &Rc<Ui>, prev: &gtk4::Button, next: &gtk4::Button, lines_btn: &gtk4::Button, close_find: &gtk4::Button, replace_one: &gtk4::Button, replace_all: &gtk4::Button, notice_close: &gtk4::Button) {
+#[allow(clippy::too_many_arguments)]
+fn connect(ui: &Rc<Ui>, prev: &gtk4::Button, next: &gtk4::Button, lines_btn: &gtk4::Button, marks_btn: &gtk4::Button, close_find: &gtk4::Button, replace_one: &gtk4::Button, replace_all: &gtk4::Button, notice_close: &gtk4::Button) {
     // drawing
     ui.text.set_draw_func(|area, cr, w, h| {
         if let Some(ui) = get_ui() {
@@ -947,6 +949,11 @@ fn connect(ui: &Rc<Ui>, prev: &gtk4::Button, next: &gtk4::Button, lines_btn: &gt
             }
         }
     });
+    marks_btn.connect_clicked(|_| {
+        if let Some(ui) = get_ui() {
+            ui.with(|a| a.toggle_highlight());
+        }
+    });
     lines_btn.connect_clicked(|_| {
         if let Some(ui) = get_ui() {
             ui.with(|a| a.exec(Cmd::FilterLines(false)));
@@ -1123,6 +1130,7 @@ fn commands() -> Vec<(&'static str, Cmd, &'static [&'static str])> {
         ("read-only", Cmd::ToggleReadOnly, &[]),
         ("filter-lines", Cmd::FilterLines(false), &["<Alt>l"]),
         ("filter-lines-not", Cmd::FilterLines(true), &[]),
+        ("clear-highlights", Cmd::ClearHighlights, &[]),
         ("toggle-bookmark", Cmd::ToggleBookmark, &["<Control>F2"]),
         ("next-bookmark", Cmd::NextBookmark, &["F2"]),
         ("prev-bookmark", Cmd::PrevBookmark, &["<Shift>F2"]),
@@ -1236,7 +1244,7 @@ fn menu_model(recent: &gio::Menu) -> gio::Menu {
     bar.append_submenu(Some("_Edit"), &edit);
     let view = gio::Menu::new();
     view.append_section(None, &section(&[("Word wrap", "wrap"), ("Line numbers", "line-numbers"), ("Character at the caret", "char-info")]));
-    view.append_section(None, &section(&[("Show only matching lines", "filter-lines"), ("Show lines not matching", "filter-lines-not")]));
+    view.append_section(None, &section(&[("Show only matching lines", "filter-lines"), ("Show lines not matching", "filter-lines-not"), ("Clear highlights", "clear-highlights")]));
     view.append_section(None, &section(&[("Zoom in", "zoom-in"), ("Zoom out", "zoom-out"), ("Reset zoom", "zoom-reset")]));
     let theme = section(&[("Use system setting", "theme-system"), ("Light", "theme-light"), ("Dark", "theme-dark")]);
     view.append_submenu(Some("Theme"), &theme);
@@ -1315,6 +1323,7 @@ const SHORTCUTS: &str = "Slate keyboard shortcuts
   Ctrl+Alt+Enter           Replace all
   Alt+S                    Find in selection (in the find box)
   Alt+A                    Next / previous match through all open tabs (in the find box: on or off)
+  Alt+H                    Highlight the search in every tab, in a color of its own (in the find box)
   Up / Down                The searches (or replacements) before (in the find box)
   \\n  \\t                 A line break, a tab, in a regular expression's replacement
   Esc                      Close the find bar
@@ -1367,6 +1376,10 @@ impl Ui {
             }
             gdk::Key::a | gdk::Key::A if state.contains(gdk::ModifierType::ALT_MASK) => {
                 self.tabs_btn.set_active(!self.tabs_btn.is_active());
+                glib::Propagation::Stop
+            }
+            gdk::Key::h | gdk::Key::H if state.contains(gdk::ModifierType::ALT_MASK) => {
+                self.with(|a| a.toggle_highlight());
                 glib::Propagation::Stop
             }
             gdk::Key::Escape => {
@@ -2083,7 +2096,8 @@ impl Ui {
             (v.top, v.rows.last().map(|r| r.seg.end + 1).unwrap_or(v.top + (1 << 20)))
         };
         let matches = a.visible_matches(top, until.max(top + 1));
-        a.with_view(&g, |v, cx| v.paint(cx, cr, gw + PAD, focused, caret_on, &matches));
+        let marks = a.visible_marks(top, until.max(top + 1));
+        a.with_view(&g, |v, cx| v.paint(cx, cr, gw + PAD, focused, caret_on, &matches, &marks));
         if gw > 0.0 {
             let t = a.theme.clone();
             set_color(cr, t.surface);

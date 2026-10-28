@@ -88,6 +88,8 @@ pub struct Theme {
     pub caret: u32,
     pub match_bg: u32,
     pub match_current: u32,
+    /// Highlighted searches (the find box's Highlight), each in one of these in turn.
+    pub marks: [u32; 5],
     /// The bracket at the caret and the one it pairs with.
     pub bracket_bg: u32,
     pub bracket_border: u32,
@@ -152,6 +154,7 @@ impl Theme {
             caret: rgb(0x000000),
             match_bg: rgb(0xFFE59A),
             match_current: rgb(0xF7B93E),
+            marks: [rgba(0x2EA043, 0x48), rgba(0x0969DA, 0x38), rgba(0xBF3989, 0x38), rgba(0xD4A72C, 0x60), rgba(0x8250DF, 0x38)],
             bracket_bg: rgba(0x000000, 0x12),
             bracket_border: rgb(0xA8A8A8),
             whitespace: rgba(0x000000, 0x40),
@@ -222,6 +225,7 @@ impl Theme {
             caret: rgb(0xFFFFFF),
             match_bg: rgba(0xEA9A3C, 0x55),
             match_current: rgba(0xF2B03A, 0xB0),
+            marks: [rgba(0x3FB950, 0x58), rgba(0x58A6FF, 0x55), rgba(0xF778BA, 0x55), rgba(0xE3B341, 0x58), rgba(0xBC8CFF, 0x55)],
             bracket_bg: rgba(0xFFFFFF, 0x14),
             bracket_border: rgb(0x7A7A7A),
             whitespace: rgba(0xFFFFFF, 0x40),
@@ -303,6 +307,7 @@ impl Theme {
             caret: text,
             match_bg: rgba(hl, 0x60),
             match_current: hl,
+            marks: [rgba(hl, 0x60); 5],
             bracket_bg: rgba(window, 0),
             bracket_border: link,
             whitespace: gray,
