@@ -149,6 +149,7 @@ fn busy(cell: &Cell) -> bool {
             || t.task.is_some()
             || t.search.job.is_some()
             || t.find_job.is_some()
+            || t.find_all.is_some()
             || t.structure.busy()
             || t.structure.pausing()
     }) || a.disk_job.is_some()
@@ -651,6 +652,7 @@ fn describe(cell: &Cell, what: &str) -> String {
                     ("task", t.task.is_some()),
                     ("count", t.search.job.is_some()),
                     ("find", t.find_job.is_some()),
+                    ("find all tabs", t.find_all.is_some()),
                     ("structure", t.structure.busy()),
                 ];
                 v.extend(parts.iter().filter(|p| p.1).map(|p| p.0));

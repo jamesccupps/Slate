@@ -181,6 +181,15 @@ pub struct FindJob {
     pub live: bool,
 }
 
+/// Find next or previous through every open tab, on another thread (`App::find_in_tabs`): the tab and the match it
+/// found, and whether the search came back round to this tab; for the versions of the texts searched and this tab's
+/// selection when it started.
+pub struct FindAllJob {
+    pub job: Job<Option<(u64, u64, u64, bool)>>,
+    pub versions: Vec<(u64, u64)>,
+    pub sel: Sel,
+}
+
 pub struct Tab {
     pub id: u64,
     pub doc: Document,
@@ -202,6 +211,7 @@ pub struct Tab {
     pub search: Search,
     /// A find next/previous or a search as you type running in the background (big documents, regexes).
     pub find_job: Option<FindJob>,
+    pub find_all: Option<FindAllJob>,
     pub notice: Option<Notice>,
     /// The session backup file of this tab (unique, so it never collides with another tab's from an earlier run)
     /// and the document version last written to it.
@@ -310,6 +320,7 @@ impl Tab {
             task: None,
             search: Search::default(),
             find_job: None,
+            find_all: None,
             notice: None,
             backup_name: None,
             backup_version: u64::MAX,
@@ -1013,6 +1024,7 @@ impl App {
                 Hit::Find(Part::Close) => "Close (Esc)",
                 Hit::Find(Part::ReplaceAll) => "Replace all (Ctrl+Alt+Enter)",
                 Hit::Find(Part::InSel) => "Find in selection (Alt+S)",
+                Hit::Find(Part::AllTabs) => "Find next and previous go through all open tabs (Alt+A)",
                 Hit::Find(Part::Filter) => "Show only matching lines, in a tab of their own (Alt+L)",
                 Hit::Status(StatusItem::Position) => "Go to line (Ctrl+G)",
                 Hit::Status(StatusItem::Zoom) => "Reset zoom (Ctrl+0)",

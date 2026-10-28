@@ -279,6 +279,10 @@ pub struct Find {
     /// The tab the last count was for.
     count_tab: u64,
     find_job: Option<(u64, bool, Sel, Job<Option<(u64, u64)>>)>,
+    /// Find next and previous go on through every open tab (`App::find_in_tabs`).
+    pub all_tabs: bool,
+    /// That search on another thread: the versions of the texts searched and the selection it went on from.
+    find_all: Option<(Vec<(u64, u64)>, Sel, Job<Option<(u64, u64, u64, bool)>>)>,
     /// Up and Down in a box go through its history: where they are in it (None: the text typed, kept in
     /// `history_typed` meanwhile).
     pub history_at: Option<usize>,
@@ -1523,7 +1527,12 @@ impl App {
                 if self.find.matcher.is_some() {
                     edit::remember(&mut self.settings.find_history, &self.find.query.text);
                 }
-                self.find_step(cmd == Cmd::FindNext);
+                // (Find in selection keeps to the selection)
+                if self.find.all_tabs && self.find.matcher.is_some() && self.tab().view.scope.is_none() && self.tabs.len() > 1 {
+                    self.find_in_tabs(cmd == Cmd::FindNext);
+                } else {
+                    self.find_step(cmd == Cmd::FindNext);
+                }
             }
             Cmd::ReplaceOne => self.replace_one(),
             Cmd::ReplaceAll => self.start_task(TaskKind::ReplaceAll),
@@ -2202,6 +2211,24 @@ impl App {
                 None => running = true,
             }
         }
+        if let Some((versions, sel, job)) = self.find.find_all.as_mut() {
+            match job.take() {
+                Some(hit) => {
+                    let (versions, sel) = (std::mem::take(versions), *sel);
+                    self.find.find_all = None;
+                    // (dropped if a text searched or where it went on from changed meanwhile)
+                    let same = |id: u64| {
+                        let now = self.tabs.iter().find(|t| t.id == id).map(|t| t.doc.version);
+                        now.is_some() && now == versions.iter().find(|v| v.0 == id).map(|v| v.1)
+                    };
+                    let tab = &self.tabs[self.active];
+                    if tab.view.sel == sel && same(tab.id) && hit.is_none_or(|(id, ..)| same(id)) {
+                        self.found_in_tabs(hit);
+                    }
+                }
+                None => running = true,
+            }
+        }
         if let Some((v, fwd, sel, job)) = self.find.find_job.as_mut() {
             match job.take() {
                 Some(hit) => {
@@ -2220,7 +2247,79 @@ impl App {
     }
 
     pub fn find_running(&self) -> bool {
-        self.find.find_job.is_some() || self.find.count_job.is_some()
+        self.find.find_job.is_some() || self.find.count_job.is_some() || self.find.find_all.is_some()
+    }
+
+    /// Find next or previous with All tabs on: from the selection to this tab's end (or back to its start), then the
+    /// other tabs in their order (each from its start, or back from its end), then the rest of this one; the first
+    /// match found is selected, in its tab. A tab of matching lines (its lines are another tab's) or one whose text
+    /// isn't there yet is passed over. On another thread when there's more text than `Matcher::sync_limit`.
+    fn find_in_tabs(&mut self, fwd: bool) {
+        let Ok(m) = Matcher::new(&self.find.query) else { return };
+        let (n, cur) = (self.tabs.len(), self.active);
+        let tab = &mut self.tabs[cur];
+        let (len, sel) = (tab.doc.len(), tab.view.sel);
+        let from = if fwd { sel.end() } else { sel.start() };
+        let here = (tab.id, tab.doc.snapshot());
+        let mut parts = vec![(here.0, here.1.clone(), if fwd { (from, len) } else { (0, from) }, false)];
+        for k in 1..n {
+            let t = &mut self.tabs[if fwd { (cur + k) % n } else { (cur + n - k) % n }];
+            if t.filter.is_none() && !t.loading() {
+                parts.push((t.id, t.doc.snapshot(), (0, t.doc.len()), false));
+            }
+        }
+        parts.push((here.0, here.1, if fwd { (0, from) } else { (from, len) }, true));
+        let total: u64 = parts.iter().map(|p| p.2.1 - p.2.0).sum();
+        let sync = total <= m.sync_limit();
+        let search = move |ctx: Option<&crate::core::job::Ctx>| {
+            for (id, snap, (a, b), wrapped) in &parts {
+                let r = if fwd { m.find_fwd(snap, *a, *b, ctx) } else { m.find_back(snap, *a, *b, ctx) };
+                if let Some((s, e)) = r {
+                    return Some((*id, s, e, *wrapped));
+                }
+                if ctx.is_some_and(|c| c.cancelled()) {
+                    return None;
+                }
+            }
+            None
+        };
+        if sync {
+            let hit = search(None);
+            self.found_in_tabs(hit);
+            return;
+        }
+        let versions = self.tabs.iter().map(|t| (t.id, t.doc.version)).collect();
+        let job = Job::spawn(total, self.notify.clone(), move |ctx| search(Some(ctx)));
+        self.find.find_all = Some((versions, sel, job));
+        self.flash("Searching…", false);
+    }
+
+    /// Shows what `find_in_tabs` found: the match, in its tab.
+    fn found_in_tabs(&mut self, hit: Option<(u64, u64, u64, bool)>) {
+        let Some((id, s, e, wrapped)) = hit else {
+            self.flash("No results in any tab", true);
+            self.dirty_view = true;
+            return;
+        };
+        let Some(i) = self.tabs.iter().position(|t| t.id == id) else { return };
+        let moved = i != self.active;
+        self.activate(i);
+        self.find.last_match = Some((s, e));
+        let tab = &mut self.tabs[i];
+        tab.view.sel = Sel::new(s, e);
+        tab.view.want_x = None;
+        self.reveal_pending = true;
+        self.reveal_center = true;
+        if moved {
+            let name = self.tabs[i].title();
+            self.flash(format!("Found in {name}"), false);
+            self.keep_count();
+        } else if wrapped {
+            self.flash("Search wrapped around (all tabs)", false);
+        } else {
+            self.flash = None;
+        }
+        self.dirty_view = true;
     }
 
     fn find_step(&mut self, fwd: bool) {

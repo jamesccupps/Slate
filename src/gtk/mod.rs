@@ -72,6 +72,8 @@ pub struct Ui {
     regex_btn: gtk4::ToggleButton,
     /// Find in selection (Alt+S).
     sel_btn: gtk4::ToggleButton,
+    /// Find next and previous through all open tabs (Alt+A).
+    tabs_btn: gtk4::ToggleButton,
     notice: gtk4::Box,
     notice_label: gtk4::Label,
     /// The notice's Save as… button (after a save that failed).
@@ -561,6 +563,10 @@ pub fn window(application: &gtk4::Application, test: Option<Rc<testmode::Test>>)
     sel_btn.set_icon_name("edit-select-all-symbolic");
     sel_btn.set_tooltip_text(Some("Find in selection (Alt+S)"));
     sel_btn.add_css_class("flat");
+    let tabs_btn = gtk4::ToggleButton::new();
+    tabs_btn.set_icon_name("view-paged-symbolic");
+    tabs_btn.set_tooltip_text(Some("Find next and previous go through all open tabs (Alt+A)"));
+    tabs_btn.add_css_class("flat");
     let lines_btn = icon_button("view-list-symbolic", "Show only matching lines, in a tab of their own (Alt+L)");
     let find_count = gtk4::Label::new(None);
     find_count.add_css_class("dim-label");
@@ -568,7 +574,7 @@ pub fn window(application: &gtk4::Application, test: Option<Rc<testmode::Test>>)
     let next = icon_button("go-down-symbolic", "Next match (F3)");
     let close_find = icon_button("window-close-symbolic", "Close (Esc)");
     let find_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
-    for w in [find_entry.upcast_ref::<gtk4::Widget>(), case_btn.upcast_ref(), word_btn.upcast_ref(), regex_btn.upcast_ref(), sel_btn.upcast_ref(), find_count.upcast_ref(), prev.upcast_ref(), next.upcast_ref(), lines_btn.upcast_ref(), close_find.upcast_ref()] {
+    for w in [find_entry.upcast_ref::<gtk4::Widget>(), case_btn.upcast_ref(), word_btn.upcast_ref(), regex_btn.upcast_ref(), sel_btn.upcast_ref(), tabs_btn.upcast_ref(), find_count.upcast_ref(), prev.upcast_ref(), next.upcast_ref(), lines_btn.upcast_ref(), close_find.upcast_ref()] {
         find_row.append(w);
     }
     let replace_entry = gtk4::Entry::builder().placeholder_text("Replace with").hexpand(true).build();
@@ -660,6 +666,7 @@ pub fn window(application: &gtk4::Application, test: Option<Rc<testmode::Test>>)
         word_btn,
         regex_btn,
         sel_btn,
+        tabs_btn,
         notice,
         notice_label,
         notice_save_as,
@@ -926,6 +933,14 @@ fn connect(ui: &Rc<Ui>, prev: &gtk4::Button, next: &gtk4::Button, lines_btn: &gt
         if let Some(ui) = get_ui() {
             if !ui.syncing.get() {
                 ui.with(|a| a.toggle_in_sel());
+            }
+        }
+    });
+    ui.tabs_btn.connect_toggled(|b| {
+        if let Some(ui) = get_ui() {
+            if !ui.syncing.get() {
+                let on = b.is_active();
+                ui.with(|a| a.find.all_tabs = on);
             }
         }
     });
@@ -1294,6 +1309,7 @@ const SHORTCUTS: &str = "Slate keyboard shortcuts
   F3 / Shift+F3            Next / previous match (in the find box: Enter / Shift+Enter)
   Ctrl+Alt+Enter           Replace all
   Alt+S                    Find in selection (in the find box)
+  Alt+A                    Next / previous match through all open tabs (in the find box: on or off)
   Up / Down                The searches (or replacements) before (in the find box)
   \\n  \\t                 A line break, a tab, in a regular expression's replacement
   Esc                      Close the find bar
@@ -1342,6 +1358,10 @@ impl Ui {
             }
             gdk::Key::s | gdk::Key::S if state.contains(gdk::ModifierType::ALT_MASK) => {
                 self.sel_btn.set_active(!self.sel_btn.is_active());
+                glib::Propagation::Stop
+            }
+            gdk::Key::a | gdk::Key::A if state.contains(gdk::ModifierType::ALT_MASK) => {
+                self.tabs_btn.set_active(!self.tabs_btn.is_active());
                 glib::Propagation::Stop
             }
             gdk::Key::Escape => {
@@ -1914,6 +1934,7 @@ impl Ui {
         self.word_btn.set_active(a.find.query.whole_word);
         self.regex_btn.set_active(a.find.query.regex);
         self.sel_btn.set_active(a.tab().view.scope.is_some());
+        self.tabs_btn.set_active(a.find.all_tabs);
         let count = match (&a.find.error, &a.find.found) {
             (Some(e), _) => e.clone(),
             (None, Some((_, f))) if f.count == 0 => "No results".into(),

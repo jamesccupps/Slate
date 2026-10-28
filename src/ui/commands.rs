@@ -388,6 +388,7 @@ Find and replace
   Enter / Shift+Enter           Next / previous match (in the find box)
   Alt+C / Alt+W / Alt+R         Match case / Whole word / Regular expression
   Alt+S                         Find in selection (what was selected when the bar opened)
+  Alt+A                         Next / previous match through all open tabs (on or off)
   Up / Down                     The searches (or replacements) before, in the find box
   \\n  \\t                      A line break, a tab, in a regular expression's replacement
   Enter                         Replace this match (in the replace box)

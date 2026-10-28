@@ -1449,6 +1449,23 @@ impl App {
                 running = true;
             }
         }
+        // Find next / previous through all tabs, on another thread.
+        if let Some(f) = self.tabs[i].find_all.as_mut() {
+            if let Some(r) = f.job.take() {
+                let f = self.tabs[i].find_all.take().unwrap();
+                // (not if a text searched or where it started from changed meanwhile)
+                let same = |id: u64| {
+                    let now = self.tabs.iter().find(|t| t.id == id).map(|t| t.doc.version);
+                    now.is_some() && now == f.versions.iter().find(|v| v.0 == id).map(|v| v.1)
+                };
+                let found_same = r.is_none_or(|(id, ..)| same(id));
+                if i == self.active && self.tabs[i].view.sel == f.sel && same(self.tabs[i].id) && found_same {
+                    self.found_in_tabs(r);
+                }
+            } else {
+                running = true;
+            }
+        }
         // Find next / previous, or the search as you type, on another thread.
         if let Some(f) = self.tabs[i].find_job.as_mut() {
             if let Some(r) = f.job.take() {
@@ -2712,11 +2729,21 @@ impl App {
             from = tab.doc.next_char(from);
         }
         self.find.origin = Some(from);
+        // (Find in selection keeps to the selection)
+        let all = self.find.all_tabs && self.tab().view.scope.is_none() && self.tabs.len() > 1;
         if !forward {
-            if let Some(r) = self.counted_previous(from) {
-                self.found_next(r);
-                return;
+            match self.counted_previous(from) {
+                // (through all tabs, only one before the caret here: else the tabs before this one come first)
+                Some(r) if !all || matches!(r, Some((_, false))) => {
+                    self.found_next(r);
+                    return;
+                }
+                _ => {}
             }
+        }
+        if all {
+            self.find_in_tabs(m, from, forward);
+            return;
         }
         if len > m.sync_limit() {
             self.find_async(m, from, forward, false);
@@ -2730,6 +2757,66 @@ impl App {
             m.find_back(doc, a, from, None).map(|x| (x, false)).or_else(|| inside(m.find_back(doc, from, b, None)).map(|x| (x, true)))
         };
         self.found_next(r);
+    }
+
+    /// Find next or previous with All tabs on: from `from` to this tab's end (or back to its start), then the other
+    /// tabs in their order (each from its start, or back from its end), then the rest of this one; the first match
+    /// found is selected, in its tab. A tab of matching lines (its lines are another tab's) or one whose text isn't
+    /// there yet is passed over. On another thread when there's more text than `Matcher::sync_limit`.
+    fn find_in_tabs(&mut self, m: Arc<Matcher>, from: u64, forward: bool) {
+        let (n, cur) = (self.tabs.len(), self.active);
+        let len = self.tab().doc.len();
+        let here = (self.tab().id, self.tab_mut().doc.snapshot());
+        let mut parts = vec![(here.0, here.1.clone(), if forward { (from, len) } else { (0, from) }, false)];
+        for k in 1..n {
+            let t = &mut self.tabs[if forward { (cur + k) % n } else { (cur + n - k) % n }];
+            if t.filter.is_none() && t.text_coming().is_none() {
+                parts.push((t.id, t.doc.snapshot(), (0, t.doc.len()), false));
+            }
+        }
+        parts.push((here.0, here.1, if forward { (0, from) } else { (from, len) }, true));
+        let total: u64 = parts.iter().map(|p| p.2.1 - p.2.0).sum();
+        let search = move |ctx: Option<&crate::core::job::Ctx>| {
+            for (id, snap, (a, b), wrapped) in &parts {
+                let r = if forward { m.find_fwd(snap, *a, *b, ctx) } else { m.find_back(snap, *a, *b, ctx) };
+                if let Some((s, e)) = r {
+                    return Some((*id, s, e, *wrapped));
+                }
+                if ctx.is_some_and(|c| c.cancelled()) {
+                    return None;
+                }
+            }
+            None
+        };
+        if total <= self.find.matcher.as_ref().map_or(0, |m| m.sync_limit()) {
+            let r = search(None);
+            self.found_in_tabs(r);
+            return;
+        }
+        let versions = self.tabs.iter().map(|t| (t.id, t.doc.version)).collect();
+        let notify = self.notify.clone();
+        let tab = self.tab_mut();
+        let sel = tab.view.sel;
+        tab.find_all = Some(FindAllJob { job: Job::spawn(total, notify, move |ctx| search(Some(ctx))), versions, sel });
+        self.timer(TIMER_JOBS, 100);
+    }
+
+    /// Shows what `find_in_tabs` found: the match, in its tab.
+    fn found_in_tabs(&mut self, r: Option<(u64, u64, u64, bool)>) {
+        let Some((id, s, e, wrapped)) = r else {
+            self.flash_search("No results in any tab", true);
+            return;
+        };
+        let Some(i) = self.tabs.iter().position(|t| t.id == id) else { return };
+        let moved = i != self.active;
+        self.activate(i);
+        self.select_match(s, e);
+        self.find.origin = Some(s);
+        if moved {
+            self.flash_search(format!("Found in {}", self.tab_label(i)), false);
+        } else if wrapped {
+            self.flash_search("Search wrapped around (all tabs)", false);
+        }
     }
 
     /// Where the find bar searches in the tab shown: its Find in selection range, else the whole text.
@@ -2930,6 +3017,10 @@ impl App {
             Part::Go => self.go_to_line_from_bar(),
             Part::InSel => self.toggle_in_sel(),
             Part::Filter => self.filter_lines(false),
+            Part::AllTabs => {
+                self.find.all_tabs = !self.find.all_tabs;
+                self.invalidate();
+            }
         }
     }
 
@@ -2985,6 +3076,7 @@ impl App {
                     VK_W => Some(Part::Word),
                     VK_R => Some(Part::Regex),
                     VK_S => Some(Part::InSel),
+                    VK_A => Some(Part::AllTabs),
                     _ => None,
                 };
                 if let Some(p) = part {

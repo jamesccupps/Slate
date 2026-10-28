@@ -53,6 +53,8 @@ pub enum Part {
     InSel,
     /// Show only matching lines (Alt+L).
     Filter,
+    /// Find next and previous go on through every open tab (Alt+A).
+    AllTabs,
 }
 
 pub struct FindBar {
@@ -71,6 +73,8 @@ pub struct FindBar {
     pub status_bad: bool,
     /// Find in selection is on in the tab shown (its view has a `scope`).
     pub in_sel: bool,
+    /// Find next and previous go on through every open tab (`App::find_in_tabs`).
+    pub all_tabs: bool,
     /// What was selected when the bar opened, and the match the search selected last: Find in selection takes the
     /// first while what's selected is that match (searching as you type selects one).
     pub sel_before: Option<(u64, u64)>,
@@ -128,6 +132,7 @@ impl FindBar {
             status: String::new(),
             status_bad: false,
             in_sel: false,
+            all_tabs: false,
             sel_before: None,
             last_match: None,
             history_at: None,
@@ -307,11 +312,12 @@ impl FindBar {
         self.inputs.push((self.find_edit, b));
         // Toggles sit inside the box on the right.
         let tw = 26.0;
-        let tx = b.right() - 4.0 * tw - 2.0;
+        let tx = b.right() - 5.0 * tw - 2.0;
         self.parts.push((Part::Case, Rect::new(tx, y + 2.0, tw, box_h - 4.0)));
         self.parts.push((Part::Word, Rect::new(tx + tw, y + 2.0, tw, box_h - 4.0)));
         self.parts.push((Part::Regex, Rect::new(tx + 2.0 * tw, y + 2.0, tw, box_h - 4.0)));
         self.parts.push((Part::InSel, Rect::new(tx + 3.0 * tw, y + 2.0, tw, box_h - 4.0)));
+        self.parts.push((Part::AllTabs, Rect::new(tx + 4.0 * tw, y + 2.0, tw, box_h - 4.0)));
         place(self.find_edit, Rect::new(b.x + 4.0, b.y, tx - b.x - 6.0, b.h));
         show(self.find_edit, true);
         show(self.goto_edit, false);
@@ -379,6 +385,7 @@ impl FindBar {
                 Part::Word => self.query.whole_word,
                 Part::Regex => self.query.regex,
                 Part::InSel => self.in_sel,
+                Part::AllTabs => self.all_tabs,
                 _ => false,
             };
             if on {
@@ -402,6 +409,8 @@ impl FindBar {
                 Part::Regex => g.text(".*", ui, *b, color, Align::Center),
                 // (a box of dashes: the selection)
                 Part::InSel => g.text("\u{E8B3}", icons, *b, color, Align::Center),
+                // (windows one over the other: the tabs)
+                Part::AllTabs => g.text("\u{E7C4}", icons, *b, color, Align::Center),
                 Part::Filter => g.text("\u{E71C}", icons, *b, t.text_dim, Align::Center),
                 Part::Prev => g.text("\u{E70E}", icons, *b, t.text_dim, Align::Center),
                 Part::Next => g.text("\u{E70D}", icons, *b, t.text_dim, Align::Center),
