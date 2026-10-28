@@ -555,6 +555,9 @@ impl Matcher {
         idx: &mut IndexBuilder,
         ctx: &Ctx,
     ) -> io::Result<Filtered> {
+        if let Some(r) = self.filter_in_parts(snap, invert, w, idx, ctx, self.parts_for(snap.len(), snap.len())) {
+            return r;
+        }
         let len = snap.len();
         let ends_with_nl = len > 0 && snap.slice(len - 1, len, &mut Vec::new()) == b"\n";
         let mut lines = Lines::default();
@@ -632,6 +635,143 @@ impl Matcher {
             write(&[], 0, done, len, done_line, &mut out)?;
         }
         Ok(out)
+    }
+
+    /// `filter_lines_to` on several threads, for a long text (None: not this way, and nothing written). The text is
+    /// cut at line starts and each part's matched lines are noted side by side, then written in order. That's exact
+    /// while no match has a line break in it (none runs into the next part then, so each part finds the matches one
+    /// search would): a part that finds one gives up, and so does one with more stretches of lines than its share of
+    /// `RUNS_MAX`; one search does it then.
+    fn filter_in_parts(
+        &self,
+        snap: &Snapshot,
+        invert: bool,
+        w: &mut dyn Write,
+        idx: &mut IndexBuilder,
+        ctx: &Ctx,
+        n: usize,
+    ) -> Option<io::Result<Filtered>> {
+        let len = snap.len();
+        if n < 2 {
+            return None;
+        }
+        let bounds = cut_into(0, len, n, |p| next_nl(snap, &[], 0, p).map_or(len, |q| q + 1));
+        if bounds.len() < 2 {
+            return None;
+        }
+        let sizes = self.part_sizes(len, n);
+        let share = RUNS_MAX / (2 * bounds.len());
+        let parts = side_by_side(&bounds, ctx, |a, b, c| {
+            let mut kept = Kept { whole: true, ..Default::default() };
+            let mut lines = Lines { at: a, line: 0, start: a };
+            self.windows(snap, a, b, Some(c), sizes, &mut |hay, hs, hit| {
+                let (s, e) = match hit {
+                    Hit::Done(upto) => {
+                        lines.advance(snap, hay, hs, upto.min(b));
+                        return true;
+                    }
+                    Hit::Match(s, e) => (s, e),
+                };
+                kept.matches += 1;
+                if memchr::memchr(b'\n', &hay[(s - hs) as usize..(e - hs) as usize]).is_some() {
+                    kept.whole = false;
+                    return false;
+                }
+                lines.advance(snap, hay, hs, s);
+                let le = next_nl(snap, hay, hs, s).map_or(len, |p| p + 1);
+                match kept.ranges.last_mut() {
+                    // (a line kept already, or none: an empty match after the last line break)
+                    _ if le == lines.start => {}
+                    Some(r) if lines.start < r.1 => {}
+                    Some(r) if lines.start == r.1 => (r.1, r.3) = (le, r.3 + 1),
+                    _ => kept.ranges.push((lines.start, le, lines.line, 1)),
+                }
+                if kept.ranges.len() > share {
+                    kept.whole = false;
+                    return false;
+                }
+                true
+            });
+            lines.advance(snap, &[], 0, b);
+            kept.lines = lines.line;
+            kept
+        });
+        if ctx.cancelled() {
+            return Some(Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled")));
+        }
+        if parts.iter().any(|k| !k.whole) {
+            return None;
+        }
+        let ends_with_nl = snap.slice(len - 1, len, &mut Vec::new()) == b"\n";
+        let mut out = Filtered::default();
+        let mut text = Reader::default();
+        // the lines before the part, and (with `invert`) where the text not written yet starts and its line
+        let (mut base, mut done, mut done_line) = (0u64, 0u64, 0u64);
+        let mut write = || -> io::Result<()> {
+            for k in &parts {
+                out.matches += k.matches;
+                for &(rs, re, line, count) in &k.ranges {
+                    let line = base + line;
+                    if !invert {
+                        text.put(snap, rs, re, &mut *w, &mut *idx)?;
+                        out.map.push(line, count);
+                    } else {
+                        if rs > done {
+                            text.put(snap, done, rs, &mut *w, &mut *idx)?;
+                            out.map.push(done_line, line - done_line);
+                        }
+                        (done, done_line) = (re, line + count);
+                    }
+                }
+                base += k.lines;
+            }
+            if invert && done < len {
+                text.put(snap, done, len, &mut *w, &mut *idx)?;
+                // (only the very last line can end without a line break)
+                out.map.push(done_line, base - done_line + u64::from(!ends_with_nl));
+            }
+            Ok(())
+        };
+        Some(write().map(|_| out))
+    }
+}
+
+/// The lines one part of a text has a match in (`Matcher::filter_in_parts`).
+#[derive(Default)]
+struct Kept {
+    /// Stretches of whole lines (start, end, their first line counted from the part's start, how many lines).
+    ranges: Vec<(u64, u64, u64, u64)>,
+    matches: u64,
+    /// The line breaks in the part.
+    lines: u64,
+    /// False: the part gave up (see `filter_in_parts`).
+    whole: bool,
+}
+
+/// Writes stretches of a text in order, from windows of it read a few MB at a time.
+#[derive(Default)]
+struct Reader {
+    buf: Vec<u8>,
+    start: u64,
+}
+
+impl Reader {
+    fn put(&mut self, snap: &Snapshot, a: u64, b: u64, w: &mut dyn Write, idx: &mut IndexBuilder) -> io::Result<()> {
+        let mut a = a;
+        while a < b {
+            let end = self.start + self.buf.len() as u64;
+            if a < self.start || a >= end {
+                self.start = a;
+                snap.read_over(a, (a + WINDOW).min(snap.len()), &mut self.buf);
+                continue;
+            }
+            let e = b.min(end);
+            let c = &self.buf[(a - self.start) as usize..(e - self.start) as usize];
+            idx.push(c);
+            w.write_all(c)?;
+            a = e;
+        }
+        Ok(())
     }
 }
 
@@ -818,19 +958,87 @@ pub fn count_all(m: &Matcher, snap: &Snapshot, ctx: &Ctx) -> Found {
 const PAR_MIN: u64 = if cfg!(test) { 3000 } else { 16 << 20 };
 
 /// `count_all` of the matches inside `[from, to)` (Find in selection). A long text is cut into one part per core (up
-/// to 8), searched side by side: 850 MB in about a third of the time.
+/// to 8), searched side by side: 850 MB in about half the time.
 pub fn count_in(m: &Matcher, snap: &Snapshot, from: u64, to: u64, ctx: &Ctx) -> Found {
     let to = to.min(snap.len());
     let from = from.min(to);
-    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(8);
-    // (a regex: in a text up to `ONE_WINDOW` exact as one window, and its windows are big)
-    let n = match (to - from < PAR_MIN, m.regex_mode) {
-        (true, _) => 1,
-        (false, true) if snap.len() <= ONE_WINDOW => 1,
-        (false, true) => threads.min(4),
-        (false, false) => threads,
-    };
-    count_parts(m, snap, from, to, ctx, n)
+    count_parts(m, snap, from, to, ctx, m.parts_for(snap.len(), to - from))
+}
+
+impl Matcher {
+    /// How many parts to search `n` bytes of a text of `len` in, side by side (`count_in`, `filter_lines_to`).
+    fn parts_for(&self, len: u64, n: u64) -> usize {
+        let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(8);
+        // (a regex: in a text up to `ONE_WINDOW` exact as one window, and its windows are big)
+        match (n < PAR_MIN, self.regex_mode) {
+            (true, _) => 1,
+            (false, true) if len <= ONE_WINDOW => 1,
+            (false, true) => threads.min(4),
+            (false, false) => threads,
+        }
+    }
+
+    /// The window and overlap to search a part of a text of `len` with, in `n` parts: smaller, as each part's is read
+    /// beside the others'.
+    fn part_sizes(&self, len: u64, n: usize) -> (u64, u64) {
+        match self.sizes(len, true) {
+            // (a regex in a text up to `ONE_WINDOW`: one window, as that's exact)
+            (w, 0) => (w, 0),
+            (w, o) if n > 1 && w > ONE_WINDOW / 2 => (w / 2, o),
+            (w, o) if n > 1 => (w / 4, o),
+            s => s,
+        }
+    }
+}
+
+/// Runs `f(start, end, ctx)` for each part of the text in `bounds`, side by side, its progress the bytes done in
+/// all of them together. A panic in one is passed on.
+fn side_by_side<R: Send>(bounds: &[(u64, u64)], ctx: &Ctx, f: impl Fn(u64, u64, &Ctx) -> R + Sync) -> Vec<R> {
+    let start = bounds.first().map_or(0, |b| b.0);
+    let done: Vec<Arc<AtomicU64>> = bounds.iter().map(|&(a, _)| Arc::new(AtomicU64::new(a))).collect();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut out: Vec<Option<R>> = bounds.iter().map(|_| None).collect();
+    let f = &f;
+    std::thread::scope(|s| {
+        for (i, (&(a, b), p)) in bounds.iter().zip(&done).enumerate() {
+            let c = Ctx { cancel: ctx.cancel.clone(), progress: p.clone() };
+            let tx = tx.clone();
+            s.spawn(move || {
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(a, b, &c)));
+                let _ = tx.send((i, r));
+            });
+        }
+        let mut left = bounds.len();
+        while left > 0 {
+            match rx.recv_timeout(std::time::Duration::from_millis(15)) {
+                Ok((i, Ok(r))) => {
+                    out[i] = Some(r);
+                    left -= 1;
+                }
+                Ok((_, Err(e))) => std::panic::resume_unwind(e),
+                Err(_) => {}
+            }
+            ctx.set(start + bounds.iter().zip(&done).map(|(&(a, _), p)| p.load(Ordering::Relaxed).saturating_sub(a)).sum::<u64>());
+        }
+    });
+    out.into_iter().flatten().collect()
+}
+
+/// `[from, to)` cut into `n` parts of about the same size, each moved on to where `cut` says (never back).
+fn cut_into(from: u64, to: u64, n: usize, mut cut: impl FnMut(u64) -> u64) -> Vec<(u64, u64)> {
+    let step = (to - from).div_ceil(n.max(1) as u64).max(1);
+    let mut cuts: Vec<u64> = (1..n as u64).map(|i| cut((from + i * step).min(to)).min(to)).collect();
+    cuts.insert(0, from);
+    cuts.push(to);
+    let mut at = from;
+    cuts.iter()
+        .skip(1)
+        .filter_map(|&c| {
+            let part = (at < c).then_some((at, c));
+            at = at.max(c);
+            part
+        })
+        .collect()
 }
 
 /// The matches starting in one part of the text, as one search from the part's start finds them.
@@ -856,14 +1064,7 @@ impl Part {
 /// own match: "aa" in "aaa"): then the part is searched again from that match's end until it finds one of the part's
 /// own matches, from which on the two agree.
 fn count_parts(m: &Matcher, snap: &Snapshot, from: u64, to: u64, ctx: &Ctx, n: usize) -> Found {
-    // (smaller windows for parts: each part's is read beside the others')
-    let sizes = match m.sizes(snap.len(), true) {
-        // (a regex in a text up to `ONE_WINDOW`: one window, as that's exact)
-        (w, 0) => (w, 0),
-        (w, o) if n > 1 && w > ONE_WINDOW / 2 => (w / 2, o),
-        (w, o) if n > 1 => (w / 4, o),
-        s => s,
-    };
+    let sizes = m.part_sizes(snap.len(), n);
     let search = |a: u64, b: u64, c: &Ctx| {
         let mut part = Part { count: 0, positions: Vec::new(), last: None };
         m.windows(snap, a, b, Some(c), sizes, &mut |_, _, hit| {
@@ -874,44 +1075,10 @@ fn count_parts(m: &Matcher, snap: &Snapshot, from: u64, to: u64, ctx: &Ctx, n: u
         });
         part
     };
-    let step = (to - from).div_ceil(n.max(1) as u64).max(1);
     // (cut between characters: a search starting inside one could find an empty match there)
     let mut scratch = Vec::new();
-    let mut cut = |p: u64| p + snap.slice(p, (p + 4).min(to), &mut scratch).iter().take_while(|&&c| c & 0xC0 == 0x80).count() as u64;
-    let mut cuts: Vec<u64> = (1..n as u64).map(|i| cut((from + i * step).min(to))).collect();
-    cuts.insert(0, from);
-    cuts.push(to);
-    let bounds: Vec<(u64, u64)> = cuts.windows(2).map(|w| (w[0], w[1].max(w[0]))).filter(|(a, b)| a < b).collect();
-    let parts: Vec<Part> = if bounds.len() < 2 {
-        vec![search(from, to, ctx)]
-    } else {
-        let done: Vec<Arc<AtomicU64>> = bounds.iter().map(|&(a, _)| Arc::new(AtomicU64::new(a))).collect();
-        let (tx, rx) = std::sync::mpsc::channel();
-        let mut parts: Vec<Option<Part>> = bounds.iter().map(|_| None).collect();
-        std::thread::scope(|s| {
-            for (i, (&(a, b), p)) in bounds.iter().zip(&done).enumerate() {
-                let c = Ctx { cancel: ctx.cancel.clone(), progress: p.clone() };
-                let tx = tx.clone();
-                s.spawn(move || {
-                    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| search(a, b, &c)));
-                    let _ = tx.send((i, r));
-                });
-            }
-            let mut left = bounds.len();
-            while left > 0 {
-                match rx.recv_timeout(std::time::Duration::from_millis(15)) {
-                    Ok((i, Ok(p))) => {
-                        parts[i] = Some(p);
-                        left -= 1;
-                    }
-                    Ok((_, Err(e))) => std::panic::resume_unwind(e),
-                    Err(_) => {}
-                }
-                ctx.set(from + bounds.iter().zip(&done).map(|(&(a, _), p)| p.load(Ordering::Relaxed).saturating_sub(a)).sum::<u64>());
-            }
-        });
-        parts.into_iter().flatten().collect()
-    };
+    let bounds = cut_into(from, to, n, |p| p + snap.slice(p, (p + 4).min(to), &mut scratch).iter().take_while(|&&c| c & 0xC0 == 0x80).count() as u64);
+    let parts: Vec<Part> = if bounds.len() < 2 { vec![search(from, to, ctx)] } else { side_by_side(&bounds, ctx, search) };
     let mut all = Part { count: 0, positions: Vec::new(), last: None };
     for (p, &(_, b)) in parts.into_iter().zip(&bounds) {
         let Some((_, end)) = all.last else {
@@ -1068,6 +1235,48 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn filtering_in_parts_keeps_what_one_search_does() {
+        // parts cut at line starts, on 2 to 8 threads; a match with a line break in it gives up (one search does it)
+        let words = ["ab", "x", "AB", "a", " ", "\n", "\r\n", "\n\n", "abab", "é", "line", "xx"];
+        let mut r = 0x7F4A_7C15_9E37_79B9u64;
+        let mut text = String::new();
+        for _ in 0..4000 {
+            r ^= r << 13;
+            r ^= r >> 7;
+            r ^= r << 17;
+            text.push_str(words[(r % words.len() as u64) as usize]);
+        }
+        let mut gave_up = 0;
+        for end in ["", "\n"] {
+            let text = format!("{text}{end}");
+            let snap = fragmented(text.as_bytes());
+            for (query, regex) in [("ab", false), ("x", false), ("^x", true), ("$", true), ("b\na", false), ("é|line", true), (r"a\s+x", true)] {
+                let m = Matcher::new(&Query { text: query.into(), regex, ..Default::default() }).unwrap();
+                let found = count_all(&m, &snap, &ctx());
+                for invert in [false, true] {
+                    let (want, want_lines) = filtered_simply(text.as_bytes(), &found.positions, invert);
+                    for n in 2..=8 {
+                        let mut out = Vec::new();
+                        let mut idx = IndexBuilder::new();
+                        let Some(f) = m.filter_in_parts(&snap, invert, &mut out, &mut idx, &ctx(), n) else {
+                            assert!(out.is_empty());
+                            gave_up += 1;
+                            continue;
+                        };
+                        let f = f.unwrap();
+                        assert!(out == want, "{query:?} invert {invert}, {n} parts");
+                        let got: Vec<u64> = (0..f.map.lines).map(|l| f.map.source(l).unwrap()).collect();
+                        assert_eq!(got, want_lines, "{query:?} invert {invert}, {n} parts");
+                        assert_eq!(f.matches, found.count, "{query:?}");
+                    }
+                }
+            }
+        }
+        // ("b\na" and "a\s+x" can span lines: only those)
+        assert!(gave_up > 0 && gave_up <= 2 * 2 * 2 * 7, "{gave_up}");
     }
 
     #[test]
