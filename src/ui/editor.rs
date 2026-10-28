@@ -63,6 +63,18 @@ pub struct SegLayout {
     pub composing: Option<u32>,
 }
 
+/// A wavy line from `x0` to `x1`, its bottom at `y` (a word spelled wrong).
+fn squiggle(g: &super::gfx::Gfx, x0: f32, x1: f32, y: f32, color: u32) {
+    let (half, h) = (2.0f32, 1.5f32);
+    let (mut x, mut up) = (x0, true);
+    while x < x1 - 0.5 {
+        let nx = (x + half).min(x1);
+        let (ya, yb) = if up { (y, y - h) } else { (y - h, y) };
+        g.line(x, ya, nx, yb, color, 1.0);
+        (x, up) = (nx, !up);
+    }
+}
+
 /// A UTF-16 unit of a character that may show as a color glyph: emoji (all outside the BMP, the symbols and dingbats
 /// of U+2190…U+2BFF, the emoji variation selector) and the few others with an emoji form. (Not the stand-ins for
 /// control characters, U+2400…U+243F.)
@@ -841,6 +853,25 @@ impl View {
         (seg, lay, row, x)
     }
 
+    /// The words worth spell checking in the rows on screen (`crate::spell::words_in`): where, and what.
+    pub fn spell_words(&mut self, cx: &Ctx) -> Vec<(u64, u64, String)> {
+        let mut segs: Vec<Seg> = self.rows.iter().map(|r| r.seg).collect();
+        segs.dedup_by_key(|s| s.start);
+        let mut spans = std::mem::take(&mut self.spans);
+        let mut out = Vec::new();
+        for seg in segs {
+            let st = self.hl_state(cx, &seg);
+            let bytes = self.window(cx.doc, seg.start, seg.end).to_vec();
+            for (a, b) in crate::spell::words_in(cx.lang, &bytes, st, &mut spans) {
+                if let Ok(w) = std::str::from_utf8(&bytes[a..b]) {
+                    out.push((seg.start + a as u64, seg.start + b as u64, w.to_string()));
+                }
+            }
+        }
+        self.spans = spans;
+        out
+    }
+
     /// The text an input method composes at the caret (None: it's done); the rows are laid out again with it.
     pub fn set_composing(&mut self, c: Option<Composing>) {
         if self.composing != c {
@@ -1096,7 +1127,9 @@ impl View {
 
     /// Paints the rows from the last `layout_rows` (call it first). `overtype`: the caret marks the character that
     /// typing replaces.
-    pub fn paint(&mut self, cx: &Ctx, focused: bool, caret_on: bool, matches: &[(u64, u64)], marks: &[(u64, u64, u32)], overtype: bool) {
+    /// `wrong`: words spelled wrong, underlined with a wavy line.
+    #[allow(clippy::too_many_arguments)]
+    pub fn paint(&mut self, cx: &Ctx, focused: bool, caret_on: bool, matches: &[(u64, u64)], marks: &[(u64, u64, u32)], wrong: &[(u64, u64)], overtype: bool) {
         let g = cx.g;
         let t = cx.theme;
         let geom = cx.geom;
@@ -1248,6 +1281,13 @@ impl View {
             self.paint_whitespace(cx, ox);
         } else if !self.ws_clusters.is_empty() {
             self.ws_clusters.clear();
+        }
+
+        // Words spelled wrong: a wavy line under each.
+        for &(a, b) in wrong {
+            for (rc, _) in self.range_rects(cx, a, b, ox, false) {
+                squiggle(g, rc.x, rc.right(), rc.y + row_h - 1.0, t.error);
+            }
         }
 
         // Text an input method is composing: its clauses underlined, the one being converted thicker, and the caret

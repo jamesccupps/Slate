@@ -129,6 +129,11 @@ pub enum Cmd {
     FilterLines(bool),
     /// No search highlighted any more (the find bar's Highlight).
     ClearHighlights,
+    SpellCheck,
+    /// The spell check menu's suggestion (`App::spell_word`).
+    Suggestion(u8),
+    AddWord,
+    IgnoreWord,
     /// Bookmarks: the caret's line marked or not (Ctrl+F2), the next and previous (F2, Shift+F2), none.
     ToggleBookmark,
     NextBookmark,
@@ -306,6 +311,27 @@ pub struct Find {
     last_match: Option<(u64, u64)>,
 }
 
+/// Spell check's checker (`crate::spell`, Enchant: `super::spell`).
+pub enum Spelling {
+    NotYet,
+    /// Made a moment after the window shows.
+    Soon,
+    Ready(crate::spell::Speller),
+    /// No Enchant, or no dictionary.
+    Unavailable,
+}
+
+/// A word spelled wrong, in a tab, for the text's menu.
+pub struct SpellWord {
+    pub tab: u64,
+    /// The document's version then (the word is only changed while the text is as it was).
+    pub version: u64,
+    pub start: u64,
+    pub end: u64,
+    pub word: String,
+    pub suggestions: Vec<String>,
+}
+
 pub struct App {
     pub tabs: Vec<Tab>,
     pub active: usize,
@@ -352,6 +378,12 @@ pub struct App {
     /// Searches kept highlighted in every tab, each in a color of its own (the find bar's Highlight, Alt+H), in the
     /// order they were added.
     pub highlights: Vec<(Query, Matcher)>,
+    /// Spell check's checker.
+    pub speller: Spelling,
+    /// The checker is wanted: the window makes it a moment after it shows (at once in test mode).
+    pub speller_wanted: bool,
+    /// The word spelled wrong the text's menu was opened on (for its suggestions, Add to dictionary, Ignore).
+    pub spell_word: Option<SpellWord>,
     /// The status bar's column (document version, caret, column) and selection size (version, start, end,
     /// characters), counted once for each.
     pub col_cache: std::cell::Cell<Option<(u64, u64, u64)>>,
@@ -406,6 +438,9 @@ impl App {
             next_id: 1,
             disk_job: None,
             highlights: Vec::new(),
+            speller: Spelling::NotYet,
+            speller_wanted: false,
+            spell_word: None,
             col_cache: Default::default(),
             sel_cache: Default::default(),
             field_cache: Default::default(),
@@ -1291,6 +1326,70 @@ impl App {
         }
     }
 
+    // ---- spell check ----
+
+    /// Words spelled wrong on screen, but not one the caret is at the end of while the text has the keyboard (being
+    /// typed); none in tabs that can't be edited. The first time, the checker is asked for (`speller_wanted`).
+    pub fn misspelled(&mut self, g: &Geom, focused: bool) -> Vec<(u64, u64)> {
+        let tab = self.tab();
+        if !self.settings.spell_check || tab.read_only || tab.filter.is_some() || !crate::spell::checks(tab.lang) {
+            return Vec::new();
+        }
+        let caret = tab.view.sel.caret;
+        if matches!(self.speller, Spelling::NotYet) {
+            self.speller = Spelling::Soon;
+            self.speller_wanted = true;
+        }
+        if !matches!(self.speller, Spelling::Ready(_)) {
+            return Vec::new();
+        }
+        let words = self.with_view(g, |v, cx| {
+            v.layout_rows(cx);
+            v.spell_words(cx)
+        });
+        let Spelling::Ready(s) = &mut self.speller else { return Vec::new() };
+        words.into_iter().filter(|(_, b, w)| (*b != caret || !focused) && s.wrong(w)).map(|(a, b, _)| (a, b)).collect()
+    }
+
+    /// Makes spell check's checker (Enchant: `super::spell`).
+    pub fn make_speller(&mut self, scripted: bool) {
+        self.speller = super::spell::speller(scripted).map_or(Spelling::Unavailable, Spelling::Ready);
+    }
+
+    /// A word spelled wrong at (`x`, `y`) in the text area: what it may have been meant to be, with the word noted for
+    /// the menu's commands (`spell_word`). None: not one there.
+    pub fn spelling_at(&mut self, g: &Geom, x: f64, y: f64) -> Option<Vec<String>> {
+        self.spell_word = None;
+        let tab = self.tab();
+        if !self.settings.spell_check || tab.read_only || tab.filter.is_some() || !matches!(self.speller, Spelling::Ready(_)) {
+            return None;
+        }
+        let (pos, words) = self.with_view(g, |v, cx| (v.pos_at(cx, x, y), v.spell_words(cx)));
+        let (start, end, word) = words.into_iter().find(|&(a, b, _)| a <= pos && pos <= b)?;
+        let Spelling::Ready(s) = &mut self.speller else { return None };
+        if !s.wrong(&word) {
+            return None;
+        }
+        let suggestions = s.suggest(&word);
+        let tab = self.tab();
+        self.spell_word = Some(SpellWord { tab: tab.id, version: tab.doc.version, start, end, word, suggestions: suggestions.clone() });
+        Some(suggestions)
+    }
+
+    /// Puts suggestion `i` in place of the word the menu was for (while the text is as it was).
+    fn spell_replace(&mut self, i: usize) {
+        let Some(w) = self.spell_word.take() else { return };
+        let Some(s) = w.suggestions.get(i) else { return };
+        if self.tab().id != w.tab || self.tab().doc.version != w.version || !self.editable() {
+            return;
+        }
+        let tab = &mut self.tabs[self.active];
+        tab.doc.seal();
+        tab.view.sel = edit::replace_selection(&mut tab.doc, Sel { anchor: w.start, caret: w.end }, s.as_bytes(), EditKind::Other);
+        tab.doc.seal();
+        self.after_edit(true);
+    }
+
     // ---- input methods ----
 
     /// An input method starts composing (its "preedit"): from now on what it composes shows at the caret, and a
@@ -1833,6 +1932,16 @@ impl App {
             Cmd::LineNumbers => {
                 self.settings.line_numbers = !self.settings.line_numbers;
                 self.style.line_numbers = self.settings.line_numbers;
+            }
+            Cmd::SpellCheck => {
+                self.settings.spell_check = !self.settings.spell_check;
+                self.settings.save();
+            }
+            Cmd::Suggestion(i) => self.spell_replace(i as usize),
+            Cmd::AddWord | Cmd::IgnoreWord => {
+                if let (Some(w), Spelling::Ready(s)) = (self.spell_word.take(), &mut self.speller) {
+                    s.accept(&w.word, cmd == Cmd::AddWord);
+                }
             }
             Cmd::ZoomIn | Cmd::ZoomOut | Cmd::ZoomReset => {
                 let z = self.settings.zoom;

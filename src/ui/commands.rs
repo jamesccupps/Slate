@@ -79,6 +79,11 @@ pub enum Cmd {
     ToggleWrap,
     ToggleLineNumbers,
     ToggleWhitespace,
+    ToggleSpellCheck,
+    /// The spell check menu's suggestion (`App::spell_word`).
+    Suggestion(u8),
+    AddWord,
+    IgnoreWord,
     /// Typing replaces the character after the caret (Insert).
     ToggleOvertype,
     ToggleStructure,

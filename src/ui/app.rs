@@ -465,6 +465,27 @@ pub struct UiFonts {
     pub family: String,
 }
 
+/// Spell check's checker (`crate::spell`, Windows' own: `super::spell`).
+pub enum Spelling {
+    NotYet,
+    /// Made a moment after the window shows (`TIMER_SPELL`).
+    Soon,
+    Ready(crate::spell::Speller),
+    /// Windows has none, or no dictionary.
+    Unavailable,
+}
+
+/// A word spelled wrong, in a tab, for the text's menu.
+pub struct SpellWord {
+    pub tab: u64,
+    /// The document's version then (the word is only changed while the text is as it was).
+    pub version: u64,
+    pub start: u64,
+    pub end: u64,
+    pub word: String,
+    pub suggestions: Vec<String>,
+}
+
 pub struct App {
     pub hwnd: HWND,
     pub g: Gfx,
@@ -555,6 +576,12 @@ pub struct App {
     /// Searches kept highlighted in every tab, each in a color of its own (the find box's Highlight, Alt+H), in the
     /// order they were added.
     pub highlights: Vec<(crate::core::search::Query, Arc<crate::core::search::Matcher>)>,
+    /// Spell check's checker.
+    pub speller: Spelling,
+    /// The word spelled wrong the text's menu was opened on (for its suggestions, Add to dictionary, Ignore).
+    pub spell_word: Option<SpellWord>,
+    /// The words spelled wrong shown last (test mode's `print:wrong`).
+    pub spell_shown: Vec<(u64, u64)>,
     /// The button listing all tabs, at the end of the tab strip (zero size while all tabs fit).
     pub tablist_rect: Rect,
     /// Characters and words of a document (tab id, document version), and a count running on another thread.
@@ -661,6 +688,9 @@ impl App {
             waits: Vec::new(),
             print_last: Default::default(),
             highlights: Vec::new(),
+            speller: Spelling::NotYet,
+            spell_word: None,
+            spell_shown: Vec::new(),
             tablist_rect: Rect::default(),
             doc_counts: None,
             count_job: None,
@@ -1478,7 +1508,32 @@ impl App {
         // (no caret or current line in a tab whose text is still coming)
         let coming = tab.text_coming();
         let editor_focused = focused && self.focused && coming.is_none();
-        tab.view.paint(&cx, editor_focused, caret_on, &matches, &marks, self.overtype);
+        // Words spelled wrong on screen, but not one the caret is at the end of while the text has the keyboard (being
+        // typed); none in tabs that can't be edited.
+        let mut wrong = Vec::new();
+        if self.settings.spell_check && !tab.read_only && tab.filter.is_none() && coming.is_none() && crate::spell::checks(tab.lang) {
+            if matches!(self.speller, Spelling::NotYet) {
+                // (made a moment after the window shows, as it takes ~25 ms; at once in test mode)
+                self.speller = Spelling::Soon;
+                if win::testing() {
+                    self.speller = super::spell::speller(true).map_or(Spelling::Unavailable, Spelling::Ready);
+                } else {
+                    unsafe {
+                        windows::Win32::UI::WindowsAndMessaging::SetTimer(hwnd, super::actions::TIMER_SPELL, 300, None);
+                    }
+                }
+            }
+            if let Spelling::Ready(s) = &mut self.speller {
+                let caret = tab.view.sel.caret;
+                for (a, b, w) in tab.view.spell_words(&cx) {
+                    if (b != caret || !editor_focused) && s.wrong(&w) {
+                        wrong.push((a, b));
+                    }
+                }
+            }
+        }
+        tab.view.paint(&cx, editor_focused, caret_on, &matches, &marks, &wrong, self.overtype);
+        self.spell_shown = wrong;
         if editor_focused {
             // The hidden system caret goes where Slate's is (Magnifier and screen readers follow that one). While the
             // caret is scrolled out of view there's none, so they don't stay on a place it has left.

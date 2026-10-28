@@ -37,6 +37,8 @@ pub struct Settings {
     pub line_numbers: bool,
     /// Dots for spaces, arrows for tabs, marks for line breaks.
     pub show_whitespace: bool,
+    /// Words spelled wrong underlined (`crate::spell`).
+    pub spell_check: bool,
     pub theme: ThemeMode,
     pub tab_size: u32,
     pub use_spaces: bool,
@@ -76,6 +78,7 @@ impl Default for Settings {
             wrap: true,
             line_numbers: true,
             show_whitespace: false,
+            spell_check: true,
             theme: ThemeMode::System,
             tab_size: 4,
             use_spaces: true,

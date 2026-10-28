@@ -219,6 +219,9 @@ fn cmd_of(name: &str) -> Option<Cmd> {
         "MoveLineUp" => Cmd::MoveLineUp,
         "MoveLineDown" => Cmd::MoveLineDown,
         "ToggleWrap" => Cmd::ToggleWrap,
+        "ToggleSpellCheck" => Cmd::ToggleSpellCheck,
+        "AddWord" => Cmd::AddWord,
+        "IgnoreWord" => Cmd::IgnoreWord,
         "ToggleLineNumbers" => Cmd::ToggleLineNumbers,
         "ToggleStructure" => Cmd::ToggleStructure,
         "TogglePathBar" => Cmd::TogglePathBar,
@@ -719,6 +722,18 @@ fn describe(cell: &Cell, what: &str) -> String {
         }
         "armed" => a.menu_armed.map(|i| super::commands::MENU_TITLES[i].to_string()).unwrap_or_default(),
         "opened" => super::win::SCRIPTED.with(|s| s.borrow().as_ref().map(|s| s.menus.join(" | ")).unwrap_or_default()),
+        // the items of the last popup menu that would have opened (`rmenu:`)
+        "popupitems" => super::win::SCRIPTED.with(|s| s.borrow().as_ref().map(|s| s.menu_items.join(" | ")).unwrap_or_default()),
+        // the words spelled wrong on screen
+        "wrong" => {
+            let t = a.tab();
+            a.spell_shown.iter().map(|&(s, e)| String::from_utf8_lossy(&t.doc.read(s, e)).into_owned()).collect::<Vec<_>>().join(" ")
+        }
+        "speller" => match &a.speller {
+            super::app::Spelling::Ready(s) => s.lang.clone(),
+            super::app::Spelling::Unavailable => "none".into(),
+            _ => "not yet".into(),
+        },
         "scrollx" => format!("{:.0}", a.tab().view.scroll_x),
         "zoom" => format!("{:.0}%", a.settings.zoom * 100.0),
         "topline" => {
@@ -1008,6 +1023,19 @@ pub fn run(args: &[String]) -> i32 {
                 let enc = a.tab().doc.encoding;
                 a.start_save(i, PathBuf::from(arg), enc, false);
             }
+            // the text's menu at a point (client DIPs), as a right click there opens it, and an item chosen in it by
+            // its label: `rmenu:<x>,<y>[|<label>]` (`print:popupitems` lists them)
+            "rmenu" => {
+                let (at, pick) = arg.split_once('|').map_or((arg, None), |(p, l)| (p, Some(l.to_string())));
+                let (x, y) = at.split_once(',').map(|(x, y)| (x.trim().parse().unwrap_or(0.0), y.trim().parse().unwrap_or(0.0))).unwrap_or((0.0, 0.0));
+                super::win::SCRIPTED.with(|s| {
+                    if let Some(s) = s.borrow_mut().as_mut() {
+                        s.pick = pick;
+                    }
+                });
+                cell.borrow_mut().pending.push(super::app::Deferred::ContextMenu(x, y));
+                drain_pending(&cell);
+            }
             "click" | "dblclick" | "rclick" => {
                 let (x, y) = arg.split_once(',').map(|(x, y)| (x.parse().unwrap_or(0.0), y.parse().unwrap_or(0.0))).unwrap_or((0.0, 0.0));
                 let n = if op == "dblclick" { 2 } else { 1 };
@@ -1091,7 +1119,15 @@ pub fn run(args: &[String]) -> i32 {
                     failures += 1;
                 }
             }
-            "print" => out.push_str(&format!("{arg}: {}\n", describe(&cell, arg))),
+            "print" => {
+                // (the words spelled wrong are worked out when a frame is drawn: one first)
+                if arg == "wrong" {
+                    if let Ok(_frame) = offscreen(&cell) {
+                        cell.borrow_mut().paint();
+                    }
+                }
+                out.push_str(&format!("{arg}: {}\n", describe(&cell, arg)));
+            }
             "expect" => {
                 let (what, want) = arg.split_once('=').unwrap_or((arg, ""));
                 let got = describe(&cell, what);

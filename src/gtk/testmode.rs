@@ -216,6 +216,21 @@ async fn script(lines: Vec<String>, test: Rc<Test>) -> i32 {
                 }
             }
             "up" => ui.release_for_test(arg == "ctrl"),
+            // the spelling part of the text's menu at a point (`down:`'s), and an item chosen in it by its label:
+            // `rmenu:<x>,<y>[|<label>]`
+            "rmenu" => {
+                let (at, pick) = arg.split_once('|').map_or((arg, None), |(p, l)| (p, Some(l)));
+                let (x, y) = at.split_once(',').unwrap_or(("0", "0"));
+                let gw = ui.app.try_borrow().map(|a| ui.gutter_width(&a)).unwrap_or(0.0);
+                let items = ui.spell_items(x.trim().parse::<f64>().unwrap_or(0.0) - gw - super::PAD, y.trim().parse().unwrap_or(0.0));
+                log(&mut out, format!("spellmenu: {}", items.iter().map(|(l, _)| l.as_str()).collect::<Vec<_>>().join(" | ")));
+                if let Some((_, action)) = pick.and_then(|p| items.iter().find(|(l, _)| l == p)) {
+                    match commands().into_iter().find(|(n, _, _)| n == action) {
+                        Some((_, cmd, _)) => ui.command(cmd),
+                        None => log(&mut out, format!("rmenu: {action} does nothing")),
+                    }
+                }
+            }
             // an input method: `start`, `commit|<text>` and `end` are its signals, sent to the window's input method
             // context; `pre|<text>|<cursor>|<clauses>` (`edit::Composing::parse`) what it composes, as GTK gives it:
             // an underline, and a background on the clause being converted
@@ -418,6 +433,21 @@ fn value(what: &str, test: &Test) -> String {
     match what {
         "text" => String::from_utf8_lossy(&tab.doc.read(0, tab.doc.len().min(1 << 20))).into_owned(),
         "sel" => format!("{}..{}", tab.view.sel.anchor, tab.view.sel.caret),
+        // the words spelled wrong on screen, and the checker's language
+        "wrong" => {
+            drop(a);
+            let g = ui.geom();
+            let focused = ui.text.has_focus();
+            let wrong = ui.guarded(|a| a.misspelled(&g, focused)).unwrap_or_default();
+            let Ok(a) = ui.app.try_borrow() else { return "(busy)".into() };
+            let tab = a.tab();
+            wrong.iter().map(|&(s, e)| String::from_utf8_lossy(&tab.doc.read(s, e)).into_owned()).collect::<Vec<_>>().join(" ")
+        }
+        "speller" => match &a.speller {
+            super::app::Spelling::Ready(s) => s.lang.clone(),
+            super::app::Spelling::Unavailable => "none".into(),
+            _ => "not yet".into(),
+        },
         // what an input method is composing: `<text>|<cursor, bytes>|<clauses: start-end, * converting>`, or `none`
         "composing" => match &tab.view.composing {
             Some(c) => {

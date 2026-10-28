@@ -67,6 +67,8 @@ pub const TIMER_TIP: usize = 10;
 pub const TIMER_STRUCTURE: usize = 11;
 /// The window kept off the screen until its first frame (`win::cloak`) is shown by now in any case.
 pub const TIMER_UNCLOAK: usize = 12;
+/// The window has shown: spell check's checker is made (`App::speller`).
+pub const TIMER_SPELL: usize = 13;
 
 const BIG_CLIPBOARD: u64 = 64 << 20;
 /// What the status bar says when the clipboard couldn't be written.
@@ -2254,6 +2256,43 @@ impl App {
         self.after_edit();
     }
 
+    // ---- spell check ----
+
+    /// A word spelled wrong at (`x`, `y`) in the text (client DIPs): what it may have been meant to be, with the word
+    /// noted for the menu's commands (`spell_word`). None: not one there.
+    pub fn spelling_at(&mut self, x: f32, y: f32) -> Option<Vec<String>> {
+        self.spell_word = None;
+        let tab = self.tab();
+        if !self.settings.spell_check || tab.read_only || tab.filter.is_some() || !matches!(self.speller, Spelling::Ready(_)) {
+            return None;
+        }
+        let (pos, _) = self.with_view(|v, cx| v.pos_at(cx, x, y));
+        let words = self.with_view(|v, cx| v.spell_words(cx));
+        let (start, end, word) = words.into_iter().find(|&(a, b, _)| a <= pos && pos <= b)?;
+        let Spelling::Ready(s) = &mut self.speller else { return None };
+        if !s.wrong(&word) {
+            return None;
+        }
+        let suggestions = s.suggest(&word);
+        let tab = self.tab();
+        self.spell_word = Some(SpellWord { tab: tab.id, version: tab.doc.version, start, end, word, suggestions: suggestions.clone() });
+        Some(suggestions)
+    }
+
+    /// Puts suggestion `i` in place of the word the menu was for (while the text is as it was).
+    fn spell_replace(&mut self, i: usize) {
+        let Some(w) = self.spell_word.take() else { return };
+        let Some(s) = w.suggestions.get(i) else { return };
+        if self.tab().id != w.tab || self.tab().doc.version != w.version || !self.editable() {
+            return;
+        }
+        let tab = self.tab_mut();
+        tab.doc.seal();
+        tab.view.sel = editor::replace_selection(&mut tab.doc, Sel { anchor: w.start, caret: w.end }, s.as_bytes(), EditKind::Other);
+        tab.doc.seal();
+        self.after_edit();
+    }
+
     // ---- input methods (`ime`) ----
 
     /// An input method starts composing: from now on what it composes shows at the caret, and a selection goes, as
@@ -3907,6 +3946,11 @@ impl App {
                 self.invalidate();
             }
             TIMER_TIP => self.show_tip(),
+            TIMER_SPELL => {
+                self.kill_timer(id);
+                self.speller = super::spell::speller(false).map_or(Spelling::Unavailable, Spelling::Ready);
+                self.invalidate();
+            }
             TIMER_UNCLOAK => {
                 self.kill_timer(id);
                 if win::uncloak() {
@@ -4168,6 +4212,17 @@ impl App {
             Cmd::ToggleWhitespace => {
                 self.settings.show_whitespace = !self.settings.show_whitespace;
                 self.settings_changed();
+            }
+            Cmd::ToggleSpellCheck => {
+                self.settings.spell_check = !self.settings.spell_check;
+                self.settings_changed();
+            }
+            Cmd::Suggestion(i) => self.spell_replace(i as usize),
+            Cmd::AddWord | Cmd::IgnoreWord => {
+                if let (Some(w), Spelling::Ready(s)) = (self.spell_word.take(), &mut self.speller) {
+                    s.accept(&w.word, cmd == Cmd::AddWord);
+                    self.invalidate();
+                }
             }
             Cmd::ToggleReadOnly => {
                 let tab = self.tab_mut();
@@ -4740,6 +4795,7 @@ impl App {
                     check(Cmd::ToggleWrap, "&Word wrap", "Alt+Z", s.wrap),
                     check(Cmd::ToggleLineNumbers, "&Line numbers", "", s.line_numbers),
                     check(Cmd::ToggleWhitespace, "Show w&hitespace", "", s.show_whitespace),
+                    check(Cmd::ToggleSpellCheck, if matches!(self.speller, Spelling::Unavailable) { "Spell chec&k (Windows has no dictionary for it)" } else { "Spell chec&k" }, "", s.spell_check),
                     item(Cmd::CharInfo, "&Character at the caret", ""),
                     Item::Sep,
                     item(Cmd::FilterLines(false), "Show only &matching lines", "Alt+L"),
@@ -5098,8 +5154,8 @@ fn client_to_screen(hwnd: HWND, x: i32, y: i32) -> POINT {
 /// Shows a popup menu at client DIPs (x, y), below that point or (`up`) above it; returns the chosen command.
 /// `name` says which menu it is (test mode notes it instead of showing it).
 fn popup(cell: &Cell, name: &str, items: Vec<Item>, x: f32, y: f32, up: bool) -> Option<Cmd> {
-    if win::scripted_menu(name) {
-        return None;
+    if let Some(chosen) = win::scripted_menu(name, &items) {
+        return chosen;
     }
     let (hwnd, px, py) = {
         let a = cell.borrow();
@@ -5172,6 +5228,7 @@ pub fn run(cell: &Cell, d: Deferred) {
         Deferred::Cmd(c) => run_cmd(cell, c),
         Deferred::Menu(i) => show_menu_bar(cell, i),
         Deferred::ContextMenu(x, y) => {
+            let spelling = cell.borrow_mut().spelling_at(x, y);
             let items = {
                 let a = cell.borrow();
                 let tab = a.tab();
@@ -5211,6 +5268,15 @@ pub fn run(cell: &Cell, d: Deferred) {
                     v.push(item(Cmd::CopyJsonPath, "Copy JSON pat&h", ""));
                 } else if tab.lang == Lang::Xml {
                     v.push(item(Cmd::CopyJsonPath, "Copy XML pat&h (XPath)", ""));
+                }
+                // a word spelled wrong: what it may have been meant to be, first
+                if let Some(sugg) = spelling {
+                    let mut first: Vec<Item> = sugg.iter().enumerate().map(|(i, s)| item(Cmd::Suggestion(i as u8), &s.replace('&', "&&"), "")).collect();
+                    if first.is_empty() {
+                        first.push(enabled(Cmd::Suggestion(0), "(No suggestions)", "", false));
+                    }
+                    first.extend([Item::Sep, item(Cmd::AddWord, "&Add to dictionary", ""), item(Cmd::IgnoreWord, "&Ignore", ""), Item::Sep]);
+                    v.splice(0..0, first);
                 }
                 v
             };

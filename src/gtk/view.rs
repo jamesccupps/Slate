@@ -721,6 +721,25 @@ impl View {
         (seg, lay, line, x)
     }
 
+    /// The words worth spell checking in the rows on screen (`crate::spell::words_in`): where, and what.
+    pub fn spell_words(&mut self, cx: &Ctx) -> Vec<(u64, u64, String)> {
+        let mut segs: Vec<Seg> = self.rows.iter().map(|r| r.seg).collect();
+        segs.dedup_by_key(|s| s.start);
+        let mut spans = std::mem::take(&mut self.spans);
+        let mut out = Vec::new();
+        for seg in segs {
+            let st = self.hl_state(cx, &seg);
+            let bytes = cx.doc.read(seg.start, seg.end);
+            for (a, b) in crate::spell::words_in(cx.lang, &bytes, st, &mut spans) {
+                if let Ok(w) = std::str::from_utf8(&bytes[a..b]) {
+                    out.push((seg.start + a as u64, seg.start + b as u64, w.to_string()));
+                }
+            }
+        }
+        self.spans = spans;
+        out
+    }
+
     /// The text an input method composes at the caret (None: it's done).
     pub fn set_composing(&mut self, c: Option<edit::Composing>) {
         if self.composing != c {
@@ -907,7 +926,9 @@ impl View {
     /// Draws the rows: the current line, the selection, find matches, the text, the caret. `ox`: where the text
     /// starts (after the gutter).
     #[allow(clippy::too_many_arguments)]
-    pub fn paint(&mut self, cx: &Ctx, cr: &cairo::Context, ox: f64, focused: bool, caret_on: bool, matches: &[(u64, u64)], marks: &[(u64, u64, u32)]) {
+    /// `wrong`: words spelled wrong, underlined with a wavy line.
+    #[allow(clippy::too_many_arguments)]
+    pub fn paint(&mut self, cx: &Ctx, cr: &cairo::Context, ox: f64, focused: bool, caret_on: bool, matches: &[(u64, u64)], marks: &[(u64, u64, u32)], wrong: &[(u64, u64)]) {
         self.layout_rows(cx);
         let t = cx.theme;
         let row_h = cx.style.row_h;
@@ -1034,6 +1055,31 @@ impl View {
                     break;
                 }
             }
+        }
+        // words spelled wrong: a wavy line under each
+        if !wrong.is_empty() {
+            set_color(cr, t.error);
+            cr.set_line_width(1.0);
+            for r in rows.iter() {
+                let (la, lb) = r.lay.line_range(r.line);
+                let (sa, sb) = (r.seg.start + r.lay.rel(la), r.seg.start + r.lay.rel(lb));
+                let Some(line) = r.lay.layout.line_readonly(r.line as i32) else { continue };
+                for &(a, b) in wrong.iter().filter(|&&(a, b)| b > sa && a < sb) {
+                    let (ia, ib) = (r.lay.disp(a.max(sa) - r.seg.start), r.lay.disp(b.min(sb) - r.seg.start));
+                    for p in line.x_ranges(ia, ib).chunks(2) {
+                        let (xa, xb) = (x0 + p[0] as f64 / pango::SCALE as f64, x0 + p[1] as f64 / pango::SCALE as f64);
+                        let y = r.y + row_h - 1.0;
+                        let (mut x, mut up) = (xa, true);
+                        cr.move_to(x, y);
+                        while x < xb - 0.5 {
+                            x = (x + 2.0).min(xb);
+                            cr.line_to(x, if up { y - 1.5 } else { y });
+                            up = !up;
+                        }
+                    }
+                }
+            }
+            let _ = cr.stroke();
         }
         // text an input method is composing: its clauses underlined, the one being converted thicker; the caret at
         // its cursor

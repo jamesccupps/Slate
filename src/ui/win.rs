@@ -44,6 +44,9 @@ pub struct Scripted {
     pub clipboard_seq: u32,
     /// The menus that would have opened (they never are in this mode, as they'd wait for the mouse).
     pub menus: Vec<String>,
+    /// The last one's items (`print:popupitems`), and the item to choose in the next (`rmenu:`).
+    pub menu_items: Vec<String>,
+    pub pick: Option<String>,
     /// The window with the keyboard focus, as far as Slate knows (`set_focus`): the real focus is never taken, as that
     /// would activate the hidden window and take the keyboard from the user's own windows.
     pub focus: isize,
@@ -72,8 +75,20 @@ pub fn focus() -> HWND {
 }
 
 /// Test mode: notes that menu `name` would open now (and returns true: don't show it).
-pub fn scripted_menu(name: &str) -> bool {
-    scripted(|s| s.menus.push(name.to_string())).is_some()
+/// Test mode: notes a menu that would have opened and its items, and gives the item `rmenu:` chose, if any. None:
+/// not test mode.
+pub fn scripted_menu(name: &str, items: &[super::commands::Item]) -> Option<Option<super::commands::Cmd>> {
+    use super::commands::Item;
+    let label = |l: &str| l.replace('&', "");
+    scripted(|s| {
+        s.menus.push(name.to_string());
+        s.menu_items = items.iter().filter_map(|i| if let Item::Cmd { label: l, .. } = i { Some(label(l)) } else { None }).collect();
+        let pick = s.pick.take()?;
+        items.iter().find_map(|i| match i {
+            Item::Cmd { cmd, label: l, enabled: true, .. } if label(l) == pick => Some(*cmd),
+            _ => None,
+        })
+    })
 }
 
 /// Changes whenever anything is put on the clipboard (by any program).

@@ -55,6 +55,7 @@ Architecture: $arch
 Maintainer: jamesccupps <148652101+jamesccupps@users.noreply.github.com>
 Installed-Size: $size
 Depends: libgtk-4-1 (>= 4.8), libc6 (>= 2.36)
+Recommends: libenchant-2-2, hunspell-en-us | hunspell-dictionary
 Section: editors
 Priority: optional
 Homepage: https://github.com/jamesccupps/Slate

@@ -7,6 +7,7 @@ mod app;
 mod chrome;
 mod print;
 mod session;
+mod spell;
 mod testmode;
 mod view;
 
@@ -1149,6 +1150,14 @@ fn commands() -> Vec<(&'static str, Cmd, &'static [&'static str])> {
         ("filter-lines", Cmd::FilterLines(false), &["<Alt>l"]),
         ("filter-lines-not", Cmd::FilterLines(true), &[]),
         ("clear-highlights", Cmd::ClearHighlights, &[]),
+        ("spell-check", Cmd::SpellCheck, &[]),
+        ("suggest-0", Cmd::Suggestion(0), &[]),
+        ("suggest-1", Cmd::Suggestion(1), &[]),
+        ("suggest-2", Cmd::Suggestion(2), &[]),
+        ("suggest-3", Cmd::Suggestion(3), &[]),
+        ("suggest-4", Cmd::Suggestion(4), &[]),
+        ("add-word", Cmd::AddWord, &[]),
+        ("ignore-word", Cmd::IgnoreWord, &[]),
         ("toggle-bookmark", Cmd::ToggleBookmark, &["<Control>F2"]),
         ("next-bookmark", Cmd::NextBookmark, &["F2"]),
         ("prev-bookmark", Cmd::PrevBookmark, &["<Shift>F2"]),
@@ -1157,7 +1166,7 @@ fn commands() -> Vec<(&'static str, Cmd, &'static [&'static str])> {
 }
 
 /// Menu items that show a check mark: their actions have a true/false state (`Ui::sync_menu`).
-const CHECKED: &[&str] = &["wrap", "line-numbers", "theme-system", "theme-light", "theme-dark", "eol-lf", "eol-crlf", "read-only"];
+const CHECKED: &[&str] = &["wrap", "line-numbers", "spell-check", "theme-system", "theme-light", "theme-dark", "eol-lf", "eol-crlf", "read-only"];
 
 fn actions(ui: &Rc<Ui>) {
     // (in place of the window's own "win" group: menus and shortcuts find these the same way)
@@ -1261,7 +1270,7 @@ fn menu_model(recent: &gio::Menu) -> gio::Menu {
     edit.append_section(None, &section(&[("Time/date", "date-time")]));
     bar.append_submenu(Some("_Edit"), &edit);
     let view = gio::Menu::new();
-    view.append_section(None, &section(&[("Word wrap", "wrap"), ("Line numbers", "line-numbers"), ("Character at the caret", "char-info")]));
+    view.append_section(None, &section(&[("Word wrap", "wrap"), ("Line numbers", "line-numbers"), ("Spell check", "spell-check"), ("Character at the caret", "char-info")]));
     view.append_section(None, &section(&[("Show only matching lines", "filter-lines"), ("Show lines not matching", "filter-lines-not"), ("Clear highlights", "clear-highlights")]));
     view.append_section(None, &section(&[("Zoom in", "zoom-in"), ("Zoom out", "zoom-out"), ("Reset zoom", "zoom-reset")]));
     let theme = section(&[("Use system setting", "theme-system"), ("Light", "theme-light"), ("Dark", "theme-dark")]);
@@ -1882,8 +1891,30 @@ impl Ui {
         self.status_menu.popup();
     }
 
+    /// The spelling part of the text's menu for a word spelled wrong at (`x`, `y`) in the text area: (label, action).
+    pub fn spell_items(&self, x: f64, y: f64) -> Vec<(String, String)> {
+        let g = self.geom();
+        let Some(Some(sugg)) = self.guarded(|a| a.spelling_at(&g, x, y)) else { return Vec::new() };
+        let mut v: Vec<(String, String)> = sugg.iter().enumerate().map(|(i, s)| (s.clone(), format!("suggest-{i}"))).collect();
+        if v.is_empty() {
+            // (an action there isn't: shown greyed out)
+            v.push(("(No suggestions)".into(), "no-suggestions".into()));
+        }
+        v.push(("Add to dictionary".into(), "add-word".into()));
+        v.push(("Ignore".into(), "ignore-word".into()));
+        v
+    }
+
     fn context_menu(&self, x: f64, y: f64) {
         let menu = gio::Menu::new();
+        // a word spelled wrong: what it may have been meant to be, first
+        let gw = self.app.try_borrow().map(|a| self.gutter_width(&a)).unwrap_or(0.0);
+        let spell = self.spell_items(x - gw - PAD, y);
+        if let Some(k) = spell.iter().position(|(_, a)| a == "add-word") {
+            let pairs: Vec<(&str, &str)> = spell.iter().map(|(l, a)| (l.as_str(), a.as_str())).collect();
+            menu.append_section(None, &section(&pairs[..k]));
+            menu.append_section(None, &section(&pairs[k..]));
+        }
         menu.append_section(None, &section(&[("Cut", "cut"), ("Copy", "copy"), ("Paste", "paste")]));
         menu.append_section(None, &section(&[("Select all", "select-all")]));
         let pop = gtk4::PopoverMenu::from_model(Some(&menu));
@@ -2103,6 +2134,7 @@ impl Ui {
         let checks = [
             ("wrap", a.style.wrap),
             ("line-numbers", a.style.line_numbers),
+            ("spell-check", a.settings.spell_check),
             ("theme-system", theme == ThemeMode::System),
             ("theme-light", theme == ThemeMode::Light),
             ("theme-dark", theme == ThemeMode::Dark),
@@ -2195,7 +2227,21 @@ impl Ui {
         };
         let matches = a.visible_matches(top, until.max(top + 1));
         let marks = a.visible_marks(top, until.max(top + 1));
-        a.with_view(&g, |v, cx| v.paint(cx, cr, gw + PAD, focused, caret_on, &matches, &marks));
+        let wrong = a.misspelled(&g, focused);
+        if std::mem::take(&mut a.speller_wanted) {
+            // (made a moment after the window shows, as it takes a while; at once in test mode)
+            if self.test.is_some() {
+                a.make_speller(true);
+                area.queue_draw();
+            } else {
+                glib::timeout_add_local_once(Duration::from_millis(300), || {
+                    if let Some(ui) = get_ui() {
+                        ui.with(|a| a.make_speller(false));
+                    }
+                });
+            }
+        }
+        a.with_view(&g, |v, cx| v.paint(cx, cr, gw + PAD, focused, caret_on, &matches, &marks, &wrong));
         if gw > 0.0 {
             let t = a.theme.clone();
             set_color(cr, t.surface);

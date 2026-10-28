@@ -441,6 +441,11 @@ fn fence_closes(l: &[u8], c: u8, len: usize) -> bool {
     ind <= 3 && run >= len && l[ind + run..].trim_ascii().is_empty()
 }
 
+/// Whether a line lexed from `st` is in a code block (a fence's lines, not the fence itself).
+pub(super) fn markdown_code(st: State) -> bool {
+    st.mode & FENCE_LANG != 0 || st.kind == FENCE
+}
+
 pub(super) fn markdown(t: &[u8], mut st: State, o: &mut Out) -> State {
     let mut start = 0;
     let (mut col0, mut bol) = (st.col0, st.bol);

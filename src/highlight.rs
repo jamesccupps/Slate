@@ -941,6 +941,11 @@ impl Out<'_> {
     }
 }
 
+/// Whether a line of Markdown lexed from `st` is in a code block (spell check passes it by).
+pub fn markdown_code(st: State) -> bool {
+    markup::markdown_code(st)
+}
+
 /// Colors `text` starting in state `st` and returns the state after it. Spans (byte ranges within `text`) go to
 /// `out` when given; without it only the state is worked out (cheaper).
 pub fn lex(lang: Lang, text: &[u8], st: State, out: Option<&mut Vec<Span>>) -> State {

@@ -8,6 +8,7 @@ pub mod editor;
 pub mod findbar;
 pub mod gfx;
 pub mod ime;
+pub mod spell;
 /// (shared with the other platforms; `super::highlight` keeps working here)
 pub use crate::highlight;
 pub use crate::settings;
