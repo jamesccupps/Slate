@@ -2,7 +2,9 @@
 //! text in memory (a selection, or a whole document up to a size limit).
 
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
+use std::hash::{BuildHasher, BuildHasherDefault, Hasher};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LineOp {
@@ -202,46 +204,161 @@ fn sort_lines(lines: &mut Vec<Line>, text: &[u8]) {
     par_sort_by(lines, |a: &Line, b: &Line| line_order(a.of(text), b.of(text)));
 }
 
-/// Sorts `lines` by `cmp`, on several threads for many: runs sorted side by side, then merged. Not stable: an order
-/// that must keep equal items as they were says so itself (CSV's rows compare their places last).
+/// Sorts `lines` by `cmp`, on several threads for many: runs sorted side by side, then merged pairwise, each merge
+/// cut into pieces merged side by side too (the last merge on one thread was a fifth of a sort's time). Not stable:
+/// an order that must keep equal items as they were says so itself (CSV's rows compare their places last).
 pub(crate) fn par_sort_by<T: Copy + Send + Sync>(lines: &mut Vec<T>, cmp: impl Fn(&T, &T) -> Ordering + Copy + Send + Sync) {
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(8);
     if threads < 2 || lines.len() < 200_000 {
         lines.sort_unstable_by(cmp);
         return;
     }
-    let run = lines.len().div_ceil(threads);
+    merge_sort(lines, cmp, threads);
+}
+
+/// `par_sort_by` on `threads` threads.
+fn merge_sort<T: Copy + Send + Sync>(lines: &mut Vec<T>, cmp: impl Fn(&T, &T) -> Ordering + Copy + Send + Sync, threads: usize) {
+    let run = lines.len().div_ceil(threads).max(1);
     std::thread::scope(|s| {
         for part in lines.chunks_mut(run) {
             s.spawn(move || part.sort_unstable_by(cmp));
         }
     });
-    // runs of `width` merged pairwise into runs twice as long, the pairs side by side
+    // runs of `width` merged pairwise into runs twice as long
     let mut from = std::mem::take(lines);
     let mut to = from.clone();
     let mut width = run;
     while width < from.len() {
+        let pieces = (threads / from.len().div_ceil(2 * width)).max(1);
         std::thread::scope(|s| {
-            for (src, dst) in from.chunks(2 * width).zip(to.chunks_mut(2 * width)) {
-                s.spawn(move || {
-                    let (a, b) = src.split_at(width.min(src.len()));
-                    let (mut i, mut j) = (0, 0);
-                    for d in dst.iter_mut() {
-                        *d = if j >= b.len() || (i < a.len() && cmp(&a[i], &b[j]) != Ordering::Greater) {
-                            i += 1;
-                            a[i - 1]
-                        } else {
-                            j += 1;
-                            b[j - 1]
-                        };
-                    }
-                });
+            for (src, mut dst) in from.chunks(2 * width).zip(to.chunks_mut(2 * width)) {
+                let (a, b) = src.split_at(width.min(src.len()));
+                // (cut at even places in `a`, and in `b` before its first item not less than the one there: each piece
+                // then merges into its own part of `dst`, equal items from `a` first as in one merge)
+                let (mut i, mut j) = (0, 0);
+                for k in 1..=pieces {
+                    let (ni, nj) = if k == pieces {
+                        (a.len(), b.len())
+                    } else {
+                        let ni = a.len() * k / pieces;
+                        (ni, b.partition_point(|y| cmp(y, &a[ni]) == Ordering::Less))
+                    };
+                    let (d, rest) = std::mem::take(&mut dst).split_at_mut(ni - i + nj - j);
+                    dst = rest;
+                    let (pa, pb) = (&a[i..ni], &b[j..nj]);
+                    s.spawn(move || merge_into(pa, pb, d, cmp));
+                    (i, j) = (ni, nj);
+                }
             }
         });
         std::mem::swap(&mut from, &mut to);
         width *= 2;
     }
     *lines = from;
+}
+
+/// Merges the sorted `a` and `b` into `dst` (their length together); equal items from `a` first.
+fn merge_into<T: Copy>(a: &[T], b: &[T], dst: &mut [T], cmp: impl Fn(&T, &T) -> Ordering) {
+    let (mut i, mut j) = (0, 0);
+    for d in dst.iter_mut() {
+        *d = if j >= b.len() || (i < a.len() && cmp(&a[i], &b[j]) != Ordering::Greater) {
+            i += 1;
+            a[i - 1]
+        } else {
+            j += 1;
+            b[j - 1]
+        };
+    }
+}
+
+/// Takes out the lines that are the same as one before them (Remove duplicate lines). Many lines on several threads:
+/// each line's hash worked out side by side, then each line goes to one of the threads' tables by its hash (so the
+/// same lines meet in one) and the tables are filled side by side: one table for millions of lines was held up by
+/// memory, not by the hashing.
+fn dedupe(lines: &mut Vec<Line>, text: &[u8]) {
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(8);
+    if threads < 2 || lines.len() < 200_000 {
+        // (sized for every line at once: growing it as it goes took a fifth longer on millions of lines)
+        let mut seen = HashSet::with_capacity(lines.len());
+        lines.retain(|l| seen.insert(l.of(text)));
+        return;
+    }
+    let keep = dedupe_marks(lines, text, threads);
+    let mut k = keep.iter();
+    lines.retain(|_| k.next() == Some(&true));
+}
+
+/// Which `lines` to keep (not the same as one before), on `threads` threads.
+fn dedupe_marks(lines: &[Line], text: &[u8], threads: usize) -> Vec<bool> {
+    let state = std::hash::RandomState::new();
+    let mut hashes = vec![0u64; lines.len()];
+    let chunk = lines.len().div_ceil(threads).max(1);
+    std::thread::scope(|s| {
+        for (ls, hs) in lines.chunks(chunk).zip(hashes.chunks_mut(chunk)) {
+            let state = &state;
+            s.spawn(move || {
+                for (l, h) in ls.iter().zip(hs) {
+                    *h = state.hash_one(l.of(text));
+                }
+            });
+        }
+    });
+    let hashes = &hashes;
+    let dups: Vec<Vec<u32>> = std::thread::scope(|s| {
+        let tables: Vec<_> = (0..threads)
+            .map(|t| {
+                s.spawn(move || {
+                    // a line's hash and its first line (the table takes bits of the hash this choice of table doesn't
+                    // use); a line whose hash is a different line's (rare) goes in `others`
+                    let mut first: HashMap<u64, u32, BuildHasherDefault<Passed>> =
+                        HashMap::with_capacity_and_hasher(lines.len() / threads + lines.len() / threads / 8, Default::default());
+                    let mut others: HashSet<&[u8]> = HashSet::new();
+                    let mut dup = Vec::new();
+                    for (i, &h) in hashes.iter().enumerate() {
+                        if (h >> 40) as usize % threads != t {
+                            continue;
+                        }
+                        let line = lines[i].of(text);
+                        let same = match first.entry(h) {
+                            Entry::Vacant(v) => {
+                                v.insert(i as u32);
+                                false
+                            }
+                            Entry::Occupied(o) => lines[*o.get() as usize].of(text) == line || !others.insert(line),
+                        };
+                        if same {
+                            dup.push(i as u32);
+                        }
+                    }
+                    dup
+                })
+            })
+            .collect();
+        tables.into_iter().map(|h| h.join().unwrap_or_else(|e| std::panic::resume_unwind(e))).collect()
+    });
+    let mut keep = vec![true; lines.len()];
+    for &i in dups.iter().flatten() {
+        keep[i as usize] = false;
+    }
+    keep
+}
+
+/// A hasher for keys that are a hash already.
+#[derive(Default)]
+struct Passed(u64);
+
+impl Hasher for Passed {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0 ^ b as u64).wrapping_mul(0x100_0000_01B3);
+        }
+    }
+    fn write_u64(&mut self, n: u64) {
+        self.0 = n;
+    }
 }
 
 /// Runs `op` over `text` (whole lines). Returns the new text and how many lines were sorted, removed or changed.
@@ -296,9 +413,7 @@ pub fn apply_to(op: LineOp, text: &[u8], out: &mut dyn FnMut(&[u8]) -> std::io::
             }
         }
         LineOp::Dedupe => {
-            // (sized for every line at once: growing it as it goes took a fifth longer on millions of lines)
-            let mut seen = HashSet::with_capacity(lines.len());
-            lines.retain(|l| seen.insert(l.of(text)));
+            dedupe(&mut lines, text);
             count = before - lines.len() as u64;
         }
         LineOp::RemoveBlank => {
@@ -522,6 +637,49 @@ mod tests {
         assert!(run(LineOp::SortDesc, &text).0 == desc.join("\n") + "\n");
         // already in order: nothing to do
         assert_eq!(run(LineOp::SortAsc, &want).1, 0);
+    }
+
+    #[test]
+    fn merging_in_pieces_and_tables_side_by_side_are_the_same() {
+        // runs merged in pieces cut at equal items too (few values), on any number of threads; the same for the
+        // tables Remove duplicates fills side by side
+        let mut r = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = || {
+            r ^= r << 13;
+            r ^= r >> 7;
+            r ^= r << 17;
+            r
+        };
+        for len in [0, 1, 7, 100, 1001, 5000] {
+            let items: Vec<(u32, u32)> = (0..len).map(|i| ((next() % 13) as u32, i)).collect();
+            for threads in 2..=8 {
+                let mut got = items.clone();
+                merge_sort(&mut got, |a: &(u32, u32), b: &(u32, u32)| a.0.cmp(&b.0), threads);
+                assert!(got.windows(2).all(|w| w[0].0 <= w[1].0), "{len} items on {threads} threads");
+                let (mut x, mut y) = (got.clone(), items.clone());
+                x.sort_unstable_by_key(|p| p.1);
+                y.sort_unstable_by_key(|p| p.1);
+                assert!(x == y, "{len} items on {threads} threads: the same items");
+            }
+        }
+        let words = ["a", "b", "", " ", "é", "a ", "B", "ab"];
+        let mut text = Vec::new();
+        for _ in 0..3000 {
+            text.extend_from_slice(words[(next() % 8) as usize].as_bytes());
+            text.extend_from_slice(words[(next() % 8) as usize].as_bytes());
+            text.push(b'\n');
+        }
+        let mut lines = Vec::new();
+        let mut start = 0;
+        for nl in memchr::memchr_iter(b'\n', &text) {
+            lines.push(Line(start as u32, (nl - start) as u32));
+            start = nl + 1;
+        }
+        let mut seen = HashSet::new();
+        let want: Vec<bool> = lines.iter().map(|l| seen.insert(l.of(&text))).collect();
+        for threads in 2..=8 {
+            assert!(dedupe_marks(&lines, &text, threads) == want, "{threads} threads");
+        }
     }
 
     #[test]

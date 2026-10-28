@@ -109,10 +109,13 @@ struct BlockCache {
 enum Store {
     Mem(Box<[u8]>),
     /// `opened`: the file's stamp and identity through `file` when this source was made. `bulk`: a second handle on
-    /// it, opened when first needed (None if it couldn't be: `file` does).
+    /// it, opened when first needed (None if it couldn't be: `file` does); `bulk_busy` while a read uses it, and
+    /// `spare`: more such handles, for reads on other threads meanwhile (`bulk_read`).
     File {
         file: File,
         bulk: OnceLock<Option<File>>,
+        bulk_busy: AtomicBool,
+        spare: Mutex<Vec<File>>,
         cache: Mutex<BlockCache>,
         path: PathBuf,
         kind: SourceKind,
@@ -433,7 +436,7 @@ impl Source {
         let indexed = index.as_ref().is_some_and(|i| i.complete);
         let opened = stamp_of(&file);
         let cache = Mutex::new(BlockCache { map: HashMap::new(), tick: 0 });
-        let store = Store::File { file, bulk: OnceLock::new(), cache, path, kind, opened };
+        let store = Store::File { file, bulk: OnceLock::new(), bulk_busy: AtomicBool::new(false), spare: Mutex::new(Vec::new()), cache, path, kind, opened };
         let s = Source::new(store, len, index.unwrap_or_else(NlIndex::empty));
         if indexed && kind == SourceKind::File {
             *s.fingerprint.lock().unwrap() = s.take_fingerprint(s.len);
@@ -640,6 +643,24 @@ impl Source {
         bulk.get_or_init(|| os::reopen(file)).as_ref().unwrap_or(file)
     }
 
+    /// `file_read` of a big range through the bulk handle; while another thread's read has it (Count all reads its
+    /// parts side by side), through a handle of its own, kept for next time: Windows runs one handle's reads one
+    /// after the other, so they'd wait for each other.
+    fn bulk_read(&self, off: u64, buf: &mut [u8]) -> bool {
+        let Store::File { file, bulk_busy, spare, .. } = &self.store else { unreachable!() };
+        if bulk_busy.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+            let ok = self.file_read(self.bulk(), off, buf);
+            bulk_busy.store(false, Ordering::Release);
+            return ok;
+        }
+        let Some(h) = spare.lock().unwrap().pop().or_else(|| os::reopen(file)) else {
+            return self.file_read(self.bulk(), off, buf);
+        };
+        let ok = self.file_read(&h, off, buf);
+        spare.lock().unwrap().push(h);
+        ok
+    }
+
     /// Reads `buf.len()` bytes at `off`; missing bytes become zeros and count as a read error. Returns whether
     /// everything was read.
     fn file_read(&self, file: &File, off: u64, buf: &mut [u8]) -> bool {
@@ -720,7 +741,7 @@ impl Source {
                     let mut pos = start;
                     while pos < end {
                         let n = ((end - pos) as usize).min(buf.len());
-                        self.file_read(self.bulk(), pos, &mut buf[..n]);
+                        self.bulk_read(pos, &mut buf[..n]);
                         if !f(&buf[..n]) {
                             return false;
                         }
@@ -749,7 +770,7 @@ impl Source {
                 } else {
                     let old = out.len();
                     out.resize(old + (end - start) as usize, 0);
-                    self.file_read(self.bulk(), start, &mut out[old..]);
+                    self.bulk_read(start, &mut out[old..]);
                 }
             }
         }
@@ -769,7 +790,7 @@ impl Source {
                         true
                     });
                 } else {
-                    self.file_read(self.bulk(), start, dst);
+                    self.bulk_read(start, dst);
                 }
             }
         }
