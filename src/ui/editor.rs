@@ -58,6 +58,9 @@ pub struct SegLayout {
     /// Where the colors start (UTF-16 position, color), when they're given at drawing time rather than set on the
     /// layout (which costs a lot more when the text is packed with them; but a layout drawn whole needs them on it).
     pub colors: Vec<(u32, u32)>,
+    /// Where the text an input method is composing starts (UTF-16), in the caret's segment while it does (`map` gives
+    /// its units the caret's byte, so everything after it maps as before).
+    pub composing: Option<u32>,
 }
 
 /// A UTF-16 unit of a character that may show as a color glyph: emoji (all outside the BMP, the symbols and dingbats
@@ -384,6 +387,10 @@ pub struct View {
     pub bookmarks: Vec<u64>,
     /// Find in selection: the part of the text the find bar searches (drawn faintly); it follows edits (`sync`).
     pub scope: Option<(u64, u64)>,
+    /// Text an input method is composing, shown at the caret (`set_composing`).
+    pub composing: Option<Composing>,
+    /// The caret's segment laid out with it (by everything its layout depends on).
+    composed: Option<(u64, Rc<SegLayout>)>,
 }
 
 impl Default for View {
@@ -418,6 +425,8 @@ impl View {
             ws_clusters: Vec::new(),
             bookmarks: Vec::new(),
             scope: None,
+            composing: None,
+            composed: None,
         }
     }
 
@@ -438,6 +447,7 @@ impl View {
     /// Forgets cached layouts (font, theme or wrap changed).
     pub fn clear_cache(&mut self) {
         self.cache.clear();
+        self.composed = None;
         self.cache_bytes = 0;
         self.ws_clusters.clear();
         self.max_top = None;
@@ -544,6 +554,23 @@ impl View {
         bytes.hash(&mut h);
         (width, cx.style.generation, cx.lang as u8, st, whole_line).hash(&mut h);
         let key = h.finish();
+        // (the caret's segment while an input method composes: with the composition in it, kept apart)
+        if let Some(c) = self.composing.clone() {
+            let caret = self.sel.caret;
+            if seg.start <= caret && caret <= seg.end && self.segment_at(cx.doc, caret).start == seg.start {
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                (key, caret, &c.text).hash(&mut h);
+                let ckey = h.finish();
+                if let Some((k, lay)) = &self.composed {
+                    if *k == ckey {
+                        return lay.clone();
+                    }
+                }
+                let lay = Rc::new(self.build_layout(cx, &bytes, st, whole_line, Some((caret - seg.start, &c.text))));
+                self.composed = Some((ckey, lay.clone()));
+                return lay;
+            }
+        }
         self.tick += 1;
         if let Some(e) = self.cache.get_mut(&key) {
             if e.bytes == bytes {
@@ -551,7 +578,7 @@ impl View {
                 return e.layout.clone();
             }
         }
-        let lay = Rc::new(self.build_layout(cx, &bytes, st, whole_line));
+        let lay = Rc::new(self.build_layout(cx, &bytes, st, whole_line, None));
         if !cx.g.has_target() {
             // No render target yet (colors need its brushes): use this layout once, don't keep it.
             return lay;
@@ -571,10 +598,18 @@ impl View {
         lay
     }
 
-    fn build_layout(&mut self, cx: &Ctx, bytes: &[u8], st: HlState, whole_line: bool) -> SegLayout {
+    /// `comp`: text an input method is composing, put in at that byte (`SegLayout::composing`).
+    fn build_layout(&mut self, cx: &Ctx, bytes: &[u8], st: HlState, whole_line: bool, comp: Option<(u64, &str)>) -> SegLayout {
         let mut u = Vec::with_capacity(bytes.len());
         let mut map = Vec::with_capacity(bytes.len() + 1);
         text::decode_display(bytes, &mut u, &mut map);
+        let composing = comp.map(|(rel, s)| {
+            let k = map.partition_point(|&m| (m as u64) < rel);
+            let ins: Vec<u16> = s.encode_utf16().collect();
+            map.splice(k..k, std::iter::repeat_n(rel as u32, ins.len()));
+            u.splice(k..k, ins);
+            k as u32
+        });
         let (fmt, max_w) = if cx.style.wrap {
             (&cx.style.format_wrap, cx.geom.text_w.max(cx.style.char_w * 8.0))
         } else {
@@ -622,7 +657,7 @@ impl View {
         }
         let colors = if plain { colors_of(cx.theme, &spans, &map, total) } else { Vec::new() };
         self.spans = spans;
-        SegLayout { parts, map, rows, width: tm.widthIncludingTrailingWhitespace, plain, colors }
+        SegLayout { parts, map, rows, width: tm.widthIncludingTrailingWhitespace, plain, colors, composing }
     }
 
     // ---- rows ----
@@ -806,8 +841,50 @@ impl View {
         (seg, lay, row, x)
     }
 
-    /// Caret position in client DIPs (top-left of the caret), if it's on screen.
+    /// The text an input method composes at the caret (None: it's done); the rows are laid out again with it.
+    pub fn set_composing(&mut self, c: Option<Composing>) {
+        if self.composing != c {
+            self.composing = c;
+            self.composed = None;
+            self.rows.clear();
+        }
+    }
+
+    /// The caret's segment laid out with the composition in it, and where the composition starts there (UTF-16).
+    fn composing_place(&mut self, cx: &Ctx) -> Option<(Seg, Rc<SegLayout>, u32)> {
+        self.composing.as_ref()?;
+        let seg = self.segment_at(cx.doc, self.sel.caret);
+        let lay = self.layout_of(cx, &seg);
+        let k = lay.composing?;
+        Some((seg, lay, k))
+    }
+
+    /// Where byte `b` of the composition is: client DIPs of its left edge and its row's top, if that row is shown.
+    fn composing_point_at(&mut self, cx: &Ctx, b: usize) -> Option<(f32, f32)> {
+        if self.rows.is_empty() {
+            self.layout_rows(cx);
+        }
+        let (seg, lay, k) = self.composing_place(cx)?;
+        let text = &self.composing.as_ref()?.text;
+        let u = k + text.get(..b).unwrap_or(text).encode_utf16().count() as u32;
+        let row = lay.row_of_u16(u);
+        let vr = self.rows.iter().find(|r| r.seg.start == seg.start && r.row == row)?;
+        Some((cx.geom.text_x - self.scroll_x + lay.x_of(u, false), vr.y))
+    }
+
+    /// Where an input method's candidates go: under the clause it's converting, else at its cursor (client DIPs, the
+    /// row's top).
+    pub fn composing_point(&mut self, cx: &Ctx) -> Option<(f32, f32)> {
+        let b = self.composing.as_ref()?.anchor();
+        self.composing_point_at(cx, b)
+    }
+
+    /// Caret position in client DIPs (top-left of the caret), if it's on screen; while an input method composes, in
+    /// the composition, at its cursor.
     pub fn caret_point(&mut self, cx: &Ctx) -> Option<(f32, f32)> {
+        if let Some(b) = self.composing.as_ref().map(|c| c.cursor) {
+            return self.composing_point_at(cx, b);
+        }
         let (seg, lay, row, x) = self.caret_place(cx, self.sel.caret, self.upstream);
         let rs = seg.start + lay.row_bytes(row).0;
         let vr = self.rows.iter().find(|r| r.start == rs && r.seg.start == seg.start)?;
@@ -1173,8 +1250,33 @@ impl View {
             self.ws_clusters.clear();
         }
 
-        // Caret: a thin bar, or a bar under the character typing replaces.
-        if focused && caret_on {
+        // Text an input method is composing: its clauses underlined, the one being converted thicker, and the caret
+        // at its cursor.
+        if let (Some(c), Some((seg, _, k))) = (self.composing.clone(), self.composing_place(cx)) {
+            let at = |b: usize| k + c.text.get(..b).unwrap_or(&c.text).encode_utf16().count() as u32;
+            let px = 1.0 / (g.dpi / 96.0);
+            for &(a, b, target) in &c.clauses {
+                let (ua, ub) = (at(a), at(b));
+                let h = if target { (2.0 * px).max((row_h * 0.08 / px).round() * px) } else { px };
+                for vr in self.rows.iter().filter(|r| r.seg.start == seg.start) {
+                    let (rs, re) = vr.lay.rows[vr.row];
+                    let (s, e) = (ua.max(rs), ub.min(re));
+                    if s >= e {
+                        continue;
+                    }
+                    for (x, w) in vr.lay.range_x(vr.row, s, e) {
+                        g.fill(Rect::new(ox + x + px, vr.y + row_h - h - px, (w - 2.0 * px).max(px), h), t.text);
+                    }
+                }
+            }
+            if focused && caret_on {
+                if let Some((x, y)) = self.composing_point_at(cx, c.cursor) {
+                    let w = (1.5f32 * g.dpi / 96.0).round() / (g.dpi / 96.0);
+                    g.fill(Rect::new(x.round() - 0.5, y, w.max(1.0), row_h), t.caret);
+                }
+            }
+        } else if focused && caret_on {
+            // Caret: a thin bar, or a bar under the character typing replaces.
             if let Some(r) = self.rows.iter().find(|r| r.start == caret_row_start && r.seg.start == caret_place.0.start) {
                 let x = ox + caret_place.3;
                 let y = r.y;

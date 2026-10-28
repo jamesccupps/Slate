@@ -1291,6 +1291,40 @@ impl App {
         }
     }
 
+    // ---- input methods ----
+
+    /// An input method starts composing (its "preedit"): from now on what it composes shows at the caret, and a
+    /// selection goes, as typing over it would take it. Where the text can't be typed in, the reason shows instead.
+    pub fn ime_start(&mut self) {
+        if !self.editable() {
+            return;
+        }
+        let tab = &mut self.tabs[self.active];
+        if tab.view.block.is_none() && !tab.view.sel.is_empty() {
+            tab.view.sel = edit::replace_selection(&mut tab.doc, tab.view.sel, b"", EditKind::Other);
+            self.after_edit(true);
+        }
+        self.tabs[self.active].view.set_composing(Some(edit::Composing::default()));
+    }
+
+    /// What the input method composes now (what it chooses comes as typed text: `insert_text`).
+    pub fn ime_preedit(&mut self, c: edit::Composing) {
+        if self.tab().view.composing.is_none() && !c.text.is_empty() {
+            self.ime_start();
+        }
+        let v = &mut self.tabs[self.active].view;
+        if v.composing.is_some() {
+            v.set_composing(Some(c));
+        }
+    }
+
+    /// The input method is done composing.
+    pub fn ime_end(&mut self) {
+        for t in &mut self.tabs {
+            t.view.set_composing(None);
+        }
+    }
+
     pub fn insert_text(&mut self, text: &str) {
         if text.is_empty() || !self.editable() {
             return;

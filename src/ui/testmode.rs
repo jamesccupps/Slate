@@ -21,7 +21,11 @@
 //! sees the pointer; `down:<x>,<y>,right` or `,middle` for the others), `leave` (WM_MOUSELEAVE), `wheelraw:<delta>`
 //! or `wheelraw:ctrl,<delta>` (one WM_MOUSEWHEEL over the text, or with `@<x>,<y>` over that point; touchpads send
 //! small deltas), `char:<hex>[,<hex>…]` (WM_CHAR
-//! through the window procedure, e.g. `char:d83d,de00`), `ime` (WM_IME_COMPOSITION, as typing in an IME), `altkey`
+//! through the window procedure, e.g. `char:d83d,de00`), `ime` (WM_IME_COMPOSITION, as typing in an IME), `imemsg:`
+//! (an input method's messages through the window procedure, with what it would have: `start`, `comp|<text>|<cursor>|
+//! <attributes, a digit per UTF-16 unit>|<clause starts, comma between>`, `result|<text>`, `end`; `print:composing`),
+//! `clickraw:<x>,<y>` (a left click's messages through the window procedure, in client pixels; `click:` calls the
+//! App directly), `altkey`
 //! (Alt pressed and released alone: WM_SYSCOMMAND SC_KEYMENU), `altgr:on|off` (pretend Ctrl+Alt+letter types a
 //! character, like AltGr on a Polish keyboard), `activate` / `deactivate` (WM_ACTIVATE), `cancelmode`
 //! (WM_CANCELMODE: something took the mouse capture), `timer:<id>` (run a timer's tick now; 3 = disk check, 4 = drag
@@ -647,6 +651,14 @@ fn describe(cell: &Cell, what: &str) -> String {
             .unwrap_or_default(),
         "window" => (unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindow(a.hwnd) }.as_bool()).to_string(),
         "saving" => a.tabs.iter().filter(|t| t.save.is_some()).count().to_string(),
+        // what an input method is composing: `<text>|<cursor, bytes>|<clauses: start-end, * converting>`, or `none`
+        "composing" => match &a.tab().view.composing {
+            Some(c) => {
+                let cl: Vec<String> = c.clauses.iter().map(|&(s, e, t)| format!("{s}-{e}{}", if t { "*" } else { "" })).collect();
+                format!("{}|{}|{}", c.text, c.cursor, cl.join(","))
+            }
+            None => "none".into(),
+        },
         // the printer the preview lays its pages out for while none was chosen: Windows' default one
         "printer" => match super::print::Last::default().printer(a.hwnd) {
             Some(p) => {
@@ -1215,6 +1227,42 @@ pub fn run(args: &[String]) -> i32 {
                 unsafe { SendMessageW(hwnd, WM_SYSCOMMAND, WPARAM(SC_KEYMENU as usize), LPARAM(0)) };
             }
             "altgr" => super::commands::FORCED_ALTGR.with(|f| f.set(arg == "on")),
+            // a left click as the window gets one: its messages through the window procedure (`<x>,<y>` client pixels)
+            "clickraw" => {
+                use windows::Win32::Foundation::{LPARAM, WPARAM};
+                use windows::Win32::UI::WindowsAndMessaging::{SendMessageW, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE};
+                let (x, y) = arg.split_once(',').map(|(x, y)| (x.trim().parse().unwrap_or(0), y.trim().parse().unwrap_or(0))).unwrap_or((0, 0));
+                let lp = LPARAM((((y as u32 & 0xFFFF) << 16) | (x as u32 & 0xFFFF)) as isize);
+                for (m, w) in [(WM_MOUSEMOVE, 0), (WM_LBUTTONDOWN, 1), (WM_LBUTTONUP, 0)] {
+                    unsafe { SendMessageW(hwnd, m, WPARAM(w), lp) };
+                }
+                drain_pending(&cell);
+            }
+            "imemsg" => {
+                use windows::Win32::Foundation::{LPARAM, WPARAM};
+                use windows::Win32::UI::Input::Ime::{GCS_COMPATTR, GCS_COMPCLAUSE, GCS_COMPSTR, GCS_CURSORPOS, GCS_RESULTSTR};
+                use windows::Win32::UI::WindowsAndMessaging::{SendMessageW, WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_STARTCOMPOSITION};
+                let mut p = arg.split('|');
+                let (msg, lp) = match p.next().unwrap_or_default() {
+                    "start" => (WM_IME_STARTCOMPOSITION, 0),
+                    "comp" => {
+                        let comp: Vec<u16> = p.next().unwrap_or_default().encode_utf16().collect();
+                        let cursor = p.next().and_then(|c| c.parse().ok()).unwrap_or(comp.len() as u32);
+                        let attrs = p.next().unwrap_or_default().bytes().map(|b| b.wrapping_sub(b'0')).collect();
+                        let clauses = p.next().unwrap_or_default().split(',').filter_map(|c| c.parse().ok()).collect();
+                        let raw = super::ime::Raw { comp, attrs, clauses, cursor, result: Vec::new() };
+                        super::ime::FAKE.with(|f| *f.borrow_mut() = Some(raw));
+                        (WM_IME_COMPOSITION, (GCS_COMPSTR.0 | GCS_COMPATTR.0 | GCS_COMPCLAUSE.0 | GCS_CURSORPOS.0) as isize)
+                    }
+                    "result" => {
+                        let result = p.next().unwrap_or_default().encode_utf16().collect();
+                        super::ime::FAKE.with(|f| *f.borrow_mut() = Some(super::ime::Raw { result, ..Default::default() }));
+                        (WM_IME_COMPOSITION, GCS_RESULTSTR.0 as isize)
+                    }
+                    _ => (WM_IME_ENDCOMPOSITION, 0),
+                };
+                unsafe { SendMessageW(hwnd, msg, WPARAM(0), LPARAM(lp)) };
+            }
             "contrast" => {
                 use windows::Win32::Foundation::{LPARAM, WPARAM};
                 use windows::Win32::UI::WindowsAndMessaging::{SPI_SETHIGHCONTRAST, SendMessageW, WM_SETTINGCHANGE};

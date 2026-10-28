@@ -9,7 +9,8 @@
 //! `find:<text>`, `replace:<text>`, `goto:<line>`, `answer:save,dont,cancel` (or a path for Open and Save as),
 //! `lang:<name>`, `set:wrap=true` (also `line_numbers`, `font_size`), `wait:<ms>`, `jobs` (wait for background
 //! work), `shot:<file.png>`, `print:<what>` (`text`, `sel`, `status`, `title`, `tabs`, `lang`, `asked`,
-//! `clipboard`, `find`, `dirty`, `top`, `session`: the session folder's files, `notice`), `expect:<what>=<value>`,
+//! `clipboard`, `find`, `dirty`, `top`, `session`: the session folder's files, `notice`, `composing`),
+//! `imemsg:start|pre|<text>|<cursor>|<clauses>|commit|<text>|end` (an input method), `expect:<what>=<value>`,
 //! `t:<label>` (a timing mark), `persist`, `session:save|soon|restore` (`soon`: on another thread, as the timer
 //! does), `printpdf:<file>[|selection]` (the tab printed into a PDF file, no dialog), `quit`.
 
@@ -21,7 +22,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use gtk4::prelude::*;
-use gtk4::{gdk, gio, glib, graphene};
+use gtk4::{gdk, gio, glib, graphene, pango};
 
 use super::app::Cmd;
 use super::{commands, get_ui, session, window};
@@ -215,6 +216,35 @@ async fn script(lines: Vec<String>, test: Rc<Test>) -> i32 {
                 }
             }
             "up" => ui.release_for_test(arg == "ctrl"),
+            // an input method: `start`, `commit|<text>` and `end` are its signals, sent to the window's input method
+            // context; `pre|<text>|<cursor>|<clauses>` (`edit::Composing::parse`) what it composes, as GTK gives it:
+            // an underline, and a background on the clause being converted
+            "imemsg" => {
+                let mut p = arg.splitn(2, '|');
+                match p.next().unwrap_or_default() {
+                    "start" => ui.im.emit_by_name::<()>("preedit-start", &[]),
+                    "commit" => ui.im.emit_by_name::<()>("commit", &[&p.next().unwrap_or_default()]),
+                    "pre" => {
+                        let c = crate::edit::Composing::parse(p.next().unwrap_or_default());
+                        let attrs = pango::AttrList::new();
+                        for &(s, e, target) in &c.clauses {
+                            let mut u = pango::AttrInt::new_underline(pango::Underline::Single);
+                            u.set_start_index(s as u32);
+                            u.set_end_index(e as u32);
+                            attrs.insert(u);
+                            if target {
+                                let mut b = pango::AttrColor::new_background(0x8000, 0x8000, 0x8000);
+                                b.set_start_index(s as u32);
+                                b.set_end_index(e as u32);
+                                attrs.insert(b);
+                            }
+                        }
+                        let cursor = c.text[..c.cursor].chars().count() as i32;
+                        ui.preedit(super::view::composing_of(&c.text, &attrs, cursor));
+                    }
+                    _ => ui.im.emit_by_name::<()>("preedit-end", &[]),
+                }
+            }
             "findkey" | "replacekey" => match combo(arg) {
                 Some((k, m, _)) => {
                     if !ui.entry_key_for_test(op == "findkey", k, m) {
@@ -388,6 +418,14 @@ fn value(what: &str, test: &Test) -> String {
     match what {
         "text" => String::from_utf8_lossy(&tab.doc.read(0, tab.doc.len().min(1 << 20))).into_owned(),
         "sel" => format!("{}..{}", tab.view.sel.anchor, tab.view.sel.caret),
+        // what an input method is composing: `<text>|<cursor, bytes>|<clauses: start-end, * converting>`, or `none`
+        "composing" => match &tab.view.composing {
+            Some(c) => {
+                let cl: Vec<String> = c.clauses.iter().map(|&(s, e, t)| format!("{s}-{e}{}", if t { "*" } else { "" })).collect();
+                format!("{}|{}|{}", c.text, c.cursor, cl.join(","))
+            }
+            None => "none".into(),
+        },
         "status" => super::chrome::status_texts(&a).0,
         "statusbar" => {
             let (l, r, _) = super::chrome::status_texts(&a);

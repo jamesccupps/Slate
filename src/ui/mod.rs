@@ -7,6 +7,7 @@ pub mod crash;
 pub mod editor;
 pub mod findbar;
 pub mod gfx;
+pub mod ime;
 /// (shared with the other platforms; `super::highlight` keeps working here)
 pub use crate::highlight;
 pub use crate::settings;
@@ -41,9 +42,7 @@ use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1D
 use windows::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{CreateMutexW, GetCurrentProcessId};
-use windows::Win32::UI::Input::Ime::{
-    CFS_POINT, COMPOSITIONFORM, ImmGetContext, ImmReleaseContext, ImmSetCompositionFontW, ImmSetCompositionWindow,
-};
+use windows::Win32::UI::Input::Ime::ISC_SHOWUICOMPOSITIONWINDOW;
 use windows::Win32::UI::Shell::{DragAcceptFiles, DragFinish, DragQueryFileW, HDROP};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, w};
@@ -259,6 +258,17 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
 
 /// Paints, always ending the paint (or Windows sends WM_PAINT forever). A panic while painting is logged and the
 /// target thrown away, but not shown as a message: showing it would paint again, and fail again.
+/// Tells the input method where its composition is (under the clause it's converting), outside the App's borrow.
+fn place_ime(cell: &Cell, hwnd: HWND) {
+    let at = cell.try_borrow_mut().ok().and_then(|mut a| {
+        let (x, y) = a.with_view(|v, cx| v.composing_point(cx).or_else(|| v.caret_point(cx)))?;
+        Some((a.dip_to_px(x), a.dip_to_px(y), a.dip_to_px(a.style.row_h), a.settings.font.clone()))
+    });
+    if let Some((x, y, h, font)) = at {
+        ime::place(hwnd, x, y, h, &font);
+    }
+}
+
 fn on_paint(cell: &Cell, hwnd: HWND) {
     use std::sync::atomic::{AtomicU32, Ordering};
     static FAILS: AtomicU32 = AtomicU32::new(0);
@@ -286,6 +296,14 @@ fn on_paint(cell: &Cell, hwnd: HWND) {
 }
 
 fn handle(cell: &Cell, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
+    // A click ends what an input method is composing first: what shows is typed where the caret is, before the click
+    // moves it. (Keys are the input method's: one may end a composition itself, its result still on the way.)
+    if matches!(msg, WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN) && cell.try_borrow().is_ok_and(|a| a.tab().view.composing.is_some()) {
+        let had = cell.try_borrow_mut().is_ok_and(|mut a| a.ime_finish());
+        if had {
+            ime::cancel(hwnd);
+        }
+    }
     match msg {
         WM_PAINT => {
             on_paint(cell, hwnd);
@@ -624,34 +642,35 @@ fn handle(cell: &Cell, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<L
             win::set_focus(if back { saved } else { hwnd });
             Some(LRESULT(0))
         }
-        WM_IME_STARTCOMPOSITION => {
-            if let Ok(mut a) = cell.try_borrow_mut() {
-                a.wake_caret();
-                let p = a.with_view(|v, cx| v.caret_point(cx));
-                if let Some((x, y)) = p {
-                    let (px, py) = (a.dip_to_px(x), a.dip_to_px(y));
-                    let font_px = a.dip_to_px(a.style.row_h * 0.8);
-                    unsafe {
-                        let himc = ImmGetContext(hwnd);
-                        let cf = COMPOSITIONFORM { dwStyle: CFS_POINT, ptCurrentPos: POINT { x: px, y: py }, rcArea: RECT::default() };
-                        let _ = ImmSetCompositionWindow(himc, &cf);
-                        let mut lf = windows::Win32::Graphics::Gdi::LOGFONTW { lfHeight: -font_px, ..Default::default() };
-                        for (i, c) in a.settings.font.encode_utf16().take(31).enumerate() {
-                            lf.lfFaceName[i] = c;
-                        }
-                        let _ = ImmSetCompositionFontW(himc, &lf);
-                        let _ = ImmReleaseContext(hwnd, himc);
-                    }
-                }
-            }
-            None
+        // Input methods (`ime`): Slate draws the composition in the text, so Windows' composition window stays hidden.
+        WM_IME_SETCONTEXT => {
+            let lp = if wp.0 != 0 { LPARAM(lp.0 & !(ISC_SHOWUICOMPOSITIONWINDOW as isize)) } else { lp };
+            Some(unsafe { DefWindowProcW(hwnd, msg, wp, lp) })
         }
-        WM_IME_COMPOSITION | WM_IME_ENDCOMPOSITION => {
-            // (typing in the IME: the caret blinks again, as for any key)
-            if let Ok(mut a) = cell.try_borrow_mut() {
-                a.wake_caret();
+        WM_IME_STARTCOMPOSITION => {
+            let started = cell.try_borrow_mut().is_ok_and(|mut a| a.ime_start());
+            if started {
+                place_ime(cell, hwnd);
+            } else {
+                ime::cancel(hwnd);
             }
-            None
+            // (not on to DefWindowProc, which would show Windows' composition window)
+            Some(LRESULT(0))
+        }
+        WM_IME_COMPOSITION => {
+            let (result, comp) = ime::read(hwnd, lp);
+            if let Ok(mut a) = cell.try_borrow_mut() {
+                a.ime_composition(result.as_deref(), comp);
+            }
+            place_ime(cell, hwnd);
+            // (the result was typed: DefWindowProc would send it again as WM_IME_CHAR)
+            Some(LRESULT(0))
+        }
+        WM_IME_ENDCOMPOSITION => {
+            if let Ok(mut a) = cell.try_borrow_mut() {
+                a.ime_end();
+            }
+            Some(LRESULT(0))
         }
         WM_MENUSELECT => {
             let top = actions::TOP_MENU.with(|t| t.get());

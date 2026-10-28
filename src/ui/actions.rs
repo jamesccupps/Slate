@@ -3,7 +3,7 @@
 //! App methods never open modal UI (menus, dialogs) because they run while the App is borrowed; they queue a
 //! `Deferred` instead, which `run` performs after the borrow ends.
 
-use crate::edit::{Sink, convert_eol, lines_done, nothing_to_clean};
+use crate::edit::{Composing, Sink, convert_eol, lines_done, nothing_to_clean};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -2252,6 +2252,58 @@ impl App {
             editor::replace_selection(&mut tab.doc, sel, s.as_bytes(), EditKind::Typing)
         };
         self.after_edit();
+    }
+
+    // ---- input methods (`ime`) ----
+
+    /// An input method starts composing: from now on what it composes shows at the caret, and a selection goes, as
+    /// typing over it would take it. False when the text can't be typed in (the reason shows): it's dropped.
+    pub fn ime_start(&mut self) -> bool {
+        if !self.editable() {
+            return false;
+        }
+        let tab = self.tab_mut();
+        if tab.view.block.is_none() && !tab.view.sel.is_empty() {
+            tab.view.sel = editor::replace_selection(&mut tab.doc, tab.view.sel, b"", EditKind::Other);
+            self.after_edit();
+        }
+        self.tab_mut().view.set_composing(Some(Composing::default()));
+        self.wake_caret();
+        self.invalidate();
+        true
+    }
+
+    /// What the input method has now: a `result` to type (as keys type it), and what it's composing.
+    pub fn ime_composition(&mut self, result: Option<&str>, comp: Composing) {
+        let composing = self.tab().view.composing.is_some();
+        if let Some(r) = result {
+            self.tab_mut().view.set_composing(None);
+            self.type_text(r);
+        }
+        // (only while one shows here: not after `ime_finish` typed it)
+        if composing {
+            self.tab_mut().view.set_composing(Some(comp));
+        }
+        self.wake_caret();
+        self.invalidate();
+    }
+
+    /// The input method is done (what it chose was typed already).
+    pub fn ime_end(&mut self) {
+        for t in &mut self.tabs {
+            t.view.set_composing(None);
+        }
+        self.invalidate();
+    }
+
+    /// Ends a composition by typing what shows of it (before a click moves the caret). True when there was one: the
+    /// input method's own copy is to be dropped then (`ime::cancel`).
+    pub fn ime_finish(&mut self) -> bool {
+        let Some(c) = self.tab().view.composing.clone() else { return false };
+        self.tab_mut().view.set_composing(None);
+        self.type_text(&c.text);
+        self.invalidate();
+        true
     }
 
     pub fn on_char(&mut self, c: u16) {

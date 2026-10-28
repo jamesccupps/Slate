@@ -788,6 +788,23 @@ fn connect(ui: &Rc<Ui>, prev: &gtk4::Button, next: &gtk4::Button, lines_btn: &gt
             ui.with(|a| a.insert_text(&s));
         }
     });
+    // what an input method composes shows in the text at the caret (`View::composing`)
+    ui.im.connect_preedit_start(|_| {
+        if let Some(ui) = get_ui() {
+            ui.with(|a| a.ime_start());
+        }
+    });
+    ui.im.connect_preedit_changed(|im| {
+        if let Some(ui) = get_ui() {
+            let (text, attrs, cursor) = im.preedit_string();
+            ui.preedit(view::composing_of(&text, &attrs, cursor));
+        }
+    });
+    ui.im.connect_preedit_end(|_| {
+        if let Some(ui) = get_ui() {
+            ui.with(|a| a.ime_end());
+        }
+    });
     let focus = gtk4::EventControllerFocus::new();
     focus.connect_enter(|_| {
         if let Some(ui) = get_ui() {
@@ -1605,7 +1622,19 @@ impl Ui {
         handled
     }
 
+    /// What the input method composes now (its preedit, or test mode's).
+    pub fn preedit(&self, c: crate::edit::Composing) {
+        self.touch();
+        self.with(|a| a.ime_preedit(c));
+    }
+
     fn text_pressed(&self, button: u32, n: i32, x: f64, y: f64, shift: bool, alt: bool) {
+        // A click ends a composition first, where the caret is (as in GTK's own text view: the input method commits
+        // it or drops it); what still shows of it then goes.
+        if self.app.try_borrow().is_ok_and(|a| a.tab().view.composing.is_some()) {
+            self.im.reset();
+            self.with(|a| a.ime_end());
+        }
         self.touch();
         self.text.grab_focus();
         let g = self.geom();

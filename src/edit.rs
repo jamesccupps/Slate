@@ -363,6 +363,48 @@ pub fn text_lines(doc: &Document) -> Option<u64> {
     Some(if len > 0 && doc.byte_at(len - 1) == Some(b'\n') { n - 1 } else { n })
 }
 
+// ---- input methods ----
+
+/// Text an input method is composing (Chinese, Japanese, Korean…), shown in the text at the caret until it's typed
+/// or dropped. It's never in the document meanwhile: no undo step, nothing for the session, searches or screen
+/// readers.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Composing {
+    pub text: String,
+    /// Its clauses: `[start, end)` in `text` (bytes), and whether it's the one being converted (a thicker line).
+    pub clauses: Vec<(usize, usize, bool)>,
+    /// Where the input method's cursor is in `text` (bytes).
+    pub cursor: usize,
+}
+
+impl Composing {
+    /// Test mode: `<text>|<cursor>|<clauses>`, the cursor and the clauses' ends in characters, the clauses as
+    /// `<end>` or `<end>*` (the one being converted), comma between (`にほんご|4|2*,4`). Without clauses, one.
+    pub fn parse(s: &str) -> Composing {
+        let mut p = s.split('|');
+        let text = p.next().unwrap_or_default().to_string();
+        let byte = |chars: usize| text.char_indices().nth(chars).map_or(text.len(), |(i, _)| i);
+        let cursor = byte(p.next().and_then(|c| c.parse().ok()).unwrap_or(usize::MAX));
+        let mut clauses = Vec::new();
+        let mut start = 0;
+        for c in p.next().unwrap_or_default().split(',').filter(|c| !c.is_empty()) {
+            let end = byte(c.trim_end_matches('*').parse().unwrap_or(usize::MAX));
+            clauses.push((start, end, c.ends_with('*')));
+            start = end;
+        }
+        if clauses.is_empty() && !text.is_empty() {
+            clauses.push((0, text.len(), false));
+        }
+        Composing { text, clauses, cursor }
+    }
+
+    /// Where the input method's list of candidates goes: under the clause being converted, else at the cursor
+    /// (bytes in `text`).
+    pub fn anchor(&self) -> usize {
+        self.clauses.iter().find(|c| c.2).map_or(self.cursor, |c| c.0)
+    }
+}
+
 // ---- column selection ----
 
 /// A column selection (Alt+drag, Shift+Alt+arrows): the lines from `anchor`'s to `caret`'s (each a line and a column),

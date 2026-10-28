@@ -97,6 +97,9 @@ pub struct Lay {
     /// The colored display ranges `[a, b)` (sorted, never crossing) and their colors.
     pub colors: Vec<(u32, u32, u32)>,
     bytes: usize,
+    /// Where the text an input method is composing starts (display index), in the caret's segment while it does
+    /// (`map` gives its bytes the caret's byte, so everything after it maps as before).
+    pub composing: Option<i32>,
 }
 
 impl Lay {
@@ -233,12 +236,39 @@ pub struct View {
     /// Each segment's cache key, for one version of the document (no reading and hashing it every frame).
     keys: HashMap<(u64, u64), u64>,
     keys_version: u64,
+    /// Text an input method is composing, shown at the caret (`set_composing`).
+    pub composing: Option<edit::Composing>,
+    /// The caret's segment laid out with it (by everything its layout depends on).
+    composed: Option<(u64, Rc<Lay>)>,
 }
 
 impl Default for View {
     fn default() -> Self {
         View::new()
     }
+}
+
+/// What an input method composes, from GTK's preedit: its text, its attributes (a clause where they change; one with a
+/// background, which input methods use to mark the clause being converted, is that one) and the cursor (characters).
+pub fn composing_of(text: &str, attrs: &pango::AttrList, cursor: i32) -> edit::Composing {
+    let n = text.len() as i32;
+    let mut clauses = Vec::new();
+    let mut it = attrs.iterator();
+    loop {
+        let (a, b) = it.range();
+        let (a, b) = (a.clamp(0, n), b.clamp(0, n));
+        if b > a && text.is_char_boundary(a as usize) && text.is_char_boundary(b as usize) {
+            clauses.push((a as usize, b as usize, it.get(pango::AttrType::Background).is_some()));
+        }
+        if !it.next_style_change() {
+            break;
+        }
+    }
+    if clauses.is_empty() && n > 0 {
+        clauses.push((0, n as usize, false));
+    }
+    let cursor = text.char_indices().nth(cursor.max(0) as usize).map_or(text.len(), |(i, _)| i);
+    edit::Composing { text: text.to_string(), clauses, cursor }
 }
 
 /// A color 0xAARRGGBB for cairo.
@@ -317,6 +347,8 @@ impl View {
             keys_version: u64::MAX,
             bookmarks: Vec::new(),
             scope: None,
+            composing: None,
+            composed: None,
         }
     }
 
@@ -350,6 +382,7 @@ impl View {
     /// Forgets the laid out text (another font, theme or language).
     pub fn clear_cache(&mut self) {
         self.cache.clear();
+        self.composed = None;
         self.keys.clear();
         self.cache_bytes = 0;
         self.hl.reset();
@@ -439,6 +472,25 @@ impl View {
             self.keys.clear();
             self.keys_version = cx.doc.version;
         }
+        // (the caret's segment while an input method composes: with the composition in it, kept apart)
+        if let Some(c) = self.composing.clone() {
+            let caret = self.sel.caret;
+            if seg.start <= caret && caret <= seg.end && self.segment_at(cx.doc, caret).start == seg.start {
+                let st = self.hl_state(cx, seg);
+                let bytes = cx.doc.read(seg.start, seg.end);
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                (&bytes, st, seg.line_start, cx.lang, shape, caret, &c.text).hash(&mut h);
+                let ckey = h.finish();
+                if let Some((k, lay)) = &self.composed {
+                    if *k == ckey {
+                        return lay.clone();
+                    }
+                }
+                let lay = Rc::new(self.build(cx, &bytes, st, seg.line_start, Some((caret - seg.start, &c.text))));
+                self.composed = Some((ckey, lay.clone()));
+                return lay;
+            }
+        }
         self.tick += 1;
         if let Some(e) = self.keys.get(&(seg.start, seg.end)).and_then(|k| self.cache.get_mut(k)) {
             e.used = self.tick;
@@ -457,7 +509,7 @@ impl View {
             e.used = self.tick;
             return e.lay.clone();
         }
-        let lay = Rc::new(self.build(cx, &bytes, st, seg.line_start));
+        let lay = Rc::new(self.build(cx, &bytes, st, seg.line_start, None));
         self.cache_bytes += lay.bytes;
         if self.cache.len() >= CACHE_MAX || self.cache_bytes > CACHE_BYTES {
             // the oldest half goes (never what's on screen: those were used since)
@@ -472,8 +524,15 @@ impl View {
         lay
     }
 
-    fn build(&mut self, cx: &Ctx, bytes: &[u8], st: HlState, line_start: bool) -> Lay {
-        let (text, map) = display_text(bytes);
+    /// `comp`: text an input method is composing, put in at that byte (`Lay::composing`).
+    fn build(&mut self, cx: &Ctx, bytes: &[u8], st: HlState, line_start: bool, comp: Option<(u64, &str)>) -> Lay {
+        let (mut text, mut map) = display_text(bytes);
+        let composing = comp.map(|(rel, s)| {
+            let k = map.partition_point(|&m| (m as u64) < rel);
+            text.insert_str(k, s);
+            map.splice(k..k, std::iter::repeat_n(rel as u32, s.len()));
+            k as i32
+        });
         let layout = pango::Layout::new(cx.pango);
         layout.set_font_description(Some(&cx.style.font));
         let tab_px = (cx.style.tab_size.max(1) as f64 * cx.style.char_w).round() as i32;
@@ -534,7 +593,7 @@ impl View {
             }
         }
         let bytes_kept = text.len() * 6 + map.len() * 4 + colors.len() * 12 + 256;
-        Lay { layout, map, line_y, colors, bytes: bytes_kept }
+        Lay { layout, map, line_y, colors, bytes: bytes_kept, composing }
     }
 
     // ---- rows ----
@@ -662,8 +721,31 @@ impl View {
         (seg, lay, line, x)
     }
 
-    /// The caret's rectangle in the text area (None when it isn't on screen).
+    /// The text an input method composes at the caret (None: it's done).
+    pub fn set_composing(&mut self, c: Option<edit::Composing>) {
+        if self.composing != c {
+            self.composing = c;
+            self.composed = None;
+        }
+    }
+
+    /// Where byte `b` of the composition is in the text area: (x, the row's y), if that row is shown.
+    pub fn composing_point(&mut self, cx: &Ctx, b: usize) -> Option<(f64, f64)> {
+        self.composing.as_ref()?;
+        let seg = self.segment_at(cx.doc, self.sel.caret);
+        let lay = self.layout_of(cx, &seg);
+        let i = lay.composing? + b as i32;
+        let line = lay.line_of(i, false);
+        let r = self.rows.iter().find(|r| r.seg.start == seg.start && r.line == line)?;
+        Some((lay.x_of(i) - self.scroll_x, r.y))
+    }
+
+    /// The caret's rectangle in the text area (None when it isn't on screen): for an input method, under the clause
+    /// it's converting while it composes.
     pub fn caret_rect(&mut self, cx: &Ctx) -> Option<(f64, f64, f64, f64)> {
+        if let Some(b) = self.composing.as_ref().map(|c| c.anchor()) {
+            return self.composing_point(cx, b).map(|(x, y)| (x, y, 2.0, cx.style.row_h));
+        }
         let pos = self.sel.caret;
         let (seg, _, line, x) = self.caret_place(cx, pos);
         let r = self.rows.iter().find(|r| r.seg.start == seg.start && r.line == line)?;
@@ -953,8 +1035,36 @@ impl View {
                 }
             }
         }
+        // text an input method is composing: its clauses underlined, the one being converted thicker; the caret at
+        // its cursor
+        if let Some(c) = self.composing.clone() {
+            set_color(cr, t.text);
+            for r in rows.iter() {
+                let (Some(k), Some(line)) = (r.lay.composing, r.lay.layout.line_readonly(r.line as i32)) else { continue };
+                let (la, lb) = r.lay.line_range(r.line);
+                for &(a, b, target) in &c.clauses {
+                    let (s, e) = ((k + a as i32).max(la), (k + b as i32).min(lb));
+                    if s >= e {
+                        continue;
+                    }
+                    let h = if target { (row_h * 0.08).round().max(2.0) } else { 1.0 };
+                    for p in line.x_ranges(s, e).chunks(2) {
+                        let (xa, xb) = (p[0] as f64 / pango::SCALE as f64, p[1] as f64 / pango::SCALE as f64);
+                        cr.rectangle(x0 + xa + 1.0, r.y + row_h - h - 1.0, (xb - xa - 2.0).max(1.0), h);
+                    }
+                }
+                let _ = cr.fill();
+                let i = k + c.cursor as i32;
+                if focused && caret_on && r.lay.line_of(i, false) == r.line {
+                    set_color(cr, t.caret);
+                    cr.rectangle((x0 + r.lay.x_of(i)).round(), r.y, 2.0, row_h);
+                    let _ = cr.fill();
+                    set_color(cr, t.text);
+                }
+            }
+        }
         // the caret
-        if focused && caret_on {
+        if focused && caret_on && self.composing.is_none() {
             for r in rows.iter() {
                 let (la, lb) = r.lay.line_range(r.line);
                 let (a, b) = (r.seg.start + r.lay.rel(la), r.seg.start + r.lay.rel(lb));
@@ -1064,6 +1174,25 @@ mod tests {
         assert_eq!(*map.last().unwrap(), 9);
         let i = text.find('d').unwrap();
         assert_eq!(map[i], 6);
+    }
+
+    #[test]
+    fn preedit_attributes_become_clauses() {
+        // an underline over all of it, a background on the clause being converted
+        let attrs = pango::AttrList::new();
+        let mut u = pango::AttrInt::new_underline(pango::Underline::Single);
+        u.set_start_index(0);
+        u.set_end_index(12);
+        attrs.insert(u);
+        let mut b = pango::AttrColor::new_background(0, 0, 0);
+        b.set_start_index(6);
+        b.set_end_index(12);
+        attrs.insert(b);
+        let c = composing_of("にほんご", &attrs, 2);
+        assert_eq!((c.clauses, c.cursor), (vec![(0, 6, false), (6, 12, true)], 6));
+        // no attributes: one clause; a cursor past the end is at the end
+        let c = composing_of("ab", &pango::AttrList::new(), 9);
+        assert_eq!((c.clauses, c.cursor), (vec![(0, 2, false)], 2));
     }
 
     #[test]
