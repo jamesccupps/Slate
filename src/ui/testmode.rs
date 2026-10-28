@@ -503,6 +503,10 @@ fn crc32(data: &[u8], mut c: u32) -> u32 {
     c
 }
 
+fn preview_png(path: &Path, w: i32, h: i32, bgra: &[u8]) -> Result<(), String> {
+    write_png(path, w as u32, h as u32, bgra).map_err(|e| e.to_string())
+}
+
 /// A minimal PNG writer (RGB, uncompressed deflate blocks).
 fn write_png(path: &Path, w: u32, h: u32, bgra: &[u8]) -> std::io::Result<()> {
     let mut raw = Vec::with_capacity(((w * 3 + 1) * h) as usize);
@@ -643,6 +647,14 @@ fn describe(cell: &Cell, what: &str) -> String {
             .unwrap_or_default(),
         "window" => (unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindow(a.hwnd) }.as_bool()).to_string(),
         "saving" => a.tabs.iter().filter(|t| t.save.is_some()).count().to_string(),
+        // the printer the preview lays its pages out for while none was chosen: Windows' default one
+        "printer" => match super::print::Last::default().printer(a.hwnd) {
+            Some(p) => {
+                p.discard();
+                "default".into()
+            }
+            None => "none".into(),
+        },
         "busy" => {
             // what `jobs` waits for
             let mut v = Vec::new();
@@ -1227,13 +1239,29 @@ pub fn run(args: &[String]) -> i32 {
                 };
                 unsafe { SendMessageW(hwnd, m, WPARAM(w), LPARAM(0)) };
             }
-            // the print preview of the tab, page `n` (from 1), into a picture: `previewshot:<png>|<n>[|width]` (laid
+            // File → Print preview run for real, its window hidden, doing `steps` (| between; `preview::Script`)
+            "previewrun" => {
+                let steps = arg.split('|').filter(|s| !s.is_empty()).map(String::from).collect();
+                super::preview::SCRIPT.with(|s| *s.borrow_mut() = Some(super::preview::Script { steps, out: String::new(), shot: preview_png }));
+                super::actions::run_cmd(&cell, super::commands::Cmd::PrintPreview);
+                drain_pending(&cell);
+                let script = super::preview::SCRIPT.with(|s| s.borrow_mut().take());
+                if let Some(s) = script {
+                    out.push_str(&s.out);
+                    if !s.steps.is_empty() {
+                        out.push_str(&format!("previewrun: {} steps not done (the preview closed or never opened)\n", s.steps.len()));
+                        failures += 1;
+                    }
+                }
+            }
+            // the print preview of the tab, page `n` (from 1), into a picture: `previewshot:<png>|<n>[|width|noprinter]` (laid
             // out for Microsoft Print to PDF)
             "previewshot" => {
                 let mut parts = arg.split('|');
                 let file = parts.next().unwrap_or_default();
                 let page: usize = parts.next().and_then(|n| n.parse().ok()).unwrap_or(1);
-                let width = parts.next() == Some("width");
+                let opt = parts.next();
+                let width = opt == Some("width");
                 let made = {
                     let mut a = cell.borrow_mut();
                     let i = a.active;
@@ -1242,7 +1270,8 @@ pub fn run(args: &[String]) -> i32 {
                     let source = super::preview::Source { snap, from: 0, to, line: 1, line_start: 0, lang: a.tabs[i].lang };
                     let style = super::actions::print_style(&a.settings, &a.tabs[i], to);
                     let theme = a.theme.clone();
-                    match super::print::Printer::pdf() {
+                    // (`noprinter`: as the window shows when there's none)
+                    match (opt == Some("noprinter")).then_some(None).or_else(|| super::print::Printer::pdf().map(Some)) {
                         Some(p) => super::preview::picture(p, &source, style, theme, page, width, 900, 1100),
                         None => Err("no Microsoft Print to PDF printer".into()),
                     }

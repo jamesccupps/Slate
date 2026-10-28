@@ -307,9 +307,12 @@ lighter one on dark), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate`, `$
     of a millimetre, 3/4 inch unless changed, or the printer's own margin where it's wider). Print preview on
     Windows is `ui/preview.rs`: a modal window of its own (GDI, the theme's colors; the main window waits, its
     timers and jobs going on) playing back the pages as metafiles made for the printer chosen last or the default one
-    (`print::Pages`, `Last::printer`: so what shows is what prints), laid out on a job's thread; its bar has the
-    options, Page setup (PageSetupDlgW: paper and orientation kept in `Last` while Slate runs, the margins in the
-    settings) and Print (on to `print_tab`). On Linux it's GTK's (`PrintOperationAction::Preview`: the desktop's
+    (`print::Pages`, `Last::printer`: so what shows is what prints; the default one through PrintDlgEx's
+    PD_RETURNDEFAULT, which wants PD_NOPAGENUMS too, else "the parameter is incorrect": 0.14's try build found no
+    printer on any PC, and crashed drawing that message, as DrawTextW reads an empty slice's placeholder pointer),
+    laid out on a job's thread; its bar has the options, Page setup (PageSetupDlgW: paper and orientation kept in
+    `Last` while Slate runs, the margins in the settings) and Print (on to `print_tab`); the window is never
+    narrower than its bar (`min_width`: narrower, Page setup slid under Print and Close). On Linux it's GTK's (`PrintOperationAction::Preview`: the desktop's
     previewer), and File → Page setup GTK's dialog (`print_run_page_setup_dialog_async`, kept while Slate runs).
   - `job.rs` — background jobs with progress/cancel, notify the UI by posting a window message (on Linux: an idle
     callback on GLib's main loop).
@@ -648,8 +651,11 @@ lighter one on dark), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate`, `$
   as a second start with `--read-only` / `--wait` / `-` does (`waitevent:<name>` makes the event, `print:waits`
   shows the waits and whether it's set), `print:findtext` the find bar's boxes and Find in selection's range,
   `print:rows` the structure panel's rows (`row:<n>` / `rowopen:<n>` click one, or its arrow),
-  `previewshot:<png>|<page>[|width]` the print preview drawn into a picture (laid out for Microsoft Print to PDF;
-  the window itself never shows in this mode, nor does Page setup), `set:print_colors=false` (and
+  `previewshot:<png>|<page>[|width|noprinter]` the print preview drawn into a picture (laid out for Microsoft Print
+  to PDF, or as it shows without a printer), `previewrun:<steps, | between>` File → Print preview run for real
+  with its window hidden (the default printer, the layout's job, the bar's clicks and keys: `preview::Script`; Page
+  setup's dialog is never shown, nor is Print's), `print:printer` (`default` when Windows' default printer is
+  found, as the preview looks for it), `set:print_colors=false` (and
   `print_line_numbers`, `print_header`, `print_margins=l,t,r,b`), `down:`/`move:`/`up:` with `,alt` or `,ctrl`
   held (a column selection, a copy dropped), and
   `contrast:on`

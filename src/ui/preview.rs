@@ -72,6 +72,7 @@ enum Item {
 }
 
 const TIMER_LAYOUT: usize = 1;
+const TIMER_SCRIPT: usize = 2;
 const WM_MOUSELEAVE: u32 = 0x02A3;
 const BAR_H: i32 = 44;
 
@@ -101,6 +102,29 @@ struct State {
 
 thread_local! {
     static STATE: RefCell<Option<State>> = const { RefCell::new(None) };
+    /// Test mode's steps for the window (`previewrun:`), while it runs one.
+    pub static SCRIPT: RefCell<Option<Script>> = const { RefCell::new(None) };
+}
+
+/// Test mode: what to do in the preview window instead of a person (`previewrun:`). The window runs as it does for
+/// real (the printer looked up, the layout's job and timer, the bar's clicks, keys), only never shown: each step
+/// once the layout is done, after a frame drawn as the screen would show it. Steps: `click:<item>` (`next`,
+/// `colors`…; `setup` only notes it, as the dialog is never shown), `key:<left|right|home|end|up|down|esc>`,
+/// `wheel:<delta>`, `size:<w>x<h>` (the window's, as dragging its edge: not under its minimum), `shot:<png>`,
+/// `state`. What they find goes in `out`.
+pub struct Script {
+    pub steps: std::collections::VecDeque<String>,
+    pub out: String,
+    pub shot: fn(&std::path::Path, i32, i32, &[u8]) -> Result<(), String>,
+}
+
+fn note(s: String) {
+    SCRIPT.with(|c| {
+        if let Some(c) = c.borrow_mut().as_mut() {
+            c.out.push_str(&s);
+            c.out.push('\n');
+        }
+    });
 }
 
 fn with<R>(f: impl FnOnce(&mut State) -> R) -> Option<R> {
@@ -122,10 +146,10 @@ impl State {
     /// Lays the text out again (for the printer chosen last, with the style as it is now), on another thread.
     fn relayout(&mut self) {
         self.pages = None;
-        self.job = None;
+        self.drop_job();
         self.error = None;
         let Some(printer) = self.last.printer(self.owner) else {
-            self.error = Some("There's no printer to lay the pages out for. Add one in Windows' Settings.".into());
+            self.error = Some(NO_PRINTER.into());
             return;
         };
         let geo = Geometry::new(printer.0, &self.style);
@@ -148,6 +172,14 @@ impl State {
         self.job = Some((job, printer, geo));
         unsafe {
             SetTimer(self.hwnd, TIMER_LAYOUT, 30, None);
+        }
+    }
+
+    /// Gives up a layout being worked out (the job only uses the shape, never the printer's DC).
+    fn drop_job(&mut self) {
+        if let Some((job, printer, _)) = self.job.take() {
+            drop(job);
+            printer.discard();
         }
     }
 
@@ -257,6 +289,8 @@ impl State {
     }
 }
 
+const NO_PRINTER: &str = "There's no printer to lay the pages out for. Add one in Windows' Settings.";
+
 /// The window's scale (its DPI over 96).
 fn scale(hwnd: HWND) -> f32 {
     let dpi = unsafe { GetDpiForWindow(hwnd) };
@@ -306,6 +340,9 @@ fn icon_font(k: f32) -> HFONT {
 }
 
 fn text_w(dc: HDC, s: &str) -> i32 {
+    if s.is_empty() {
+        return 0;
+    }
     let u: Vec<u16> = s.encode_utf16().collect();
     let mut sz = SIZE::default();
     unsafe {
@@ -337,6 +374,10 @@ fn round(dc: HDC, r: RECT, argb: u32, k: f32) {
 }
 
 fn text_in(dc: HDC, s: &str, r: RECT, argb: u32, flags: DRAW_TEXT_FORMAT) {
+    // (an empty slice's pointer is a placeholder, and DrawTextW reads it even for no characters: an access violation)
+    if s.is_empty() {
+        return;
+    }
     let mut u: Vec<u16> = s.encode_utf16().collect();
     let mut r = r;
     unsafe {
@@ -530,6 +571,10 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
             invalidate(hwnd);
             LRESULT(0)
         }
+        WM_TIMER if wp.0 == TIMER_SCRIPT => {
+            script_step(hwnd);
+            LRESULT(0)
+        }
         WM_SIZE => {
             invalidate(hwnd);
             LRESULT(0)
@@ -623,7 +668,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
             let mmi = lp.0 as *mut MINMAXINFO;
             let k = scale(hwnd);
             unsafe {
-                (*mmi).ptMinTrackSize = POINT { x: (720.0 * k) as i32, y: (400.0 * k) as i32 };
+                (*mmi).ptMinTrackSize = POINT { x: min_width(hwnd, k), y: (400.0 * k) as i32 };
             }
             LRESULT(0)
         }
@@ -643,9 +688,40 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
     }
 }
 
+/// How wide the window must be for the bar's items to fit side by side (narrower, Page setup went under Print and
+/// Close, and a click on Close opened it).
+fn min_width(hwnd: HWND, k: f32) -> i32 {
+    let bar = with(|st| unsafe {
+        let dc = GetDC(hwnd);
+        let font = ui_font(k);
+        let old = SelectObject(dc, font);
+        // (laid out for a window 0 wide: Print and Close then reach left of 0 by the room they take)
+        let items = place_items(st, dc, 0, k);
+        SelectObject(dc, old);
+        let _ = DeleteObject(font);
+        ReleaseDC(hwnd, dc);
+        let right = |i: &Item| matches!(i, Item::Print | Item::Close);
+        let left_end = items.iter().filter(|(i, _)| !right(i)).map(|(_, r)| r.right).max().unwrap_or(0);
+        let right_room = items.iter().filter(|(i, _)| right(i)).map(|(_, r)| -r.left).max().unwrap_or(0);
+        left_end + right_room + (12.0 * k) as i32
+    });
+    let (mut wr, mut cr) = (RECT::default(), RECT::default());
+    unsafe {
+        let _ = GetWindowRect(hwnd, &mut wr);
+        let _ = GetClientRect(hwnd, &mut cr);
+    }
+    let frame = (wr.right - wr.left) - (cr.right - cr.left);
+    (bar.unwrap_or(0) + frame).max((720.0 * k) as i32)
+}
+
 /// Does what `item` is for (outside the state's borrow: Page setup shows a dialog).
 fn act(item: Item) {
     if item == Item::Setup {
+        // (test mode never shows a dialog)
+        if super::win::SCRIPTED.with(|s| s.borrow_mut().as_mut().map(|s| s.asked.push("Page setup".into())).is_some()) {
+            note("Page setup: its dialog isn't shown in test mode".into());
+            return;
+        }
         let Some((hwnd, mut last, mut m)) = with(|st| (st.hwnd, std::mem::take(&mut st.last), st.style.margins)) else { return };
         let ok = last.page_setup(hwnd, &mut m);
         with(|st| {
@@ -733,8 +809,19 @@ pub fn run(owner: HWND, title: &str, source: Source, style: Style, last: Last, t
             })
         });
         with(|st| st.relayout());
+        // (wide enough for the bar, on screens whose scaling makes it wider than the window's usual share)
+        let need = min_width(hwnd, scale(hwnd)).min(wa.right - wa.left);
+        if need > w {
+            let x = wa.left + (wa.right - wa.left - need) / 2;
+            let _ = SetWindowPos(hwnd, None, x, y, need, h, SWP_NOZORDER | SWP_NOACTIVATE);
+        }
         let _ = EnableWindow(owner, false);
-        let _ = ShowWindow(hwnd, SW_SHOW);
+        let scripted = SCRIPT.with(|s| s.borrow().is_some());
+        if scripted {
+            SetTimer(hwnd, TIMER_SCRIPT, 10, None);
+        } else {
+            let _ = ShowWindow(hwnd, SW_SHOW);
+        }
         let mut msg = MSG::default();
         loop {
             if with(|st| st.done).unwrap_or(true) {
@@ -750,11 +837,14 @@ pub fn run(owner: HWND, title: &str, source: Source, style: Style, last: Last, t
         }
         // (the main window gets the keyboard back before this one goes, so it doesn't drop behind other windows)
         let _ = EnableWindow(owner, true);
-        let _ = SetForegroundWindow(owner);
+        if !scripted {
+            let _ = SetForegroundWindow(owner);
+        }
         let _ = DestroyWindow(hwnd);
         let st = STATE.with(|s| s.borrow_mut().take());
         match st {
-            Some(st) => {
+            Some(mut st) => {
+                st.drop_job();
                 let changed = st.changed.then(|| st.style.clone());
                 (st.outcome, st.last, changed)
             }
@@ -763,19 +853,26 @@ pub fn run(owner: HWND, title: &str, source: Source, style: Style, last: Last, t
     }
 }
 
-/// Test mode: the preview of `source` laid out for `printer` (Microsoft Print to PDF), page `page` (from 1) drawn
-/// into a `w` by `h` picture (BGRA, top row first), with Page width on or off. Also the page count.
-pub fn picture(printer: Printer, source: &Source, style: Style, theme: Theme, page: usize, width: bool, w: i32, h: i32) -> Result<(Vec<u8>, usize), String> {
-    let geo = Geometry::new(printer.0, &style);
-    let state = print::state_at(&source.snap, source.lang, source.line_start, source.from);
-    let text = print::Text { snap: &source.snap, from: source.from, to: source.to, line: source.line, lang: source.lang, state };
-    let rows = match print::layout(&text, geo.shape(&style), &mut |_| true) {
-        Ok(Some(rows)) => rows,
-        Ok(None) => return Err("stopped".into()),
-        Err(TooMany) => return Err(super::print::too_many()),
+/// Test mode: the preview of `source` laid out for `printer` (Microsoft Print to PDF; None: as the window shows
+/// without one), page `page` (from 1) drawn into a `w` by `h` picture (BGRA, top row first), with Page width on or
+/// off. Also the page count.
+pub fn picture(printer: Option<Printer>, source: &Source, style: Style, theme: Theme, page: usize, width: bool, w: i32, h: i32) -> Result<(Vec<u8>, usize), String> {
+    let pages = match printer {
+        Some(printer) => {
+            let geo = Geometry::new(printer.0, &style);
+            let state = print::state_at(&source.snap, source.lang, source.line_start, source.from);
+            let text = print::Text { snap: &source.snap, from: source.from, to: source.to, line: source.line, lang: source.lang, state };
+            let rows = match print::layout(&text, geo.shape(&style), &mut |_| true) {
+                Ok(Some(rows)) => rows,
+                Ok(None) => return Err("stopped".into()),
+                Err(TooMany) => return Err(super::print::too_many()),
+            };
+            Some(Pages::new(printer, geo, style.clone(), rows))
+        }
+        None => None,
     };
-    let pages = Pages::new(printer, geo, style.clone(), rows);
-    let count = pages.count();
+    let count = pages.as_ref().map_or(0, |p| p.count());
+    let error = pages.is_none().then(|| NO_PRINTER.to_string());
     let mut st = State {
         hwnd: HWND::default(),
         owner: HWND::default(),
@@ -783,10 +880,10 @@ pub fn picture(printer: Printer, source: &Source, style: Style, theme: Theme, pa
         style,
         source: Source { snap: source.snap.clone(), ..*source },
         notify: std::sync::Arc::new(|| {}),
-        pages: Some(pages),
+        pages,
         job: None,
-        error: None,
-        page: page.saturating_sub(1).min(count - 1),
+        error,
+        page: page.saturating_sub(1).min(count.saturating_sub(1)),
         width,
         scroll: 0,
         items: Vec::new(),
@@ -797,6 +894,11 @@ pub fn picture(printer: Printer, source: &Source, style: Style, theme: Theme, pa
         done: false,
         changed: false,
     };
+    Ok((frame(&mut st, w, h, 1.0)?, count))
+}
+
+/// The window's client area as `st` draws it, `w` by `h` at scale `k`, into a picture (BGRA, top row first).
+fn frame(st: &mut State, w: i32, h: i32, k: f32) -> Result<Vec<u8>, String> {
     unsafe {
         let screen = GetDC(None);
         let mem = CreateCompatibleDC(screen);
@@ -815,13 +917,100 @@ pub fn picture(printer: Printer, source: &Source, style: Style, theme: Theme, pa
         let mut bits = std::ptr::null_mut();
         let dib = CreateDIBSection(mem, &bmi, DIB_RGB_COLORS, &mut bits, None, 0).map_err(|e| e.to_string())?;
         let old = SelectObject(mem, dib);
-        paint(&mut st, mem, w, h, 1.0);
+        paint(st, mem, w, h, k);
         let _ = GdiFlush();
         let out = std::slice::from_raw_parts(bits as *const u8, (w * h * 4) as usize).to_vec();
         SelectObject(mem, old);
         let _ = DeleteObject(dib);
         let _ = DeleteDC(mem);
         ReleaseDC(None, screen);
-        Ok((out, count))
+        Ok(out)
+    }
+}
+
+/// Test mode: the script's next step (`Script`), once the layout is done.
+fn script_step(hwnd: HWND) {
+    let (w, h) = client(hwnd);
+    let k = scale(hwnd);
+    // (a frame first, as the screen shows one before anything's clicked: it places the bar's items)
+    let Some(Some(pic)) = with(|st| if st.job.is_some() { None } else { Some(frame(st, w, h, k)) }) else { return };
+    let Some(step) = SCRIPT.with(|s| s.borrow_mut().as_mut().and_then(|s| s.steps.pop_front())) else {
+        note("preview still open at the script's end: closed".into());
+        with(|st| st.done = true);
+        return;
+    };
+    let (op, arg) = step.split_once(':').unwrap_or((&step, ""));
+    let send = |msg: u32, wp: usize, lp: isize| unsafe { SendMessageW(hwnd, msg, WPARAM(wp), LPARAM(lp)) };
+    match op {
+        "click" => {
+            let at = with(|st| st.items.iter().find(|(i, _)| format!("{i:?}").eq_ignore_ascii_case(arg)).map(|(_, r)| *r)).flatten();
+            match at {
+                Some(r) => {
+                    let lp = ((((r.top + r.bottom) / 2) << 16) | (((r.left + r.right) / 2) & 0xFFFF)) as isize;
+                    send(WM_MOUSEMOVE, 0, lp);
+                    send(WM_LBUTTONDOWN, 1, lp);
+                    send(WM_LBUTTONUP, 0, lp);
+                }
+                None => note(format!("click: no item {arg}")),
+            }
+        }
+        "key" => {
+            let vk = match arg {
+                "left" => VK_LEFT,
+                "right" => VK_RIGHT,
+                "home" => VK_HOME,
+                "end" => VK_END,
+                "up" => VK_UP,
+                "down" => VK_DOWN,
+                "pgdn" => VK_NEXT,
+                "pgup" => VK_PRIOR,
+                "esc" => VK_ESCAPE,
+                _ => {
+                    note(format!("key: no key {arg}"));
+                    return;
+                }
+            };
+            send(WM_KEYDOWN, vk.0 as usize, 0);
+        }
+        "wheel" => {
+            let d: i16 = arg.parse().unwrap_or(-120);
+            send(WM_MOUSEWHEEL, (d as u16 as usize) << 16, 0);
+        }
+        "size" => {
+            let (sw, sh) = arg.split_once('x').map_or((800, 600), |(a, b)| (a.parse().unwrap_or(800), b.parse().unwrap_or(600)));
+            // (as far as dragging an edge goes: SetWindowPos itself doesn't keep to WM_GETMINMAXINFO's minimum)
+            let (sw, sh) = (sw.max(min_width(hwnd, k)), sh.max((400.0 * k) as i32));
+            unsafe {
+                let _ = SetWindowPos(hwnd, None, 0, 0, sw, sh, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+            }
+        }
+        "shot" => {
+            let f = SCRIPT.with(|s| s.borrow().as_ref().map(|s| s.shot));
+            let done = match (&pic, f) {
+                (Ok(pic), Some(f)) => f(std::path::Path::new(arg), w, h, pic),
+                (Err(e), _) => Err(e.clone()),
+                (_, None) => Ok(()),
+            };
+            if let Err(e) = done {
+                note(format!("shot {arg}: {e}"));
+            }
+        }
+        "state" => {
+            let s = with(|st| {
+                let items: Vec<String> = st.items.iter().filter(|(i, _)| !st.enabled(*i)).map(|(i, _)| format!("{i:?}")).collect();
+                format!(
+                    "{} | width {} colors {} numbers {} header {} | off: {} | error: {}",
+                    st.label(Item::Count),
+                    st.width,
+                    st.style.colors,
+                    st.style.numbers,
+                    st.style.header,
+                    if items.is_empty() { "none".into() } else { items.join(" ") },
+                    st.error.as_deref().unwrap_or("none")
+                )
+            });
+            note(format!("state: {}", s.unwrap_or_default()));
+        }
+        _ => note(format!("unknown step {step}")),
     }
 }

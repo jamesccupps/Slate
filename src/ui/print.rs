@@ -76,7 +76,8 @@ impl Last {
             let mut pd = PRINTDLGEXW {
                 lStructSize: std::mem::size_of::<PRINTDLGEXW>() as u32,
                 hwndOwner: owner,
-                Flags: PD_RETURNDEFAULT,
+                // (without page ranges to fill in: else "the parameter is incorrect")
+                Flags: PD_RETURNDEFAULT | PD_NOPAGENUMS,
                 nStartPage: START_PAGE_GENERAL,
                 ..Default::default()
             };

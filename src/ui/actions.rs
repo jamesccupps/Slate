@@ -5308,8 +5308,9 @@ fn preview_tab(cell: &Cell) {
         cell.borrow_mut().flash("Print preview works once the file's lines are counted (a moment).", true);
         return;
     }
-    // (test mode never shows it: `previewshot:` draws it into a picture)
-    if super::win::SCRIPTED.with(|s| s.borrow_mut().as_mut().map(|s| s.asked.push("Print preview".into())).is_some()) {
+    // (test mode never shows it: `previewshot:` draws it into a picture, `previewrun:` runs it hidden)
+    let hidden = super::preview::SCRIPT.with(|s| s.borrow().is_some());
+    if super::win::SCRIPTED.with(|s| s.borrow_mut().as_mut().map(|s| s.asked.push("Print preview".into())).is_some()) && !hidden {
         return;
     }
     let (title, source, style, theme, notify, last) = {
@@ -5354,6 +5355,10 @@ fn print_tab(cell: &Cell) {
     }
     if !counted {
         cell.borrow_mut().flash("Print works once the file's lines are counted (a moment).", true);
+        return;
+    }
+    // (test mode never shows the dialog)
+    if super::win::SCRIPTED.with(|s| s.borrow_mut().as_mut().map(|s| s.asked.push("Print".into())).is_some()) {
         return;
     }
     let Some(choice) = ({
