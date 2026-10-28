@@ -13,6 +13,7 @@ pub use crate::settings;
 pub use crate::theme;
 pub mod install;
 pub mod jumplist;
+pub mod preview;
 pub mod print;
 pub mod prompt;
 pub mod session;

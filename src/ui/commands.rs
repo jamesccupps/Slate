@@ -24,6 +24,8 @@ pub enum Cmd {
     SaveAll,
     /// File → Print… (the system's print dialog).
     Print,
+    /// File → Print preview… (`preview`).
+    PrintPreview,
     Reload,
     RevealFile,
     CopyPath,

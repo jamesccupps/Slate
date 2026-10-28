@@ -195,6 +195,7 @@ fn cmd_of(name: &str) -> Option<Cmd> {
         "SaveAll" => Cmd::SaveAll,
         "CloseTab" => Cmd::CloseTab,
         "Exit" => Cmd::Exit,
+        "PrintPreview" => Cmd::PrintPreview,
         "CheckUpdates" => Cmd::CheckUpdates,
         "Undo" => Cmd::Undo,
         "Redo" => Cmd::Redo,
@@ -897,6 +898,15 @@ pub fn run(args: &[String]) -> i32 {
                     "restore_session" => a.settings.restore_session = v == "true",
                     "show_whitespace" => a.settings.show_whitespace = v == "true",
                     "font" => a.settings.font = v.to_string(),
+                    "print_colors" => a.settings.print_colors = v == "true",
+                    "print_line_numbers" => a.settings.print_line_numbers = v == "true",
+                    "print_header" => a.settings.print_header = v == "true",
+                    // (hundredths of a millimetre: left,top,right,bottom)
+                    "print_margins" => {
+                        if let [l, t, r, b] = v.split(',').filter_map(|x| x.trim().parse().ok()).collect::<Vec<u32>>()[..] {
+                            a.settings.print_margins = [l, t, r, b];
+                        }
+                    }
                     _ => {}
                 }
                 a.rebuild_style();
@@ -1206,6 +1216,40 @@ pub fn run(args: &[String]) -> i32 {
                     _ => (WM_CANCELMODE, 0),
                 };
                 unsafe { SendMessageW(hwnd, m, WPARAM(w), LPARAM(0)) };
+            }
+            // the print preview of the tab, page `n` (from 1), into a picture: `previewshot:<png>|<n>[|width]` (laid
+            // out for Microsoft Print to PDF)
+            "previewshot" => {
+                let mut parts = arg.split('|');
+                let file = parts.next().unwrap_or_default();
+                let page: usize = parts.next().and_then(|n| n.parse().ok()).unwrap_or(1);
+                let width = parts.next() == Some("width");
+                let made = {
+                    let mut a = cell.borrow_mut();
+                    let i = a.active;
+                    let snap = a.tabs[i].doc.snapshot();
+                    let to = snap.len();
+                    let source = super::preview::Source { snap, from: 0, to, line: 1, line_start: 0, lang: a.tabs[i].lang };
+                    let style = super::actions::print_style(&a.settings, &a.tabs[i], to);
+                    let theme = a.theme.clone();
+                    match super::print::Printer::pdf() {
+                        Some(p) => super::preview::picture(p, &source, style, theme, page, width, 900, 1100),
+                        None => Err("no Microsoft Print to PDF printer".into()),
+                    }
+                };
+                match made {
+                    Ok((bgra, pages)) => {
+                        out.push_str(&format!("preview: {pages} pages\n"));
+                        if let Err(e) = write_png(Path::new(file), 900, 1100, &bgra) {
+                            out.push_str(&format!("previewshot {file}: {e}\n"));
+                            failures += 1;
+                        }
+                    }
+                    Err(e) => {
+                        out.push_str(&format!("previewshot failed: {e}\n"));
+                        failures += 1;
+                    }
+                }
             }
             // a click on the structure panel's row (its arrow: `rowopen:`)
             "row" | "rowopen" => {

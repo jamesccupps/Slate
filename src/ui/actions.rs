@@ -2113,15 +2113,7 @@ impl App {
         let (from, to) = if selection && !sel.is_empty() { (sel.start(), sel.end()) } else { (0, snap.len()) };
         let line = tab.doc.line_of(from).unwrap_or(0) + 1;
         let line_start = tab.doc.line_start_of(from);
-        let style = super::print::Style {
-            font: s.font.clone(),
-            size: s.font_size,
-            numbers: s.line_numbers,
-            tab: s.tab_size as usize,
-            title: tab.title(),
-            last_line: tab.doc.line_of(to).unwrap_or(0) + 1,
-            theme: crate::theme::Theme::light(crate::theme::rgb(0x0067C0)),
-        };
+        let style = print_style(s, tab, to);
         let lang = tab.lang;
         let job = Job::spawn(to - from, notify, move |ctx| {
             let before = snap.read_errors();
@@ -4370,6 +4362,7 @@ impl App {
                     item(Cmd::SaveAll, "Save a&ll", "Ctrl+Alt+S"),
                     Item::Sep,
                     item(Cmd::Print, "&Print…", "Ctrl+P"),
+                    item(Cmd::PrintPreview, "Print pre&view…", ""),
                     Item::Sep,
                     enabled(Cmd::Reload, "Reloa&d from disk", "", has_path),
                     enabled(Cmd::RevealFile, "Show in &folder", "", has_path),
@@ -5028,6 +5021,70 @@ pub fn run(cell: &Cell, d: Deferred) {
     }
 }
 
+/// How the tab's text up to `to` looks on paper, from the settings.
+pub fn print_style(s: &crate::settings::Settings, tab: &Tab, to: u64) -> super::print::Style {
+    super::print::Style {
+        font: s.font.clone(),
+        size: s.font_size,
+        numbers: s.print_line_numbers,
+        tab: s.tab_size as usize,
+        title: tab.title(),
+        last_line: tab.doc.line_of(to).unwrap_or(0) + 1,
+        theme: crate::theme::Theme::light(crate::theme::rgb(0x0067C0)),
+        colors: s.print_colors,
+        header: s.print_header,
+        margins: s.print_margins,
+    }
+}
+
+/// File → Print preview: the pages as they'll print, in a window of their own (`preview::run`), whose Print goes on
+/// to the print dialog (`print_tab`). The options and margins changed there are the settings from then on.
+fn preview_tab(cell: &Cell) {
+    let (hwnd, busy, counted) = {
+        let a = cell.borrow();
+        let t = a.tab();
+        (a.hwnd, t.task.is_some() || t.save.is_some(), t.doc.line_count().is_some())
+    };
+    if busy {
+        cell.borrow_mut().flash("Still working on the previous task (Esc cancels it).", true);
+        return;
+    }
+    if !counted {
+        cell.borrow_mut().flash("Print preview works once the file's lines are counted (a moment).", true);
+        return;
+    }
+    // (test mode never shows it: `previewshot:` draws it into a picture)
+    if super::win::SCRIPTED.with(|s| s.borrow_mut().as_mut().map(|s| s.asked.push("Print preview".into())).is_some()) {
+        return;
+    }
+    let (title, source, style, theme, notify, last) = {
+        let mut a = cell.borrow_mut();
+        let i = a.active;
+        let snap = a.tabs[i].doc.snapshot();
+        let tab = &a.tabs[i];
+        let to = snap.len();
+        let source = super::preview::Source { snap, from: 0, to, line: 1, line_start: 0, lang: tab.lang };
+        let style = print_style(&a.settings, tab, to);
+        let (title, theme, notify) = (tab.title(), a.theme.clone(), a.notify.clone());
+        let last = std::mem::take(&mut a.print_last);
+        (title, source, style, theme, notify, last)
+    };
+    let (outcome, last, changed) = super::preview::run(hwnd, &title, source, style, last, theme, notify);
+    {
+        let mut a = cell.borrow_mut();
+        a.print_last = last;
+        if let Some(st) = changed {
+            let s = &mut a.settings;
+            (s.print_colors, s.print_line_numbers, s.print_header, s.print_margins) = (st.colors, st.numbers, st.header, st.margins);
+            a.settings.save();
+        }
+        a.invalidate();
+    }
+    if outcome == super::preview::Outcome::Print {
+        print_tab(cell);
+    }
+}
+
 /// File → Print: the system's print dialog, a question first when it's a lot of pages, then the pages printed on
 /// another thread (`App::start_print`).
 fn print_tab(cell: &Cell) {
@@ -5179,6 +5236,7 @@ pub fn run_cmd(cell: &Cell, cmd: Cmd) {
             }
         }
         Cmd::Print => print_tab(cell),
+        Cmd::PrintPreview => preview_tab(cell),
         Cmd::Exit => close_window(cell),
         Cmd::Copy | Cmd::Cut => {
             let (size, hwnd) = {

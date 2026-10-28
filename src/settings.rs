@@ -56,6 +56,12 @@ pub struct Settings {
     /// The last searches and replacements, newest first (Up and Down in the find bar's boxes).
     pub find_history: Vec<String>,
     pub replace_history: Vec<String>,
+    /// Printing: the margins from the paper's edges in hundredths of a millimetre (left, top, right, bottom), the
+    /// text in its colors, line numbers, and the file's name at the top of each page with its number at the bottom.
+    pub print_margins: [u32; 4],
+    pub print_colors: bool,
+    pub print_line_numbers: bool,
+    pub print_header: bool,
     /// Settings this version doesn't know (written by a newer one), kept for it.
     #[serde(flatten)]
     pub other: serde_json::Map<String, serde_json::Value>,
@@ -85,6 +91,10 @@ impl Default for Settings {
             failed_update: String::new(),
             find_history: Vec::new(),
             replace_history: Vec::new(),
+            print_margins: [1905; 4],
+            print_colors: true,
+            print_line_numbers: true,
+            print_header: true,
             other: serde_json::Map::new(),
         }
     }
