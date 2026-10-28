@@ -363,6 +363,42 @@ pub fn text_lines(doc: &Document) -> Option<u64> {
     Some(if len > 0 && doc.byte_at(len - 1) == Some(b'\n') { n - 1 } else { n })
 }
 
+/// One search a tab of matching lines was made with: its matcher, whether it kept the lines without a match, and what
+/// was searched for (for its name and note). A tab of lines filtered again has the searches in the order they ran.
+#[derive(Clone)]
+pub struct FilterStep {
+    pub matcher: Arc<crate::core::search::Matcher>,
+    pub invert: bool,
+    pub query: String,
+}
+
+/// The lines of `snap` the searches of `steps` keep, one after the other (a tab of matching lines made again from the
+/// text it came from, when that changed: a log that grew): their text, its line breaks, which line of `snap` each
+/// one is, and what the last search found. Err: written nowhere, cancelled, or a step kept no line.
+pub fn filter_again(
+    steps: &[FilterStep],
+    snap: Snapshot,
+    ctx: &Ctx,
+) -> io::Result<(Arc<Source>, u64, crate::core::search::LineMap, crate::core::search::Filtered)> {
+    let mut snap = snap;
+    let mut map: Option<crate::core::search::LineMap> = None;
+    let mut last = None;
+    for step in steps {
+        let mut sink = Sink::new(snap.len())?;
+        let mut idx = IndexBuilder::new();
+        let found = step.matcher.filter_lines_to(&snap, step.invert, &mut sink, &mut idx, ctx)?;
+        let (src, nl) = sink.finish(idx)?;
+        map = Some(match &map {
+            Some(outer) => found.map.through(outer),
+            None => found.map.clone(),
+        });
+        snap = crate::core::buffer::Buffer::from_source(src.clone(), nl).snapshot();
+        last = Some((src, nl, found));
+    }
+    let (Some((src, nl, found)), Some(map)) = (last, map) else { return Err(io::Error::other("no search")) };
+    Ok((src, nl, map, found))
+}
+
 /// What a tab of matching lines says about itself: `lines` of the `total` lines of `name` have the search `q` (or don't).
 pub fn filtered_note(lines: u64, total: Option<u64>, name: &str, q: &str, invert: bool, cut: bool) -> String {
     let verb = match (invert, lines == 1) {
@@ -1680,6 +1716,24 @@ mod tests {
         remember(&mut h, "a");
         remember(&mut h, "");
         assert_eq!(h, ["a", "b"]);
+    }
+
+    #[test]
+    fn a_tab_of_lines_filtered_twice_is_made_again() {
+        use crate::core::search::{Matcher, Query};
+        let step = |text: &str, invert| FilterStep {
+            matcher: Arc::new(Matcher::new(&Query { text: text.into(), ..Default::default() }).unwrap()),
+            invert,
+            query: text.into(),
+        };
+        let ctx = Ctx { cancel: Default::default(), progress: Default::default() };
+        // the lines with ERROR, then of those the ones without "disk"
+        let mut doc = Document::from_text(b"ok\nERROR net\nok\nERROR disk\nERROR net 2\nok");
+        let (src, nl, map, found) = filter_again(&[step("ERROR", false), step("disk", true)], doc.snapshot(), &ctx).unwrap();
+        let out = Document::from_buffer(crate::core::buffer::Buffer::from_source(src, nl));
+        assert_eq!(out.read(0, out.len()), b"ERROR net\nERROR net 2\n");
+        assert_eq!((0..map.lines).map(|l| map.source(l).unwrap()).collect::<Vec<_>>(), [1, 4]);
+        assert_eq!(found.matches, 1);
     }
 
     #[test]

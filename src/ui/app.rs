@@ -84,6 +84,8 @@ pub enum TaskKind {
     Print,
     /// Show only matching lines (false), or the lines without a match (true).
     Filter(bool),
+    /// A tab of matching lines made again, its source's file read again (`App::filter_again`).
+    Refilter,
     /// CSV or TSV: the rows sorted by field `col` (from 0), Z to A when `desc`, the first row on top when `header`.
     SortColumn { col: usize, desc: bool, d: crate::core::csv::Dialect, header: bool },
 }
@@ -116,7 +118,9 @@ pub enum TaskResult {
     /// Done (printed): what to say.
     Done(String),
     /// The lines kept by a filter, for a tab of their own.
-    Filtered { src: Arc<Source>, nl: u64, found: crate::core::search::Filtered, query: String },
+    Filtered { src: Arc<Source>, nl: u64, found: crate::core::search::Filtered, query: String, matcher: Arc<crate::core::search::Matcher> },
+    /// A tab of matching lines made again: its lines, and which line of the source each one is.
+    Refiltered { src: Arc<Source>, nl: u64, map: crate::core::search::LineMap, found: crate::core::search::Filtered },
     Failed(String),
     Cancelled,
 }
@@ -212,6 +216,8 @@ pub struct Tab {
     /// A find next/previous or a search as you type running in the background (big documents, regexes).
     pub find_job: Option<FindJob>,
     pub find_all: Option<FindAllJob>,
+    /// Its tabs of matching lines are to be made again once its lines are counted (`App::filter_again`).
+    pub filter_again: bool,
     pub notice: Option<Notice>,
     /// The session backup file of this tab (unique, so it never collides with another tab's from an earlier run)
     /// and the document version last written to it.
@@ -250,6 +256,8 @@ pub struct Tab {
 pub struct FilterOf {
     pub source: u64,
     pub map: Arc<crate::core::search::LineMap>,
+    /// The searches it was made with (to make it again when the source's file was read again: `App::filter_again`).
+    pub steps: Vec<crate::edit::FilterStep>,
 }
 
 /// A tab's file being read on another thread (`Tab::load_job`).
@@ -321,6 +329,7 @@ impl Tab {
             search: Search::default(),
             find_job: None,
             find_all: None,
+            filter_again: false,
             notice: None,
             backup_name: None,
             backup_version: u64::MAX,
@@ -1783,7 +1792,7 @@ impl App {
                 TaskKind::Lines(_) => "Cleaning up lines".into(),
                 TaskKind::SortColumn { .. } => "Sorting rows".into(),
                 TaskKind::Print => "Printing".into(),
-                TaskKind::Filter(_) => "Finding the lines".into(),
+                TaskKind::Filter(_) | TaskKind::Refilter => "Finding the lines".into(),
             };
             return Some((format!("{what}… {:.0}%  (Esc to cancel)", task.job.fraction() * 100.0), false));
         }

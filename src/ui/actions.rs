@@ -789,6 +789,7 @@ impl App {
         }
         self.update_title();
         self.invalidate();
+        self.filter_again(i);
     }
 
     // ---- tabs from the session that aren't back yet ----
@@ -1389,6 +1390,9 @@ impl App {
                 self.tabs[i].index_job = None;
                 self.tabs[i].doc.poll_index();
                 self.tabs[i].view.clear_cache();
+                if self.tabs[i].filter_again {
+                    self.filter_again(i);
+                }
                 if i == self.active && self.tabs[i].doc.index_error().is_none() {
                     self.drop_flash(STILL_READING);
                 }
@@ -1686,7 +1690,7 @@ impl App {
                         let name = header.then(|| crate::edit::csv_column_name(&crate::edit::csv_header(&tab.doc, d).0, d, col)).flatten();
                         crate::edit::csv_sorted(count, col, name.as_deref(), header)
                     }
-                    TaskKind::Validate(_) | TaskKind::Print | TaskKind::Filter(_) => String::new(),
+                    TaskKind::Validate(_) | TaskKind::Print | TaskKind::Filter(_) | TaskKind::Refilter => String::new(),
                 };
                 if matches!(task.kind, TaskKind::Format(_)) {
                     // (now indented by the formatter's own rule)
@@ -1743,24 +1747,18 @@ impl App {
                 self.layout();
             }
             TaskResult::Done(m) => self.flash(m, false),
-            TaskResult::Filtered { src, nl, found, query } => {
+            TaskResult::Filtered { src, nl, found, query, matcher } => {
                 let TaskKind::Filter(invert) = task.kind else { return };
-                self.show_filtered(i, invert, src, nl, found, &query);
+                self.show_filtered(i, crate::edit::FilterStep { matcher, invert, query }, src, nl, found);
             }
+            TaskResult::Refiltered { src, nl, map, found } => self.refiltered(i, src, nl, map, found),
             TaskResult::Cancelled => self.flash("Cancelled", false),
         }
     }
 
     /// The lines a filter of tab `i` kept, in a tab of their own after it (or what it found when no line is kept).
-    fn show_filtered(
-        &mut self,
-        i: usize,
-        invert: bool,
-        src: Arc<Source>,
-        nl: u64,
-        found: crate::core::search::Filtered,
-        query: &str,
-    ) {
+    fn show_filtered(&mut self, i: usize, step: crate::edit::FilterStep, src: Arc<Source>, nl: u64, found: crate::core::search::Filtered) {
+        let (invert, query) = (step.invert, step.query.as_str());
         let q: String = if query.chars().count() > 40 { query.chars().take(39).collect::<String>() + "…" } else { query.to_string() };
         if found.map.lines == 0 {
             self.flash(if invert { format!("Every line has “{q}”") } else { format!("No line has “{q}”") }, false);
@@ -1768,10 +1766,11 @@ impl App {
         }
         // (lines of a tab of lines: of the tab those came from)
         let source = &self.tabs[i];
-        let (origin, map) = match &source.filter {
-            Some(f) => (f.source, found.map.through(&f.map)),
-            None => (source.id, found.map),
+        let (origin, map, mut steps) = match &source.filter {
+            Some(f) => (f.source, found.map.through(&f.map), f.steps.clone()),
+            None => (source.id, found.map, Vec::new()),
         };
+        steps.push(step.clone());
         let (lang, encoding, eol) = (source.lang, source.doc.encoding, source.doc.eol);
         let from = self.tabs.iter().find(|t| t.id == origin);
         let name = from.map_or_else(|| "the file".to_string(), |t| t.title());
@@ -1788,7 +1787,7 @@ impl App {
         tab.untitled = 0;
         tab.lang = lang;
         tab.lang_picked = true;
-        tab.filter = Some(FilterOf { source: origin, map: Arc::new(map) });
+        tab.filter = Some(FilterOf { source: origin, map: Arc::new(map), steps });
         tab.title_override = Some(if invert { format!("not “{q}” in {name}") } else { format!("“{q}” in {name}") });
         tab.notice = Some(Notice {
             kind: NoticeKind::Info,
@@ -1798,6 +1797,69 @@ impl App {
         self.activate(at);
         self.layout();
         self.update_title();
+    }
+
+    /// Tab `i`'s file was read again (a log that grew): its tabs of matching lines are made again from it, each on
+    /// another thread (`refiltered`), once its lines are counted. A tab busy with something else is left as it is.
+    fn filter_again(&mut self, i: usize) {
+        if !self.tabs[i].doc.is_ready() {
+            self.tabs[i].filter_again = true;
+            return;
+        }
+        self.tabs[i].filter_again = false;
+        let id = self.tabs[i].id;
+        let snap = self.tabs[i].doc.snapshot();
+        let notify = self.notify.clone();
+        for t in self.tabs.iter_mut().filter(|t| t.task.is_none()) {
+            let Some(f) = t.filter.as_ref().filter(|f| f.source == id) else { continue };
+            let (steps, snap) = (f.steps.clone(), snap.clone());
+            let job = Job::spawn(snap.len(), notify.clone(), move |ctx| {
+                guarded(&snap, || match crate::edit::filter_again(&steps, snap.clone(), ctx) {
+                    Ok((src, nl, map, found)) => TaskResult::Refiltered { src, nl, map, found },
+                    Err(_) if ctx.cancelled() => TaskResult::Cancelled,
+                    Err(e) => TaskResult::Failed(format!("Couldn't go through the lines again: {e}")),
+                })
+            });
+            t.task = Some(Task { kind: TaskKind::Refilter, job, version: t.doc.version });
+        }
+        self.timer(TIMER_JOBS, 100);
+    }
+
+    /// The lines of tab `i` (of matching lines) made again: the caret stays on its line, or at the end if it was
+    /// there (following a log).
+    fn refiltered(&mut self, i: usize, src: Arc<Source>, nl: u64, map: crate::core::search::LineMap, found: crate::core::search::Filtered) {
+        let Some(f) = self.tabs[i].filter.as_ref() else { return };
+        let (origin, last) = (f.source, f.steps.last().cloned());
+        let from = self.tabs.iter().find(|t| t.id == origin);
+        let name = from.map_or_else(|| "the file".to_string(), |t| t.title());
+        let total = from.and_then(|t| crate::edit::text_lines(&t.doc));
+        let tab = &mut self.tabs[i];
+        let at_end = tab.view.sel.caret >= tab.doc.len() && !tab.doc.is_empty();
+        let (line, top) = (tab.doc.line_of(tab.view.sel.caret).unwrap_or(0), tab.doc.line_of(tab.view.top).unwrap_or(0));
+        let (encoding, eol) = (tab.doc.encoding, tab.doc.eol);
+        let mut doc = Document::from_buffer(crate::core::buffer::Buffer::from_source(src, nl));
+        doc.encoding = encoding;
+        doc.eol = eol;
+        let lines = map.lines;
+        tab.doc = doc;
+        tab.search = Search::default();
+        tab.view.forget_text();
+        tab.view.bookmarks.clear();
+        let len = tab.doc.len();
+        let at = if at_end { len } else { tab.doc.line_start(line).unwrap_or(len) };
+        tab.view.sel = Sel::at(at);
+        tab.view.top = tab.doc.line_start(top).unwrap_or(0).min(at);
+        if let Some(f) = tab.filter.as_mut() {
+            f.map = Arc::new(map);
+        }
+        if let (Some(step), Some(n)) = (last, tab.notice.as_mut()) {
+            let q: String = if step.query.chars().count() > 40 { step.query.chars().take(39).collect::<String>() + "…" } else { step.query.clone() };
+            n.text = crate::edit::filtered_note(lines, total, &name, &q, step.invert, found.cut);
+        }
+        if at_end && i == self.active {
+            self.reveal_caret(false);
+        }
+        self.invalidate();
     }
 
     /// Enter or a double-click in a tab of matching lines: the caret's line, in the tab the lines came from.
@@ -1863,8 +1925,8 @@ impl App {
         let len = snap.len();
         let line_count = tab.doc.line_count().unwrap_or(0);
         let job = match kind {
-            // (started by `start_print`)
-            TaskKind::Print => return,
+            // (started by `start_print`, `filter_again`)
+            TaskKind::Print | TaskKind::Refilter => return,
             TaskKind::Filter(invert) => {
                 let Some(m) = matcher else { return };
                 Job::spawn(len, notify, move |ctx| guarded(&snap, || {
@@ -1875,7 +1937,7 @@ impl App {
                     let mut idx = IndexBuilder::new();
                     match m.filter_lines_to(&snap, invert, &mut sink, &mut idx, ctx) {
                         Ok(found) => match sink.finish(idx) {
-                            Ok((src, nl)) => TaskResult::Filtered { src, nl, found, query },
+                            Ok((src, nl)) => TaskResult::Filtered { src, nl, found, query, matcher: m.clone() },
                             Err(e) => TaskResult::Failed(format!("Couldn't write the lines: {e}")),
                         },
                         Err(_) if ctx.cancelled() => TaskResult::Cancelled,
