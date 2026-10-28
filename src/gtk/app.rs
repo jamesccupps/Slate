@@ -53,7 +53,9 @@ pub enum Ask {
     /// Stop Slate being the default app for them?
     StopDefault,
     /// File → Print: GTK's print dialog (after a question when it's about `pages` pages, a lot).
-    Print { pages: u64 },
+    Print { pages: u64, preview: bool },
+    /// File → Page setup (GTK's dialog).
+    PageSetup,
 }
 
 /// A menu command or shortcut.
@@ -65,6 +67,8 @@ pub enum Cmd {
     SaveAs,
     SaveAll,
     Print,
+    PrintPreview,
+    PageSetup,
     CloseTab,
     ReopenClosed,
     Quit,
@@ -794,8 +798,9 @@ impl App {
         self.dirty_title = true;
     }
 
-    /// File → Print: GTK's print dialog for the tab (`Ask::Print`), unless it's far too long.
-    fn print(&mut self) {
+    /// File → Print: GTK's print dialog for the tab (`Ask::Print`), unless it's far too long; `preview`: File →
+    /// Print preview.
+    fn print(&mut self, preview: bool) {
         let tab = self.tab();
         if tab.busy() {
             self.flash("Still working on the previous task (Esc cancels it).", true);
@@ -812,7 +817,7 @@ impl App {
             self.flash(msg, true);
             return;
         }
-        self.asks.push(Ask::Print { pages });
+        self.asks.push(Ask::Print { pages, preview });
     }
 
     /// Whether anything runs in the background (test mode waits for it).
@@ -1604,7 +1609,9 @@ impl App {
             Cmd::ReplaceOne => self.replace_one(),
             Cmd::ReplaceAll => self.start_task(TaskKind::ReplaceAll),
             Cmd::GotoLine => self.asks.push(Ask::GotoLine),
-            Cmd::Print => self.print(),
+            Cmd::Print => self.print(false),
+            Cmd::PrintPreview => self.print(true),
+            Cmd::PageSetup => self.asks.push(Ask::PageSetup),
             Cmd::ToggleComment => {
                 let tab = self.tab();
                 let Some(style) = edit::comment_style(&tab.doc, tab.lang, tab.view.sel.start()) else {

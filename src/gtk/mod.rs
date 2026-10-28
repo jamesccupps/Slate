@@ -111,6 +111,8 @@ pub struct Ui {
     is_default: Cell<bool>,
     /// The printer and its settings chosen last (File → Print).
     print_settings: RefCell<Option<gtk4::PrintSettings>>,
+    /// The paper and orientation chosen in File → Page setup (while Slate runs).
+    page_setup: RefCell<Option<gtk4::PageSetup>>,
     pub test: Option<Rc<testmode::Test>>,
 }
 
@@ -692,6 +694,7 @@ pub fn window(application: &gtk4::Application, test: Option<Rc<testmode::Test>>)
         recent_shown: RefCell::new(None),
         is_default: Cell::new(test.is_none() && slate_is_default()),
         print_settings: RefCell::new(None),
+        page_setup: RefCell::new(None),
         test,
     });
     UI.with(|u| *u.borrow_mut() = Some(ui.clone()));
@@ -1059,6 +1062,8 @@ fn commands() -> Vec<(&'static str, Cmd, &'static [&'static str])> {
         ("save", Cmd::Save, &["<Control>s"]),
         ("save-as", Cmd::SaveAs, &["<Control><Shift>s"]),
         ("print", Cmd::Print, &["<Control>p"]),
+        ("print-preview", Cmd::PrintPreview, &[]),
+        ("page-setup", Cmd::PageSetup, &[]),
         ("save-all", Cmd::SaveAll, &["<Control><Alt>s"]),
         ("close-tab", Cmd::CloseTab, &["<Control>w"]),
         ("reopen-closed", Cmd::ReopenClosed, &["<Control><Shift>t"]),
@@ -1211,7 +1216,7 @@ fn menu_model(recent: &gio::Menu) -> gio::Menu {
     open.append_submenu(Some("Open recent"), recent);
     file.append_section(None, &open);
     file.append_section(None, &section(&[("Save", "save"), ("Save as…", "save-as"), ("Save all", "save-all")]));
-    file.append_section(None, &section(&[("Print…", "print")]));
+    file.append_section(None, &section(&[("Print…", "print"), ("Print preview…", "print-preview"), ("Page setup…", "page-setup")]));
     file.append_section(None, &section(&[("Read only", "read-only")]));
     file.append_section(None, &section(&[("Close tab", "close-tab"), ("Reopen closed tab", "reopen-closed"), ("Quit", "quit")]));
     bar.append_submenu(Some("_File"), &file);
@@ -2356,14 +2361,16 @@ impl Ui {
                     },
                 );
             }
-            Ask::Print { pages } if pages > crate::print::PAGES_ASK => {
-                self.dialog(&format!("Print about {} pages?", crate::edit::group(pages)), "", &[("Cancel", "cancel"), ("Print", "print")], |answer| {
+            Ask::Print { pages, preview } if pages > crate::print::PAGES_ASK => {
+                let q = format!("{} about {} pages?", if preview { "Preview" } else { "Print" }, crate::edit::group(pages));
+                self.dialog(&q, "", &[("Cancel", "cancel"), ("OK", "print")], move |answer| {
                     if let (Some(ui), "print") = (get_ui(), answer) {
-                        print::run(&ui, None);
+                        print::run(&ui, None, preview);
                     }
                 });
             }
-            Ask::Print { .. } => print::run(self, None),
+            Ask::Print { preview, .. } => print::run(self, None, preview),
+            Ask::PageSetup => print::page_setup(self),
             Ask::Shortcuts => self.show_shortcuts(),
         }
     }

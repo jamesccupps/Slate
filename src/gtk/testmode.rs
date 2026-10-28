@@ -262,6 +262,14 @@ async fn script(lines: Vec<String>, test: Rc<Test>) -> i32 {
                             a.settings.font_size = v.parse().unwrap_or(11.0);
                             a.restyle = true;
                         }
+                        "print_colors" => a.settings.print_colors = v == "true",
+                        "print_line_numbers" => a.settings.print_line_numbers = v == "true",
+                        "print_header" => a.settings.print_header = v == "true",
+                        "print_margins" => {
+                            if let [l, t, r, b] = v.split(',').filter_map(|x| x.trim().parse().ok()).collect::<Vec<u32>>()[..] {
+                                a.settings.print_margins = [l, t, r, b];
+                            }
+                        }
                         _ => {}
                     }
                     a.dirty_view = true;
@@ -312,7 +320,7 @@ async fn script(lines: Vec<String>, test: Rc<Test>) -> i32 {
                     None => (arg, false),
                 };
                 let path = std::path::absolute(file).unwrap_or_else(|_| std::path::PathBuf::from(file));
-                super::print::run(&ui, Some((path, selection)));
+                super::print::run(&ui, Some((path, selection)), false);
             }
             "session" => {
                 if std::env::var_os("SLATE_DATA_DIR").is_none() {
