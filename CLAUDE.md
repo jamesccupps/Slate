@@ -218,8 +218,19 @@ lighter one on dark), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate`, `$
     Show only matching lines, Alt+L) streams the lines a match starts in (or, inverted, the others) into a `Sink`,
     with a `LineMap` (runs of lines that follow each other in both: one entry per kept stretch, at most `RUNS_MAX`)
     saying which line of the source each one is; `LineMap::through` maps a filter of a filter to the first text.
-    400 MB, 809,820 lines kept: 0.3 s. Find in selection searches a range: `count_in`, `replace_all_to`'s `range`
+    400 MB, 809,820 lines kept: 0.23 s. Find in selection searches a range: `count_in`, `replace_all_to`'s `range`
     (a match running out of it isn't in it), find next/previous between its ends (the apps: `search_range`).
+    Over 16 MB (`PAR_MIN`), Count all and the filter search parts of the text side by side (`parts_for`: one per
+    core up to 8; a regex only in a text over `ONE_WINDOW`, in 4, with 32 MiB windows and the usual 16 MiB after:
+    ~190 MB at most; plain text 2 MB windows; `side_by_side` sums their progress). Count all's parts are cut between
+    characters and joined exactly (`count_parts`): where the last match of a part runs into the next one (a query
+    that matches within its own match, "aa" in "aaa"), that part is searched again from the match's end until it
+    meets one of its own matches. The filter's parts are cut at line starts: each notes its matched lines (`Kept`),
+    then they're written in order from windows of the text (`Reader`); a part that finds a match with a line break
+    in it (which could cross into the next part), or more stretches than its share of `RUNS_MAX`, gives up before
+    anything is written and one search does it. 850 MB of JSON counted in 0.18 s (0.39 one search), "ERROR" in a
+    400 MB log 0.13 s (0.23). A big read on one thread while another's has the file's bulk handle gets a handle of
+    its own (`Source::bulk_read`, kept for next time): Windows runs one handle's reads one after the other.
   - `json.rs` — one streaming tokenizer for pretty-print / minify / validate (JSON Lines OK), errors with offsets;
     comments (JSONC) are refused with a message saying so. Check (`Mode::Validate`) is stricter than Format: UTF-8
     only, and several values only one per line. The characters are checked beside the parse, on a second thread
@@ -234,7 +245,12 @@ lighter one on dark), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate`, `$
     on up to 8 threads (runs sorted side by side, then merged); whole documents up to 512 MB and `COUNT_MAX` (32 M)
     lines. A `\r` is part of a line break only before a `\n` (a lone one at the very end is text). `apply_to` hands
     the result on in 4 MB pieces (big documents: straight into the `Sink`, never whole in memory beside the text;
-    a 400 MB log's Sort peaked at 830 MB before, 490 MB since, and went from 4.5 to 2.8 s).
+    a 400 MB log's Sort peaked at 830 MB before, 490 MB since, and went from 4.5 to 2.8 s). Every pairwise merge is
+    cut into pieces merged side by side too (`merge_sort`: `a` cut at even places, `b` before its first item not
+    less than the one there; the last merge on one thread had been a fifth of the time): 2.0 s. Remove duplicates
+    over 200,000 lines works out the lines' hashes side by side, then each line goes to one of the threads' tables by
+    bits of its hash the tables don't use (`dedupe_marks`; a line whose hash is another line's goes in a set of its
+    own): 1.0 -> 0.47 s, 40 MB more while it runs.
   - `csv.rs` — CSV and TSV: Check (RFC 4180's quoting; every row as many fields as the first, a quote left open,
     a stray quote in a field that isn't in quotes — TSV has no quoting rules, so there a quote is text unless it
     starts a field — or something after a closing quote, with where), streaming and jumping from one special byte to
@@ -557,14 +573,27 @@ lighter one on dark), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate`, `$
   comes back as that job's failure (`job::Failure`), never as a job that runs forever.
 - The JSON/XML path bar and structure panel are worked out again after an edit only once the typing pauses
   (`structure::PAUSE`, 200 ms; documents up to 256 KiB at once): a rescan per key took a frame's time on a few MB, and
-  a whole background read of a big file per key. Meanwhile they show the old places (not current: clicks are ignored).
+  a whole background read of a big file per key. Meanwhile they show the old places: the panel keeps the edits since
+  its rows were made (`Tab::sync_view` hands it every change `View::sync` takes: `Structure::edited`), so a click on
+  a row goes to its value's place now (`place_now`; a value whose text was deleted says to try again), and the rows
+  made again open what was open by where it is now (`note_reopen`, `Reopen`), not by its key: an array element's
+  key is its index, which an element inserted before it changes. A value whose start was edited keeps its key, so
+  Format (the whole text replaced) still keeps everything open by its path. The path bar's clicks still wait.
 - A tab of matching lines (`Tab::filter`: its source tab's id and the `LineMap`) is read only, isn't kept in the
   session, shows the source's line numbers in its gutter and status bar, and Enter or a double-click goes to the line
   in the source tab (`go_to_source`). Filtering it again maps through to the first tab. Read only (`Tab::read_only`,
   File → Read only, on by itself when `os::can_write` says the file can't be written, kept in the session) is checked
   in `editable()`, which every edit goes through. Bookmarks are line starts in each view (`View::bookmarks`), mapped
   through the change log in `View::sync` (`edit::map_marks`, then `tidy_marks` back to line starts), kept in the
-  session; Format, Minify and line tools drop them, line endings and Replace all keep them by line number.
+  session; Format, Minify and line tools drop them, line endings and Replace all keep them by line number. A tab of
+  matching lines keeps the searches it was made with (`FilterOf::steps`, in order for a tab of lines filtered
+  again): when its source tab's file is read again (a log that grew), once the lines are counted, it's made again
+  on another thread (`edit::filter_again`, `TaskKind::Refilter`), its caret on its line or at the end if it was.
+- Find next and previous through all open tabs (the find box's All tabs toggle, Alt+A; `App::find_in_tabs`): on to
+  this tab's end, then the other tabs in order, then the rest of this one; a tab of matching lines or one whose text
+  isn't there yet is passed over, Find in selection keeps to the selection, and Find previous still takes a match
+  before the caret from this tab's count. Over `Matcher::sync_limit` of text in all, on another thread (`FindAllJob`,
+  dropped if a text searched or the selection changed).
 - Transforms (Format, Minify, line tools, Replace all, line endings) write into a `Sink`: memory until it passes
   64 MiB, then a temp file; Format refuses a result over 64 times the text plus 64 MiB (absurd nesting; when the
   text isn't valid JSON or XML, that's what it says instead: `edit::format_stopped`).
@@ -590,7 +619,8 @@ lighter one on dark), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate`, `$
   their own commands (`down:`/`move:`/`up:`, `wheelraw:` — over the text, or `wheelraw:<delta>@<x>,<y>` over a
   point such as the tab strip —, `altkey`, `altgr:on`, `activate`…), `request:<lines, | between>` hands files over
   as a second start with `--read-only` / `--wait` / `-` does (`waitevent:<name>` makes the event, `print:waits`
-  shows the waits and whether it's set), `print:findtext` the find bar's boxes and Find in selection's range, and
+  shows the waits and whether it's set), `print:findtext` the find bar's boxes and Find in selection's range,
+  `print:rows` the structure panel's rows (`row:<n>` / `rowopen:<n>` click one, or its arrow), and
   `contrast:on`
   pretends Windows' high contrast is on (`print:theme`, `print:syscaret`, `print:statusbar` check the results).
   Prompts are never shown, but `prompt:<file.png>|save` (or `update`, `info`) draws one into a picture.

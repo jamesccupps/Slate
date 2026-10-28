@@ -153,6 +153,14 @@ caret; Find in selection, a search history, `\n` and `\t` in regular expression 
 matching lines; `slate --read-only`, `slate --wait` and `slate -`; the taskbar's jump list (Linux: the desktop's
 recent files). Details in the [0.13.0 release notes](release-notes-0.13.0.md).
 
+## 0.14.0
+
+The second round of the *Soon* list: Count all, Show only matching lines, Sort and Remove duplicates on several
+cores (Count all about twice as fast on big files, Remove duplicates too); Find next and previous through all open
+tabs (Alt+A); a tab of matching lines that follows its file as it grows; the JSON structure panel keeping open array
+elements open when elements are put before them, and its clicks going to the right place while it catches up.
+Details in the [0.14.0 release notes](release-notes-0.14.0.md).
+
 ## Next
 
 1. **Accessibility: screen readers, the rest (M).** The text is read since 0.12.0 (checked in test mode and by a real
@@ -175,8 +183,8 @@ recent files). Details in the [0.13.0 release notes](release-notes-0.13.0.md).
 
 ## Soon
 
-- **Matching lines, more** (S each): the tab of lines following a log as it grows (filtering what's added); several
-  searches at once (lines with any of them, highlighted each in a color).
+- **Several searches at once** (S–M): lines with any of them, each highlighted in a color of its own (a tab of
+  matching lines follows a log since 0.14.0).
 - **Page setup** (M): margins, the text at the top and bottom of the pages, printing without colors (Print itself
   came in 0.10.0).
 - **Print preview** (M; the user asked, October 2026): File → Print preview… opens Slate's own window with the pages
@@ -186,23 +194,9 @@ recent files). Details in the [0.13.0 release notes](release-notes-0.13.0.md).
   does; filling its preview would mean Windows' newer printing method, whose preview Microsoft documents for Store apps
   only. The older dialog never had a preview.) On Linux, check GTK's print dialog first: its Preview button may already
   work with Slate's `GtkPrintOperation`.
-- **Find in all open tabs** (S–M).
 - **Editing:** column (Alt+drag) selection (S). Drag and drop of text (M).
 - **Spell check** like Notepad's (M). **Inline IME composition** for Chinese, Japanese and Korean (M).
 - **Tabs in the title bar**, like Windows 11 Notepad, to save space (M).
-- **JSON structure panel:** keep an open array element open when elements are inserted before it (it's keyed by
-  index today); while the panel is updating after an edit, clicks go to the row's old place (S).
-- **Count all and Show only matching lines on several cores (M).** Both search a big file on one thread: 850 MB in
-  0.35–0.45 s (a plain query is searched at several GB/s; reading the file from Windows' cache goes at 6 GB/s, faster
-  still on more threads). Split into ranges searched side by side, the counts added (and the first 10,000 places kept
-  in order), it could take 0.1–0.15 s. Show only matching lines is harder: each part's lines and line map written
-  apart, then joined in order (a big result goes to a temp file).
-- **Sort and Remove duplicates, faster (M).** On a 400 MB log of 4.85 million lines, Sort takes 2.8 s and Remove
-  duplicates 1.1 s (October 2026). Sort compares lines the way people sort (numbers by value, case ignored), on up to
-  8 threads, but its last merge runs on one: merging in parallel (splitting the runs where they meet) would save
-  ~0.5 s, and a key of each line's first bytes kept beside it would answer most comparisons without reading the text.
-  Remove duplicates is held up by memory (a faster hash saved only 5–20%): split by hash across threads, each with a
-  table of its own, it could be ~3 times faster.
 
 ## Later
 
