@@ -1143,6 +1143,13 @@ pub fn run(args: &[String]) -> i32 {
                     Some(&"middle") => 2,
                     _ => 0,
                 };
+                // (`,alt` or `,ctrl`: that key held)
+                let held = match parts.get(2) {
+                    Some(&"alt") => Some((false, false, true)),
+                    Some(&"ctrl") => Some((true, false, false)),
+                    _ => None,
+                };
+                super::commands::FORCED_MODS.with(|m| m.set(held));
                 super::actions::TEST_POINTER.with(|p| p.set(Some((x, y))));
                 {
                     let mut a = cell.borrow_mut();
@@ -1155,6 +1162,7 @@ pub fn run(args: &[String]) -> i32 {
                         _ => a.on_mouse_up(x, y, b),
                     }
                 }
+                super::commands::FORCED_MODS.with(|m| m.set(None));
                 drain_pending(&cell);
             }
             "wheelraw" => {

@@ -234,10 +234,11 @@ pub fn global_key(vk: u16, m: &Mods) -> Option<Cmd> {
 /// Shortcuts for the text area.
 pub fn editor_key(vk: u16, m: &Mods) -> Option<Cmd> {
     let k = VIRTUAL_KEY(vk);
+    // (Shift+Alt+arrows: a column selection, `App::block_key`)
     if m.alt && !m.ctrl {
         return match k {
-            VK_UP => Some(Cmd::MoveLineUp),
-            VK_DOWN => Some(Cmd::MoveLineDown),
+            VK_UP if !m.shift => Some(Cmd::MoveLineUp),
+            VK_DOWN if !m.shift => Some(Cmd::MoveLineDown),
             _ => None,
         };
     }
@@ -368,6 +369,7 @@ Editing
   Ctrl+D                        Duplicate the line (or the selection)
   Ctrl+Shift+K                  Delete the line
   Alt+Up / Alt+Down             Move the line up / down
+  Alt+drag, Shift+Alt+arrows    Column selection (type, paste, delete on every line)
   Tab / Shift+Tab               Indent / outdent the selected lines
   Ctrl+/                        Toggle comment
   Ctrl+U / Ctrl+Shift+U         lowercase / UPPERCASE
@@ -393,6 +395,7 @@ Find and replace
   Alt+C / Alt+W / Alt+R         Match case / Whole word / Regular expression
   Alt+S                         Find in selection (what was selected when the bar opened)
   Alt+A                         Next / previous match through all open tabs (on or off)
+  Alt+H                         Highlight the search in every tab, in a color of its own
   Up / Down                     The searches (or replacements) before, in the find box
   \\n  \\t                      A line break, a tab, in a regular expression's replacement
   Enter                         Replace this match (in the replace box)

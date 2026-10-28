@@ -336,6 +336,8 @@ struct TextWindow {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DragMode {
+    /// A column selection (Alt+drag: `View::block`).
+    Block,
     /// The selection taken by the mouse to somewhere else (pressed in it at `at`, at `x`, `y`): it moves once the
     /// mouse has (`moved`), and `View::drop_at` shows where it goes.
     Text { at: u64, x: i32, y: i32, moved: bool },
@@ -357,6 +359,9 @@ pub struct View {
     pub drag: Option<DragMode>,
     /// Where text dragged with the mouse would go (`DragMode::Text`).
     pub drop_at: Option<u64>,
+    /// A column selection (Alt+drag, Shift+Alt+arrows): what's selected instead of `sel` (whose caret is at the
+    /// block's caret).
+    pub block: Option<crate::edit::Block>,
     /// Widest row seen recently (for horizontal scrolling without wrapping).
     pub content_w: f32,
     win: TextWindow,
@@ -398,6 +403,7 @@ impl View {
             rows: Vec::new(),
             drag: None,
             drop_at: None,
+            block: None,
             content_w: 0.0,
             win: TextWindow::default(),
             cache: HashMap::new(),
@@ -1092,7 +1098,30 @@ impl View {
             sel_is_match |= current;
             self.fill_range(cx, ms, me, ox, if current { t.match_current } else { t.match_bg }, false);
         }
-        if !sel.is_empty() && !sel_is_match {
+        if let Some(b) = self.block {
+            // a column selection: each line's part, or a caret on each line when it has no width
+            let (first, last) = b.lines();
+            let (l, r) = b.cols();
+            let c = if focused { t.selection } else { t.selection_inactive };
+            let lines: Vec<u64> = self.rows.iter().filter_map(|row| cx.doc.line_of(row.start)).filter(|l| (first..=last).contains(l)).collect();
+            let mut seen = None;
+            for line in lines {
+                if seen == Some(line) {
+                    continue;
+                }
+                seen = Some(line);
+                let (a, e) = (crate::edit::pos_at_col(cx.doc, line, l, cx.style.tab_size), crate::edit::pos_at_col(cx.doc, line, r, cx.style.tab_size));
+                if e > a {
+                    self.fill_range(cx, a, e, ox, c, false);
+                } else if focused {
+                    let (seg, lay, row, x) = self.caret_place(cx, a, false);
+                    let rs = seg.start + lay.row_bytes(row).0;
+                    if let Some(vr) = self.rows.iter().find(|vr| vr.start == rs && vr.seg.start == seg.start) {
+                        g.fill(Rect::new((ox + x).round() - 0.5, vr.y, 1.0, row_h), t.caret);
+                    }
+                }
+            }
+        } else if !sel.is_empty() && !sel_is_match {
             let c = if focused { t.selection } else { t.selection_inactive };
             self.fill_range(cx, sel.start(), sel.end(), ox, c, true);
         }

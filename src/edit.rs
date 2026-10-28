@@ -363,6 +363,179 @@ pub fn text_lines(doc: &Document) -> Option<u64> {
     Some(if len > 0 && doc.byte_at(len - 1) == Some(b'\n') { n - 1 } else { n })
 }
 
+// ---- column selection ----
+
+/// A column selection (Alt+drag, Shift+Alt+arrows): the lines from `anchor`'s to `caret`'s (each a line and a column),
+/// between their columns. A column counts characters from the line's start, a tab going on to the next stop and a
+/// wide character taking two, as a monospace font shows them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Block {
+    pub anchor: (u64, u32),
+    pub caret: (u64, u32),
+}
+
+/// A column selection takes no more lines than this (each is worked on at every key).
+pub const BLOCK_LINES_MAX: u64 = 100_000;
+
+impl Block {
+    pub fn at(line: u64, col: u32) -> Block {
+        Block { anchor: (line, col), caret: (line, col) }
+    }
+
+    /// The first line and the last.
+    pub fn lines(&self) -> (u64, u64) {
+        (self.anchor.0.min(self.caret.0), self.anchor.0.max(self.caret.0))
+    }
+
+    /// The left column and the right (the same when it's a column of carets).
+    pub fn cols(&self) -> (u32, u32) {
+        (self.anchor.1.min(self.caret.1), self.anchor.1.max(self.caret.1))
+    }
+}
+
+/// How many columns `c` takes at column `col`.
+fn col_width(c: char, col: u32, tab: u32) -> u32 {
+    if c == '\t' { tab.max(1) - col % tab.max(1) } else { crate::print::width(c) as u32 }
+}
+
+/// The text of line `line` (without its line break).
+fn line_text(doc: &Document, line: u64) -> Option<(u64, Vec<u8>)> {
+    let start = doc.line_start(line)?;
+    let end = doc.next_newline(start).unwrap_or(doc.len());
+    let mut t = doc.read(start, end);
+    if t.last() == Some(&b'\r') {
+        t.pop();
+    }
+    Some((start, t))
+}
+
+/// The column after the text `t` (from a line's start).
+fn cols_of(t: &[u8], tab: u32) -> u32 {
+    let (mut at, mut col) = (0, 0);
+    while at < t.len() {
+        // (a byte that isn't UTF-8 is a column of its own, as it shows)
+        let (c, n) = text::decode_char(&t[at..]);
+        col += col_width(c, col, tab);
+        at += n.max(1);
+    }
+    col
+}
+
+/// The column `pos` is at in its line.
+pub fn col_of(doc: &Document, pos: u64, tab: u32) -> u32 {
+    cols_of(&doc.read(doc.line_start_of(pos), pos), tab)
+}
+
+/// Where column `col` is in the text `t` (a line starting at `start`): the place, and the columns short of it at
+/// the line's end (inside a tab or a wide character: its start).
+fn place_of_col(t: &[u8], start: u64, col: u32, tab: u32) -> (u64, u32) {
+    let (mut at, mut c) = (0usize, 0u32);
+    while at < t.len() && c < col {
+        let (ch, n) = text::decode_char(&t[at..]);
+        let w = col_width(ch, c, tab);
+        if c + w > col {
+            break;
+        }
+        c += w;
+        at += n.max(1);
+    }
+    let short = if at >= t.len() { col.saturating_sub(c) } else { 0 };
+    (start + at as u64, short)
+}
+
+/// The place at column `col` of line `line` (its end if the line is shorter).
+pub fn pos_at_col(doc: &Document, line: u64, col: u32, tab: u32) -> u64 {
+    line_text(doc, line).map_or(doc.len(), |(start, t)| place_of_col(&t, start, col, tab).0)
+}
+
+/// Each line's part of the block, top to bottom (a line shorter than the left column: an empty part at its end).
+pub fn block_ranges(doc: &Document, b: &Block, tab: u32) -> Vec<(u64, u64)> {
+    let ((first, last), (l, r)) = (b.lines(), b.cols());
+    (first..=last)
+        .filter_map(|line| {
+            let (start, t) = line_text(doc, line)?;
+            Some((place_of_col(&t, start, l, tab).0, place_of_col(&t, start, r, tab).0))
+        })
+        .collect()
+}
+
+/// The block's text: its lines' parts, a line break (`eol`) after each but the last.
+pub fn block_text(doc: &Document, b: &Block, tab: u32, eol: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (k, (s, e)) in block_ranges(doc, b, tab).into_iter().enumerate() {
+        if k > 0 {
+            out.extend_from_slice(eol);
+        }
+        out.extend_from_slice(&doc.read(s, e));
+    }
+    out
+}
+
+/// What a key does to every line of a column selection.
+pub enum BlockEdit<'a> {
+    /// The lines' parts replaced: by one text each (when there are as many as lines: Paste of a column), else by
+    /// the first on every line. A line shorter than the column is padded with spaces up to it first.
+    Put(Vec<&'a [u8]>),
+    /// The lines' parts deleted; where there's none (a column of carets), the character before (Backspace) or after.
+    Delete { back: bool },
+}
+
+/// Does `what` to every line of `b` (bottom to top, so the places above stay put), as one step to undo. Returns the
+/// block after it: a column of carets after what was put (or where the parts were).
+pub fn block_edit(doc: &mut Document, b: &Block, tab: u32, what: BlockEdit) -> Block {
+    let ((first, last), (l, r)) = (b.lines(), b.cols());
+    let before = Sel::at(pos_at_col(doc, b.caret.0, b.caret.1, tab));
+    doc.seal();
+    doc.begin(EditKind::Other, before);
+    // (the column the carets end up in: as on the caret's own line)
+    let mut col = l;
+    for (k, line) in (first..=last).rev().map(|l| ((l - first) as usize, l)) {
+        let Some((start, t)) = line_text(doc, line) else { continue };
+        let (a, short) = place_of_col(&t, start, l, tab);
+        let (e, _) = place_of_col(&t, start, r, tab);
+        let here = line == b.caret.0;
+        match &what {
+            BlockEdit::Put(texts) => {
+                let text = texts.get(if texts.len() as u64 == last - first + 1 { k } else { 0 }).copied().unwrap_or(b"");
+                if e > a {
+                    doc.delete(a, e);
+                }
+                let mut ins = vec![b' '; short as usize];
+                ins.extend_from_slice(text);
+                if !ins.is_empty() {
+                    doc.insert(a, &ins);
+                }
+                if here {
+                    col = col_of(doc, a + ins.len() as u64, tab);
+                }
+            }
+            BlockEdit::Delete { back } => {
+                let end = start + t.len() as u64;
+                let range = match (e > a, *back) {
+                    (true, _) => Some((a, e)),
+                    // (a column of carets: the character before or after each; past a line's end, none)
+                    (false, true) => (a > start && short == 0).then(|| (doc.prev_char(a), a)),
+                    (false, false) => (a < end).then(|| (a, doc.next_char(a))),
+                };
+                match range {
+                    Some((s, e)) => {
+                        doc.delete(s, e);
+                        if here {
+                            col = col_of(doc, s, tab);
+                        }
+                    }
+                    None if here && *back && r == l => col = l.saturating_sub(1),
+                    None => {}
+                }
+            }
+        }
+    }
+    let after = Block { anchor: (first, col), caret: (last, col) };
+    doc.end(Sel::at(pos_at_col(doc, last, col, tab)));
+    doc.seal();
+    after
+}
+
 /// One search a tab of matching lines was made with: its matcher, whether it kept the lines without a match, and what
 /// was searched for (for its name and note). A tab of lines filtered again has the searches in the order they ran.
 #[derive(Clone)]
@@ -1716,6 +1889,39 @@ mod tests {
         remember(&mut h, "a");
         remember(&mut h, "");
         assert_eq!(h, ["a", "b"]);
+    }
+
+    #[test]
+    fn column_selections() {
+        let all = |d: &Document| String::from_utf8(d.read(0, d.len())).unwrap();
+        let mut d = Document::from_text(b"abcd\nefgh\nij\n");
+        let b = Block { anchor: (0, 1), caret: (2, 3) };
+        assert_eq!(block_text(&d, &b, 4, b"\n"), b"bc\nfg\nj");
+        // typed on every line (one past its end: padded)
+        let b = block_edit(&mut d, &b, 4, BlockEdit::Put(vec![b"XY"]));
+        assert_eq!(all(&d), "aXYd\neXYh\niXY\n");
+        assert_eq!(b, Block { anchor: (0, 3), caret: (2, 3) });
+        // Backspace on a column of carets
+        let b = block_edit(&mut d, &b, 4, BlockEdit::Delete { back: true });
+        assert_eq!(all(&d), "aXd\neXh\niX\n");
+        assert_eq!(b.cols(), (2, 2));
+        // a column pasted: one line on each
+        let b = block_edit(&mut d, &Block { anchor: (0, 0), caret: (2, 0) }, 4, BlockEdit::Put(vec![b"1", b"2", b"3"]));
+        assert_eq!(all(&d), "1aXd\n2eXh\n3iX\n");
+        assert_eq!(b.cols(), (1, 1));
+        // each an undo step
+        d.undo();
+        assert_eq!(all(&d), "aXd\neXh\niX\n");
+        // short lines padded with spaces up to the column; Delete with nothing after the column does nothing there
+        let mut d = Document::from_text(b"abcdef\nab\nabcdef");
+        block_edit(&mut d, &Block { anchor: (0, 4), caret: (2, 4) }, 4, BlockEdit::Put(vec![b"|"]));
+        assert_eq!(all(&d), "abcd|ef\nab  |\nabcd|ef");
+        // tabs to the next stop, a wide character two columns, CRLF lines
+        let d = Document::from_text("\tx\r\n日本\r\nabc".as_bytes());
+        let b = Block { anchor: (0, 2), caret: (2, 5) };
+        assert_eq!(String::from_utf8(block_text(&d, &b, 4, b"\r\n")).unwrap(), "\tx\r\n本\r\nc");
+        assert_eq!(col_of(&d, 1, 4), 4);
+        assert_eq!(pos_at_col(&d, 1, 2, 4), 7);
     }
 
     #[test]

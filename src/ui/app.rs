@@ -530,6 +530,8 @@ pub struct App {
     pub gfx_generation: u64,
     /// Alt was pressed and released on its own: the menu bar has the keyboard, with this title highlighted.
     pub menu_armed: Option<usize>,
+    /// Alt was held for a click (a column selection): letting it go doesn't give the menu bar the keyboard.
+    pub alt_dragged: bool,
     /// Mouse wheel movement not scrolled yet (in rows; touchpads send small steps), for Ctrl+wheel zoom (in wheel
     /// units), and over the tab strip (in tabs).
     pub wheel_rows: f32,
@@ -647,6 +649,7 @@ impl App {
             mouse_tracking: false,
             gfx_generation: 0,
             menu_armed: None,
+            alt_dragged: false,
             wheel_rows: 0.0,
             wheel_zoom: 0,
             wheel_tabs: 0.0,

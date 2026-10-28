@@ -494,6 +494,7 @@ fn handle(cell: &Cell, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<L
                         a.disarm_menu_bar();
                         a.pending.push(Deferred::Menu(i));
                     }
+                    None if std::mem::take(&mut a.alt_dragged) => {}
                     None => a.toggle_menu_bar(),
                 }
             }

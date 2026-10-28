@@ -2182,8 +2182,9 @@ impl App {
         true
     }
 
-    /// After any change to the text.
+    /// After any change to the text (it ends a column selection: what keeps one sets it again after this).
     pub fn after_edit(&mut self) {
+        self.tab_mut().view.block = None;
         if self.flash.as_ref().is_some_and(|f| f.0 == "Saved") {
             self.flash = None;
         }
@@ -2207,6 +2208,7 @@ impl App {
 
     /// After the caret moved without editing.
     pub fn after_move(&mut self) {
+        self.tab_mut().view.block = None;
         self.tab_mut().doc.seal();
         self.reveal_caret(false);
         self.restart_caret();
@@ -2215,6 +2217,10 @@ impl App {
 
     pub fn type_text(&mut self, s: &str) {
         if s.is_empty() || !self.editable() {
+            return;
+        }
+        if let Some(b) = self.tab().view.block {
+            self.block_edit(b, crate::edit::BlockEdit::Put(vec![s.as_bytes()]));
             return;
         }
         let overtype = self.overtype;
@@ -2349,6 +2355,9 @@ impl App {
         self.hide_tip();
         self.wake_caret();
         let m = mods();
+        if VIRTUAL_KEY(vk) == VK_MENU {
+            self.alt_dragged = false;
+        }
         if let Some(used) = self.menu_bar_key(vk, &m) {
             return used;
         }
@@ -2374,6 +2383,9 @@ impl App {
         }
         if k == VK_APPS {
             self.context_menu_at_caret();
+            return true;
+        }
+        if self.block_key(k, &m) {
             return true;
         }
         if let Some(cmd) = editor_key(vk, &m) {
@@ -2567,6 +2579,16 @@ impl App {
     }
 
     pub fn copy(&mut self) -> bool {
+        if let Some(b) = self.tab().view.block {
+            let tab = self.tab();
+            let text = crate::edit::block_text(&tab.doc, &b, self.settings.tab_size, tab.doc.eol.as_bytes());
+            if !win::set_clipboard(self.hwnd, &text) {
+                self.flash(CLIPBOARD_BUSY, true);
+                return false;
+            }
+            self.line_clip = None;
+            return true;
+        }
         let (a, b) = self.copy_range();
         if a == b {
             return false;
@@ -2585,6 +2607,12 @@ impl App {
         if !self.editable() || !self.copy() {
             return;
         }
+        if let Some(b) = self.tab().view.block {
+            if b.cols().0 < b.cols().1 {
+                self.block_edit(b, crate::edit::BlockEdit::Delete { back: false });
+            }
+            return;
+        }
         let (a, b) = self.copy_range();
         let tab = self.tab_mut();
         let sel = tab.view.sel;
@@ -2600,6 +2628,16 @@ impl App {
             return;
         }
         let Some(text) = win::get_clipboard(self.hwnd) else { return };
+        if let Some(b) = self.tab().view.block {
+            // into every line: a line of the text each when it has as many as the selection, else all of it
+            let text = editor::normalize_eols(&text, b"\n");
+            let text = text.strip_suffix(b"\n").unwrap_or(&text);
+            let lines: Vec<&[u8]> = text.split(|&c| c == b'\n').collect();
+            let (first, last) = b.lines();
+            let parts = if lines.len() as u64 == last - first + 1 { lines } else { vec![text] };
+            self.block_edit(b, crate::edit::BlockEdit::Put(parts));
+            return;
+        }
         // A line copied with nothing selected goes in as a line, above the caret's (like VS Code).
         let line = self.line_clip.is_some() && self.line_clip == Some(win::clipboard_sequence());
         let i = self.active;
@@ -3285,9 +3323,30 @@ impl App {
         n
     }
 
+    /// The column at `x` in the text (as a monospace font has them).
+    fn col_at_x(&self, x: f32) -> u32 {
+        let geom = self.editor_geom();
+        ((x - geom.text_x + self.tab().view.scroll_x) / self.style.char_w.max(1.0)).round().max(0.0) as u32
+    }
+
     fn editor_click(&mut self, x: f32, y: f32, clicks: u32, gutter: bool) {
         let ext = mods().shift;
         let (pos, up) = self.with_view(|v, cx| v.pos_at(cx, x, y));
+        self.tab_mut().view.block = None;
+        if mods().alt && !gutter && clicks == 1 {
+            // Alt+drag: a column selection (and Alt let go after it doesn't give the menu bar the keyboard)
+            self.alt_dragged = true;
+            let col = self.col_at_x(x);
+            let tab_size = self.settings.tab_size;
+            let tab = self.tab_mut();
+            let line = tab.doc.line_of(pos).unwrap_or(0);
+            tab.view.block = Some(crate::edit::Block::at(line, col));
+            tab.view.sel = Sel::at(crate::edit::pos_at_col(&tab.doc, line, col, tab_size));
+            tab.view.drag = Some(DragMode::Block);
+            self.restart_caret();
+            self.invalidate();
+            return;
+        }
         if clicks == 2 && !gutter && self.tab().filter.is_some() {
             self.tab_mut().view.set_caret(pos, false);
             self.go_to_source();
@@ -3550,8 +3609,79 @@ impl App {
                 tab.view.sel = if pos < a { Sel::new(b, ls) } else { Sel::new(a, le.max(b)) };
             }
             DragMode::Text { moved: true, .. } => tab.view.drop_at = Some(pos),
+            DragMode::Block => {
+                let line = doc.line_of(pos).unwrap_or(0);
+                let tab_size = self.settings.tab_size;
+                let col = self.col_at_x(x);
+                let tab = self.tab_mut();
+                if let Some(b) = tab.view.block.as_mut() {
+                    // (no more lines than a column selection takes)
+                    let max = crate::edit::BLOCK_LINES_MAX - 1;
+                    b.caret = (line.clamp(b.anchor.0.saturating_sub(max), b.anchor.0 + max), col);
+                    tab.view.sel = Sel::at(crate::edit::pos_at_col(&tab.doc, b.caret.0, col, tab_size));
+                }
+            }
             _ => {}
         }
+        self.invalidate();
+    }
+
+    /// Keys for a column selection: Shift+Alt+arrows make or grow it, Backspace and Delete work on every line, Esc
+    /// ends it. True when the key was used. (Typing, Copy, Cut and Paste go through `type_text` and the clipboard's
+    /// functions; anything that moves the caret or edits otherwise ends it: `after_move`, `after_edit`.)
+    fn block_key(&mut self, k: VIRTUAL_KEY, m: &Mods) -> bool {
+        let tab_size = self.settings.tab_size;
+        if m.alt && m.shift && !m.ctrl && matches!(k, VK_UP | VK_DOWN | VK_LEFT | VK_RIGHT) {
+            let tab = self.tab_mut();
+            let caret = tab.view.sel.caret;
+            let doc = &tab.doc;
+            let mut b = tab.view.block.unwrap_or_else(|| {
+                crate::edit::Block::at(doc.line_of(caret).unwrap_or(0), crate::edit::col_of(doc, caret, tab_size))
+            });
+            let last = doc.line_of(doc.len()).unwrap_or(0);
+            let (line, col) = b.caret;
+            b.caret = match k {
+                VK_UP => (line.saturating_sub(1), col),
+                VK_DOWN => ((line + 1).min(last), col),
+                VK_LEFT => (line, col.saturating_sub(1)),
+                _ => (line, col + 1),
+            };
+            if b.caret.0.abs_diff(b.anchor.0) >= crate::edit::BLOCK_LINES_MAX {
+                return true;
+            }
+            let at = crate::edit::pos_at_col(doc, b.caret.0, b.caret.1, tab_size);
+            tab.view.sel = Sel::at(at);
+            self.after_move();
+            self.tab_mut().view.block = Some(b);
+            self.invalidate();
+            return true;
+        }
+        let Some(b) = self.tab().view.block else { return false };
+        match k {
+            VK_BACK | VK_DELETE => {
+                self.block_edit(b, crate::edit::BlockEdit::Delete { back: k == VK_BACK });
+                true
+            }
+            VK_ESCAPE if !self.find.open => {
+                self.tab_mut().view.block = None;
+                self.invalidate();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// `edit::block_edit` on the tab shown, the column selection after it kept.
+    fn block_edit(&mut self, b: crate::edit::Block, what: crate::edit::BlockEdit) {
+        if !self.editable() {
+            return;
+        }
+        let tab_size = self.settings.tab_size;
+        let tab = self.tab_mut();
+        let after = crate::edit::block_edit(&mut tab.doc, &b, tab_size, what);
+        tab.view.sel = Sel::at(crate::edit::pos_at_col(&tab.doc, after.caret.0, after.caret.1, tab_size));
+        self.after_edit();
+        self.tab_mut().view.block = Some(after);
         self.invalidate();
     }
 
@@ -3929,6 +4059,7 @@ impl App {
             }
             Cmd::SelectAll => {
                 let tab = self.tab_mut();
+                tab.view.block = None;
                 tab.view.sel = Sel::new(0, tab.doc.len());
                 self.invalidate();
             }
