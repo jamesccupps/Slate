@@ -191,6 +191,9 @@ struct TextWindow {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Drag {
+    /// The selection taken by the mouse to somewhere else (pressed in it at `at`, at `x`, `y` in the text): it moves
+    /// once the mouse has (`moved`), and `View::drop_at` shows where it goes.
+    Text { at: u64, x: i32, y: i32, moved: bool },
     Chars,
     Words(u64, u64),
     Lines(u64, u64),
@@ -208,6 +211,8 @@ pub struct View {
     pub max_w: f64,
     pub rows: Vec<VisRow>,
     pub drag: Option<Drag>,
+    /// Where text dragged with the mouse would go (`Drag::Text`).
+    pub drop_at: Option<u64>,
     /// The starts of the lines bookmarked, in order (`edit::toggle_mark`); they follow edits (`sync`).
     pub bookmarks: Vec<u64>,
     /// Find in selection: the part of the text the find bar searches (drawn faintly); it follows edits (`sync`).
@@ -294,6 +299,7 @@ impl View {
             max_w: 0.0,
             rows: Vec::new(),
             drag: None,
+            drop_at: None,
             cache: HashMap::new(),
             cache_bytes: 0,
             tick: 0,
@@ -891,6 +897,20 @@ impl View {
             // (the line's own x in the layout: an indent, a wrapped row hanging under the indentation)
             let lx = r.lay.x_of(line.start_index()) - line_x_from_start(&r.lay, r.line);
             draw_row(cr, &r.lay, &line, x0 + lx, r.y + cx.style.baseline, ox, ox + cx.width, t.text);
+        }
+        // where dragged text would go: a caret in the accent color
+        if let Some(p) = self.drop_at {
+            for r in rows.iter() {
+                let (la, lb) = r.lay.line_range(r.line);
+                let (a, b) = (r.seg.start + r.lay.rel(la), r.seg.start + r.lay.rel(lb));
+                if p >= a && (p < b || (p == b && r.line + 1 == r.lay.lines())) {
+                    let x = r.lay.x_of(r.lay.disp(p - r.seg.start));
+                    set_color(cr, t.accent);
+                    cr.rectangle((x0 + x).round() - 1.0, r.y, 2.0, row_h);
+                    let _ = cr.fill();
+                    break;
+                }
+            }
         }
         // the caret
         if focused && caret_on {

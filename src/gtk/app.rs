@@ -2521,6 +2521,37 @@ impl App {
     }
 
     /// Matches on screen: from the count when it's done for this text.
+    /// Drag and drop: the selection moved to `to` (copied, with `copy`), as one step to undo, and selected there.
+    pub fn drop_text(&mut self, to: u64, copy: bool) {
+        let sel = self.tab().view.sel;
+        let (a, b) = (sel.start(), sel.end());
+        // (onto itself: nothing)
+        if sel.is_empty() || (!copy && to >= a && to <= b) || !self.editable() {
+            return;
+        }
+        let tab = &mut self.tabs[self.active];
+        let text = tab.doc.read(a, b);
+        let n = text.len() as u64;
+        tab.doc.seal();
+        tab.doc.begin(EditKind::Other, sel);
+        let at = if copy || to < a {
+            if !copy {
+                tab.doc.delete(a, b);
+            }
+            tab.doc.insert(to, &text);
+            to
+        } else {
+            tab.doc.insert(to, &text);
+            tab.doc.delete(a, b);
+            to - n
+        };
+        let new = Sel::new(at, at + n);
+        tab.doc.end(new);
+        tab.doc.seal();
+        tab.view.sel = new;
+        self.after_edit(true);
+    }
+
     /// The highlighted searches' matches in `[a, b)` of the tab shown (searched directly: a screenful), each with its
     /// color.
     pub fn visible_marks(&self, a: u64, b: u64) -> Vec<(u64, u64, u32)> {

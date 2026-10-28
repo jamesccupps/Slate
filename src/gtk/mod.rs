@@ -826,10 +826,10 @@ fn connect(ui: &Rc<Ui>, prev: &gtk4::Button, next: &gtk4::Button, lines_btn: &gt
             ui.text_dragged(x + dx, y + dy);
         }
     });
-    drag.connect_drag_end(|_, _, _| {
+    drag.connect_drag_end(|g, _, _| {
         if let Some(ui) = get_ui() {
-            ui.with(|a| a.tab_mut().view.drag = None);
-            ui.set_primary();
+            let ctrl = g.current_event_state().contains(gdk::ModifierType::CONTROL_MASK);
+            ui.text_released(ctrl);
         }
     });
     ui.text.add_controller(drag);
@@ -1347,6 +1347,19 @@ const SHORTCUTS: &str = "Slate keyboard shortcuts
 
 impl Ui {
     /// Test mode: a key as if pressed in the text.
+    /// Test mode: the left button pressed at `x`, `y` in the text (`n`: which click), the mouse moved there, let go.
+    pub fn press_for_test(&self, n: i32, x: f64, y: f64) {
+        self.text_pressed(1, n, x, y, false);
+    }
+
+    pub fn drag_for_test(&self, x: f64, y: f64) {
+        self.text_dragged(x, y);
+    }
+
+    pub fn release_for_test(&self, ctrl: bool) {
+        self.text_released(ctrl);
+    }
+
     pub fn key_for_test(&self, keyval: gdk::Key, state: gdk::ModifierType) -> bool {
         self.key(keyval, state)
     }
@@ -1635,6 +1648,10 @@ impl Ui {
             a.with_view(&g, |v, cx| {
                 let pos = v.pos_at(cx, x, y).min(doc_len);
                 match n {
+                    // (in the selection: it may be dragged somewhere else; a click without moving puts the caret there)
+                    1 if !shift && !v.sel.is_empty() && pos > v.sel.start() && pos < v.sel.end() => {
+                        v.drag = Some(view::Drag::Text { at: pos, x: x as i32, y: y as i32, moved: false });
+                    }
                     1 => {
                         v.set_caret(pos, shift);
                         v.drag = Some(view::Drag::Chars);
@@ -1673,10 +1690,38 @@ impl Ui {
         }
     }
 
+    /// The mouse button let go after a press in the text: dragged text dropped (moved there, or copied with `ctrl`),
+    /// a press in the selection that didn't move puts the caret there.
+    fn text_released(&self, ctrl: bool) {
+        let done = self.with(|a| {
+            let v = &mut a.tab_mut().view;
+            match (v.drag.take(), v.drop_at.take()) {
+                (Some(view::Drag::Text { moved: true, .. }), Some(to)) => a.drop_text(to, ctrl),
+                (Some(view::Drag::Text { at, moved: false, .. }), _) => v.sel = Sel::at(at),
+                _ => {}
+            }
+            a.dirty_view = true;
+        });
+        if done.is_some() {
+            self.set_primary();
+        }
+    }
+
     fn text_dragged(&self, x: f64, y: f64) {
         let g = self.geom();
         let gw = self.app.try_borrow().map(|a| self.gutter_width(&a)).unwrap_or(0.0);
         let x = x - gw - PAD;
+        // dragged text starts moving once the mouse has gone as far as GTK says a drag starts
+        let start = self.app.try_borrow().ok().and_then(|a| match a.tab().view.drag {
+            Some(view::Drag::Text { x: x0, y: y0, moved: false, .. }) => Some((x0, y0)),
+            _ => None,
+        });
+        if let Some((x0, y0)) = start {
+            let far = gtk4::Settings::default().map_or(8, |s| s.gtk_dnd_drag_threshold()).max(2) as f64;
+            if (x - x0 as f64).abs() < far && (y - y0 as f64).abs() < far {
+                return;
+            }
+        }
         self.with(|a| {
             a.with_view(&g, |v, cx| {
                 if y < 0.0 {
@@ -1696,6 +1741,10 @@ impl Ui {
                         let a0 = cx.doc.line_start_of(pos);
                         let b0 = cx.doc.next_newline(a0).map_or(cx.doc.len(), |p| p + 1);
                         v.sel = if a0 < la { Sel::new(lb, a0) } else { Sel::new(la, b0.max(lb)) };
+                    }
+                    Some(view::Drag::Text { at, x, y, .. }) => {
+                        v.drag = Some(view::Drag::Text { at, x, y, moved: true });
+                        v.drop_at = Some(pos);
                     }
                     None => {}
                 }
