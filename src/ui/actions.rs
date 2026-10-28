@@ -2256,6 +2256,56 @@ impl App {
         self.after_edit();
     }
 
+    // ---- tabs in the title bar ----
+
+    /// The mouse over caption button `b` (None: over none of them now): its background. Windows says when the mouse
+    /// leaves them (TME_NONCLIENT).
+    pub fn caption_hover(&mut self, b: Option<u8>) {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{TME_LEAVE, TME_NONCLIENT, TRACKMOUSEEVENT, TrackMouseEvent};
+        if b.is_some() {
+            let mut t = TRACKMOUSEEVENT { cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE | TME_NONCLIENT, hwndTrack: self.hwnd, dwHoverTime: 0 };
+            unsafe {
+                let _ = TrackMouseEvent(&mut t);
+            }
+        } else if matches!(self.down, Hit::Caption(_)) {
+            self.down = Hit::None;
+        }
+        let h = b.map_or(Hit::None, Hit::Caption);
+        if (b.is_some() || matches!(self.hover, Hit::Caption(_))) && self.hover != h {
+            self.hover = h;
+            self.invalidate();
+        }
+    }
+
+    pub fn caption_press(&mut self, b: u8) {
+        self.down = Hit::Caption(b);
+        self.hover = Hit::Caption(b);
+        self.invalidate();
+    }
+
+    /// Let go over caption button `b`: what it does (SC_MINIMIZE, SC_MAXIMIZE or SC_RESTORE, SC_CLOSE, for
+    /// WM_SYSCOMMAND), when it's the one pressed. Test mode only notes it (`print:asked`): it would show the hidden
+    /// window, or end the test.
+    pub fn caption_release(&mut self, b: Option<u8>) -> Option<usize> {
+        let pressed = std::mem::replace(&mut self.down, Hit::None);
+        // (the next move over the buttons shows which one the mouse is on again)
+        self.hover = Hit::None;
+        self.invalidate();
+        let b = b.filter(|&b| pressed == Hit::Caption(b))?;
+        use windows::Win32::UI::WindowsAndMessaging::{IsZoomed, SC_CLOSE, SC_MAXIMIZE, SC_MINIMIZE, SC_RESTORE};
+        let zoomed = unsafe { IsZoomed(self.hwnd) }.as_bool();
+        let (cmd, name) = match b {
+            0 => (SC_MINIMIZE, "Minimize"),
+            1 if zoomed => (SC_RESTORE, "Restore"),
+            1 => (SC_MAXIMIZE, "Maximize"),
+            _ => (SC_CLOSE, "Close"),
+        };
+        if win::SCRIPTED.with(|s| s.borrow_mut().as_mut().map(|s| s.asked.push(name.into())).is_some()) {
+            return None;
+        }
+        Some(cmd as usize)
+    }
+
     // ---- spell check ----
 
     /// A word spelled wrong at (`x`, `y`) in the text (client DIPs): what it may have been meant to be, with the word
@@ -3335,7 +3385,8 @@ impl App {
                 self.tab_drag = Some((i, x, false));
                 capture(self.hwnd);
             }
-            (0, Hit::TabStrip) => {
+            // (tabs in the title bar: the strip's empty room is the caption, a double-click there is Windows')
+            (0, Hit::TabStrip) if !self.custom_frame => {
                 if self.click_count(x, y) == 2 {
                     self.pending.push(Deferred::Cmd(Cmd::NewTab));
                 }
@@ -3948,7 +3999,7 @@ impl App {
             TIMER_TIP => self.show_tip(),
             TIMER_SPELL => {
                 self.kill_timer(id);
-                self.speller = super::spell::speller(false).map_or(Spelling::Unavailable, Spelling::Ready);
+                self.speller = super::spell::speller(win::testing()).map_or(Spelling::Unavailable, Spelling::Ready);
                 self.invalidate();
             }
             TIMER_UNCLOAK => {
@@ -4216,6 +4267,11 @@ impl App {
             Cmd::ToggleSpellCheck => {
                 self.settings.spell_check = !self.settings.spell_check;
                 self.settings_changed();
+            }
+            Cmd::ToggleTitleBarTabs => {
+                self.settings.tabs_in_title_bar = !self.settings.tabs_in_title_bar;
+                self.settings_changed();
+                self.sync_frame();
             }
             Cmd::Suggestion(i) => self.spell_replace(i as usize),
             Cmd::AddWord | Cmd::IgnoreWord => {
@@ -4795,6 +4851,7 @@ impl App {
                     check(Cmd::ToggleWrap, "&Word wrap", "Alt+Z", s.wrap),
                     check(Cmd::ToggleLineNumbers, "&Line numbers", "", s.line_numbers),
                     check(Cmd::ToggleWhitespace, "Show w&hitespace", "", s.show_whitespace),
+                    check(Cmd::ToggleTitleBarTabs, "&Tabs in the title bar", "", s.tabs_in_title_bar && !self.theme.hc),
                     check(Cmd::ToggleSpellCheck, if matches!(self.speller, Spelling::Unavailable) { "Spell chec&k (Windows has no dictionary for it)" } else { "Spell chec&k" }, "", s.spell_check),
                     item(Cmd::CharInfo, "&Character at the caret", ""),
                     Item::Sep,
@@ -5317,6 +5374,16 @@ pub fn run(cell: &Cell, d: Deferred) {
             if let Some(c) = popup(cell, "tabs", items, r.x, r.bottom(), false) {
                 run_cmd(cell, c);
             }
+        }
+        Deferred::Frame => {
+            use windows::Win32::UI::WindowsAndMessaging::{SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetWindowPos};
+            let hwnd = cell.borrow().hwnd;
+            unsafe {
+                let _ = SetWindowPos(hwnd, None, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            }
+            let mut a = cell.borrow_mut();
+            a.layout();
+            a.invalidate();
         }
         Deferred::UpdatePrompt => {
             let (rel, hwnd) = {

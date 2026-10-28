@@ -392,6 +392,9 @@ impl Tab {
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Deferred {
     Cmd(Cmd),
+    /// The window's frame changed (tabs in the title bar on or off): SetWindowPos, which sends WM_NCCALCSIZE and
+    /// WM_SIZE, outside the App's borrow.
+    Frame,
     Menu(usize),
     ContextMenu(f32, f32),
     TabMenu(usize, f32, f32),
@@ -455,6 +458,8 @@ pub enum Hit {
     Text,
     VBar,
     HBar,
+    /// Tabs in the title bar: minimize (0), maximize or restore (1), close (2).
+    Caption(u8),
 }
 
 pub struct UiFonts {
@@ -500,6 +505,12 @@ pub struct App {
     pub dpi: u32,
     pub size: (f32, f32),
     pub r_tabs: Rect,
+    /// Tabs in the title bar (`super::CUSTOM_FRAME`): the frame has no caption, the tab strip is the window's top,
+    /// with the window's buttons drawn at its end (`caption_rects`).
+    pub custom_frame: bool,
+    pub caption_rects: [Rect; 3],
+    /// The window is the active one (its caption buttons are dimmed when it isn't).
+    pub window_active: bool,
     pub r_menu: Rect,
     pub r_find: Rect,
     pub r_notice: Rect,
@@ -635,6 +646,9 @@ impl App {
             dpi,
             size: (800.0, 600.0),
             r_tabs: Rect::default(),
+            custom_frame: super::CUSTOM_FRAME.with(|c| c.get()),
+            caption_rects: [Rect::default(); 3],
+            window_active: true,
             r_menu: Rect::default(),
             r_find: Rect::default(),
             r_notice: Rect::default(),
@@ -751,8 +765,20 @@ impl App {
     }
 
     /// Re-reads the theme (settings or Windows changed).
+    /// Tabs in the title bar where the setting says so, but not in high contrast (Windows' own title bar there): the
+    /// frame is worked out again outside the App's borrow (`Deferred::Frame`).
+    pub fn sync_frame(&mut self) {
+        let on = self.settings.tabs_in_title_bar && !self.theme.hc;
+        if on != self.custom_frame {
+            self.custom_frame = on;
+            super::CUSTOM_FRAME.with(|c| c.set(on));
+            self.pending.push(Deferred::Frame);
+        }
+    }
+
     pub fn apply_theme(&mut self) {
         self.theme = make_theme(self.settings.theme);
+        self.sync_frame();
         if self.theme.hc {
             win::system_title_bar(self.hwnd);
         } else {
@@ -819,6 +845,12 @@ impl App {
         let mut y = 0.0;
         self.r_tabs = band(y, metrics::TAB_BAR_H);
         y += metrics::TAB_BAR_H;
+        self.caption_rects = if self.custom_frame {
+            let r = self.r_tabs;
+            std::array::from_fn(|k| Rect::new(r.right() - (3 - k) as f32 * metrics::CAPTION_W, r.y, metrics::CAPTION_W, r.h))
+        } else {
+            [Rect::default(); 3]
+        };
         self.r_menu = band(y, metrics::MENU_BAR_H);
         y += metrics::MENU_BAR_H;
         let fh = self.find.height();
@@ -864,7 +896,9 @@ impl App {
         let bar = self.r_tabs;
         let left = 8.0;
         let new_w = 36.0;
-        let mut avail = (bar.w - left - new_w - 16.0).max(metrics::TAB_MIN_W);
+        // (tabs in the title bar: room for the window's buttons, and some to drag the window by)
+        let reserved = if self.custom_frame { 3.0 * metrics::CAPTION_W + metrics::DRAG_MIN } else { 0.0 };
+        let mut avail = (bar.w - left - new_w - 16.0 - reserved).max(metrics::TAB_MIN_W);
         // Tabs that don't all fit: a button after the new-tab one lists them all.
         let overflow = self.tabs.len() as f32 * metrics::TAB_MIN_W > avail;
         if overflow {
@@ -947,6 +981,9 @@ impl App {
 
     pub fn hit(&self, x: f32, y: f32) -> Hit {
         if self.r_tabs.contains(x, y) {
+            if let Some(k) = self.caption_rects.iter().position(|r| r.contains(x, y)) {
+                return Hit::Caption(k as u8);
+            }
             for (i, (r, c)) in self.tab_rects.iter().enumerate() {
                 if r.contains(x, y) && x >= self.r_tabs.x && x < self.tabs_clip_right() {
                     if c.contains(x, y) {
@@ -1297,6 +1334,22 @@ impl App {
             }
             g.text("\u{E70D}", &self.fonts.icons_small, lr, t.text_dim, Align::Center);
         }
+        // the window's buttons (tabs in the title bar), as Windows 11 draws them: close turns red under the mouse
+        if self.custom_frame {
+            let zoomed = unsafe { windows::Win32::UI::WindowsAndMessaging::IsZoomed(self.hwnd) }.as_bool();
+            let glyphs = ["\u{E921}", if zoomed { "\u{E923}" } else { "\u{E922}" }, "\u{E8BB}"];
+            for (k, r) in self.caption_rects.iter().enumerate() {
+                let h = Hit::Caption(k as u8);
+                let mut fg = if self.window_active { t.text } else { t.text_faint };
+                if k == 2 && self.hover == h {
+                    g.fill(*r, if self.down == h { 0xFFB3261A } else { 0xFFC42B1C });
+                    fg = 0xFFFFFFFF;
+                } else if let Some(bg) = self.hot(h) {
+                    g.fill(*r, bg);
+                }
+                g.text(glyphs[k], &self.fonts.icons_small, *r, fg, Align::Center);
+            }
+        }
     }
 
     /// Where tab `i`'s title goes: all of the tab but what shows at its end (the close button, the unsaved-changes
@@ -1513,14 +1566,11 @@ impl App {
         let mut wrong = Vec::new();
         if self.settings.spell_check && !tab.read_only && tab.filter.is_none() && coming.is_none() && crate::spell::checks(tab.lang) {
             if matches!(self.speller, Spelling::NotYet) {
-                // (made a moment after the window shows, as it takes ~25 ms; at once in test mode)
+                // (made a moment after the window shows, as it takes ~25 ms; test mode too, so startups measure the
+                // same: its scripts run the timer, `timer:13`)
                 self.speller = Spelling::Soon;
-                if win::testing() {
-                    self.speller = super::spell::speller(true).map_or(Spelling::Unavailable, Spelling::Ready);
-                } else {
-                    unsafe {
-                        windows::Win32::UI::WindowsAndMessaging::SetTimer(hwnd, super::actions::TIMER_SPELL, 300, None);
-                    }
+                unsafe {
+                    windows::Win32::UI::WindowsAndMessaging::SetTimer(hwnd, super::actions::TIMER_SPELL, 300, None);
                 }
             }
             if let Spelling::Ready(s) = &mut self.speller {

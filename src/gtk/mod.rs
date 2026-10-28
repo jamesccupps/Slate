@@ -81,6 +81,8 @@ pub struct Ui {
     notice_save_as: gtk4::Button,
     status_menu: gtk4::PopoverMenu,
     im: gtk4::IMMulticontext,
+    /// The press on the tab strip being handled (for the window menu, which wants the event).
+    tab_event: std::cell::Cell<Option<gdk::Event>>,
     css: gtk4::CssProvider,
     strip: RefCell<chrome::TabStrip>,
     first_tab: Cell<usize>,
@@ -623,7 +625,18 @@ pub fn window(application: &gtk4::Application, test: Option<Rc<testmode::Test>>)
     middle.append(&vbar);
     let root = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
     root.append(&menubar);
-    root.append(&tabs);
+    // Tabs in the title bar (the setting as Slate starts): the strip and the desktop's own window buttons are the
+    // window's title bar, which GTK draws; else the strip goes under the menu bar.
+    if settings.tabs_in_title_bar {
+        let bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+        bar.add_css_class("slate-titlebar");
+        tabs.set_hexpand(true);
+        bar.append(&tabs);
+        bar.append(&gtk4::WindowControls::new(gtk4::PackType::End));
+        window.set_titlebar(Some(&bar));
+    } else {
+        root.append(&tabs);
+    }
     root.append(&find_box);
     root.append(&notice);
     root.append(&middle);
@@ -676,6 +689,7 @@ pub fn window(application: &gtk4::Application, test: Option<Rc<testmode::Test>>)
         notice_save_as,
         status_menu,
         im,
+        tab_event: std::cell::Cell::new(None),
         css,
         strip: RefCell::new(chrome::TabStrip::default()),
         first_tab: Cell::new(0),
@@ -886,10 +900,30 @@ fn connect(ui: &Rc<Ui>, prev: &gtk4::Button, next: &gtk4::Button, lines_btn: &gt
     tclick.set_button(0);
     tclick.connect_pressed(|g, n, x, _| {
         if let Some(ui) = get_ui() {
+            ui.tab_event.set(g.current_event());
             ui.tabs_pressed(g.current_button(), n, x);
         }
     });
     ui.tabs.add_controller(tclick);
+    // the strip's empty room in the title bar: dragged, it moves the window (the desktop does, from where it was
+    // pressed)
+    let tdrag = gtk4::GestureDrag::new();
+    tdrag.connect_drag_update(|g, dx, dy| {
+        let Some(ui) = get_ui() else { return };
+        let Some((x, y)) = g.start_point() else { return };
+        let threshold = gtk4::Settings::default().map_or(8, |s| s.gtk_dnd_drag_threshold()) as f64;
+        if !ui.in_title_bar() || chrome::tab_part_at(&ui.strip.borrow(), x).is_some() || dx.hypot(dy) < threshold {
+            return;
+        }
+        let toplevel = ui.window.surface().and_then(|s| s.downcast::<gdk::Toplevel>().ok());
+        let (Some(t), Some(dev)) = (toplevel, g.current_event_device()) else { return };
+        #[allow(deprecated)]
+        let (wx, wy) = ui.tabs.translate_coordinates(&ui.window, x, y).unwrap_or((x, y));
+        let (nx, ny) = ui.window.surface_transform();
+        t.begin_move(&dev, g.current_button() as i32, wx + nx, wy + ny, g.current_event_time());
+        g.reset();
+    });
+    ui.tabs.add_controller(tdrag);
     let tmotion = gtk4::EventControllerMotion::new();
     tmotion.connect_motion(|_, x, _| {
         if let Some(ui) = get_ui() {
@@ -1151,6 +1185,7 @@ fn commands() -> Vec<(&'static str, Cmd, &'static [&'static str])> {
         ("filter-lines-not", Cmd::FilterLines(true), &[]),
         ("clear-highlights", Cmd::ClearHighlights, &[]),
         ("spell-check", Cmd::SpellCheck, &[]),
+        ("title-bar-tabs", Cmd::TitleBarTabs, &[]),
         ("suggest-0", Cmd::Suggestion(0), &[]),
         ("suggest-1", Cmd::Suggestion(1), &[]),
         ("suggest-2", Cmd::Suggestion(2), &[]),
@@ -1166,7 +1201,7 @@ fn commands() -> Vec<(&'static str, Cmd, &'static [&'static str])> {
 }
 
 /// Menu items that show a check mark: their actions have a true/false state (`Ui::sync_menu`).
-const CHECKED: &[&str] = &["wrap", "line-numbers", "spell-check", "theme-system", "theme-light", "theme-dark", "eol-lf", "eol-crlf", "read-only"];
+const CHECKED: &[&str] = &["wrap", "line-numbers", "spell-check", "title-bar-tabs", "theme-system", "theme-light", "theme-dark", "eol-lf", "eol-crlf", "read-only"];
 
 fn actions(ui: &Rc<Ui>) {
     // (in place of the window's own "win" group: menus and shortcuts find these the same way)
@@ -1270,7 +1305,7 @@ fn menu_model(recent: &gio::Menu) -> gio::Menu {
     edit.append_section(None, &section(&[("Time/date", "date-time")]));
     bar.append_submenu(Some("_Edit"), &edit);
     let view = gio::Menu::new();
-    view.append_section(None, &section(&[("Word wrap", "wrap"), ("Line numbers", "line-numbers"), ("Spell check", "spell-check"), ("Character at the caret", "char-info")]));
+    view.append_section(None, &section(&[("Word wrap", "wrap"), ("Line numbers", "line-numbers"), ("Spell check", "spell-check"), ("Tabs in the title bar", "title-bar-tabs"), ("Character at the caret", "char-info")]));
     view.append_section(None, &section(&[("Show only matching lines", "filter-lines"), ("Show lines not matching", "filter-lines-not"), ("Clear highlights", "clear-highlights")]));
     view.append_section(None, &section(&[("Zoom in", "zoom-in"), ("Zoom out", "zoom-out"), ("Reset zoom", "zoom-reset")]));
     let theme = section(&[("Use system setting", "theme-system"), ("Light", "theme-light"), ("Dark", "theme-dark")]);
@@ -1846,8 +1881,34 @@ impl Ui {
         });
     }
 
+    /// The tab strip is the window's title bar (`Settings::tabs_in_title_bar` as Slate started).
+    fn in_title_bar(&self) -> bool {
+        self.window.titlebar().is_some()
+    }
+
     fn tabs_pressed(&self, button: u32, n: i32, x: f64) {
         let part = chrome::tab_part_at(&self.strip.borrow(), x);
+        if part.is_none() && self.in_title_bar() {
+            // the strip's empty room is the title bar's: a double-click maximizes or restores, a right-click shows
+            // the desktop's window menu (dragging moves the window: `tdrag`)
+            match (button, n) {
+                (1, 2) => {
+                    if self.window.is_maximized() {
+                        self.window.unmaximize();
+                    } else {
+                        self.window.maximize();
+                    }
+                }
+                (3, 1) => {
+                    let toplevel = self.window.surface().and_then(|s| s.downcast::<gdk::Toplevel>().ok());
+                    if let (Some(t), Some(e)) = (toplevel, self.tab_event.take()) {
+                        t.show_window_menu(e);
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
         match (part, button) {
             (Some(chrome::TabPart::Tab(i)), 1) => {
                 self.with(|a| a.activate(i));
@@ -1977,6 +2038,8 @@ impl Ui {
              .slate-notice {{ background-color: {notice}; color: {text}; padding: 6px 12px; }}
              .slate-notice label {{ color: {text}; }}
              menubar {{ background-color: {frame}; color: {text}; }}
+             .slate-titlebar, .slate-titlebar:backdrop {{ background-color: {frame}; background-image: none; box-shadow: none; }}
+             .slate-titlebar windowcontrols button {{ color: {text}; }}
              menubar > item {{ color: {text}; }}
              window {{ background-color: {frame}; }}",
             frame = hex(t.frame),
@@ -2135,6 +2198,7 @@ impl Ui {
             ("wrap", a.style.wrap),
             ("line-numbers", a.style.line_numbers),
             ("spell-check", a.settings.spell_check),
+            ("title-bar-tabs", a.settings.tabs_in_title_bar),
             ("theme-system", theme == ThemeMode::System),
             ("theme-light", theme == ThemeMode::Light),
             ("theme-dark", theme == ThemeMode::Dark),

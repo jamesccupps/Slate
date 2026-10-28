@@ -39,6 +39,8 @@ pub struct Settings {
     pub show_whitespace: bool,
     /// Words spelled wrong underlined (`crate::spell`).
     pub spell_check: bool,
+    /// Windows: the tabs in the title bar, as in Windows 11's Notepad (Windows' own title bar in high contrast).
+    pub tabs_in_title_bar: bool,
     pub theme: ThemeMode,
     pub tab_size: u32,
     pub use_spaces: bool,
@@ -79,6 +81,7 @@ impl Default for Settings {
             line_numbers: true,
             show_whitespace: false,
             spell_check: true,
+            tabs_in_title_bar: true,
             theme: ThemeMode::System,
             tab_size: 4,
             use_spaces: true,

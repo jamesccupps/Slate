@@ -80,6 +80,7 @@ pub enum Cmd {
     ToggleLineNumbers,
     ToggleWhitespace,
     ToggleSpellCheck,
+    ToggleTitleBarTabs,
     /// The spell check menu's suggestion (`App::spell_word`).
     Suggestion(u8),
     AddWord,

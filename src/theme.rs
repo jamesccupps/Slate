@@ -457,6 +457,10 @@ pub fn system_accent(dark: bool) -> u32 {
 /// Sizes in DIPs.
 pub mod metrics {
     pub const TAB_BAR_H: f32 = 38.0;
+    /// Tabs in the title bar: the window's minimize, maximize and close buttons are this wide (as Windows 11's)...
+    pub const CAPTION_W: f32 = 46.0;
+    /// ...and the tab strip keeps at least this much room free beside them, to drag the window by.
+    pub const DRAG_MIN: f32 = 40.0;
     pub const MENU_BAR_H: f32 = 32.0;
     pub const STATUS_H: f32 = 26.0;
     pub const FIND_ROW_H: f32 = 40.0;

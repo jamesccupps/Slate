@@ -130,6 +130,7 @@ pub enum Cmd {
     /// No search highlighted any more (the find bar's Highlight).
     ClearHighlights,
     SpellCheck,
+    TitleBarTabs,
     /// The spell check menu's suggestion (`App::spell_word`).
     Suggestion(u8),
     AddWord,
@@ -1936,6 +1937,13 @@ impl App {
             Cmd::SpellCheck => {
                 self.settings.spell_check = !self.settings.spell_check;
                 self.settings.save();
+            }
+            Cmd::TitleBarTabs => {
+                // (GTK makes a window's title bar as it's shown: the next start has it)
+                self.settings.tabs_in_title_bar = !self.settings.tabs_in_title_bar;
+                self.settings.save();
+                let where_ = if self.settings.tabs_in_title_bar { "in the title bar" } else { "under the menu bar" };
+                self.flash(&format!("The tabs go {where_} from the next start."), false);
             }
             Cmd::Suggestion(i) => self.spell_replace(i as usize),
             Cmd::AddWord | Cmd::IgnoreWord => {

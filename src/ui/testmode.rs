@@ -220,6 +220,7 @@ fn cmd_of(name: &str) -> Option<Cmd> {
         "MoveLineDown" => Cmd::MoveLineDown,
         "ToggleWrap" => Cmd::ToggleWrap,
         "ToggleSpellCheck" => Cmd::ToggleSpellCheck,
+        "ToggleTitleBarTabs" => Cmd::ToggleTitleBarTabs,
         "AddWord" => Cmd::AddWord,
         "IgnoreWord" => Cmd::IgnoreWord,
         "ToggleLineNumbers" => Cmd::ToggleLineNumbers,
@@ -728,6 +729,19 @@ fn describe(cell: &Cell, what: &str) -> String {
         "wrong" => {
             let t = a.tab();
             a.spell_shown.iter().map(|&(s, e)| String::from_utf8_lossy(&t.doc.read(s, e)).into_owned()).collect::<Vec<_>>().join(" ")
+        }
+        // the window's frame: `title bar tabs` or `standard`, and how far the client area starts below the window's top
+        "frame" => {
+            use windows::Win32::Foundation::{POINT, RECT};
+            use windows::Win32::Graphics::Gdi::ClientToScreen;
+            use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
+            let (mut r, mut p) = (RECT::default(), POINT::default());
+            unsafe {
+                let _ = GetWindowRect(a.hwnd, &mut r);
+                let _ = ClientToScreen(a.hwnd, &mut p);
+            }
+            let kind = if a.custom_frame { "title bar tabs" } else { "standard" };
+            format!("{kind}, client {} px below the top{}", p.y - r.top, if super::CUSTOM_FRAME.with(|c| c.get()) == a.custom_frame { "" } else { " (MISMATCH)" })
         }
         "speller" => match &a.speller {
             super::app::Spelling::Ready(s) => s.lang.clone(),
@@ -1263,6 +1277,62 @@ pub fn run(args: &[String]) -> i32 {
                 unsafe { SendMessageW(hwnd, WM_SYSCOMMAND, WPARAM(SC_KEYMENU as usize), LPARAM(0)) };
             }
             "altgr" => super::commands::FORCED_ALTGR.with(|f| f.set(arg == "on")),
+            // the window's frame, as Windows asks it (`<x>,<y>` client DIPs): `nchit:` what's there (WM_NCHITTEST),
+            // `ncmove:` the mouse there, `ncclick:` a left click there (the non-client messages, when it's the frame's),
+            // `ncleave` (WM_NCMOUSELEAVE)
+            // the window active or not, as Windows tells its frame (WM_NCACTIVATE: `ncactivate:0|1`)
+            "ncactivate" => {
+                use windows::Win32::Foundation::{LPARAM, WPARAM};
+                use windows::Win32::UI::WindowsAndMessaging::{SendMessageW, WM_NCACTIVATE};
+                unsafe { SendMessageW(hwnd, WM_NCACTIVATE, WPARAM((arg == "1") as usize), LPARAM(0)) };
+            }
+            "nchit" | "ncmove" | "ncclick" | "ncleave" => {
+                use windows::Win32::Foundation::{LPARAM, POINT, WPARAM};
+                use windows::Win32::Graphics::Gdi::ClientToScreen;
+                use windows::Win32::UI::WindowsAndMessaging::*;
+                let (x, y) = arg.split_once(',').map(|(x, y)| (x.trim().parse().unwrap_or(0.0), y.trim().parse().unwrap_or(0.0))).unwrap_or((0.0, 0.0));
+                let mut p = {
+                    let a = cell.borrow();
+                    POINT { x: a.dip_to_px(x), y: a.dip_to_px(y) }
+                };
+                unsafe {
+                    let _ = ClientToScreen(hwnd, &mut p);
+                }
+                let lp = LPARAM((((p.y as u32 & 0xFFFF) << 16) | (p.x as u32 & 0xFFFF)) as isize);
+                let code = unsafe { SendMessageW(hwnd, WM_NCHITTEST, WPARAM(0), lp) }.0 as u32;
+                let name = match code {
+                    HTCLIENT => "client",
+                    HTCAPTION => "caption",
+                    HTMINBUTTON => "minimize",
+                    HTMAXBUTTON => "maximize",
+                    HTCLOSE => "close",
+                    HTTOP => "top",
+                    HTTOPLEFT => "topleft",
+                    HTTOPRIGHT => "topright",
+                    HTLEFT => "left",
+                    HTRIGHT => "right",
+                    HTBOTTOM => "bottom",
+                    HTSYSMENU => "sysmenu",
+                    _ => "other",
+                };
+                match op {
+                    "nchit" => out.push_str(&format!("nchit {arg}: {name}\n")),
+                    "ncmove" => unsafe {
+                        SendMessageW(hwnd, WM_NCMOUSEMOVE, WPARAM(code as usize), lp);
+                    },
+                    "ncleave" => unsafe {
+                        SendMessageW(hwnd, WM_NCMOUSELEAVE, WPARAM(0), LPARAM(0));
+                    },
+                    // (only the window's buttons: a press on the caption or an edge would start Windows' own moving
+                    // or sizing, which follows the real mouse)
+                    _ if !matches!(code, HTMINBUTTON | HTMAXBUTTON | HTCLOSE) => out.push_str(&format!("ncclick {arg}: {name}, not clicked\n")),
+                    _ => unsafe {
+                        SendMessageW(hwnd, WM_NCLBUTTONDOWN, WPARAM(code as usize), lp);
+                        SendMessageW(hwnd, WM_NCLBUTTONUP, WPARAM(code as usize), lp);
+                    },
+                }
+                drain_pending(&cell);
+            }
             // a left click as the window gets one: its messages through the window procedure (`<x>,<y>` client pixels)
             "clickraw" => {
                 use windows::Win32::Foundation::{LPARAM, WPARAM};

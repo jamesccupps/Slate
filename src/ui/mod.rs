@@ -237,6 +237,10 @@ fn guarded<R>(cell: &Cell, what: impl FnOnce() -> String, f: impl FnOnce() -> R)
 }
 
 extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    // (the frame from the start: Windows works it out while the window is made, before there's an App)
+    if msg == WM_NCCALCSIZE && CUSTOM_FRAME.with(|c| c.get()) {
+        return calc_frame(hwnd, wp, lp);
+    }
     let Some(cell) = app_cell() else {
         return unsafe { DefWindowProcW(hwnd, msg, wp, lp) };
     };
@@ -296,6 +300,72 @@ fn on_paint(cell: &Cell, hwnd: HWND) {
     }
 }
 
+thread_local! {
+    /// Tabs in the title bar (`App::custom_frame`): the frame has no caption and the tab strip is the window's top.
+    /// Read by WM_NCCALCSIZE, which comes before the App exists and while it's borrowed.
+    pub static CUSTOM_FRAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The frame's thickness (pixels): a maximized window reaches past the screen by this much.
+fn frame_y(hwnd: HWND) -> i32 {
+    use windows::Win32::UI::HiDpi::GetSystemMetricsForDpi;
+    let dpi = win::dpi_of(hwnd);
+    unsafe { GetSystemMetricsForDpi(SM_CYFRAME, dpi) + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi) }
+}
+
+/// WM_NCCALCSIZE with tabs in the title bar (`CUSTOM_FRAME`): the caption goes, the side and bottom borders stay;
+/// maximized, the top comes in by the frame, which reaches past the screen. (Its first `RECT` either way: the
+/// window's proposed rectangle in, the client area out.)
+fn calc_frame(hwnd: HWND, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    let rect = lp.0 as *mut RECT;
+    let top = unsafe { (*rect).top };
+    let r = unsafe { DefWindowProcW(hwnd, WM_NCCALCSIZE, wp, lp) };
+    let zoomed = unsafe { IsZoomed(hwnd) }.as_bool();
+    unsafe {
+        (*rect).top = top + if zoomed { frame_y(hwnd) } else { 0 };
+    }
+    r
+}
+
+/// What a point (client pixels) is in a window with tabs in the title bar: the top edge resizes (unless
+/// maximized), the window's buttons answer as Windows' own (so Windows 11 shows Snap layouts over maximize), the
+/// tab strip's empty room is the caption (drag, double-click, the window's menu); the rest is Slate's.
+fn frame_hit(cell: &Cell, hwnd: HWND, p: POINT) -> u32 {
+    use windows::Win32::UI::HiDpi::GetSystemMetricsForDpi;
+    let zoomed = unsafe { IsZoomed(hwnd) }.as_bool();
+    if !zoomed && p.y < unsafe { GetSystemMetricsForDpi(SM_CYFRAME, win::dpi_of(hwnd)) } {
+        let mut rc = RECT::default();
+        unsafe {
+            let _ = GetClientRect(hwnd, &mut rc);
+        }
+        let corner = frame_y(hwnd) * 2;
+        return if p.x < corner {
+            HTTOPLEFT
+        } else if p.x >= rc.right - corner {
+            HTTOPRIGHT
+        } else {
+            HTTOP
+        };
+    }
+    cell.try_borrow().map_or(HTCLIENT, |a| match a.hit(a.px_to_dip(p.x), a.px_to_dip(p.y)) {
+        Hit::Caption(0) => HTMINBUTTON,
+        Hit::Caption(1) => HTMAXBUTTON,
+        Hit::Caption(_) => HTCLOSE,
+        Hit::TabStrip => HTCAPTION,
+        _ => HTCLIENT,
+    })
+}
+
+/// The caption button a WM_NCHITTEST code is.
+fn caption_button(code: usize) -> Option<u8> {
+    match code as u32 {
+        HTMINBUTTON => Some(0),
+        HTMAXBUTTON => Some(1),
+        HTCLOSE => Some(2),
+        _ => None,
+    }
+}
+
 fn handle(cell: &Cell, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
     // A click ends what an input method is composing first: what shows is typed where the caret is, before the click
     // moves it. (Keys are the input method's: one may end a composition itself, its result still on the way.)
@@ -311,6 +381,50 @@ fn handle(cell: &Cell, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<L
             Some(LRESULT(0))
         }
         WM_ERASEBKGND => Some(LRESULT(1)),
+        WM_NCHITTEST if CUSTOM_FRAME.with(|c| c.get()) => {
+            let r = unsafe { DefWindowProcW(hwnd, msg, wp, lp) };
+            if r.0 != HTCLIENT as isize {
+                return Some(r);
+            }
+            let (x, y) = xy(lp);
+            let mut p = POINT { x, y };
+            unsafe {
+                let _ = ScreenToClient(hwnd, &mut p);
+            }
+            Some(LRESULT(frame_hit(cell, hwnd, p) as isize))
+        }
+        WM_NCMOUSEMOVE | WM_NCMOUSELEAVE if CUSTOM_FRAME.with(|c| c.get()) => {
+            let b = if msg == WM_NCMOUSEMOVE { caption_button(wp.0) } else { None };
+            if let Ok(mut a) = cell.try_borrow_mut() {
+                a.caption_hover(b);
+            }
+            if b.is_some() { Some(LRESULT(0)) } else { None }
+        }
+        // (not on to DefWindowProc, which would draw Windows' old buttons there)
+        WM_NCLBUTTONDOWN | WM_NCLBUTTONDBLCLK if CUSTOM_FRAME.with(|c| c.get()) && caption_button(wp.0).is_some() => {
+            if let (Ok(mut a), Some(b)) = (cell.try_borrow_mut(), caption_button(wp.0)) {
+                a.caption_press(b);
+            }
+            Some(LRESULT(0))
+        }
+        WM_NCLBUTTONUP if CUSTOM_FRAME.with(|c| c.get()) => {
+            let b = caption_button(wp.0);
+            let go = cell.try_borrow_mut().ok().and_then(|mut a| a.caption_release(b));
+            if let Some(cmd) = go {
+                unsafe {
+                    let _ = PostMessageW(hwnd, WM_SYSCOMMAND, WPARAM(cmd), LPARAM(0));
+                }
+            }
+            if b.is_some() { Some(LRESULT(0)) } else { None }
+        }
+        WM_NCACTIVATE if CUSTOM_FRAME.with(|c| c.get()) => {
+            if let Ok(mut a) = cell.try_borrow_mut() {
+                a.window_active = wp.0 != 0;
+                a.invalidate();
+            }
+            // (-1: no caption to draw again)
+            Some(unsafe { DefWindowProcW(hwnd, msg, wp, LPARAM(-1)) })
+        }
         WM_GETOBJECT => uia::on_getobject(hwnd, wp, lp),
         WM_SIZE => {
             if let Ok(mut a) = cell.try_borrow_mut() {
@@ -948,6 +1062,7 @@ pub fn create_window(hinst: HINSTANCE, s: &settings::Settings) -> HWND {
         Some(r) => (r.left, r.top, r.right - r.left, r.bottom - r.top),
         None => (CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT),
     };
+    CUSTOM_FRAME.with(|c| c.set(s.tabs_in_title_bar && !crate::theme::high_contrast_on()));
     unsafe {
         let hwnd = CreateWindowExW(
             WS_EX_ACCEPTFILES,
