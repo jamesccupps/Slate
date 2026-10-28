@@ -26,6 +26,8 @@ pub enum Cmd {
     Print,
     /// File → Print preview… (`preview`).
     PrintPreview,
+    /// File → Page setup… (Windows' dialog: paper, orientation, margins).
+    PageSetup,
     Reload,
     RevealFile,
     CopyPath,

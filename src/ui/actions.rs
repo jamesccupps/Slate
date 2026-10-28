@@ -4596,6 +4596,7 @@ impl App {
                     Item::Sep,
                     item(Cmd::Print, "&Print…", "Ctrl+P"),
                     item(Cmd::PrintPreview, "Print pre&view…", ""),
+                    item(Cmd::PageSetup, "Page set&up…", ""),
                     Item::Sep,
                     enabled(Cmd::Reload, "Reloa&d from disk", "", has_path),
                     enabled(Cmd::RevealFile, "Show in &folder", "", has_path),
@@ -5271,6 +5272,26 @@ pub fn print_style(s: &crate::settings::Settings, tab: &Tab, to: u64) -> super::
     }
 }
 
+/// File → Page setup: Windows' dialog for the printer chosen last (paper, orientation, margins); the margins are the
+/// settings from then on.
+fn page_setup(cell: &Cell) {
+    // (test mode never shows it)
+    if super::win::SCRIPTED.with(|s| s.borrow_mut().as_mut().map(|s| s.asked.push("Page setup".into())).is_some()) {
+        return;
+    }
+    let (hwnd, mut last, mut margins) = {
+        let mut a = cell.borrow_mut();
+        (a.hwnd, std::mem::take(&mut a.print_last), a.settings.print_margins)
+    };
+    let ok = last.page_setup(hwnd, &mut margins);
+    let mut a = cell.borrow_mut();
+    a.print_last = last;
+    if ok {
+        a.settings.print_margins = margins;
+        a.settings.save();
+    }
+}
+
 /// File → Print preview: the pages as they'll print, in a window of their own (`preview::run`), whose Print goes on
 /// to the print dialog (`print_tab`). The options and margins changed there are the settings from then on.
 fn preview_tab(cell: &Cell) {
@@ -5471,6 +5492,7 @@ pub fn run_cmd(cell: &Cell, cmd: Cmd) {
         }
         Cmd::Print => print_tab(cell),
         Cmd::PrintPreview => preview_tab(cell),
+        Cmd::PageSetup => page_setup(cell),
         Cmd::Exit => close_window(cell),
         Cmd::Copy | Cmd::Cut => {
             let (size, hwnd) = {

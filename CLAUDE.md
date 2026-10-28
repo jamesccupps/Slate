@@ -299,8 +299,18 @@ lighter one on dark), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate`, `$
     asked about past 100). The windows measure their font and draw: `ui/print.rs` (PrintDlgEx; the document started
     on the UI thread, where a printer's own dialog such as Print to PDF's Save as belongs; the pages drawn with GDI on
     a job's thread, each character on the columns' grid through ExtTextOutW's advances; a guard ends or abandons the
-    document and lets the printer go) and `gtk/print.rs` (GtkPrintOperation: the layout in begin-print, when the
-    paper is known; Pango and cairo in draw-page; the settings kept while Slate runs).
+    document and lets the printer go; `Geometry` works out a page for a printer DC and `draw_page` draws one, shared
+    by printing and the preview) and `gtk/print.rs` (GtkPrintOperation: the layout in begin-print, when the
+    paper is known; Pango and cairo in draw-page; the settings kept while Slate runs; a "Text" tab of Slate's own in
+    the dialog, `create-custom-widget`). The options are settings (`print_colors`: else black, bold and italic
+    kept; `print_line_numbers`; `print_header`: the file's name and the page's number; `print_margins` in hundredths
+    of a millimetre, 3/4 inch unless changed, or the printer's own margin where it's wider). Print preview on
+    Windows is `ui/preview.rs`: a modal window of its own (GDI, the theme's colors; the main window waits, its
+    timers and jobs going on) playing back the pages as metafiles made for the printer chosen last or the default one
+    (`print::Pages`, `Last::printer`: so what shows is what prints), laid out on a job's thread; its bar has the
+    options, Page setup (PageSetupDlgW: paper and orientation kept in `Last` while Slate runs, the margins in the
+    settings) and Print (on to `print_tab`). On Linux it's GTK's (`PrintOperationAction::Preview`: the desktop's
+    previewer), and File → Page setup GTK's dialog (`print_run_page_setup_dialog_async`, kept while Slate runs).
   - `job.rs` — background jobs with progress/cancel, notify the UI by posting a window message (on Linux: an idle
     callback on GLib's main loop).
 - `src/gtk/` — the Linux app (GTK 4): `mod.rs` the window (menu bar from a `gio::Menu`, actions with accelerators
@@ -589,6 +599,23 @@ lighter one on dark), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate`, `$
   matching lines keeps the searches it was made with (`FilterOf::steps`, in order for a tab of lines filtered
   again): when its source tab's file is read again (a log that grew), once the lines are counted, it's made again
   on another thread (`edit::filter_again`, `TaskKind::Refilter`), its caret on its line or at the end if it was.
+- Highlighted searches (the find box's Highlight, Alt+H; `App::highlights`, both apps): kept while Slate runs, drawn
+  under the search's own matches in every tab, each in one of `Theme::marks` (searched in the screenful shown,
+  `matches_in`); Highlight with the same search takes it away, View → Clear highlights all. With highlights, Show
+  only matching lines uses one regex of them all and the box's search (`Matcher::any`: each part with its own case
+  and whole-word options), its tab named "“ERROR” or “WARN” in app.log".
+- Column selection (`edit::Block`, `View::block`, both apps): lines and columns (characters from the line's start,
+  a tab to the next stop, a wide character two: what a monospace font shows; the mouse's column is its x over the
+  font's character width). Alt+drag (`DragMode::Block`; Alt let go after it doesn't give the menu bar the keyboard:
+  `App::alt_dragged`) or Shift+Alt+arrows (so Shift+Alt+Up/Down don't move the line) make it, at most
+  `BLOCK_LINES_MAX` lines. Typing, Paste (a text of as many lines: one each), Backspace and Delete go through
+  `edit::block_edit` (every line, bottom to top, one undo step; a line short of the column padded with spaces when
+  something is put there); Copy and Cut take `block_text`. Anything else that edits or moves the caret ends it
+  (`after_edit`, `after_move`; what keeps it sets it again after).
+- Drag and drop of text (`DragMode::Text`, `view::Drag::Text`): a press inside the selection takes it once the mouse
+  goes past the system's drag distance (SM_CXDRAG; GTK's `gtk-dnd-drag-threshold`), `View::drop_at` drawn as a caret
+  in the accent color; let go, the text moves there (with Ctrl, a copy) as one undo step (`drop_text`). A press that
+  doesn't move puts the caret there. Only inside Slate (not to or from other programs).
 - Find next and previous through all open tabs (the find box's All tabs toggle, Alt+A; `App::find_in_tabs`): on to
   this tab's end, then the other tabs in order, then the rest of this one; a tab of matching lines or one whose text
   isn't there yet is passed over, Find in selection keeps to the selection, and Find previous still takes a match
@@ -620,7 +647,11 @@ lighter one on dark), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate`, `$
   point such as the tab strip —, `altkey`, `altgr:on`, `activate`…), `request:<lines, | between>` hands files over
   as a second start with `--read-only` / `--wait` / `-` does (`waitevent:<name>` makes the event, `print:waits`
   shows the waits and whether it's set), `print:findtext` the find bar's boxes and Find in selection's range,
-  `print:rows` the structure panel's rows (`row:<n>` / `rowopen:<n>` click one, or its arrow), and
+  `print:rows` the structure panel's rows (`row:<n>` / `rowopen:<n>` click one, or its arrow),
+  `previewshot:<png>|<page>[|width]` the print preview drawn into a picture (laid out for Microsoft Print to PDF;
+  the window itself never shows in this mode, nor does Page setup), `set:print_colors=false` (and
+  `print_line_numbers`, `print_header`, `print_margins=l,t,r,b`), `down:`/`move:`/`up:` with `,alt` or `,ctrl`
+  held (a column selection, a copy dropped), and
   `contrast:on`
   pretends Windows' high contrast is on (`print:theme`, `print:syscaret`, `print:statusbar` check the results).
   Prompts are never shown, but `prompt:<file.png>|save` (or `update`, `info`) draws one into a picture.
@@ -637,7 +668,8 @@ lighter one on dark), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate`, `$
   `print:session` (the session folder's files), `print:notice` and `print:blink` (whether the caret's timer runs:
   it stops after `BLINK_STOP` or with the window in the background, so an idle Slate sleeps), and
   `findkey:<combo>` / `replacekey:<combo>` (a key in the find or replace box: `up`, `alt+s`; `key:` goes to the
-  text).
+  text), `down:<x>,<y>[,alt]` / `move:<x>,<y>` / `up:[ctrl]` (the left button in the text, the gutter included),
+  `set:print_colors=false` and the other print options.
 - Measuring: `t:<label>` marks; `print:startup` (each startup step in ms since the process was created: `warp`,
   `device`, `first frame` or `first frame (WARP)` and the switch; a hidden test window gets no WM_PAINT, so the
   switch shows at the harness's next paint), `SLATE_INDEX_FILE=<file> cargo test --release --lib index_speed --

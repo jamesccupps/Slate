@@ -155,11 +155,13 @@ recent files). Details in the [0.13.0 release notes](release-notes-0.13.0.md).
 
 ## 0.14.0
 
-The second round of the *Soon* list: Count all, Show only matching lines, Sort and Remove duplicates on several
-cores (Count all about twice as fast on big files, Remove duplicates too); Find next and previous through all open
-tabs (Alt+A); a tab of matching lines that follows its file as it grows; the JSON structure panel keeping open array
-elements open when elements are put before them, and its clicks going to the right place while it catches up.
-Details in the [0.14.0 release notes](release-notes-0.14.0.md).
+The second round of the *Soon* list: print preview (Windows: a window of its own with the printer's pages; Linux:
+GTK's) and page setup, with print options (colors, line numbers, header and footer, margins); column selection
+(Alt+drag, Shift+Alt+arrows) and drag and drop of text; searches kept highlighted in colors of their own, Show
+only matching lines for any of them; Find next and previous through all open tabs (Alt+A); a tab of matching lines
+that follows its file as it grows; Count all, Show only matching lines, Sort and Remove duplicates on several
+cores; the JSON structure panel keeping open array elements open when elements are put before them, and its clicks
+going to the right place while it catches up. Details in the [0.14.0 release notes](release-notes-0.14.0.md).
 
 ## Next
 
@@ -183,18 +185,6 @@ Details in the [0.14.0 release notes](release-notes-0.14.0.md).
 
 ## Soon
 
-- **Several searches at once** (S–M): lines with any of them, each highlighted in a color of its own (a tab of
-  matching lines follows a log since 0.14.0).
-- **Page setup** (M): margins, the text at the top and bottom of the pages, printing without colors (Print itself
-  came in 0.10.0).
-- **Print preview** (M; the user asked, October 2026): File → Print preview… opens Slate's own window with the pages
-  as they'll print (`src/print.rs`'s layout, drawn with Direct2D): page arrows, the page count, zoom, and Print, which
-  goes on to the system's dialog. The same on Windows 10 and 11 with either print dialog. (Windows 11's newer print
-  dialog says "This app doesn't support print preview" for every classic app that prints the usual way, as Slate
-  does; filling its preview would mean Windows' newer printing method, whose preview Microsoft documents for Store apps
-  only. The older dialog never had a preview.) On Linux, check GTK's print dialog first: its Preview button may already
-  work with Slate's `GtkPrintOperation`.
-- **Editing:** column (Alt+drag) selection (S). Drag and drop of text (M).
 - **Spell check** like Notepad's (M). **Inline IME composition** for Chinese, Japanese and Korean (M).
 - **Tabs in the title bar**, like Windows 11 Notepad, to save space (M).
 

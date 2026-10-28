@@ -20,12 +20,15 @@ JSON file opens instantly, scrolls smoothly, and can be searched, edited, format
 - Tabs that come back after a restart, including unsaved changes (like Windows 11 Notepad), for big files too (on
   Linux, up to 64 MB). Work is never lost silently: anything that can't be kept is asked about, and Windows won't
   shut down over it without asking.
-- Find and replace with match case, whole word and regular expressions; fast on huge files. Find in selection
-  (Alt+S), Find next and previous through all open tabs (Alt+A), the last searches and replacements with Up and
-  Down, and `\n` / `\t` in a regular expression's replacement for a line break or a tab.
-- Show only the lines that match a search (or the ones that don't), in a tab of their own with each line's number in
-  the file; Enter or a double-click goes to that line in the file, and it follows a log as it grows. 809,820
-  lines out of a 400 MB log in 0.23 s.
+- Find and replace with match case, whole word and regular expressions; fast on huge files (on several cores).
+  Find in selection (Alt+S), Find next and previous through all open tabs (Alt+A), searches kept highlighted in
+  every tab, each in a color of its own (Alt+H), the last searches and replacements with Up and Down, and `\n` /
+  `\t` in a regular expression's replacement for a line break or a tab.
+- Column selection (Alt+drag, Shift+Alt+arrows: type, paste and delete on every line) and dragging selected text
+  to another place (with Ctrl, a copy).
+- Show only the lines that match a search (or the ones that don't, or any of the highlighted ones), in a tab of
+  their own with each line's number in the file; Enter or a double-click goes to that line in the file, and it
+  follows a log as it grows. 809,820 lines out of a 400 MB log in 0.23 s.
 - Bookmarks (Ctrl+F2, then F2 / Shift+F2 to go from one to the next), kept with the tabs; read-only tabs (File → Read
   only; a file you can't write opens that way).
 - Syntax colors for 52 kinds of files: Python, PowerShell, Batch, Shell, VBScript/VBA, AutoHotkey, Perl, R, C, C++,
@@ -43,9 +46,10 @@ JSON file opens instantly, scrolls smoothly, and can be searched, edited, format
 - JSON and XML: format (pretty-print), minify and check, also for JSON Lines; a path bar showing where the caret
   is (`data › [1203] › name`, `catalog › book[3] › title`; copy it as a JSON path or XPath) and a structure panel to
   browse objects, arrays and elements, fast on huge files.
-- Print (Ctrl+P): the file or the selection, in its colors, with line numbers (when they're shown) and page numbers;
-  long lines go on in the next row, breaking between words. *Microsoft Print to PDF* (Windows) and *Print to File*
-  (Linux) make a PDF.
+- Print (Ctrl+P): the file or the selection, in its colors (or black), with line numbers and the file's name and
+  page numbers (each can be left out); long lines go on in the next row, breaking between words. Print preview
+  shows the pages as they'll print, and Page setup the paper and margins. *Microsoft Print to PDF* (Windows) and
+  *Print to File* (Linux) make a PDF.
 - Characters you can't see are shown: control characters as symbols (␀, ␛…), zero-width ones and a byte order mark
   inside the text as ▯, the bidirectional controls of the "Trojan Source" trick as ⇄ (they don't reorder the text on
   screen); Show whitespace marks non-breaking and other look-alike spaces. *View → Character at the caret* says
@@ -89,6 +93,7 @@ The usual ones work as in Notepad (Ctrl+N, O, S, F, H, G, Z, Y, A, X, C, V), plu
 | Ctrl+P | Print |
 | Ctrl+D / Ctrl+Shift+K | Duplicate / delete the line |
 | Alt+Up / Alt+Down | Move the line up / down |
+| Alt+drag, Shift+Alt+arrows | Column selection |
 | Ctrl+/ | Toggle comment |
 | Ctrl+U / Ctrl+Shift+U | lowercase / UPPERCASE |
 | Shift+Alt+F | Format JSON or XML |
@@ -96,6 +101,7 @@ The usual ones work as in Notepad (Ctrl+N, O, S, F, H, G, Z, Y, A, X, C, V), plu
 | Alt+L | Show only the lines with a match |
 | Alt+S (in the find box) | Find in selection |
 | Alt+A (in the find box) | Next / previous match through all open tabs |
+| Alt+H (in the find box) | Highlight the search in every tab |
 | Ctrl+F2 / F2 / Shift+F2 | Bookmark the line / next / previous bookmark |
 | Alt+Z | Word wrap |
 | Ctrl+Plus / Ctrl+Minus / Ctrl+0 | Zoom in / out / reset |
