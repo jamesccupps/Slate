@@ -15,7 +15,7 @@ use windows::Win32::System::SystemInformation::GetLocalTime;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    DestroyMenu, DestroyWindow, GetCaretBlinkTime, GetSystemMetrics, KillTimer, SM_CXDOUBLECLK, SPI_GETCARETTIMEOUT,
+    DestroyMenu, DestroyWindow, GetCaretBlinkTime, GetSystemMetrics, KillTimer, SM_CXDOUBLECLK, SM_CXDRAG, SM_CYDRAG, SPI_GETCARETTIMEOUT,
     SPI_GETWHEELSCROLLLINES, SW_SHOWNORMAL, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SetTimer, SystemParametersInfoW,
     TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_TOPALIGN, TrackPopupMenuEx,
 };
@@ -3305,6 +3305,9 @@ impl App {
             let (a, b) = tab.doc.word_at(pos);
             tab.view.sel = Sel::new(a, b);
             tab.view.drag = Some(DragMode::Words(a, b));
+        } else if !ext && !tab.view.sel.is_empty() && pos > tab.view.sel.start() && pos < tab.view.sel.end() {
+            // (in the selection: it may be dragged somewhere else; a click without moving puts the caret there)
+            tab.view.drag = Some(DragMode::Text { at: pos, x: x as i32, y: y as i32, moved: false });
         } else {
             tab.view.set_caret(pos, ext);
             tab.view.upstream = up;
@@ -3312,6 +3315,37 @@ impl App {
         }
         self.restart_caret();
         self.invalidate();
+    }
+
+    /// Drag and drop: the selection moved to `to` (copied, with Ctrl), as one step to undo, and selected there.
+    fn drop_text(&mut self, to: u64, copy: bool) {
+        let sel = self.tab().view.sel;
+        let (a, b) = (sel.start(), sel.end());
+        // (onto itself: nothing)
+        if sel.is_empty() || (!copy && to >= a && to <= b) || !self.editable() {
+            return;
+        }
+        let tab = self.tab_mut();
+        let text = tab.doc.read(a, b);
+        let n = text.len() as u64;
+        tab.doc.seal();
+        tab.doc.begin(EditKind::Other, sel);
+        let at = if copy || to < a {
+            if !copy {
+                tab.doc.delete(a, b);
+            }
+            tab.doc.insert(to, &text);
+            to
+        } else {
+            tab.doc.insert(to, &text);
+            tab.doc.delete(a, b);
+            to - n
+        };
+        let new = Sel::new(at, at + n);
+        tab.doc.end(new);
+        tab.doc.seal();
+        tab.view.sel = new;
+        self.after_edit();
     }
 
     fn vbar_down(&mut self, y: f32) {
@@ -3455,6 +3489,22 @@ impl App {
                 self.with_view(|v, cx| v.set_scroll_fraction(cx, f));
                 self.invalidate();
             }
+            DragMode::Text { at, x: x0, y: y0, moved } => {
+                // (it starts moving once the mouse has gone as far as Windows says a drag starts)
+                let (dx, dy) = unsafe { (GetSystemMetrics(SM_CXDRAG), GetSystemMetrics(SM_CYDRAG)) };
+                let (dx, dy) = (self.px_to_dip(dx).max(2.0), self.px_to_dip(dy).max(2.0));
+                if !moved && (x - x0 as f32).abs() < dx && (y - y0 as f32).abs() < dy {
+                    return;
+                }
+                self.tab_mut().view.drag = Some(DragMode::Text { at, x: x0, y: y0, moved: true });
+                let r = self.r_edit;
+                if y < r.y || y > r.bottom() {
+                    self.timer(TIMER_SCROLL, 40);
+                } else {
+                    self.kill_timer(TIMER_SCROLL);
+                }
+                self.extend_drag(DragMode::Text { at, x: x0, y: y0, moved: true }, x, y);
+            }
             DragMode::HScroll { grab } => {
                 let geom = self.editor_geom();
                 let hb = geom.hbar();
@@ -3499,6 +3549,7 @@ impl App {
                 let le = doc.next_newline(pos).map(|p| p + 1).unwrap_or(doc.len());
                 tab.view.sel = if pos < a { Sel::new(b, ls) } else { Sel::new(a, le.max(b)) };
             }
+            DragMode::Text { moved: true, .. } => tab.view.drop_at = Some(pos),
             _ => {}
         }
         self.invalidate();
@@ -3520,7 +3571,18 @@ impl App {
         }
         self.struct_drag = None;
         if !self.tabs.is_empty() {
-            self.tab_mut().view.drag = None;
+            let drag = self.tab_mut().view.drag.take();
+            let drop = self.tab_mut().view.drop_at.take();
+            match (drag, drop) {
+                // dropped: moved there (copied, with Ctrl)
+                (Some(DragMode::Text { moved: true, .. }), Some(to)) => self.drop_text(to, mods().ctrl),
+                // a click in the selection that didn't move: the caret goes there
+                (Some(DragMode::Text { at, moved: false, .. }), _) => {
+                    self.tab_mut().view.set_caret(at, false);
+                    self.restart_caret();
+                }
+                _ => {}
+            }
         }
         self.tab_drag = None;
         match (button, down, hit) {

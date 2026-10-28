@@ -336,6 +336,9 @@ struct TextWindow {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DragMode {
+    /// The selection taken by the mouse to somewhere else (pressed in it at `at`, at `x`, `y`): it moves once the
+    /// mouse has (`moved`), and `View::drop_at` shows where it goes.
+    Text { at: u64, x: i32, y: i32, moved: bool },
     Chars,
     Words(u64, u64),
     Lines(u64, u64),
@@ -352,6 +355,8 @@ pub struct View {
     pub scroll_x: f32,
     pub rows: Vec<VisRow>,
     pub drag: Option<DragMode>,
+    /// Where text dragged with the mouse would go (`DragMode::Text`).
+    pub drop_at: Option<u64>,
     /// Widest row seen recently (for horizontal scrolling without wrapping).
     pub content_w: f32,
     win: TextWindow,
@@ -392,6 +397,7 @@ impl View {
             scroll_x: 0.0,
             rows: Vec::new(),
             drag: None,
+            drop_at: None,
             content_w: 0.0,
             win: TextWindow::default(),
             cache: HashMap::new(),
@@ -1151,6 +1157,14 @@ impl View {
                     let w = (1.5f32 * g.dpi / 96.0).round() / (g.dpi / 96.0);
                     g.fill(Rect::new(x.round() - 0.5, y, w.max(1.0), row_h), t.caret);
                 }
+            }
+        }
+        // Where dragged text would go: a caret in the accent color.
+        if let Some(p) = self.drop_at {
+            let (seg, lay, row, x) = self.caret_place(cx, p, false);
+            let rs = seg.start + lay.row_bytes(row).0;
+            if let Some(r) = self.rows.iter().find(|r| r.start == rs && r.seg.start == seg.start) {
+                g.fill(Rect::new((ox + x).round() - 1.0, r.y, 2.0, row_h), t.accent);
             }
         }
         g.pop_clip();
