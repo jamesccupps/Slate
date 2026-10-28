@@ -206,10 +206,10 @@ async fn script(lines: Vec<String>, test: Rc<Test>) -> i32 {
             // the mouse's left button in the text (`x,y` from the text area's corner, the gutter in it): pressed, moved
             // there with it held, let go (`up:ctrl` with Ctrl held)
             "down" | "move" => {
-                let (x, y) = arg.split_once(',').unwrap_or(("0", "0"));
+                let (x, y) = arg.trim_end_matches(",alt").split_once(',').unwrap_or(("0", "0"));
                 let (x, y) = (x.trim().parse().unwrap_or(0.0), y.trim().parse().unwrap_or(0.0));
                 if op == "down" {
-                    ui.press_for_test(1, x, y);
+                    ui.press_for_test(1, x, y, arg.ends_with(",alt"));
                 } else {
                     ui.drag_for_test(x, y);
                 }

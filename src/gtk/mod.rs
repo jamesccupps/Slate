@@ -809,8 +809,9 @@ fn connect(ui: &Rc<Ui>, prev: &gtk4::Button, next: &gtk4::Button, lines_btn: &gt
     click.set_button(0);
     click.connect_pressed(|g, n, x, y| {
         if let Some(ui) = get_ui() {
-            let shift = g.current_event_state().contains(gdk::ModifierType::SHIFT_MASK);
-            ui.text_pressed(g.current_button(), n, x, y, shift);
+            let state = g.current_event_state();
+            let (shift, alt) = (state.contains(gdk::ModifierType::SHIFT_MASK), state.contains(gdk::ModifierType::ALT_MASK));
+            ui.text_pressed(g.current_button(), n, x, y, shift, alt);
         }
     });
     ui.text.add_controller(click);
@@ -1324,6 +1325,7 @@ const SHORTCUTS: &str = "Slate keyboard shortcuts
   Alt+S                    Find in selection (in the find box)
   Alt+A                    Next / previous match through all open tabs (in the find box: on or off)
   Alt+H                    Highlight the search in every tab, in a color of its own (in the find box)
+  Alt+drag, Shift+Alt+arrows  Column selection (type, paste, delete on every line)
   Up / Down                The searches (or replacements) before (in the find box)
   \\n  \\t                 A line break, a tab, in a regular expression's replacement
   Esc                      Close the find bar
@@ -1348,8 +1350,8 @@ const SHORTCUTS: &str = "Slate keyboard shortcuts
 impl Ui {
     /// Test mode: a key as if pressed in the text.
     /// Test mode: the left button pressed at `x`, `y` in the text (`n`: which click), the mouse moved there, let go.
-    pub fn press_for_test(&self, n: i32, x: f64, y: f64) {
-        self.text_pressed(1, n, x, y, false);
+    pub fn press_for_test(&self, n: i32, x: f64, y: f64, alt: bool) {
+        self.text_pressed(1, n, x, y, false, alt);
     }
 
     pub fn drag_for_test(&self, x: f64, y: f64) {
@@ -1603,7 +1605,7 @@ impl Ui {
         handled
     }
 
-    fn text_pressed(&self, button: u32, n: i32, x: f64, y: f64, shift: bool) {
+    fn text_pressed(&self, button: u32, n: i32, x: f64, y: f64, shift: bool, alt: bool) {
         self.touch();
         self.text.grab_focus();
         let g = self.geom();
@@ -1647,7 +1649,16 @@ impl Ui {
             let doc_len = a.tab().doc.len();
             a.with_view(&g, |v, cx| {
                 let pos = v.pos_at(cx, x, y).min(doc_len);
+                v.block = None;
                 match n {
+                    // Alt+drag: a column selection
+                    1 if alt => {
+                        let line = cx.doc.line_of(pos).unwrap_or(0);
+                        let col = ((x + v.scroll_x) / cx.style.char_w).round().max(0.0) as u32;
+                        v.block = Some(crate::edit::Block::at(line, col));
+                        v.sel = Sel::at(crate::edit::pos_at_col(cx.doc, line, col, cx.style.tab_size));
+                        v.drag = Some(view::Drag::Block);
+                    }
                     // (in the selection: it may be dragged somewhere else; a click without moving puts the caret there)
                     1 if !shift && !v.sel.is_empty() && pos > v.sel.start() && pos < v.sel.end() => {
                         v.drag = Some(view::Drag::Text { at: pos, x: x as i32, y: y as i32, moved: false });
@@ -1745,6 +1756,15 @@ impl Ui {
                     Some(view::Drag::Text { at, x, y, .. }) => {
                         v.drag = Some(view::Drag::Text { at, x, y, moved: true });
                         v.drop_at = Some(pos);
+                    }
+                    Some(view::Drag::Block) => {
+                        let line = cx.doc.line_of(pos).unwrap_or(0);
+                        let col = ((x + v.scroll_x) / cx.style.char_w).round().max(0.0) as u32;
+                        if let Some(b) = v.block.as_mut() {
+                            let max = crate::edit::BLOCK_LINES_MAX - 1;
+                            b.caret = (line.clamp(b.anchor.0.saturating_sub(max), b.anchor.0 + max), col);
+                            v.sel = Sel::at(crate::edit::pos_at_col(cx.doc, b.caret.0, col, cx.style.tab_size));
+                        }
                     }
                     None => {}
                 }

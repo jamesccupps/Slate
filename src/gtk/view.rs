@@ -191,6 +191,8 @@ struct TextWindow {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Drag {
+    /// A column selection (Alt+drag: `View::block`).
+    Block,
     /// The selection taken by the mouse to somewhere else (pressed in it at `at`, at `x`, `y` in the text): it moves
     /// once the mouse has (`moved`), and `View::drop_at` shows where it goes.
     Text { at: u64, x: i32, y: i32, moved: bool },
@@ -213,6 +215,9 @@ pub struct View {
     pub drag: Option<Drag>,
     /// Where text dragged with the mouse would go (`Drag::Text`).
     pub drop_at: Option<u64>,
+    /// A column selection (Alt+drag, Shift+Alt+arrows): what's selected instead of `sel` (whose caret is at the
+    /// block's caret).
+    pub block: Option<edit::Block>,
     /// The starts of the lines bookmarked, in order (`edit::toggle_mark`); they follow edits (`sync`).
     pub bookmarks: Vec<u64>,
     /// Find in selection: the part of the text the find bar searches (drawn faintly); it follows edits (`sync`).
@@ -300,6 +305,7 @@ impl View {
             rows: Vec::new(),
             drag: None,
             drop_at: None,
+            block: None,
             cache: HashMap::new(),
             cache_bytes: 0,
             tick: 0,
@@ -881,6 +887,19 @@ impl View {
                 fill(cr, r, *a, *b, t.match_bg, false);
             }
         }
+        // a column selection: each line's part
+        if let Some(b) = self.block.filter(|b| b.cols().0 < b.cols().1) {
+            let ((first, last), (l, r)) = (b.lines(), b.cols());
+            let c = if focused { t.selection } else { t.selection_inactive };
+            for row in rows.iter() {
+                let (la, _) = row.lay.line_range(row.line);
+                let Some(line) = cx.doc.line_of(row.seg.start + row.lay.rel(la)) else { continue };
+                if (first..=last).contains(&line) {
+                    let (a, e) = (edit::pos_at_col(cx.doc, line, l, cx.style.tab_size), edit::pos_at_col(cx.doc, line, r, cx.style.tab_size));
+                    fill(cr, row, a, e, c, false);
+                }
+            }
+        }
         if sb > sa {
             let color = if focused { t.selection } else { t.selection_inactive };
             for r in rows.iter() {
@@ -897,6 +916,28 @@ impl View {
             // (the line's own x in the layout: an indent, a wrapped row hanging under the indentation)
             let lx = r.lay.x_of(line.start_index()) - line_x_from_start(&r.lay, r.line);
             draw_row(cr, &r.lay, &line, x0 + lx, r.y + cx.style.baseline, ox, ox + cx.width, t.text);
+        }
+        // a column selection's carets (one on each line when it has no width)
+        if let Some(b) = self.block.filter(|b| focused && b.cols().0 == b.cols().1) {
+            let ((first, last), (l, _)) = (b.lines(), b.cols());
+            for row in rows.iter() {
+                let (la, _) = row.lay.line_range(row.line);
+                let Some(line) = cx.doc.line_of(row.seg.start + row.lay.rel(la)) else { continue };
+                if line < first || line > last {
+                    continue;
+                }
+                let a = edit::pos_at_col(cx.doc, line, l, cx.style.tab_size);
+                {
+                    let (ra, rb) = row.lay.line_range(row.line);
+                    let (sa, sb) = (row.seg.start + row.lay.rel(ra), row.seg.start + row.lay.rel(rb));
+                    if a >= sa && (a < sb || (a == sb && row.line + 1 == row.lay.lines())) {
+                        let x = row.lay.x_of(row.lay.disp(a - row.seg.start));
+                        set_color(cr, t.caret);
+                        cr.rectangle((x0 + x).round(), row.y, 1.0, row_h);
+                        let _ = cr.fill();
+                    }
+                }
+            }
         }
         // where dragged text would go: a caret in the accent color
         if let Some(p) = self.drop_at {

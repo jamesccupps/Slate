@@ -1274,9 +1274,11 @@ impl App {
         true
     }
 
-    /// After the text changed: the view takes the changes, the caret is shown.
+    /// After the text changed: the view takes the changes, the caret is shown (a column selection ends: what keeps
+    /// one sets it again after this).
     pub fn after_edit(&mut self, cx_reveal: bool) {
         let tab = &mut self.tabs[self.active];
+        tab.view.block = None;
         tab.view.sync(&mut tab.doc);
         tab.view.want_x = None;
         self.find.found = None;
@@ -1291,6 +1293,10 @@ impl App {
 
     pub fn insert_text(&mut self, text: &str) {
         if text.is_empty() || !self.editable() {
+            return;
+        }
+        if let Some(b) = self.tab().view.block {
+            self.block_edit(b, edit::BlockEdit::Put(vec![text.as_bytes()]));
             return;
         }
         let tab = &mut self.tabs[self.active];
@@ -1308,8 +1314,31 @@ impl App {
         self.after_edit(true);
     }
 
+    /// `edit::block_edit` on the tab shown, the column selection after it kept.
+    pub fn block_edit(&mut self, b: edit::Block, what: edit::BlockEdit) {
+        if !self.editable() {
+            return;
+        }
+        let ts = self.settings.tab_size;
+        let tab = &mut self.tabs[self.active];
+        let after = edit::block_edit(&mut tab.doc, &b, ts, what);
+        tab.view.sel = Sel::at(edit::pos_at_col(&tab.doc, after.caret.0, after.caret.1, ts));
+        self.after_edit(true);
+        self.tabs[self.active].view.block = Some(after);
+    }
+
     pub fn paste_text(&mut self, text: &str) {
         if !self.editable() {
+            return;
+        }
+        if let Some(b) = self.tab().view.block {
+            // into every line: a line of the text each when it has as many as the selection, else all of it
+            let fixed = edit::normalize_eols(text.as_bytes(), b"\n");
+            let fixed = fixed.strip_suffix(b"\n").unwrap_or(&fixed);
+            let lines: Vec<&[u8]> = fixed.split(|&c| c == b'\n').collect();
+            let (first, last) = b.lines();
+            let parts = if lines.len() as u64 == last - first + 1 { lines } else { vec![fixed] };
+            self.block_edit(b, edit::BlockEdit::Put(parts));
             return;
         }
         let line = self.copied_line.as_deref() == Some(text);
@@ -1374,10 +1403,51 @@ impl App {
         let alt = mods.contains(gdk::ModifierType::ALT_MASK);
         self.caret_on = true;
         let moving = |app: &mut App, f: &mut dyn FnMut(&mut View, &Ctx)| {
-            app.with_view(g, |v, c| f(v, c));
+            app.with_view(g, |v, c| {
+                v.block = None;
+                f(v, c)
+            });
             app.reveal_pending = true;
             app.dirty_view = true;
         };
+        let ts = self.settings.tab_size;
+        let arrows = matches!(key, Key::Up | Key::KP_Up | Key::Down | Key::KP_Down | Key::Left | Key::KP_Left | Key::Right | Key::KP_Right);
+        if alt && shift && !ctrl && arrows {
+            // a column selection made or grown
+            let tab = &mut self.tabs[self.active];
+            let caret = tab.view.sel.caret;
+            let doc = &tab.doc;
+            let mut b = tab.view.block.unwrap_or_else(|| edit::Block::at(doc.line_of(caret).unwrap_or(0), edit::col_of(doc, caret, ts)));
+            let last = doc.line_of(doc.len()).unwrap_or(0);
+            let (line, col) = b.caret;
+            b.caret = match key {
+                Key::Up | Key::KP_Up => (line.saturating_sub(1), col),
+                Key::Down | Key::KP_Down => ((line + 1).min(last), col),
+                Key::Left | Key::KP_Left => (line, col.saturating_sub(1)),
+                _ => (line, col + 1),
+            };
+            if b.caret.0.abs_diff(b.anchor.0) < edit::BLOCK_LINES_MAX {
+                tab.view.sel = Sel::at(edit::pos_at_col(doc, b.caret.0, b.caret.1, ts));
+                tab.view.block = Some(b);
+            }
+            self.reveal_pending = true;
+            self.dirty_view = true;
+            return true;
+        }
+        if let Some(b) = self.tab().view.block {
+            match key {
+                Key::BackSpace | Key::Delete | Key::KP_Delete if !ctrl && !(shift && key != Key::BackSpace) => {
+                    self.block_edit(b, edit::BlockEdit::Delete { back: key == Key::BackSpace });
+                    return true;
+                }
+                Key::Escape if !self.find.open => {
+                    self.tabs[self.active].view.block = None;
+                    self.dirty_view = true;
+                    return true;
+                }
+                _ => {}
+            }
+        }
         match key {
             Key::Left | Key::KP_Left if !alt => {
                 moving(self, &mut |v, c| {
@@ -1405,8 +1475,8 @@ impl App {
                     v.want_x = None;
                 });
             }
-            Key::Up | Key::KP_Up if alt => self.exec(Cmd::MoveLineUp),
-            Key::Down | Key::KP_Down if alt => self.exec(Cmd::MoveLineDown),
+            Key::Up | Key::KP_Up if alt && !shift => self.exec(Cmd::MoveLineUp),
+            Key::Down | Key::KP_Down if alt && !shift => self.exec(Cmd::MoveLineDown),
             Key::Up | Key::KP_Up if ctrl => moving(self, &mut |v, c| v.scroll_rows(c, -1)),
             Key::Down | Key::KP_Down if ctrl => moving(self, &mut |v, c| v.scroll_rows(c, 1)),
             Key::Up | Key::KP_Up => moving(self, &mut |v, c| v.move_rows(c, -1, shift)),
@@ -1539,6 +1609,19 @@ impl App {
                     None => self.flash(if cmd == Cmd::Undo { "Nothing to undo" } else { "Nothing to redo" }, false),
                 }
             }
+            Cmd::Copy if self.tab().view.block.is_some() => {
+                let tab = self.tab();
+                let text = edit::block_text(&tab.doc, &tab.view.block.unwrap(), self.settings.tab_size, tab.doc.eol.as_bytes());
+                self.copied_line = None;
+                self.copy_out = Some(String::from_utf8_lossy(&text).into_owned());
+            }
+            Cmd::Cut if self.tab().view.block.is_some() => {
+                self.exec(Cmd::Copy);
+                let b = self.tab().view.block.unwrap();
+                if b.cols().0 < b.cols().1 {
+                    self.block_edit(b, edit::BlockEdit::Delete { back: false });
+                }
+            }
             Cmd::Copy => match self.selected_text() {
                 Some(t) => {
                     self.copied_line = self.tab().view.sel.is_empty().then(|| t.clone());
@@ -1571,6 +1654,7 @@ impl App {
             Cmd::Paste => self.paste_wanted = true,
             Cmd::SelectAll => {
                 let tab = &mut self.tabs[self.active];
+                tab.view.block = None;
                 tab.view.sel = Sel::new(0, tab.doc.len());
             }
             Cmd::Find | Cmd::Replace => {
