@@ -150,7 +150,8 @@ jobs:
             if (!(Test-Path -LiteralPath "$un\Slate") -or !(Test-Path 'HKCU:\Software\Slate\Capabilities') -or !(Test-Path -LiteralPath "$classes\*\shell\Slate")) { throw "0.15.0 didn't register under its names" }
             if ($leftovers) {
               foreach ($k in 'Software\Slate Text Editor', 'Software\Classes\*\shell\Slate Text Editor', 'Software\Microsoft\Windows\CurrentVersion\Uninstall\Slate Text Editor', 'Software\JamesCupps\Slate', 'Software\Classes\*\shell\JamesCupps.Slate', 'Software\Microsoft\Windows\CurrentVersion\Uninstall\JamesCupps.Slate') {
-                reg add "HKCU\$k" /f | Out-Null
+                # (empty, as RegCreateKeyExW left them: reg add would give each an empty default value)
+                [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($k).Dispose()
               }
               reg add 'HKCU\Software\RegisteredApplications' /v JamesCupps.Slate /d 'Software\JamesCupps\Slate\Capabilities' /f | Out-Null
               reg delete 'HKCU\Software\RegisteredApplications' /v Slate /f | Out-Null
@@ -160,7 +161,10 @@ jobs:
             if ($p.ExitCode -ne 0) { throw "--install over 0.15.0 failed (exit code $($p.ExitCode))" }
             $left = @("$un\Slate", 'HKCU:\Software\Slate', "$classes\*\shell\Slate", 'HKCU:\Software\JamesCupps', "$classes\*\shell\JamesCupps.Slate", "$un\JamesCupps.Slate") | Where-Object { Test-Path -LiteralPath $_ }
             $left += @('Slate', 'JamesCupps.Slate') | Where-Object { Has $apps $_ } | ForEach-Object { "Default apps' $_" }
-            if ($left) { throw "the update left $($left -join ', ')" }
+            if ($left) {
+              foreach ($k in $left) { if ($k -like 'HKCU:*') { reg query ($k -replace '^HKCU:', 'HKCU') /s } }
+              throw "the update left $($left -join ', ')"
+            }
             $entry = Get-ItemProperty -LiteralPath "$un\Slate Text Editor"
             "$($entry.DisplayName) $($entry.DisplayVersion) by $($entry.Publisher): $($entry.QuietUninstallString)"
             if ($entry.DisplayVersion -ne $v) { throw "Installed apps says $($entry.DisplayVersion), not $v" }
