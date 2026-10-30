@@ -8,6 +8,7 @@ mod chrome;
 mod print;
 mod session;
 mod spell;
+mod structure;
 mod testmode;
 mod view;
 
@@ -95,6 +96,20 @@ pub struct Ui {
     status_items: RefCell<Vec<(chrome::StatusItem, f64, f64)>>,
     /// The menu bar's light/dark button.
     theme_btn: gtk4::Button,
+    /// JSON and XML: the path bar above the text, and the structure panel at its side; where the path bar's
+    /// segments were drawn, and what's under the mouse in each.
+    path_bar: gtk4::DrawingArea,
+    panel: gtk4::DrawingArea,
+    path_segs: RefCell<Vec<(f64, f64)>>,
+    path_hover: Cell<Option<structure::PathPart>>,
+    panel_hover: Cell<Option<structure::PanelPart>>,
+    /// The panel's width as a drag on its edge started.
+    panel_drag: Cell<Option<f64>>,
+    /// A look again at the structure is due once the typing pauses.
+    struct_timer: Cell<bool>,
+    /// View's JSON or XML items (the structure panel and the path bar), for the language they're shown for.
+    view_extra: gio::Menu,
+    view_extra_for: Cell<Option<Lang>>,
     /// A look again at the status bar's counts is due (`App::doc_counts_now`).
     count_timer: Cell<bool>,
     /// Set while the window sets its own scrollbars and boxes (their signals then aren't the user's).
@@ -658,7 +673,8 @@ pub fn window(application: &gtk4::Application, test: Option<Rc<testmode::Test>>)
 
     let recent_menu = gio::Menu::new();
     let format_extra = gio::Menu::new();
-    let menubar = gtk4::PopoverMenuBar::from_model(Some(&menu_model(&recent_menu, &format_extra, &mono_families(&text.pango_context(), &settings.font))));
+    let view_extra = gio::Menu::new();
+    let menubar = gtk4::PopoverMenuBar::from_model(Some(&menu_model(&recent_menu, &format_extra, &view_extra, &mono_families(&text.pango_context(), &settings.font))));
     // A menu bar item clicked kept the keyboard once its menu closed (typing went nowhere, as Ctrl+N's new tab
     // showed): as on Windows, the keyboard stays in the text, and the menus open in popovers of their own.
     let mut item = menubar.first_child();
@@ -666,9 +682,17 @@ pub fn window(application: &gtk4::Application, test: Option<Rc<testmode::Test>>)
         w.set_focusable(false);
         item = w.next_sibling();
     }
+    let path_bar = gtk4::DrawingArea::new();
+    path_bar.set_content_height(structure::PATH_H as i32);
+    path_bar.set_hexpand(true);
+    path_bar.set_visible(false);
+    let panel = gtk4::DrawingArea::new();
+    panel.set_vexpand(true);
+    panel.set_visible(false);
     let middle = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
     middle.append(&text);
     middle.append(&vbar);
+    middle.append(&panel);
     // the light/dark switch at the menu bar's end, as on Windows (View → Theme has the system setting too)
     let theme_btn = gtk4::Button::from_icon_name("weather-clear-night-symbolic");
     theme_btn.add_css_class("flat");
@@ -696,6 +720,7 @@ pub fn window(application: &gtk4::Application, test: Option<Rc<testmode::Test>>)
     }
     root.append(&find_box);
     root.append(&notice);
+    root.append(&path_bar);
     root.append(&middle);
     root.append(&hbar);
     root.append(&status);
@@ -760,6 +785,15 @@ pub fn window(application: &gtk4::Application, test: Option<Rc<testmode::Test>>)
         status_items: RefCell::new(Vec::new()),
         theme_btn: theme_btn.clone(),
         count_timer: Cell::new(false),
+        path_bar: path_bar.clone(),
+        panel: panel.clone(),
+        path_segs: RefCell::new(Vec::new()),
+        path_hover: Cell::new(None),
+        panel_hover: Cell::new(None),
+        panel_drag: Cell::new(None),
+        struct_timer: Cell::new(false),
+        view_extra: view_extra.clone(),
+        view_extra_for: Cell::new(None),
         syncing: Cell::new(false),
         scroll_acc: Cell::new(0.0),
         drag_origin: Cell::new((0.0, 0.0)),
@@ -1165,6 +1199,116 @@ fn connect(ui: &Rc<Ui>, prev: &gtk4::Button, next: &gtk4::Button, lines_btn: &gt
             ui.text.queue_draw();
         }
     });
+    ui.path_bar.set_draw_func(|area, cr, w, h| {
+        if let Some(ui) = get_ui() {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let Ok(a) = ui.app.try_borrow() else { return };
+                let segs = structure::paint_path(cr, &area.pango_context(), &a.tab().structure, &a.theme, w as f64, h as f64, ui.path_hover.get(), ui.panel.is_visible());
+                *ui.path_segs.borrow_mut() = segs;
+            }));
+        }
+    });
+    ui.panel.set_draw_func(|area, cr, w, h| {
+        if let Some(ui) = get_ui() {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let Ok(mut a) = ui.app.try_borrow_mut() else { return };
+                let t = a.theme.clone();
+                let i = a.active;
+                let hover = match ui.panel_hover.get() {
+                    Some(structure::PanelPart::Row(k, _)) => Some(k),
+                    _ => None,
+                };
+                let close = ui.panel_hover.get() == Some(structure::PanelPart::Close);
+                structure::paint_panel(cr, &area.pango_context(), &mut a.tabs[i].structure, &t, w as f64, h as f64, hover, close);
+            }));
+        }
+    });
+    let pclick = gtk4::GestureClick::new();
+    pclick.connect_pressed(|_, _, x, _| {
+        if let Some(ui) = get_ui() {
+            ui.path_pressed(x);
+        }
+    });
+    ui.path_bar.add_controller(pclick);
+    let pmotion = gtk4::EventControllerMotion::new();
+    pmotion.connect_motion(|_, x, _| {
+        if let Some(ui) = get_ui() {
+            let part = structure::path_part_at(&ui.path_segs.borrow(), ui.path_bar.width() as f64, ui.path_bar.height() as f64, x);
+            if ui.path_hover.replace(part) != part {
+                ui.path_bar.queue_draw();
+            }
+        }
+    });
+    pmotion.connect_leave(|_| {
+        if let Some(ui) = get_ui() {
+            ui.path_hover.set(None);
+            ui.path_bar.queue_draw();
+        }
+    });
+    ui.path_bar.add_controller(pmotion);
+    let sclick = gtk4::GestureClick::new();
+    sclick.connect_pressed(|_, n, x, y| {
+        if let Some(ui) = get_ui() {
+            ui.panel_pressed(n, x, y);
+        }
+    });
+    ui.panel.add_controller(sclick);
+    // the panel's left edge, dragged: its width
+    let sdrag = gtk4::GestureDrag::new();
+    sdrag.connect_drag_begin(|_, x, _| {
+        if let Some(ui) = get_ui() {
+            let w = ui.panel.width() as f64;
+            ui.panel_drag.set((x < structure::SPLITTER_W).then_some(w));
+        }
+    });
+    sdrag.connect_drag_update(|_, dx, _| {
+        if let Some(ui) = get_ui() {
+            if let Some(w0) = ui.panel_drag.get() {
+                let w = ui.panel_width(w0 - dx);
+                ui.with(|a| a.settings.structure_width = w as f32);
+            }
+        }
+    });
+    sdrag.connect_drag_end(|_, _, _| {
+        if let Some(ui) = get_ui() {
+            if ui.panel_drag.take().is_some() {
+                ui.with(|a| a.settings.save());
+            }
+        }
+    });
+    ui.panel.add_controller(sdrag);
+    let smotion = gtk4::EventControllerMotion::new();
+    smotion.connect_motion(|_, x, y| {
+        if let Some(ui) = get_ui() {
+            let part = ui.app.try_borrow().ok().and_then(|a| {
+                structure::panel_part_at(&a.tab().structure, ui.panel.width() as f64, ui.panel.height() as f64, x, y)
+            });
+            ui.panel.set_cursor_from_name((part == Some(structure::PanelPart::Splitter)).then_some("col-resize"));
+            if ui.panel_hover.replace(part) != part {
+                ui.panel.queue_draw();
+            }
+        }
+    });
+    smotion.connect_leave(|_| {
+        if let Some(ui) = get_ui() {
+            ui.panel_hover.set(None);
+            ui.panel.queue_draw();
+        }
+    });
+    ui.panel.add_controller(smotion);
+    let sscroll = gtk4::EventControllerScroll::new(gtk4::EventControllerScrollFlags::VERTICAL);
+    sscroll.connect_scroll(|_, _, dy| {
+        if let Some(ui) = get_ui() {
+            let body_h = (ui.panel.height() as f64 - structure::HEADER_H).max(0.0);
+            ui.guarded(|a| {
+                let i = a.active;
+                structure::scroll_by(&mut a.tabs[i].structure, body_h, dy * 3.0);
+            });
+            ui.panel.queue_draw();
+        }
+        glib::Propagation::Stop
+    });
+    ui.panel.add_controller(sscroll);
     ui.theme_btn.connect_clicked(|_| {
         if let Some(ui) = get_ui() {
             ui.command(Cmd::ToggleTheme);
@@ -1361,6 +1505,9 @@ fn commands() -> Vec<(&'static str, Cmd, &'static [&'static str])> {
         // (Insert: `App::on_key`, so it stays the find boxes' own there)
         ("overtype", Cmd::ToggleOvertype, &[]),
         ("toggle-theme", Cmd::ToggleTheme, &[]),
+        ("structure-panel", Cmd::ToggleStructure, &["<Control><Shift>o"]),
+        ("path-bar", Cmd::TogglePathBar, &[]),
+        ("copy-json-path", Cmd::CopyJsonPath, &[]),
     ]
 }
 
@@ -1393,7 +1540,7 @@ fn mono_families(ctx: &pango::Context, current: &str) -> Vec<String> {
 
 /// Menu items that show a check mark: their actions have a true/false state (`Ui::sync_menu`).
 const CHECKED: &[&str] =
-    &["wrap", "line-numbers", "show-whitespace", "spell-check", "title-bar-tabs", "theme-system", "theme-light", "theme-dark", "eol-lf", "eol-crlf", "read-only", "restore-session"];
+    &["wrap", "line-numbers", "show-whitespace", "spell-check", "title-bar-tabs", "theme-system", "theme-light", "theme-dark", "eol-lf", "eol-crlf", "read-only", "restore-session", "structure-panel", "path-bar"];
 
 fn actions(ui: &Rc<Ui>) {
     // (in place of the window's own "win" group: menus and shortcuts find these the same way)
@@ -1524,7 +1671,7 @@ fn section(items: &[(&str, &str)]) -> gio::Menu {
     m
 }
 
-fn menu_model(recent: &gio::Menu, format_extra: &gio::Menu, fonts: &[String]) -> gio::Menu {
+fn menu_model(recent: &gio::Menu, format_extra: &gio::Menu, view_extra: &gio::Menu, fonts: &[String]) -> gio::Menu {
     let bar = gio::Menu::new();
     let file = gio::Menu::new();
     let open = section(&[("New tab", "new-tab"), ("Open…", "open")]);
@@ -1570,6 +1717,7 @@ fn menu_model(recent: &gio::Menu, format_extra: &gio::Menu, fonts: &[String]) ->
         ]),
     );
     view.append_section(None, &section(&[("Show only matching lines", "filter-lines"), ("Show lines not matching", "filter-lines-not"), ("Clear highlights", "clear-highlights")]));
+    view.append_section(None, view_extra);
     let zoom = section(&[("Zoom in", "zoom-in"), ("Zoom out", "zoom-out"), ("Reset zoom", "zoom-reset")]);
     let rest = gio::Menu::new();
     rest.append_submenu(Some("Zoom"), &zoom);
@@ -2364,6 +2512,16 @@ impl Ui {
         }
         menu.append_section(None, &section(&[("Cut", "cut"), ("Copy", "copy"), ("Paste", "paste")]));
         menu.append_section(None, &section(&[("Select all", "select-all")]));
+        let lang = self.app.try_borrow().map(|a| a.tab().lang).unwrap_or(Lang::Plain);
+        match lang {
+            Lang::Json => menu.append_section(None, &section(&[("Format JSON", "json-format"), ("Check JSON", "json-check"), ("Copy JSON path", "copy-json-path")])),
+            Lang::Xml => menu.append_section(None, &section(&[("Format XML", "xml-format"), ("Check XML", "xml-check"), ("Copy XML path (XPath)", "copy-json-path")])),
+            Lang::Csv | Lang::CsvSemi | Lang::Tsv => menu.append_section(
+                None,
+                &section(&[("Check CSV / TSV", "csv-check"), ("Sort by this column, A to Z", "csv-sort"), ("Sort by this column, Z to A", "csv-sort-desc")]),
+            ),
+            _ => {}
+        }
         let pop = gtk4::PopoverMenu::from_model(Some(&menu));
         pop.set_parent(&self.text);
         pop.set_has_arrow(false);
@@ -2442,6 +2600,56 @@ impl Ui {
         self.text.queue_draw();
         self.tabs.queue_draw();
         self.status.queue_draw();
+        if self.path_bar.is_visible() {
+            self.path_bar.queue_draw();
+        }
+        if self.panel.is_visible() {
+            self.panel.queue_draw();
+        }
+    }
+
+    /// The structure panel's width for `want`: at least `PANEL_MIN`, at most 60% of the window (half of a narrow
+    /// one), so the text keeps room for its lines.
+    fn panel_width(&self, want: f64) -> f64 {
+        let w = self.window.width() as f64;
+        let max = if w <= 0.0 { want } else if w < 900.0 { w * 0.5 } else { w * 0.6 };
+        want.min(max).max(structure::PANEL_MIN)
+    }
+
+    /// A click on the path bar: a segment goes to its value, the button shows or hides the panel.
+    fn path_pressed(&self, x: f64) {
+        let part = structure::path_part_at(&self.path_segs.borrow(), self.path_bar.width() as f64, self.path_bar.height() as f64, x);
+        match part {
+            Some(structure::PathPart::Seg(i)) => {
+                self.with(|a| a.jump_path(i));
+            }
+            Some(structure::PathPart::Toggle) => self.command(Cmd::ToggleStructure),
+            None => {}
+        }
+        self.text.grab_focus();
+    }
+
+    /// A click on the structure panel (`n` presses).
+    fn panel_pressed(&self, n: i32, x: f64, y: f64) {
+        let (w, h) = (self.panel.width() as f64, self.panel.height() as f64);
+        let part = self.app.try_borrow().ok().and_then(|a| structure::panel_part_at(&a.tab().structure, w, h, x, y));
+        match part {
+            Some(structure::PanelPart::Close) => self.command(Cmd::ToggleStructure),
+            Some(structure::PanelPart::Bar(f)) => {
+                self.guarded(|a| {
+                    let i = a.active;
+                    structure::scroll_to(&mut a.tabs[i].structure, (h - structure::HEADER_H).max(0.0), f);
+                });
+                self.panel.queue_draw();
+            }
+            Some(structure::PanelPart::Row(k, chevron)) => {
+                self.with(|a| a.struct_click(k, chevron, n == 2));
+                if !chevron {
+                    self.text.grab_focus();
+                }
+            }
+            _ => {}
+        }
     }
 
     /// Shows what the app asked for and what changed: dialogs, the clipboard, the title, the find bar, a redraw.
@@ -2500,6 +2708,33 @@ impl Ui {
             a.apply_theme();
         }
         a.keep_count();
+        let structured = a.tab().lang.has_structure();
+        let (show_path, show_panel) = (structured && a.settings.path_bar, structured && a.settings.structure_panel);
+        if self.path_bar.is_visible() != show_path {
+            self.path_bar.set_visible(show_path);
+        }
+        if self.panel.is_visible() != show_panel {
+            self.panel.set_visible(show_panel);
+        }
+        let pw = self.panel_width(a.settings.structure_width as f64) as i32;
+        if self.panel.width_request() != pw {
+            self.panel.set_width_request(pw);
+        }
+        let (wait, moved) = a.update_structure(show_path, show_panel);
+        if moved {
+            let body_h = (self.panel.height() as f64 - structure::HEADER_H).max(200.0);
+            let i = a.active;
+            structure::scroll_to_selected(&mut a.tabs[i].structure, body_h);
+        }
+        if wait && !self.struct_timer.get() {
+            self.struct_timer.set(true);
+            glib::timeout_add_local_once(crate::structure::PAUSE + Duration::from_millis(10), || {
+                if let Some(ui) = get_ui() {
+                    ui.struct_timer.set(false);
+                    ui.poll();
+                }
+            });
+        }
         if a.doc_counts_now() && !self.count_timer.get() {
             self.count_timer.set(true);
             glib::timeout_add_local_once(Duration::from_millis(350), || {
@@ -2594,6 +2829,8 @@ impl Ui {
             ("wrap", a.style.wrap),
             ("line-numbers", a.style.line_numbers),
             ("show-whitespace", a.settings.show_whitespace),
+            ("structure-panel", a.settings.structure_panel),
+            ("path-bar", a.settings.path_bar),
             ("spell-check", a.settings.spell_check),
             ("title-bar-tabs", a.settings.tabs_in_title_bar),
             ("theme-system", theme == ThemeMode::System),
@@ -2624,6 +2861,22 @@ impl Ui {
         if self.theme_btn.icon_name().as_deref() != Some(icon) {
             self.theme_btn.set_icon_name(icon);
             self.theme_btn.set_tooltip_text(Some(tip));
+        }
+        // View's structure panel and path bar: for JSON and XML only, named for the one shown
+        let lang = tab.lang.has_structure().then_some(tab.lang);
+        if self.view_extra_for.get() != lang {
+            self.view_extra.remove_all();
+            if let Some(l) = lang {
+                let what = if l == Lang::Xml { "XML" } else { "JSON" };
+                for (label, action) in [(format!("{what} structure panel"), "structure-panel"), (format!("{what} path bar"), "path-bar")] {
+                    let item = gio::MenuItem::new(Some(&label), Some(&format!("win.{action}")));
+                    if action == "structure-panel" {
+                        item.set_attribute_value("accel", Some(&"<Control><Shift>o".to_variant()));
+                    }
+                    self.view_extra.append_item(&item);
+                }
+            }
+            self.view_extra_for.set(lang);
         }
         // Formatting indent: in the Format menu for JSON and XML only
         let structured = matches!(tab.lang, Lang::Json | Lang::Xml);

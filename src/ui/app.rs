@@ -509,6 +509,8 @@ pub struct App {
     /// with the window's buttons drawn at its end (`caption_rects`).
     pub custom_frame: bool,
     pub caption_rects: [Rect; 3],
+    /// Where each part of the JSON or XML path bar was drawn (for clicks).
+    pub path_rects: Vec<Rect>,
     /// The window is the active one (its caption buttons are dimmed when it isn't).
     pub window_active: bool,
     pub r_menu: Rect,
@@ -648,6 +650,7 @@ impl App {
             r_tabs: Rect::default(),
             custom_frame: super::CUSTOM_FRAME.with(|c| c.get()),
             caption_rects: [Rect::default(); 3],
+            path_rects: Vec::new(),
             window_active: true,
             r_menu: Rect::default(),
             r_find: Rect::default(),
@@ -1026,8 +1029,7 @@ impl App {
             if super::structure::toggle_rect(self.r_path).contains(x, y) {
                 return Hit::PathToggle;
             }
-            let st = &self.tab().structure;
-            for (i, r) in st.path_rects.iter().enumerate() {
+            for (i, r) in self.path_rects.iter().enumerate() {
                 if r.contains(x, y) {
                     return Hit::PathSeg(i);
                 }
@@ -1476,7 +1478,7 @@ impl App {
         let tab = &mut self.tabs[self.active];
         if r_path.h > 0.0 {
             let seg_hover = if let Hit::PathSeg(i) = hover { Some(i) } else { None };
-            tab.structure.paint_path(&self.g, &t, &ui, r_path, seg_hover, hover == Hit::PathToggle, panel_open, &icons);
+            tab.structure.paint_path(&self.g, &t, &ui, r_path, seg_hover, hover == Hit::PathToggle, panel_open, &icons, &mut self.path_rects);
         }
         if panel_open {
             let row_hover = if let Hit::StructRow(i, _) = hover { Some(i) } else { None };

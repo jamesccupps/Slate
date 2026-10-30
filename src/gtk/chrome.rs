@@ -95,7 +95,7 @@ pub fn tab_part_at(strip: &TabStrip, x: f64) -> Option<TabPart> {
     None
 }
 
-fn text_layout(ctx: &pango::Context, font: &pango::FontDescription, text: &str, max_w: f64) -> pango::Layout {
+pub fn text_layout(ctx: &pango::Context, font: &pango::FontDescription, text: &str, max_w: f64) -> pango::Layout {
     let l = pango::Layout::new(ctx);
     l.set_font_description(Some(font));
     l.set_text(text);
@@ -105,14 +105,14 @@ fn text_layout(ctx: &pango::Context, font: &pango::FontDescription, text: &str, 
     l
 }
 
-fn draw_text(cr: &cairo::Context, l: &pango::Layout, x: f64, y_center: f64, color: u32) {
+pub fn draw_text(cr: &cairo::Context, l: &pango::Layout, x: f64, y_center: f64, color: u32) {
     let (_, h) = l.pixel_size();
     set_color(cr, color);
     cr.move_to(x, (y_center - h as f64 / 2.0).round());
     pangocairo::functions::show_layout(cr, l);
 }
 
-fn rounded(cr: &cairo::Context, x: f64, y: f64, w: f64, h: f64, r: f64) {
+pub fn rounded(cr: &cairo::Context, x: f64, y: f64, w: f64, h: f64, r: f64) {
     let r = r.min(w / 2.0).min(h / 2.0);
     cr.new_sub_path();
     cr.arc(x + w - r, y + r, r, -std::f64::consts::FRAC_PI_2, 0.0);

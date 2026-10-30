@@ -359,10 +359,11 @@ impl View {
 
     /// Takes the document's changes (after edits, undo, a reload): coloring states after them are worked out again,
     /// and the bookmarks follow them.
-    pub fn sync(&mut self, doc: &mut Document) {
+    pub fn sync(&mut self, doc: &mut Document) -> Vec<crate::core::document::Change> {
         // (the coloring index applies pending changes itself as it's asked; those it hasn't seen yet, here)
         let mut moved = false;
-        for (k, c) in doc.take_changes().iter().enumerate() {
+        let changes = doc.take_changes();
+        for (k, c) in changes.iter().enumerate() {
             crate::edit::map_marks(&mut self.bookmarks, c);
             if let Some((a, b)) = self.scope {
                 self.scope = Some((c.map(a), c.map(b)));
@@ -382,6 +383,7 @@ impl View {
         self.sel.anchor = self.sel.anchor.min(len);
         self.sel.caret = self.sel.caret.min(len);
         self.top = self.top.min(len);
+        changes
     }
 
     /// Forgets the laid out text (another font, theme or language).

@@ -308,6 +308,16 @@ async fn script(lines: Vec<String>, test: Rc<Test>) -> i32 {
                 log(&mut out, format!("gsettings {k}: {}", if ok { "set" } else { "no such setting" }));
                 settle(50).await;
             }
+            // JSON and XML: a click on the path bar's segment `i`, on the panel's row `k` (`rowclick:<k>[,chevron|double]`)
+            "pathclick" => {
+                let i: usize = arg.trim().parse().unwrap_or(0);
+                ui.with(|a| a.jump_path(i));
+            }
+            "rowclick" => {
+                let (k, how) = arg.split_once(',').unwrap_or((arg, ""));
+                let k: usize = k.trim().parse().unwrap_or(0);
+                ui.with(|a| a.struct_click(k, how == "chevron", how == "double"));
+            }
             "statusclick" => {
                 use super::chrome::StatusItem;
                 let k = match arg.trim() {
@@ -543,6 +553,21 @@ fn value(what: &str, test: &Test) -> String {
         }
         "notice" => tab.notice.clone().unwrap_or_default(),
         "encoding" => tab.doc.encoding.label(),
+        // the path bar's path, and the panel's rows (+ open, * selected; "(old)" while they're from before an edit)
+        "path" => match &tab.structure.path {
+            Some(p) => tab.structure.path_text(p),
+            None => "none".into(),
+        },
+        "rows" => {
+            let s = &tab.structure;
+            let rows: Vec<String> = s
+                .rows
+                .iter()
+                .map(|r| format!("{}{}{}", r.label, if r.expanded { "+" } else { "" }, if s.selected == Some(r.key) { "*" } else { "" }))
+                .collect();
+            format!("{}{}", if s.rows_current(&tab.doc) { "" } else { "(old) " }, rows.join(" "))
+        }
+        "shown" => format!("path bar {}, panel {}", ui.path_bar.is_visible(), ui.panel.is_visible()),
         "indent" => format!("{:?}{}", tab.indent, if tab.indent_picked { " (picked)" } else { "" }),
         "font" => format!("{} {}", a.settings.font, a.settings.font_size),
         "settings" => format!(

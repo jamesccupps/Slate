@@ -8,6 +8,7 @@ pub mod highlight;
 pub mod print;
 pub mod settings;
 pub mod spell;
+pub mod structure;
 pub mod theme;
 #[cfg(test)]
 mod fuzz;

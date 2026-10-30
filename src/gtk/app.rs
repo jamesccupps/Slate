@@ -20,6 +20,7 @@ use crate::core::{csv, json, lines, xml};
 use crate::edit::{self, Indent, Sink};
 use crate::highlight::Lang;
 use crate::settings::{Settings, ThemeMode, ZOOM_STEPS};
+use crate::structure::Structure;
 use crate::theme::Theme;
 
 use super::session;
@@ -183,6 +184,10 @@ pub enum Cmd {
     ToggleOvertype,
     /// The menu bar's button: the light theme or the dark one.
     ToggleTheme,
+    /// View → JSON (XML) structure panel (Ctrl+Shift+O), path bar; the text's menu: Copy JSON (XML) path.
+    ToggleStructure,
+    TogglePathBar,
+    CopyJsonPath,
 }
 
 pub struct SaveTask {
@@ -281,6 +286,8 @@ pub struct Tab {
     pub filter: Option<FilterOf>,
     /// The bookmarks to put back once its file is read (a tab from the session).
     pub restore_marks: Option<Vec<u64>>,
+    /// JSON and XML: the path at the caret and the structure panel's tree.
+    pub structure: Structure,
 }
 
 /// What a tab of matching lines shows: lines of the tab `source`, `map` saying which line there each line here is.
@@ -321,6 +328,12 @@ impl Tab {
         }
         let d = edit::csv_dialect(self.lang, &self.doc)?;
         edit::csv_field(&self.doc, d, self.view.sel.caret).map(|(col, name)| edit::csv_field_text(col, name.as_deref()))
+    }
+
+    /// The view brought up to the document's edits, and the JSON or XML structure told about them.
+    pub fn sync_view(&mut self) {
+        let changes = self.view.sync(&mut self.doc);
+        self.structure.edited(&changes);
     }
 
     /// An untouched empty tab (a new window's): what's opened next takes its place.
@@ -600,6 +613,7 @@ impl App {
             read_only: false,
             filter: None,
             restore_marks: None,
+            structure: Structure::default(),
         }
     }
 
@@ -924,7 +938,8 @@ impl App {
 
     /// Whether anything runs in the background (test mode waits for it).
     pub fn busy(&self) -> bool {
-        self.tabs.iter().any(|t| t.busy() || t.index.is_some())
+        self.tabs.iter().any(|t| t.busy() || t.index.is_some() || t.structure.busy() || t.structure.pausing())
+            || self.count_job.is_some()
             || self.find_running()
             || self.disk_job.is_some()
             || self.session_job.is_some()
@@ -961,6 +976,87 @@ impl App {
 
     /// Picks up finished background work (called when a job says it's done, and by a timer while any runs).
     /// Returns whether anything still runs.
+    /// Keeps the JSON or XML path (and the panel's rows, when it shows) up to date with the caret. Returns whether it
+    /// waits for the typing to pause (to be looked at again after `structure::PAUSE`), and whether the panel's
+    /// selected row changed (to be scrolled to).
+    pub fn update_structure(&mut self, path_bar: bool, panel: bool) -> (bool, bool) {
+        let notify = self.notify.clone();
+        let tab = &mut self.tabs[self.active];
+        if !tab.lang.has_structure() || !(path_bar || panel) {
+            return (false, false);
+        }
+        // (every edit told to the structure before its rows are made again)
+        tab.sync_view();
+        let caret = tab.view.sel.caret;
+        tab.structure.set_lang(tab.lang);
+        if tab.structure.waiting(&tab.doc) {
+            return (true, false);
+        }
+        tab.structure.follow = panel;
+        let before = tab.structure.selected;
+        tab.structure.update_path(&mut tab.doc, caret, &notify);
+        if panel {
+            tab.structure.rows(&mut tab.doc, &notify);
+        }
+        (false, tab.structure.selected != before)
+    }
+
+    /// Moves to a JSON or XML value: selects a small scalar, else puts the caret at its start (on a character's
+    /// start either way: a selection ending inside one would let typing split it).
+    fn jump_to_value(&mut self, start: u64, end: u64, container: bool) {
+        let tab = &mut self.tabs[self.active];
+        let len = tab.doc.len();
+        let doc = &tab.doc;
+        let on_char = |mut p: u64| {
+            p = p.min(len);
+            let from = p;
+            while p > 0 && from - p < 3 && doc.byte_at(p).is_some_and(|b| b & 0xC0 == 0x80) {
+                p -= 1;
+            }
+            p
+        };
+        let (start, end) = (on_char(start), on_char(end));
+        tab.view.sel = if !container && end > start && end - start <= 64 * 1024 { Sel::new(start, end) } else { Sel::at(start) };
+        tab.view.block = None;
+        tab.view.want_x = None;
+        tab.doc.seal();
+        self.reveal_pending = true;
+        self.reveal_center = true;
+        self.caret_on = true;
+        self.dirty_view = true;
+    }
+
+    /// A click on the path bar's segment `i`: its value.
+    pub fn jump_path(&mut self, i: usize) {
+        let tab = self.tab();
+        if !tab.structure.path_current(&tab.doc) {
+            self.flash("The path is being worked out again after your change — try again in a moment.", false);
+            return;
+        }
+        if let Some(st) = tab.structure.path.as_ref().and_then(|p| p.get(i)).cloned() {
+            let first = tab.doc.byte_at(st.start).unwrap_or(0);
+            self.jump_to_value(st.start, st.end, matches!(first, b'{' | b'[' | b'<'));
+        }
+    }
+
+    /// A click on the panel's row `i` (on its chevron, or a double-click: opened or closed).
+    pub fn struct_click(&mut self, i: usize, chevron: bool, double: bool) {
+        let Some(row) = self.tab().structure.rows.get(i).cloned() else { return };
+        self.dirty_view = true;
+        if row.expandable && (chevron || double) {
+            self.tabs[self.active].structure.toggle(row.key);
+        }
+        if !chevron && row.end > row.start {
+            // (rows from before a change: their places in the text now)
+            let Some((start, end)) = self.tab().structure.place_now(&self.tab().doc, row.start, row.end) else {
+                self.flash("The structure is being updated after your change — try again in a moment.", false);
+                return;
+            };
+            self.tabs[self.active].structure.selected = Some(row.key);
+            self.jump_to_value(start, end, row.kind.is_none_or(|k| k.is_container()));
+        }
+    }
+
     /// Counts the shown document's characters and words for the status bar: at once when it's small, on another
     /// thread up to 64 MiB once the typing pauses (meanwhile the tab's last count stands), not for a bigger one or
     /// one still being read. Returns whether it should be looked at again in a moment (a count waits or runs).
@@ -1103,6 +1199,10 @@ impl App {
                 None => running = true,
             }
         }
+        // JSON and XML structure scans
+        if self.tabs[i].structure.busy() && !self.tabs[i].structure.poll() {
+            running = true;
+        }
         if let Some(t) = self.tabs.get_mut(i).and_then(|t| t.task.as_mut()) {
             match t.job.take() {
                 Some(r) => {
@@ -1212,6 +1312,7 @@ impl App {
         }
         tab.doc = doc;
         tab.index = index;
+        tab.structure = Structure::default();
         let old = std::mem::take(&mut tab.view);
         // (the bookmarks stay: on line starts of the text as it is now)
         let mut marks = tab.restore_marks.take().unwrap_or(old.bookmarks.clone());
@@ -1487,7 +1588,7 @@ impl App {
     pub fn after_edit(&mut self, cx_reveal: bool) {
         let tab = &mut self.tabs[self.active];
         tab.view.block = None;
-        tab.view.sync(&mut tab.doc);
+        tab.sync_view();
         tab.view.want_x = None;
         self.find.found = None;
         self.session_dirty = true;
@@ -2322,6 +2423,36 @@ impl App {
                 self.style.show_whitespace = self.settings.show_whitespace;
                 self.settings.save();
             }
+            Cmd::ToggleStructure => {
+                self.settings.structure_panel = !self.settings.structure_panel;
+                if self.settings.structure_panel && !self.tab().lang.has_structure() {
+                    self.flash("The structure panel shows JSON and XML files (Format → Language).", false);
+                }
+                self.tabs[self.active].structure.mark_dirty();
+                self.settings.save();
+            }
+            Cmd::TogglePathBar => {
+                self.settings.path_bar = !self.settings.path_bar;
+                self.settings.save();
+            }
+            Cmd::CopyJsonPath => {
+                let notify = self.notify.clone();
+                let tab = &mut self.tabs[self.active];
+                let caret = tab.view.sel.caret;
+                tab.structure.set_lang(tab.lang);
+                let p = tab.structure.path_at_caret(&mut tab.doc, caret, &notify);
+                let what = if tab.structure.is_xml() { "XML" } else { "JSON" };
+                match p {
+                    Some(p) if !p.is_empty() => {
+                        let s = tab.structure.path_text(&p);
+                        self.copied_line = None;
+                        self.flash(format!("Copied {s}"), false);
+                        self.copy_out = Some(s);
+                    }
+                    Some(_) => self.flash(format!("No {what} path here"), true),
+                    None => self.flash(format!("Still reading the {what} structure — try again in a moment."), true),
+                }
+            }
             Cmd::ToggleTheme => {
                 let to = if self.theme.dark { ThemeMode::Light } else { ThemeMode::Dark };
                 self.exec(Cmd::Theme(to));
@@ -2659,7 +2790,7 @@ impl App {
                 tab.doc.end(new_sel);
                 tab.doc.seal();
                 tab.view.sel = new_sel;
-                tab.view.sync(&mut tab.doc);
+                tab.sync_view();
                 // (Find in selection: Replace all's range ends where its replacements end; anything else ends it)
                 tab.view.scope = match kind {
                     TaskKind::ReplaceAll => scope.map(|(a, b)| (a, (b + new_len).saturating_sub(old_len).max(a))),
