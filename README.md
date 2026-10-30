@@ -177,7 +177,7 @@ Linux yet:
 
 ## Where Slate keeps things
 
-- Settings, the session (open tabs and unsaved text) and `crash.log` are in `%LOCALAPPDATA%\JamesCupps\Slate`
+- Settings, the session (open tabs and unsaved text) and `crash.log` are in `%LOCALAPPDATA%\Slate Text Editor`
   (*Help → Open settings folder*; on Linux `~/.local/share/slate`; Slate 0.15 and older kept them in
   `%LOCALAPPDATA%\Slate`, and moves them by itself). *File → Restore last session* turns the session off: closing
   then asks about unsaved changes, like Notepad used to.
@@ -198,7 +198,7 @@ edit and send yourself, attaching those files if you like.
 To keep Slate but stop it opening files when they're double-clicked: *Help → Stop opening files with Slate…*; the
 file types you set to open with Slate go back to Windows' own choice. To remove it: if you used *Open files with
 Slate…* (or winget), Windows Settings → Apps → Installed apps → Slate → Uninstall removes it. Otherwise just delete
-`Slate.exe`. Your settings and unsaved text stay in `%LOCALAPPDATA%\JamesCupps\Slate` (or the portable `data` folder): delete
+`Slate.exe`. Your settings and unsaved text stay in `%LOCALAPPDATA%\Slate Text Editor` (or the portable `data` folder): delete
 that too if you don't need them any more. On Linux: `sudo apt remove slate`.
 
 ## License

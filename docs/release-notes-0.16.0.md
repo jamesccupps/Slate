@@ -22,4 +22,4 @@ Linux catches up with Windows, and a few new tools for both.
 
 ### Windows
 - When Windows restarts for an update, Slate **opens again with its tabs**, as Notepad does (with *Restart apps* on in Windows' sign-in options).
-- Slate's settings folder is now `%LOCALAPPDATA%\JamesCupps\Slate`, and its registry keys are named for its publisher too, so another program called Slate can't share them. Slate moves them from the old names (`%LOCALAPPDATA%\Slate`) by itself the first time it starts; the file types you set to open with Slate stay as they are.
+- Slate's settings folder is now `%LOCALAPPDATA%\Slate Text Editor`, and its registry keys are named "Slate Text Editor" too, so another program called Slate can't share them. Slate moves them from the old names (`%LOCALAPPDATA%\Slate`) by itself the first time it starts; the file types you set to open with Slate stay as they are.

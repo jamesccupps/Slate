@@ -142,7 +142,7 @@ there); the JSON outline for the path bar takes ~2 s more in the background and 
 Shared by both platforms: `src/core` (the engine), `src/highlight*` (colors), `src/edit.rs` (editing operations,
 display segments, coloring checkpoints, the transform sink), `src/theme.rs` (palettes; Windows' high contrast and
 accent stay Windows-only: the accent in the shade Windows 11's apps use on the theme, from Windows' accent palette, a
-lighter one on dark), `src/settings.rs` (data folder: `%LOCALAPPDATA%\JamesCupps\Slate` — 0.15.0 and older used `%LOCALAPPDATA%\Slate`, which `move_data_dir` moves at a start when no other Slate runs —, `$XDG_DATA_HOME/slate` or
+lighter one on dark), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate Text Editor` — 0.15.0 and older used `%LOCALAPPDATA%\Slate`, which `move_data_dir` moves at a start when no other Slate runs —, `$XDG_DATA_HOME/slate` or
 `~/.local/share/slate` on Linux, or the portable `data` folder). Windows: `src/ui`. Linux: `src/gtk`.
 
 - `src/core/` — the engine, no UI. Unit-tested (`cargo test --lib`). What it asks the OS for goes through `os.rs`
@@ -429,9 +429,10 @@ lighter one on dark), `src/settings.rs` (data folder: `%LOCALAPPDATA%\JamesCupps
     through IMM32: see Design decisions); `spell.rs` (Windows' spell checker); `session.rs` (tabs and
     unsaved text kept between runs; a path that isn't valid Unicode is kept as UTF-16 units, `os::json_path`, and
     arguments, drops and handed-over paths stay `OsString`s); `settings.rs` (data folder, portable mode); `install.rs`
-    (Slate's own keys are named for its publisher: `Software\JamesCupps\Slate`, RegisteredApplications
-    `JamesCupps.Slate`, `*\shell\JamesCupps.Slate`, `Uninstall\JamesCupps.Slate`; 0.15.0 and older used plain "Slate",
-    which `move_names` copies over with RegCopyTreeW and deletes, only what's Slate's, at a start with no other Slate
+    (Slate's own keys are named "Slate Text Editor": `Software\Slate Text Editor`, the same name in
+    RegisteredApplications (`registeredAppUser=Slate%20Text%20Editor`), `*\shell\Slate Text Editor`, `Uninstall\Slate
+    Text Editor`; 0.15.0 and older used plain "Slate", and a test build of 0.16.0 `JamesCupps`, which `move_names`
+    (`OLD_NAMES`) copies over with RegCopyTreeW and deletes, only what's Slate's, at a start with no other Slate
     and at `--install`; the ProgID `Slate.TextFile` stays, as renaming it would undo people's Default apps choices;
     "Open with" entries
     in HKCU, never for what Windows runs when it's double-clicked, `NOT_REGISTERED`: .bat, .cmd, .vbs, .js, .reg,

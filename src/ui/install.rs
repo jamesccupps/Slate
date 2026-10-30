@@ -17,18 +17,29 @@ use super::app::Cell;
 use super::win;
 
 const PROGID: &str = "Slate.TextFile";
-/// Slate's own keys, named for its publisher so another program called Slate can't take them over (0.15.0 and older
-/// used plain "Slate": `move_names` moves them). The ProgID above stays: renaming it would undo the Default apps
+/// Slate's own keys, named "Slate Text Editor" so another program called Slate can't take them over (0.15.0 and
+/// older used plain "Slate": `move_names` moves them). The ProgID above stays: renaming it would undo the Default apps
 /// choices people made for it, which only they can make again.
-const APP_KEY: &str = r"Software\JamesCupps\Slate";
-const CAPABILITIES: &str = r"Software\JamesCupps\Slate\Capabilities";
-/// Slate's name in RegisteredApplications (and for Default apps' `registeredAppUser`).
-const APP_NAME: &str = "JamesCupps.Slate";
+const APP_KEY: &str = r"Software\Slate Text Editor";
+const CAPABILITIES: &str = r"Software\Slate Text Editor\Capabilities";
+/// Slate's name in RegisteredApplications (and for Default apps' `registeredAppUser`, escaped).
+const APP_NAME: &str = "Slate Text Editor";
 /// "Edit with Slate" on every file's right-click menu.
-const VERB: &str = r"Software\Classes\*\shell\JamesCupps.Slate";
-const OLD_APP_KEY: &str = r"Software\Slate";
-const OLD_VERB: &str = r"Software\Classes\*\shell\Slate";
-const OLD_UNINSTALL: &str = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\Slate";
+const VERB: &str = r"Software\Classes\*\shell\Slate Text Editor";
+/// What older Slates called those keys: its own key, its name in RegisteredApplications, "Edit with Slate", its
+/// Installed apps entry. 0.15.0 and older used plain "Slate"; a test build of 0.16.0 its publisher's name.
+const OLD_NAMES: [(&str, &str, &str, &str); 2] = [
+    (r"Software\Slate", "Slate", r"Software\Classes\*\shell\Slate", r"Software\Microsoft\Windows\CurrentVersion\Uninstall\Slate"),
+    (
+        r"Software\JamesCupps\Slate",
+        "JamesCupps.Slate",
+        r"Software\Classes\*\shell\JamesCupps.Slate",
+        r"Software\Microsoft\Windows\CurrentVersion\Uninstall\JamesCupps.Slate",
+    ),
+];
+const OLD_APP_KEY: &str = OLD_NAMES[0].0;
+const OLD_VERB: &str = OLD_NAMES[0].2;
+const OLD_UNINSTALL: &str = OLD_NAMES[0].3;
 const EXTENSIONS: &[&str] = &[
     // text, data and config
     ".txt", ".log", ".json", ".jsonl", ".ndjson", ".geojson", ".md", ".markdown", ".csv", ".tsv", ".xml", ".ini",
@@ -217,12 +228,12 @@ fn register(exe: &Path) -> bool {
     ok
 }
 
-const UNINSTALL: &str = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\JamesCupps.Slate";
+const UNINSTALL: &str = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\Slate Text Editor";
 const DESCRIPTION: &str = "A fast, simple text editor that opens files of any size.";
 
 const APP_PATH: &str = r"Software\Microsoft\Windows\CurrentVersion\App Paths\Slate.exe";
 
-/// Moves what 0.15.0 and older registered under plain "Slate" names to Slate's own (`APP_KEY`, `APP_NAME`, `VERB`,
+/// Moves what older Slates registered under other names (`OLD_NAMES`) to Slate's own (`APP_KEY`, `APP_NAME`, `VERB`,
 /// `UNINSTALL`), once, and only what's Slate's: its Default apps entry, "Edit with Slate", its Installed apps entry,
 /// and the note that `forget_unregistered` ran. The ProgID, "Open with" and the file types set to open with Slate
 /// stay as they are.
@@ -255,26 +266,32 @@ pub fn move_names() {
         true
     };
     let mut moved = false;
-    // Slate's own key (its Default apps capabilities, the Registration note): Slate's when it describes Slate or
-    // holds only that note.
-    let old_caps = format!(r"{OLD_APP_KEY}\Capabilities");
-    let ours = read_str(&old_caps, "ApplicationDescription").as_deref() == Some(DESCRIPTION)
-        || (read_str(&old_caps, "ApplicationName").is_none() && read_dword(OLD_APP_KEY, "Registration").is_some());
-    if ours {
-        let listed = read_str(r"Software\RegisteredApplications", "Slate").is_some_and(|v| v.eq_ignore_ascii_case(&old_caps));
-        moved |= move_key(OLD_APP_KEY, APP_KEY);
-        if listed {
-            set(r"Software\RegisteredApplications", Some(APP_NAME), CAPABILITIES);
-            delete_value(r"Software\RegisteredApplications", "Slate");
+    for (old_key, old_name, old_verb, old_uninstall) in OLD_NAMES {
+        // Slate's own key (its Default apps capabilities, the Registration note): Slate's when it describes Slate or
+        // holds only that note.
+        let old_caps = format!(r"{old_key}\Capabilities");
+        let ours = read_str(&old_caps, "ApplicationDescription").as_deref() == Some(DESCRIPTION)
+            || (read_str(&old_caps, "ApplicationName").is_none() && read_dword(old_key, "Registration").is_some());
+        if ours {
+            let listed = read_str(r"Software\RegisteredApplications", old_name).is_some_and(|v| v.eq_ignore_ascii_case(&old_caps));
+            moved |= move_key(old_key, APP_KEY);
+            if listed {
+                set(r"Software\RegisteredApplications", Some(APP_NAME), CAPABILITIES);
+                delete_value(r"Software\RegisteredApplications", old_name);
+            }
+        }
+        // "Edit with Slate": Slate's when it runs a Slate.exe
+        if read_str(&format!(r"{old_verb}\command"), "").is_some_and(|c| c.to_ascii_lowercase().contains("slate.exe\" \"%1\"")) {
+            moved |= move_key(old_verb, VERB);
+        }
+        // Installed apps: Slate's when it uninstalls with a Slate.exe --uninstall
+        if read_str(old_uninstall, "UninstallString").is_some_and(|u| u.to_ascii_lowercase().contains("slate.exe\" --uninstall")) {
+            moved |= move_key(old_uninstall, UNINSTALL);
         }
     }
-    // "Edit with Slate": Slate's when it runs a Slate.exe
-    if read_str(&format!(r"{OLD_VERB}\command"), "").is_some_and(|c| c.to_ascii_lowercase().contains("slate.exe\" \"%1\"")) {
-        moved |= move_key(OLD_VERB, VERB);
-    }
-    // Installed apps: Slate's when it uninstalls with a Slate.exe --uninstall
-    if read_str(OLD_UNINSTALL, "UninstallString").is_some_and(|u| u.to_ascii_lowercase().contains("slate.exe\" --uninstall")) {
-        moved |= move_key(OLD_UNINSTALL, UNINSTALL);
+    // (the test build's publisher key, if nothing else is in it)
+    unsafe {
+        let _ = windows::Win32::System::Registry::RegDeleteKeyW(HKEY_CURRENT_USER, w!(r"Software\JamesCupps"));
     }
     if moved {
         unsafe {
@@ -549,7 +566,7 @@ pub fn make_default(cell: &Cell) {
         win::info(hwnd, "Slate", "Some settings couldn't be saved to the registry.");
     }
     unsafe {
-        ShellExecuteW(hwnd, w!("open"), w!("ms-settings:defaultapps?registeredAppUser=JamesCupps.Slate"), None, None, SW_SHOWNORMAL);
+        ShellExecuteW(hwnd, w!("open"), w!("ms-settings:defaultapps?registeredAppUser=Slate%20Text%20Editor"), None, None, SW_SHOWNORMAL);
     }
     let choices: Vec<(&str, Choice)> = USUAL.iter().map(|&e| (e, choice_of(e))).collect();
     let note = choices_note(&choices);
@@ -589,8 +606,7 @@ pub fn uninstall(quiet: bool) {
         for k in [APP_KEY, UNINSTALL, APP_PATH] {
             let _ = RegDeleteTreeW(HKEY_CURRENT_USER, &HSTRING::from(k));
         }
-        // (the publisher's key, if nothing else is in it; and what 0.15.0 and older called them)
-        let _ = windows::Win32::System::Registry::RegDeleteKeyW(HKEY_CURRENT_USER, w!(r"Software\JamesCupps"));
+        // (what 0.15.0 and older called them)
         if read_dword(OLD_APP_KEY, "Registration").is_some() || read_str(&format!(r"{OLD_APP_KEY}\Capabilities"), "ApplicationDescription").as_deref() == Some(DESCRIPTION) {
             let _ = RegDeleteTreeW(HKEY_CURRENT_USER, &HSTRING::from(OLD_APP_KEY));
             let _ = windows::Win32::System::Registry::RegDeleteKeyW(HKEY_CURRENT_USER, &HSTRING::from(OLD_APP_KEY));

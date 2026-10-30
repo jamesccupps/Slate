@@ -205,8 +205,8 @@ Indentation, Font and Formatting indent menus and the status bar's, Reload, Show
 other / saved / all tabs, the tab's menu and the list of tabs, Restore last session, Open settings folder, Report a
 problem, the theme button, and the desktop's light or dark followed while running. Both apps: Format → Convert
 (Base64, URL encoding, JSON escapes, SHA-256), EditorConfig, Go to line with a JSON or XML path. Windows: Slate's
-data folder and registry keys named for its publisher (`%LOCALAPPDATA%\JamesCupps\Slate`, moved once from plain
-"Slate"), and started again with its tabs after Windows restarts for an update. Details in the
+data folder and registry keys named "Slate Text Editor" (`%LOCALAPPDATA%\Slate Text Editor`, moved once from
+plain "Slate"), and started again with its tabs after Windows restarts for an update. Details in the
 [0.16.0 release notes](release-notes-0.16.0.md).
 
 ## Later

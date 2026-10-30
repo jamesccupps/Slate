@@ -171,12 +171,12 @@ fn find_data_dir() -> PathBuf {
         .join("slate");
 }
 
-/// Where Windows keeps the data folder: `%LOCALAPPDATA%\JamesCupps\Slate` (named for its publisher, so another program
-/// called Slate can't share it), and `%LOCALAPPDATA%\Slate`, where 0.15.0 and older kept it.
+/// Where Windows keeps the data folder: `%LOCALAPPDATA%\Slate Text Editor` (so another program called Slate can't
+/// share it), and `%LOCALAPPDATA%\Slate`, where 0.15.0 and older kept it.
 #[cfg(windows)]
 fn windows_data_dirs() -> (PathBuf, PathBuf) {
     let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
-    (base.join("JamesCupps").join("Slate"), base.join("Slate"))
+    (base.join("Slate Text Editor"), base.join("Slate"))
 }
 
 /// Whether `d` is a data folder Slate wrote: its settings (with a setting only Slate has) or its session.
@@ -209,16 +209,7 @@ fn move_data_dir_in(new: &std::path::Path, old: &std::path::Path) -> bool {
     if new.exists() || !is_slates_folder(old) {
         return false;
     }
-    let Some(parent) = new.parent() else { return false };
-    if std::fs::create_dir_all(parent).is_err() {
-        return false;
-    }
-    if std::fs::rename(old, new).is_err() {
-        // (the publisher's folder made for it isn't left behind empty)
-        let _ = std::fs::remove_dir(parent);
-        return false;
-    }
-    true
+    std::fs::rename(old, new).is_ok()
 }
 
 /// How big crash.log gets before it starts over (the one before kept as crash.log.old).
@@ -320,12 +311,12 @@ mod tests {
     fn the_old_data_folder_moves_only_when_its_slates() {
         let base = std::env::temp_dir().join(format!("slate-move-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
-        let (new, old) = (base.join("JamesCupps").join("Slate"), base.join("Slate"));
+        let (new, old) = (base.join("Slate Text Editor"), base.join("Slate"));
         // another program's folder of that name stays where it is
         std::fs::create_dir_all(&old).unwrap();
         std::fs::write(old.join("settings.json"), br#"{"theme": "dark"}"#).unwrap();
         assert!(!move_data_dir_in(&new, &old));
-        assert!(old.exists() && !base.join("JamesCupps").exists());
+        assert!(old.exists() && !new.exists());
         // Slate's (its settings, a session) moves, all of it
         std::fs::write(old.join("settings.json"), br#"{"restore_session": true, "json_indent": 2}"#).unwrap();
         std::fs::create_dir_all(old.join("session")).unwrap();
