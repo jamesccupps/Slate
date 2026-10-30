@@ -1692,7 +1692,7 @@ impl App {
                         let name = header.then(|| crate::edit::csv_column_name(&crate::edit::csv_header(&tab.doc, d).0, d, col)).flatten();
                         crate::edit::csv_sorted(count, col, name.as_deref(), header)
                     }
-                    TaskKind::Validate(_) | TaskKind::Print | TaskKind::Filter(_) | TaskKind::Refilter => String::new(),
+                    TaskKind::Validate(_) | TaskKind::Print | TaskKind::Filter(_) | TaskKind::Refilter | TaskKind::Hash { .. } => String::new(),
                 };
                 if matches!(task.kind, TaskKind::Format(_)) {
                     // (now indented by the formatter's own rule)
@@ -1749,6 +1749,17 @@ impl App {
                 self.layout();
             }
             TaskResult::Done(m) => self.flash(m, false),
+            TaskResult::Hash(d) => {
+                let TaskKind::Hash { from, to } = task.kind else { return };
+                let tab = &self.tabs[i];
+                let what = if from == 0 && to == tab.doc.len() && tab.doc.version == task.version {
+                    tab.title()
+                } else {
+                    format!("the selection ({})", crate::edit::plural(to - from, "byte", "bytes"))
+                };
+                self.hash = Some((what, crate::convert::hex(&d)));
+                self.pending.push(Deferred::Hash);
+            }
             TaskResult::Filtered { src, nl, found, query, matcher } => {
                 let TaskKind::Filter(invert) = task.kind else { return };
                 self.show_filtered(i, crate::edit::FilterStep { matcher, invert, query }, src, nl, found);
@@ -1902,7 +1913,7 @@ impl App {
 
     pub fn start_task(&mut self, kind: TaskKind) {
         let notify = self.notify.clone();
-        let changes = !matches!(kind, TaskKind::Validate(_) | TaskKind::Filter(_));
+        let changes = !matches!(kind, TaskKind::Validate(_) | TaskKind::Filter(_) | TaskKind::Hash { .. });
         if changes && !self.editable() {
             return;
         }
@@ -1945,6 +1956,12 @@ impl App {
         let job = match kind {
             // (started by `start_print`, `filter_again`)
             TaskKind::Print | TaskKind::Refilter => return,
+            TaskKind::Hash { from, to } => Job::spawn(to - from, notify, move |ctx| guarded(&snap, || {
+                match crate::convert::sha256_of(&snap, from, to, ctx) {
+                    Some(d) => TaskResult::Hash(d),
+                    None => TaskResult::Cancelled,
+                }
+            })),
             TaskKind::Filter(invert) => {
                 let Some(m) = matcher else { return };
                 Job::spawn(len, notify, move |ctx| guarded(&snap, || {
@@ -4532,6 +4549,38 @@ impl App {
                 tab.view.sel = if sel.anchor > sel.caret { Sel::new(new.end(), new.start()) } else { new };
                 self.after_edit();
             }
+            Cmd::Convert(crate::convert::Conv::Sha256) => {
+                let tab = self.tab();
+                let sel = tab.view.sel;
+                let (from, to) = if sel.is_empty() { (0, tab.doc.len()) } else { (sel.start(), sel.end()) };
+                self.start_task(TaskKind::Hash { from, to });
+            }
+            Cmd::Convert(c) => {
+                if !self.editable() {
+                    return;
+                }
+                let tab = self.tab_mut();
+                let sel = tab.view.sel;
+                let (a, b) = if sel.is_empty() { (0, tab.doc.len()) } else { (sel.start(), sel.end()) };
+                if b - a > crate::convert::CONVERT_MAX {
+                    self.flash("Select up to 16 MB to convert.", true);
+                    return;
+                }
+                if a == b {
+                    self.flash("Nothing to convert: select some text (or have some in the tab).", false);
+                    return;
+                }
+                let text = tab.doc.read(a, b);
+                match c.apply(&text) {
+                    Ok(out) => {
+                        let n = out.len() as u64;
+                        tab.view.sel = editor::replace_range(&mut tab.doc, sel, a, b, &out);
+                        self.after_edit();
+                        self.flash(c.done(n), false);
+                    }
+                    Err(why) => self.flash(why, true),
+                }
+            }
             Cmd::SetEol(e) => {
                 // (also to the same: stray line endings of the other kind are converted)
                 if self.tab().doc.is_empty() {
@@ -4913,6 +4962,8 @@ impl App {
                     v.push(sub("Formatting in&dent", widths.collect()));
                     v.push(Item::Sep);
                 }
+                v.push(sub("Con&vert", self.convert_items()));
+                v.push(Item::Sep);
                 v.extend([
                     sub("&Language", self.lang_items()),
                     sub(
@@ -4951,6 +5002,19 @@ impl App {
                 ]
             }
         }
+    }
+
+    /// Format → Convert: what's done to the selection (or the whole text when nothing is selected).
+    fn convert_items(&self) -> Vec<Item> {
+        use crate::convert::Conv;
+        let mut v = Vec::new();
+        for c in Conv::ALL {
+            if matches!(c, Conv::UrlEncode | Conv::JsonEscape | Conv::Sha256) {
+                v.push(Item::Sep);
+            }
+            v.push(item(Cmd::Convert(c), c.label(), ""));
+        }
+        v
     }
 
     /// Format → Indentation, also the status bar's indentation menu.
@@ -5366,6 +5430,18 @@ pub fn run(cell: &Cell, d: Deferred) {
             }
         }
         Deferred::AskLossy(id) => ask_lossy(cell, id),
+        Deferred::Hash => {
+            let (hwnd, hash) = {
+                let mut a = cell.borrow_mut();
+                (a.hwnd, a.hash.take())
+            };
+            let Some((what, hex)) = hash else { return };
+            let q = format!("SHA-256 of {what}");
+            if win::ask(hwnd, "Slate", &q, &hex, &["&Copy", "OK"]) == Some(0) {
+                let copied = win::set_clipboard(hwnd, hex.as_bytes());
+                cell.borrow_mut().flash(if copied { "SHA-256 copied" } else { CLIPBOARD_BUSY }, !copied);
+            }
+        }
         Deferred::TabList => {
             let (items, r) = {
                 let a = cell.borrow();

@@ -2,6 +2,100 @@
 //! selection, or on the whole text when nothing is selected. Encoding takes any bytes; decoding says what's wrong
 //! with its input instead of guessing.
 
+/// Format → Convert's items.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Conv {
+    Base64Encode,
+    Base64Decode,
+    UrlEncode,
+    UrlDecode,
+    JsonEscape,
+    JsonUnescape,
+    /// Shown (and copied if asked), not put in the text.
+    Sha256,
+}
+
+/// Up to this much text is converted at once (the selection, or the whole text when nothing is selected); SHA-256
+/// takes any size (on another thread).
+pub const CONVERT_MAX: u64 = 16 << 20;
+
+impl Conv {
+    pub const ALL: [Conv; 7] =
+        [Conv::Base64Encode, Conv::Base64Decode, Conv::UrlEncode, Conv::UrlDecode, Conv::JsonEscape, Conv::JsonUnescape, Conv::Sha256];
+
+    /// The menu's label.
+    pub fn label(self) -> &'static str {
+        match self {
+            Conv::Base64Encode => "Base64 encode",
+            Conv::Base64Decode => "Base64 decode",
+            Conv::UrlEncode => "URL encode",
+            Conv::UrlDecode => "URL decode",
+            Conv::JsonEscape => "JSON string escape",
+            Conv::JsonUnescape => "JSON string unescape",
+            Conv::Sha256 => "SHA-256",
+        }
+    }
+
+    /// A name for scripts and menus' actions (`base64-encode`).
+    pub fn key(self) -> &'static str {
+        match self {
+            Conv::Base64Encode => "base64-encode",
+            Conv::Base64Decode => "base64-decode",
+            Conv::UrlEncode => "url-encode",
+            Conv::UrlDecode => "url-decode",
+            Conv::JsonEscape => "json-escape",
+            Conv::JsonUnescape => "json-unescape",
+            Conv::Sha256 => "sha256",
+        }
+    }
+
+    /// What it makes of `text` (not SHA-256's: that's `Sha256`), or why it can't.
+    pub fn apply(self, text: &[u8]) -> Result<Vec<u8>, String> {
+        match self {
+            Conv::Base64Encode => Ok(base64_encode(text)),
+            Conv::Base64Decode => base64_decode(text),
+            Conv::UrlEncode => Ok(url_encode(text).into_bytes()),
+            Conv::UrlDecode => url_decode(text),
+            Conv::JsonEscape => Ok(json_escape(text)),
+            Conv::JsonUnescape => json_unescape(text),
+            Conv::Sha256 => Err("SHA-256 isn't put in the text".into()),
+        }
+    }
+
+    /// What the status bar says once it's done (`out` the result's length).
+    pub fn done(self, out: u64) -> String {
+        let what = match self {
+            Conv::Base64Encode => "Base64 encoded",
+            Conv::Base64Decode => "Base64 decoded",
+            Conv::UrlEncode => "URL encoded",
+            Conv::UrlDecode => "URL decoded",
+            Conv::JsonEscape => "Escaped for a JSON string",
+            Conv::JsonUnescape => "JSON escapes undone",
+            Conv::Sha256 => "SHA-256",
+        };
+        format!("{what} ({})", crate::edit::plural(out, "byte", "bytes"))
+    }
+}
+
+/// The SHA-256 of `snap`'s bytes `from..to`, a megabyte at a time (None: cancelled).
+pub fn sha256_of(snap: &crate::core::buffer::Snapshot, from: u64, to: u64, ctx: &crate::core::job::Ctx) -> Option<[u8; 32]> {
+    let mut h = Sha256::default();
+    let mut pos = from;
+    while pos < to {
+        if ctx.cancelled() {
+            return None;
+        }
+        let end = (pos + (1 << 20)).min(to);
+        snap.chunks(pos, end, &mut |c| {
+            h.update(c);
+            true
+        });
+        ctx.set(end - from);
+        pos = end;
+    }
+    Some(h.finish())
+}
+
 /// Base64 of `b` (the standard alphabet, padded with `=`).
 pub fn base64_encode(b: &[u8]) -> Vec<u8> {
     const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";

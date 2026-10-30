@@ -109,6 +109,8 @@ pub enum Cmd {
     /// View → Character at the caret: its code point and bytes in the status bar.
     CharInfo,
     Case(CaseOp),
+    /// Format → Convert: Base64, URL encoding, JSON escapes (on the selection, or the whole text), SHA-256.
+    Convert(crate::convert::Conv),
     SetEol(Eol),
     SaveEncoding(Encoding),
     ReopenEncoding(Encoding),

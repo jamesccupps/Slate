@@ -272,6 +272,8 @@ fn cmd_of(name: &str) -> Option<Cmd> {
         "CloseAll" => Cmd::CloseAll,
         "ToggleRestoreSession" => Cmd::ToggleRestoreSession,
         n if n.starts_with("JsonIndent") => Cmd::JsonIndent(n["JsonIndent".len()..].parse().ok()?),
+        // Format → Convert's items by their key (`Convert:base64-encode`)
+        n if n.starts_with("Convert:") => Cmd::Convert(crate::convert::Conv::ALL.into_iter().find(|c| c.key() == &n["Convert:".len()..])?),
         "ReplaceAll" => return None,
         _ => return None,
     })

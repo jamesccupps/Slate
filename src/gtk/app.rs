@@ -61,6 +61,8 @@ pub enum Ask {
     Reload { tab: u64, encoding: Option<Encoding> },
     /// File → Show in folder: the file manager shows the file.
     RevealFile(PathBuf),
+    /// Format → Convert → SHA-256's answer: of what (the selection, the file), and the hash (Copy, or OK).
+    Hash { what: String, hex: String },
     /// A link or a folder opened with the desktop's app for it (Help → Report a problem…, Open settings folder).
     OpenUri(String),
 }
@@ -188,6 +190,8 @@ pub enum Cmd {
     ToggleStructure,
     TogglePathBar,
     CopyJsonPath,
+    /// Format → Convert: Base64, URL encoding, JSON escapes (on the selection, or the whole text), SHA-256.
+    Convert(crate::convert::Conv),
 }
 
 pub struct SaveTask {
@@ -208,6 +212,8 @@ enum TaskResult {
     Refiltered { src: Arc<crate::core::source::Source>, nl: u64, map: crate::core::search::LineMap, found: crate::core::search::Filtered },
     Valid(String),
     FormatError { offset: u64, msg: String },
+    /// A SHA-256 worked out.
+    Hash([u8; 32]),
     Failed(String),
     Cancelled,
 }
@@ -234,6 +240,8 @@ enum TaskKind {
     CsvCheck(csv::Dialect),
     /// CSV or TSV: the rows sorted by field `col` (from 0), Z to A when `desc`, the first row on top when `header`.
     SortColumn { col: usize, desc: bool, d: csv::Dialect, header: bool },
+    /// Format → Convert → SHA-256 of bytes `from..to` (the selection, or all of the text).
+    Hash { from: u64, to: u64 },
 }
 
 struct Task {
@@ -2453,6 +2461,39 @@ impl App {
                     None => self.flash(format!("Still reading the {what} structure — try again in a moment."), true),
                 }
             }
+            Cmd::Convert(crate::convert::Conv::Sha256) => {
+                let tab = self.tab();
+                let sel = tab.view.sel;
+                let (from, to) = if sel.is_empty() { (0, tab.doc.len()) } else { (sel.start(), sel.end()) };
+                self.start_task(TaskKind::Hash { from, to });
+            }
+            Cmd::Convert(c) => {
+                if !self.editable() {
+                    return;
+                }
+                let tab = &mut self.tabs[self.active];
+                let sel = tab.view.sel;
+                let (a, b) = if sel.is_empty() { (0, tab.doc.len()) } else { (sel.start(), sel.end()) };
+                if b - a > crate::convert::CONVERT_MAX {
+                    self.flash("Select up to 16 MB to convert.", true);
+                    return;
+                }
+                if a == b {
+                    self.flash("Nothing to convert: select some text (or have some in the tab).", false);
+                    return;
+                }
+                let text = tab.doc.read(a, b);
+                match c.apply(&text) {
+                    Ok(out) => {
+                        tab.view.block = None;
+                        let new = edit::replace_selection(&mut tab.doc, Sel::new(a, b), &out, EditKind::Other);
+                        tab.view.sel = Sel::new(a, new.caret);
+                        self.after_edit(true);
+                        self.flash(c.done(out.len() as u64), false);
+                    }
+                    Err(why) => self.flash(why, true),
+                }
+            }
             Cmd::ToggleTheme => {
                 let to = if self.theme.dark { ThemeMode::Light } else { ThemeMode::Dark };
                 self.exec(Cmd::Theme(to));
@@ -2530,7 +2571,7 @@ impl App {
         let notify = self.notify.clone();
         let changes = !matches!(
             kind,
-            TaskKind::Json(json::Mode::Validate) | TaskKind::Xml(json::Mode::Validate) | TaskKind::Filter(_) | TaskKind::CsvCheck(_)
+            TaskKind::Json(json::Mode::Validate) | TaskKind::Xml(json::Mode::Validate) | TaskKind::Filter(_) | TaskKind::CsvCheck(_) | TaskKind::Hash { .. }
         );
         if changes && !self.editable() {
             return;
@@ -2626,6 +2667,10 @@ impl App {
                     Ok(s) => TaskResult::Valid(format!("Valid XML: {} elements (nesting depth {})", s.elements, s.max_depth)),
                     Err(_) if ctx.cancelled() => TaskResult::Cancelled,
                     Err(e) => TaskResult::FormatError { offset: e.offset, msg: e.msg },
+                },
+                TaskKind::Hash { from, to } => match crate::convert::sha256_of(&snap, from, to, ctx) {
+                    Some(d) => TaskResult::Hash(d),
+                    None => TaskResult::Cancelled,
                 },
                 TaskKind::CsvCheck(d) => match csv::check(&snap, d, ctx) {
                     Ok(s) => TaskResult::Valid(edit::csv_valid(d, s)),
@@ -2831,6 +2876,16 @@ impl App {
             TaskResult::Valid(msg) => {
                 self.clear_check_error(i);
                 self.flash(msg, false);
+            }
+            TaskResult::Hash(d) => {
+                let TaskKind::Hash { from, to } = kind else { return };
+                let tab = &self.tabs[i];
+                let what = if from == 0 && to == tab.doc.len() && tab.doc.version == version {
+                    tab.title()
+                } else {
+                    format!("the selection ({})", edit::plural(to - from, "byte", "bytes"))
+                };
+                self.asks.push(Ask::Hash { what, hex: crate::convert::hex(&d) });
             }
             TaskResult::FormatError { offset, msg } => {
                 let tab = &mut self.tabs[i];

@@ -24,6 +24,7 @@ use gtk4::{cairo, gdk, gio, glib, pango};
 use crate::core::document::Sel;
 use crate::core::job::Notify;
 use crate::core::lines::{CaseOp, LineOp};
+use crate::convert::Conv;
 use crate::core::text::{Encoding, Eol};
 use crate::highlight::Lang;
 use crate::settings::{Settings, ThemeMode};
@@ -1508,6 +1509,13 @@ fn commands() -> Vec<(&'static str, Cmd, &'static [&'static str])> {
         ("structure-panel", Cmd::ToggleStructure, &["<Control><Shift>o"]),
         ("path-bar", Cmd::TogglePathBar, &[]),
         ("copy-json-path", Cmd::CopyJsonPath, &[]),
+        ("convert-base64-encode", Cmd::Convert(Conv::Base64Encode), &[]),
+        ("convert-base64-decode", Cmd::Convert(Conv::Base64Decode), &[]),
+        ("convert-url-encode", Cmd::Convert(Conv::UrlEncode), &[]),
+        ("convert-url-decode", Cmd::Convert(Conv::UrlDecode), &[]),
+        ("convert-json-escape", Cmd::Convert(Conv::JsonEscape), &[]),
+        ("convert-json-unescape", Cmd::Convert(Conv::JsonUnescape), &[]),
+        ("convert-sha256", Cmd::Convert(Conv::Sha256), &[]),
     ]
 }
 
@@ -1734,7 +1742,16 @@ fn menu_model(recent: &gio::Menu, format_extra: &gio::Menu, view_extra: &gio::Me
         &section(&[("Check CSV / TSV", "csv-check"), ("Sort by this column, A to Z", "csv-sort"), ("Sort by this column, Z to A", "csv-sort-desc")]),
     );
     format.append_section(None, format_extra);
+    let convert = gio::Menu::new();
+    for group in [&[Conv::Base64Encode, Conv::Base64Decode][..], &[Conv::UrlEncode, Conv::UrlDecode], &[Conv::JsonEscape, Conv::JsonUnescape], &[Conv::Sha256]] {
+        let m = gio::Menu::new();
+        for c in group {
+            m.append(Some(c.label()), Some(&format!("win.convert-{}", c.key())));
+        }
+        convert.append_section(None, &m);
+    }
     let rest = gio::Menu::new();
+    rest.append_submenu(Some("Convert"), &convert);
     rest.append_submenu(Some("Language"), &lang_menu());
     rest.append_submenu(Some("Line endings"), &eol_menu());
     rest.append_submenu(Some("Encoding"), &encoding_menu());
@@ -3291,6 +3308,14 @@ impl Ui {
                 });
             }
             Ask::RevealFile(path) => reveal_file(&path),
+            Ask::Hash { what, hex } => {
+                let ask = Ask::Hash { what: what.clone(), hex: hex.clone() };
+                self.dialog(&format!("SHA-256 of {what}"), &hex, &[("OK", "ok"), ("Copy", "copy")], move |answer| {
+                    if let Some(ui) = get_ui() {
+                        ui.answer(ask.clone(), answer);
+                    }
+                });
+            }
             Ask::OpenUri(uri) => {
                 #[allow(deprecated)]
                 gtk4::show_uri(Some(&self.window), &uri, gdk::CURRENT_TIME);
@@ -3387,6 +3412,14 @@ impl Ui {
                     // (Close other / saved / all tabs carries on)
                     a.close_next();
                 });
+            }
+            Ask::Hash { hex, .. } => {
+                if answer == "copy" {
+                    self.with(|a| {
+                        a.copy_out = Some(hex);
+                        a.flash("SHA-256 copied", false);
+                    });
+                }
             }
             Ask::Reload { tab, encoding } => {
                 if answer == "reload" {

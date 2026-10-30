@@ -88,6 +88,8 @@ pub enum TaskKind {
     Refilter,
     /// CSV or TSV: the rows sorted by field `col` (from 0), Z to A when `desc`, the first row on top when `header`.
     SortColumn { col: usize, desc: bool, d: crate::core::csv::Dialect, header: bool },
+    /// Format → Convert → SHA-256 of bytes `from..to` (the selection, or all of the text).
+    Hash { from: u64, to: u64 },
 }
 
 /// The structured formats Slate can format and check (CSV and TSV: check only).
@@ -121,6 +123,8 @@ pub enum TaskResult {
     Filtered { src: Arc<Source>, nl: u64, found: crate::core::search::Filtered, query: String, matcher: Arc<crate::core::search::Matcher> },
     /// A tab of matching lines made again: its lines, and which line of the source each one is.
     Refiltered { src: Arc<Source>, nl: u64, map: crate::core::search::LineMap, found: crate::core::search::Filtered },
+    /// A SHA-256 worked out.
+    Hash([u8; 32]),
     Failed(String),
     Cancelled,
 }
@@ -405,6 +409,8 @@ pub enum Deferred {
     AskLossy(u64),
     /// The list of all tabs (the button at the end of a tab strip that overflows).
     TabList,
+    /// Format → Convert → SHA-256's answer (`App::hash`).
+    Hash,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -511,6 +517,8 @@ pub struct App {
     pub caption_rects: [Rect; 3],
     /// Where each part of the JSON or XML path bar was drawn (for clicks).
     pub path_rects: Vec<Rect>,
+    /// Format → Convert → SHA-256's answer to show: of what (the selection, the file), and the hash.
+    pub hash: Option<(String, String)>,
     /// The window is the active one (its caption buttons are dimmed when it isn't).
     pub window_active: bool,
     pub r_menu: Rect,
@@ -651,6 +659,7 @@ impl App {
             custom_frame: super::CUSTOM_FRAME.with(|c| c.get()),
             caption_rects: [Rect::default(); 3],
             path_rects: Vec::new(),
+            hash: None,
             window_active: true,
             r_menu: Rect::default(),
             r_find: Rect::default(),
@@ -1913,6 +1922,7 @@ impl App {
                 TaskKind::Lines(_) => "Cleaning up lines".into(),
                 TaskKind::SortColumn { .. } => "Sorting rows".into(),
                 TaskKind::Print => "Printing".into(),
+                TaskKind::Hash { .. } => "Working out the SHA-256".into(),
                 TaskKind::Filter(_) | TaskKind::Refilter => "Finding the lines".into(),
             };
             return Some((format!("{what}… {:.0}%  (Esc to cancel)", task.job.fraction() * 100.0), false));
