@@ -11,7 +11,7 @@ use windows::Win32::System::Registry::{
 };
 use windows::Win32::UI::Shell::{IShellLinkW, SHCNE_ASSOCCHANGED, SHCNF_IDLIST, SHChangeNotify, ShellExecuteW, ShellLink};
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
-use windows::core::{HSTRING, Interface, PCWSTR, w};
+use windows::core::{HSTRING, Interface, PCWSTR, PWSTR, w};
 
 use super::app::Cell;
 use super::win;
@@ -238,47 +238,54 @@ const APP_PATH: &str = r"Software\Microsoft\Windows\CurrentVersion\App Paths\Sla
 /// and the note that `forget_unregistered` ran. The ProgID, "Open with" and the file types set to open with Slate
 /// stay as they are.
 pub fn move_names() {
-    use windows::Win32::System::Registry::{RegCopyTreeW, RegDeleteTreeW, RegOpenKeyExW, KEY_READ};
-    // Copies key `from` (all of it) to `to`, where there's nothing yet, then deletes `from`. Returns whether there was
-    // one to move.
+    use windows::Win32::System::Registry::{KEY_ALL_ACCESS, KEY_READ, RegCopyTreeW, RegDeleteKeyW, RegDeleteTreeW, RegOpenKeyExW};
+    const APPS: &str = r"Software\RegisteredApplications";
+    // Copies key `from` (all of it) to `to`, then deletes `from`; returns whether it moved. An empty key at `to` is
+    // what a move that failed left (the test builds of 0.16.0): copied into. One with something in it was moved
+    // before: the old one is only left over. RegCopyTreeW wants all access to the key it copies into: with KEY_WRITE,
+    // the access its documentation names, it fails (access denied).
     let move_key = |from: &str, to: &str| unsafe {
         let mut src = HKEY::default();
         if RegOpenKeyExW(HKEY_CURRENT_USER, &HSTRING::from(from), 0, KEY_READ, &mut src).is_err() {
             return false;
         }
         let mut dst = HKEY::default();
-        let mut copied = false;
-        if RegOpenKeyExW(HKEY_CURRENT_USER, &HSTRING::from(to), 0, KEY_READ, &mut dst).is_ok() {
-            // (moved before: the old one is only left over)
-            let _ = RegCloseKey(dst);
-            copied = true;
-        } else if RegCreateKeyExW(HKEY_CURRENT_USER, &HSTRING::from(to), 0, None, REG_OPTION_NON_VOLATILE, KEY_WRITE, None, &mut dst, None)
+        let mut moved = false;
+        if RegCreateKeyExW(HKEY_CURRENT_USER, &HSTRING::from(to), 0, None, REG_OPTION_NON_VOLATILE, KEY_ALL_ACCESS, None, &mut dst, None)
             .is_ok()
         {
-            copied = RegCopyTreeW(src, None, dst).is_ok();
+            match key_counts(dst) {
+                Some((0, 0)) => {
+                    moved = RegCopyTreeW(src, None, dst).is_ok();
+                    if !moved {
+                        // (nothing half copied is left to pass for a moved one next time)
+                        let _ = RegDeleteTreeW(dst, None);
+                    }
+                }
+                Some(_) => moved = true,
+                None => {}
+            }
             let _ = RegCloseKey(dst);
+            if !moved && key_empty(to) {
+                let _ = RegDeleteKeyW(HKEY_CURRENT_USER, &HSTRING::from(to));
+            }
         }
         let _ = RegCloseKey(src);
-        if copied {
+        if moved {
             let _ = RegDeleteTreeW(HKEY_CURRENT_USER, &HSTRING::from(from));
-            let _ = windows::Win32::System::Registry::RegDeleteKeyW(HKEY_CURRENT_USER, &HSTRING::from(from));
+            let _ = RegDeleteKeyW(HKEY_CURRENT_USER, &HSTRING::from(from));
         }
-        true
+        moved
     };
     let mut moved = false;
-    for (old_key, old_name, old_verb, old_uninstall) in OLD_NAMES {
+    for (old_key, _, old_verb, old_uninstall) in OLD_NAMES {
         // Slate's own key (its Default apps capabilities, the Registration note): Slate's when it describes Slate or
         // holds only that note.
         let old_caps = format!(r"{old_key}\Capabilities");
         let ours = read_str(&old_caps, "ApplicationDescription").as_deref() == Some(DESCRIPTION)
             || (read_str(&old_caps, "ApplicationName").is_none() && read_dword(old_key, "Registration").is_some());
         if ours {
-            let listed = read_str(r"Software\RegisteredApplications", old_name).is_some_and(|v| v.eq_ignore_ascii_case(&old_caps));
             moved |= move_key(old_key, APP_KEY);
-            if listed {
-                set(r"Software\RegisteredApplications", Some(APP_NAME), CAPABILITIES);
-                delete_value(r"Software\RegisteredApplications", old_name);
-            }
         }
         // "Edit with Slate": Slate's when it runs a Slate.exe
         if read_str(&format!(r"{old_verb}\command"), "").is_some_and(|c| c.to_ascii_lowercase().contains("slate.exe\" \"%1\"")) {
@@ -289,14 +296,60 @@ pub fn move_names() {
             moved |= move_key(old_uninstall, UNINSTALL);
         }
     }
-    // (the test build's publisher key, if nothing else is in it)
-    unsafe {
-        let _ = windows::Win32::System::Registry::RegDeleteKeyW(HKEY_CURRENT_USER, w!(r"Software\JamesCupps"));
+    // Default apps: Slate listed under an old name is listed under its own once its key is there (a test build could
+    // leave the old name pointing at a key that's gone: dropped).
+    let in_place = read_str(CAPABILITIES, "ApplicationDescription").as_deref() == Some(DESCRIPTION);
+    for (old_key, old_name, _, _) in OLD_NAMES {
+        let old_caps = format!(r"{old_key}\Capabilities");
+        if !read_str(APPS, old_name).is_some_and(|v| v.eq_ignore_ascii_case(&old_caps)) {
+            continue;
+        }
+        if in_place {
+            set(APPS, Some(APP_NAME), CAPABILITIES);
+        }
+        if in_place || read_str(&old_caps, "ApplicationDescription").is_none() {
+            delete_value(APPS, old_name);
+            moved = true;
+        }
+    }
+    // (the keys a test build's failed move left empty under its names, and its publisher key over them)
+    let (old_key, _, old_verb, old_uninstall) = OLD_NAMES[1];
+    for k in [old_key, old_verb, old_uninstall, r"Software\JamesCupps"] {
+        if key_empty(k) {
+            unsafe {
+                let _ = RegDeleteKeyW(HKEY_CURRENT_USER, &HSTRING::from(k));
+            }
+        }
     }
     if moved {
         unsafe {
             SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, None, None);
         }
+    }
+}
+
+/// How many subkeys and values a key has.
+fn key_counts(key: HKEY) -> Option<(u32, u32)> {
+    use windows::Win32::System::Registry::RegQueryInfoKeyW;
+    let (mut keys, mut values) = (0u32, 0u32);
+    unsafe {
+        RegQueryInfoKeyW(key, PWSTR::null(), None, None, Some(&mut keys), None, None, Some(&mut values), None, None, None, None)
+    }
+    .is_ok()
+    .then_some((keys, values))
+}
+
+/// Whether the key at `path` is there with nothing in it.
+fn key_empty(path: &str) -> bool {
+    use windows::Win32::System::Registry::{KEY_READ, RegOpenKeyExW};
+    let mut key = HKEY::default();
+    unsafe {
+        if RegOpenKeyExW(HKEY_CURRENT_USER, &HSTRING::from(path), 0, KEY_READ, &mut key).is_err() {
+            return false;
+        }
+        let empty = key_counts(key) == Some((0, 0));
+        let _ = RegCloseKey(key);
+        empty
     }
 }
 
