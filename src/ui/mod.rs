@@ -70,6 +70,15 @@ pub fn class() -> PCWSTR {
         CLASS
     }
 }
+/// Whether another Slate has a window: a normal one, one running as administrator, or one that opened on its own
+/// (each has a window class of its own).
+fn other_slate_running() -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::FindWindowW;
+    [CLASS, w!("SlateMainWindow.Admin"), w!("SlateGuestWindow")]
+        .into_iter()
+        .any(|c| unsafe { FindWindowW(c, None) }.is_ok_and(|h| !h.is_invalid()))
+}
+
 pub(crate) const COPYDATA_OPEN: usize = 0x51A7E;
 /// Files with what the command line asked for besides them (`app::Opts`): lines starting with `?` (no file name
 /// can) say it — `?read-only`, `?wait=<event>`, `?text=<file>` (standard input, written to a file Slate deletes once
@@ -1495,7 +1504,14 @@ pub fn run(raw: Vec<std::ffi::OsString>) -> i32 {
         .collect();
     match hand_over_request(&paths, &opts, wait.is_some()) {
         Running::Took(_) => return 0,
-        Running::No => {}
+        Running::No => {
+            // What 0.15.0 and older named plain "Slate" (the data folder, registry keys) moves to Slate's own names,
+            // once, while no other Slate runs (it would go on using the old ones).
+            if !other_slate_running() {
+                settings::move_data_dir();
+                install::move_names();
+            }
+        }
         Running::Busy => settings::GUEST.store(true, std::sync::atomic::Ordering::Relaxed),
     }
     let _device = gfx::make_device_early();

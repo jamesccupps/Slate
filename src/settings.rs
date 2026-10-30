@@ -133,30 +133,92 @@ pub fn portable() -> bool {
     exe_dir().is_some_and(|d| d.join("Slate.portable").exists())
 }
 
+/// The data folder, once worked out (`move_data_dir` changes it).
+static DATA_DIR: std::sync::RwLock<Option<PathBuf>> = std::sync::RwLock::new(None);
+
 pub fn data_dir() -> PathBuf {
-    static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-    DIR.get_or_init(|| {
-        // For tests: a separate data folder.
-        if let Some(d) = std::env::var_os("SLATE_DATA_DIR") {
-            return PathBuf::from(d);
+    if let Some(d) = DATA_DIR.read().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        return d.clone();
+    }
+    let d = find_data_dir();
+    *DATA_DIR.write().unwrap_or_else(|e| e.into_inner()) = Some(d.clone());
+    d
+}
+
+fn find_data_dir() -> PathBuf {
+    // For tests: a separate data folder.
+    if let Some(d) = std::env::var_os("SLATE_DATA_DIR") {
+        return PathBuf::from(d);
+    }
+    if portable() {
+        if let Some(d) = exe_dir() {
+            return d.join("data");
         }
-        if portable() {
-            if let Some(d) = exe_dir() {
-                return d.join("data");
-            }
-        }
-        #[cfg(windows)]
-        return std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir).join("Slate");
-        // (XDG: $XDG_DATA_HOME, else ~/.local/share)
-        #[cfg(not(windows))]
-        return std::env::var_os("XDG_DATA_HOME")
-            .map(PathBuf::from)
-            .filter(|p| p.is_absolute())
-            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local").join("share")))
-            .unwrap_or_else(std::env::temp_dir)
-            .join("slate");
-    })
-    .clone()
+    }
+    #[cfg(windows)]
+    {
+        // (0.15.0 and older kept it in %LOCALAPPDATA%\Slate: used there until `move_data_dir` moves it)
+        let (new, old) = windows_data_dirs();
+        return if !new.exists() && is_slates_folder(&old) { old } else { new };
+    }
+    // (XDG: $XDG_DATA_HOME, else ~/.local/share)
+    #[cfg(not(windows))]
+    return std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local").join("share")))
+        .unwrap_or_else(std::env::temp_dir)
+        .join("slate");
+}
+
+/// Where Windows keeps the data folder: `%LOCALAPPDATA%\JamesCupps\Slate` (named for its publisher, so another program
+/// called Slate can't share it), and `%LOCALAPPDATA%\Slate`, where 0.15.0 and older kept it.
+#[cfg(windows)]
+fn windows_data_dirs() -> (PathBuf, PathBuf) {
+    let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
+    (base.join("JamesCupps").join("Slate"), base.join("Slate"))
+}
+
+/// Whether `d` is a data folder Slate wrote: its settings (with a setting only Slate has) or its session.
+#[cfg(windows)]
+fn is_slates_folder(d: &std::path::Path) -> bool {
+    let settings = std::fs::read(d.join("settings.json")).ok().and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+    settings.is_some_and(|v| v.get("restore_session").is_some() && v.get("tabs_in_title_bar").or(v.get("json_indent")).is_some())
+        || d.join("session").join("session.json").is_file()
+        || d.join("session-admin").join("session.json").is_file()
+}
+
+/// Moves the data folder of 0.15.0 and older (`%LOCALAPPDATA%\Slate`) to where it's kept now, once. Only at a start
+/// when no other Slate runs (it would go on using the old folder). One that can't be moved now (a file in it is open)
+/// stays in use where it is, and is moved at a later start. Returns whether it moved.
+#[cfg(windows)]
+pub fn move_data_dir() -> bool {
+    if std::env::var_os("SLATE_DATA_DIR").is_some() || portable() {
+        return false;
+    }
+    let (new, old) = windows_data_dirs();
+    let moved = move_data_dir_in(&new, &old);
+    if moved {
+        *DATA_DIR.write().unwrap_or_else(|e| e.into_inner()) = Some(new);
+    }
+    moved
+}
+
+#[cfg(windows)]
+fn move_data_dir_in(new: &std::path::Path, old: &std::path::Path) -> bool {
+    if new.exists() || !is_slates_folder(old) {
+        return false;
+    }
+    let Some(parent) = new.parent() else { return false };
+    if std::fs::create_dir_all(parent).is_err() {
+        return false;
+    }
+    if std::fs::rename(old, new).is_err() {
+        // (the publisher's folder made for it isn't left behind empty)
+        let _ = std::fs::remove_dir(parent);
+        return false;
+    }
+    true
 }
 
 /// How big crash.log gets before it starts over (the one before kept as crash.log.old).
@@ -252,6 +314,30 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn the_old_data_folder_moves_only_when_its_slates() {
+        let base = std::env::temp_dir().join(format!("slate-move-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (new, old) = (base.join("JamesCupps").join("Slate"), base.join("Slate"));
+        // another program's folder of that name stays where it is
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("settings.json"), br#"{"theme": "dark"}"#).unwrap();
+        assert!(!move_data_dir_in(&new, &old));
+        assert!(old.exists() && !base.join("JamesCupps").exists());
+        // Slate's (its settings, a session) moves, all of it
+        std::fs::write(old.join("settings.json"), br#"{"restore_session": true, "json_indent": 2}"#).unwrap();
+        std::fs::create_dir_all(old.join("session")).unwrap();
+        std::fs::write(old.join("session").join("session.json"), b"{}").unwrap();
+        assert!(move_data_dir_in(&new, &old));
+        assert!(!old.exists() && new.join("session").join("session.json").exists());
+        // once only: a folder made there again later isn't moved over it
+        std::fs::create_dir_all(old.join("session")).unwrap();
+        std::fs::write(old.join("session").join("session.json"), b"{}").unwrap();
+        assert!(!move_data_dir_in(&new, &old));
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     #[test]
     fn the_crash_log_starts_over_when_full() {

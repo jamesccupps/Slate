@@ -17,6 +17,18 @@ use super::app::Cell;
 use super::win;
 
 const PROGID: &str = "Slate.TextFile";
+/// Slate's own keys, named for its publisher so another program called Slate can't take them over (0.15.0 and older
+/// used plain "Slate": `move_names` moves them). The ProgID above stays: renaming it would undo the Default apps
+/// choices people made for it, which only they can make again.
+const APP_KEY: &str = r"Software\JamesCupps\Slate";
+const CAPABILITIES: &str = r"Software\JamesCupps\Slate\Capabilities";
+/// Slate's name in RegisteredApplications (and for Default apps' `registeredAppUser`).
+const APP_NAME: &str = "JamesCupps.Slate";
+/// "Edit with Slate" on every file's right-click menu.
+const VERB: &str = r"Software\Classes\*\shell\JamesCupps.Slate";
+const OLD_APP_KEY: &str = r"Software\Slate";
+const OLD_VERB: &str = r"Software\Classes\*\shell\Slate";
+const OLD_UNINSTALL: &str = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\Slate";
 const EXTENSIONS: &[&str] = &[
     // text, data and config
     ".txt", ".log", ".json", ".jsonl", ".ndjson", ".geojson", ".md", ".markdown", ".csv", ".tsv", ".xml", ".ini",
@@ -172,16 +184,16 @@ fn register(exe: &Path) -> bool {
     for ext in registered() {
         ok &= set_empty(&format!(r"Software\Classes\{ext}\OpenWithProgids"), PROGID);
         ok &= set(r"Software\Classes\Applications\Slate.exe\SupportedTypes", Some(ext), "");
-        ok &= set(r"Software\Slate\Capabilities\FileAssociations", Some(ext), PROGID);
+        ok &= set(&format!(r"{CAPABILITIES}\FileAssociations"), Some(ext), PROGID);
     }
     // Right-click any file: "Edit with Slate".
-    ok &= set(r"Software\Classes\*\shell\Slate", None, "Edit with Slate");
-    ok &= set(r"Software\Classes\*\shell\Slate", Some("Icon"), &icon);
-    ok &= set(r"Software\Classes\*\shell\Slate\command", None, &open);
+    ok &= set(VERB, None, "Edit with Slate");
+    ok &= set(VERB, Some("Icon"), &icon);
+    ok &= set(&format!(r"{VERB}\command"), None, &open);
     // Default apps (Settings) listing.
-    ok &= set(r"Software\Slate\Capabilities", Some("ApplicationName"), "Slate");
-    ok &= set(r"Software\Slate\Capabilities", Some("ApplicationDescription"), "A fast, simple text editor that opens files of any size.");
-    ok &= set(r"Software\RegisteredApplications", Some("Slate"), r"Software\Slate\Capabilities");
+    ok &= set(CAPABILITIES, Some("ApplicationName"), "Slate");
+    ok &= set(CAPABILITIES, Some("ApplicationDescription"), DESCRIPTION);
+    ok &= set(r"Software\RegisteredApplications", Some(APP_NAME), CAPABILITIES);
     // Apps & features entry so it can be found later.
     let un = UNINSTALL;
     ok &= set(un, Some("DisplayName"), "Slate");
@@ -205,8 +217,71 @@ fn register(exe: &Path) -> bool {
     ok
 }
 
-const UNINSTALL: &str = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\Slate";
+const UNINSTALL: &str = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\JamesCupps.Slate";
+const DESCRIPTION: &str = "A fast, simple text editor that opens files of any size.";
+
 const APP_PATH: &str = r"Software\Microsoft\Windows\CurrentVersion\App Paths\Slate.exe";
+
+/// Moves what 0.15.0 and older registered under plain "Slate" names to Slate's own (`APP_KEY`, `APP_NAME`, `VERB`,
+/// `UNINSTALL`), once, and only what's Slate's: its Default apps entry, "Edit with Slate", its Installed apps entry,
+/// and the note that `forget_unregistered` ran. The ProgID, "Open with" and the file types set to open with Slate
+/// stay as they are.
+pub fn move_names() {
+    use windows::Win32::System::Registry::{RegCopyTreeW, RegDeleteTreeW, RegOpenKeyExW, KEY_READ};
+    // Copies key `from` (all of it) to `to`, where there's nothing yet, then deletes `from`. Returns whether there was
+    // one to move.
+    let move_key = |from: &str, to: &str| unsafe {
+        let mut src = HKEY::default();
+        if RegOpenKeyExW(HKEY_CURRENT_USER, &HSTRING::from(from), 0, KEY_READ, &mut src).is_err() {
+            return false;
+        }
+        let mut dst = HKEY::default();
+        let mut copied = false;
+        if RegOpenKeyExW(HKEY_CURRENT_USER, &HSTRING::from(to), 0, KEY_READ, &mut dst).is_ok() {
+            // (moved before: the old one is only left over)
+            let _ = RegCloseKey(dst);
+            copied = true;
+        } else if RegCreateKeyExW(HKEY_CURRENT_USER, &HSTRING::from(to), 0, None, REG_OPTION_NON_VOLATILE, KEY_WRITE, None, &mut dst, None)
+            .is_ok()
+        {
+            copied = RegCopyTreeW(src, None, dst).is_ok();
+            let _ = RegCloseKey(dst);
+        }
+        let _ = RegCloseKey(src);
+        if copied {
+            let _ = RegDeleteTreeW(HKEY_CURRENT_USER, &HSTRING::from(from));
+            let _ = windows::Win32::System::Registry::RegDeleteKeyW(HKEY_CURRENT_USER, &HSTRING::from(from));
+        }
+        true
+    };
+    let mut moved = false;
+    // Slate's own key (its Default apps capabilities, the Registration note): Slate's when it describes Slate or
+    // holds only that note.
+    let old_caps = format!(r"{OLD_APP_KEY}\Capabilities");
+    let ours = read_str(&old_caps, "ApplicationDescription").as_deref() == Some(DESCRIPTION)
+        || (read_str(&old_caps, "ApplicationName").is_none() && read_dword(OLD_APP_KEY, "Registration").is_some());
+    if ours {
+        let listed = read_str(r"Software\RegisteredApplications", "Slate").is_some_and(|v| v.eq_ignore_ascii_case(&old_caps));
+        moved |= move_key(OLD_APP_KEY, APP_KEY);
+        if listed {
+            set(r"Software\RegisteredApplications", Some(APP_NAME), CAPABILITIES);
+            delete_value(r"Software\RegisteredApplications", "Slate");
+        }
+    }
+    // "Edit with Slate": Slate's when it runs a Slate.exe
+    if read_str(&format!(r"{OLD_VERB}\command"), "").is_some_and(|c| c.to_ascii_lowercase().contains("slate.exe\" \"%1\"")) {
+        moved |= move_key(OLD_VERB, VERB);
+    }
+    // Installed apps: Slate's when it uninstalls with a Slate.exe --uninstall
+    if read_str(OLD_UNINSTALL, "UninstallString").is_some_and(|u| u.to_ascii_lowercase().contains("slate.exe\" --uninstall")) {
+        moved |= move_key(OLD_UNINSTALL, UNINSTALL);
+    }
+    if moved {
+        unsafe {
+            SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, None, None);
+        }
+    }
+}
 
 fn read_str(path: &str, name: &str) -> Option<String> {
     use windows::Win32::System::Registry::{RRF_RT_REG_SZ, RegGetValueW};
@@ -271,7 +346,7 @@ fn delete_key(path: &str) {
 
 /// Whether "Open files with Slate…" set Slate up for files (Default apps lists it).
 pub fn associated() -> bool {
-    read_str(r"Software\RegisteredApplications", "Slate").is_some()
+    read_str(r"Software\RegisteredApplications", APP_NAME).is_some()
 }
 
 fn is_slate(progid: &str) -> bool {
@@ -348,20 +423,20 @@ pub fn choices_note(choices: &[(&str, Choice)]) -> String {
 
 /// Takes back what 0.8.1 and older registered for the kinds of files in `NOT_REGISTERED`, and a choice of Slate for
 /// .bat and .cmd files (made in the box Windows showed because of it: they opened in Slate instead of running).
-/// Once: `Software\Slate\Registration` notes it.
+/// Once: `Registration` in Slate's key notes it.
 fn forget_unregistered() {
-    if read_dword(r"Software\Slate", "Registration").is_some_and(|v| v >= 2) {
+    if read_dword(APP_KEY, "Registration").is_some_and(|v| v >= 2) {
         return;
     }
     for ext in NOT_REGISTERED {
         delete_value(&format!(r"Software\Classes\{ext}\OpenWithProgids"), PROGID);
         delete_value(r"Software\Classes\Applications\Slate.exe\SupportedTypes", ext);
-        delete_value(r"Software\Slate\Capabilities\FileAssociations", ext);
+        delete_value(&format!(r"{CAPABILITIES}\FileAssociations"), ext);
     }
     for ext in [".bat", ".cmd"] {
         forget_choice(ext);
     }
-    set_dword(r"Software\Slate", "Registration", 2);
+    set_dword(APP_KEY, "Registration", 2);
     unsafe {
         SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, None, None);
     }
@@ -381,13 +456,19 @@ pub fn unassociate() {
         for k in [
             format!(r"Software\Classes\{PROGID}"),
             r"Software\Classes\Applications\Slate.exe".to_string(),
-            r"Software\Classes\*\shell\Slate".to_string(),
-            r"Software\Slate\Capabilities".to_string(),
+            VERB.to_string(),
+            CAPABILITIES.to_string(),
+            // (what 0.15.0 and older called them, if they're still there)
+            OLD_VERB.to_string(),
+            format!(r"{OLD_APP_KEY}\Capabilities"),
         ] {
             let _ = RegDeleteTreeW(HKEY_CURRENT_USER, &HSTRING::from(k));
         }
     }
-    delete_value(r"Software\RegisteredApplications", "Slate");
+    delete_value(r"Software\RegisteredApplications", APP_NAME);
+    if read_str(r"Software\RegisteredApplications", "Slate").is_some_and(|v| v.eq_ignore_ascii_case(&format!(r"{OLD_APP_KEY}\Capabilities"))) {
+        delete_value(r"Software\RegisteredApplications", "Slate");
+    }
     unsafe {
         SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, None, None);
     }
@@ -468,7 +549,7 @@ pub fn make_default(cell: &Cell) {
         win::info(hwnd, "Slate", "Some settings couldn't be saved to the registry.");
     }
     unsafe {
-        ShellExecuteW(hwnd, w!("open"), w!("ms-settings:defaultapps?registeredAppUser=Slate"), None, None, SW_SHOWNORMAL);
+        ShellExecuteW(hwnd, w!("open"), w!("ms-settings:defaultapps?registeredAppUser=JamesCupps.Slate"), None, None, SW_SHOWNORMAL);
     }
     let choices: Vec<(&str, Choice)> = USUAL.iter().map(|&e| (e, choice_of(e))).collect();
     let note = choices_note(&choices);
@@ -503,8 +584,17 @@ pub fn uninstall(quiet: bool) {
     // (the file types set to open with Slate open the way Windows opens them without a choice again)
     unassociate();
     unsafe {
-        for k in [r"Software\Slate".to_string(), UNINSTALL.to_string(), APP_PATH.to_string()] {
+        for k in [APP_KEY, UNINSTALL, APP_PATH] {
             let _ = RegDeleteTreeW(HKEY_CURRENT_USER, &HSTRING::from(k));
+        }
+        // (the publisher's key, if nothing else is in it; and what 0.15.0 and older called them)
+        let _ = windows::Win32::System::Registry::RegDeleteKeyW(HKEY_CURRENT_USER, w!(r"Software\JamesCupps"));
+        if read_dword(OLD_APP_KEY, "Registration").is_some() || read_str(&format!(r"{OLD_APP_KEY}\Capabilities"), "ApplicationDescription").as_deref() == Some(DESCRIPTION) {
+            let _ = RegDeleteTreeW(HKEY_CURRENT_USER, &HSTRING::from(OLD_APP_KEY));
+            let _ = windows::Win32::System::Registry::RegDeleteKeyW(HKEY_CURRENT_USER, &HSTRING::from(OLD_APP_KEY));
+        }
+        if read_str(OLD_UNINSTALL, "UninstallString").is_some_and(|u| u.to_ascii_lowercase().contains("slate.exe\" --uninstall")) {
+            let _ = RegDeleteTreeW(HKEY_CURRENT_USER, &HSTRING::from(OLD_UNINSTALL));
         }
         if let Some(appdata) = std::env::var_os("APPDATA") {
             let _ = std::fs::remove_file(PathBuf::from(appdata).join(r"Microsoft\Windows\Start Menu\Programs\Slate.lnk"));

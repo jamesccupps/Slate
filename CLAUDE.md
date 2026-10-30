@@ -142,7 +142,7 @@ there); the JSON outline for the path bar takes ~2 s more in the background and 
 Shared by both platforms: `src/core` (the engine), `src/highlight*` (colors), `src/edit.rs` (editing operations,
 display segments, coloring checkpoints, the transform sink), `src/theme.rs` (palettes; Windows' high contrast and
 accent stay Windows-only: the accent in the shade Windows 11's apps use on the theme, from Windows' accent palette, a
-lighter one on dark), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate`, `$XDG_DATA_HOME/slate` or
+lighter one on dark), `src/settings.rs` (data folder: `%LOCALAPPDATA%\JamesCupps\Slate` — 0.15.0 and older used `%LOCALAPPDATA%\Slate`, which `move_data_dir` moves at a start when no other Slate runs —, `$XDG_DATA_HOME/slate` or
 `~/.local/share/slate` on Linux, or the portable `data` folder). Windows: `src/ui`. Linux: `src/gtk`.
 
 - `src/core/` — the engine, no UI. Unit-tested (`cargo test --lib`). What it asks the OS for goes through `os.rs`
