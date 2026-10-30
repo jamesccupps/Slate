@@ -255,8 +255,24 @@ pub fn paint_tabs(cr: &cairo::Context, ctx: &pango::Context, app: &App, strip: &
     }
 }
 
+/// A status bar item at the right (what a click on it does: `Ui::status_pressed`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StatusItem {
+    /// "OVR" while typing replaces characters (Insert); a click turns it off.
+    Overtype,
+    /// "Read only" for a tab that is; a click makes it editable.
+    ReadOnly,
+    /// How the document is indented: the indentation menu.
+    Indent,
+    Lang,
+    Eol,
+    Encoding,
+    /// The document's words and characters (when counted) and its size, at the end.
+    Size,
+}
+
 /// The status bar's texts: what's at the left (where the caret is, or a message), and the items at the right.
-pub fn status_texts(app: &App) -> (String, Vec<String>, bool) {
+pub fn status_texts(app: &App) -> (String, Vec<(StatusItem, String)>, bool) {
     let tab = app.tab();
     let doc = &tab.doc;
     let mut bad = false;
@@ -311,15 +327,26 @@ pub fn status_texts(app: &App) -> (String, Vec<String>, bool) {
         if !sel.is_empty() {
             let n = sel.end() - sel.start();
             if n <= 4 << 20 {
-                let k = match app.sel_cache.get() {
-                    Some((v, a, b, k)) if (v, a, b) == (doc.version, sel.start(), sel.end()) => k,
+                let c = match app.sel_cache.get() {
+                    Some((v, a, b, c)) if (v, a, b) == (doc.version, sel.start(), sel.end()) => c,
                     _ => {
-                        let k = chars(sel.start(), sel.end());
-                        app.sel_cache.set(Some((doc.version, sel.start(), sel.end(), k)));
-                        k
+                        let c = crate::edit::count(&doc.read(sel.start(), sel.end()));
+                        app.sel_cache.set(Some((doc.version, sel.start(), sel.end(), c)));
+                        c
                     }
                 };
-                s.push_str(&format!("  ({} selected)", crate::edit::group(k)));
+                // (lines: from the start's line to the end's)
+                let lines = match (doc.line_of(sel.start()), doc.line_of(sel.end())) {
+                    (Some(a), Some(b)) => b - a + 1,
+                    _ => 1,
+                };
+                let words = crate::edit::plural(c.words, "word", "words");
+                let chars = crate::edit::group(c.chars);
+                if lines > 1 {
+                    s.push_str(&format!("  ({chars} selected, {words}, {} lines)", crate::edit::group(lines)));
+                } else {
+                    s.push_str(&format!("  ({chars} selected, {words})"));
+                }
             } else {
                 s.push_str(&format!("  ({} selected)", size_text(n)));
             }
@@ -327,14 +354,25 @@ pub fn status_texts(app: &App) -> (String, Vec<String>, bool) {
         s
     };
     let indent = match tab.indent {
-        crate::edit::Indent::Tabs => "Tabs".to_string(),
+        crate::edit::Indent::Tabs => format!("Tab size: {}", app.settings.tab_size),
         crate::edit::Indent::Spaces(n) => format!("Spaces: {n}"),
     };
-    let mut right = vec![indent, tab.lang.label().to_string(), doc.eol.short().to_string(), doc.encoding.label(), size_text(doc.len())];
-    // (item 5: a click makes it editable)
-    if tab.read_only || tab.filter.is_some() {
-        right.push("Read only".into());
+    let mut right = Vec::new();
+    if app.overtype {
+        right.push((StatusItem::Overtype, "OVR".to_string()));
     }
+    if tab.read_only || tab.filter.is_some() {
+        right.push((StatusItem::ReadOnly, "Read only".into()));
+    }
+    right.push((StatusItem::Indent, indent));
+    right.push((StatusItem::Lang, tab.lang.label().to_string()));
+    right.push((StatusItem::Eol, doc.eol.short().to_string()));
+    right.push((StatusItem::Encoding, doc.encoding.label()));
+    let size = size_text(doc.len());
+    let counts = app.counts_shown().filter(|c| c.chars > 0 && !tab.loading()).map(|c| {
+        format!("{}, {}  ·  {size}", crate::edit::plural(c.words, "word", "words"), crate::edit::plural(c.chars, "character", "characters"))
+    });
+    right.push((StatusItem::Size, counts.unwrap_or(size)));
     (left, right, bad)
 }
 
@@ -348,7 +386,7 @@ pub fn size_text(n: u64) -> String {
 }
 
 /// What's in the status bar where: (item index, x, width) for the items at the right.
-pub fn paint_status(cr: &cairo::Context, ctx: &pango::Context, app: &App, width: f64, height: f64) -> Vec<(usize, f64, f64)> {
+pub fn paint_status(cr: &cairo::Context, ctx: &pango::Context, app: &App, width: f64, height: f64) -> Vec<(StatusItem, f64, f64)> {
     let t = &app.theme;
     set_color(cr, t.frame);
     cr.paint().ok();
@@ -356,29 +394,34 @@ pub fn paint_status(cr: &cairo::Context, ctx: &pango::Context, app: &App, width:
     cr.rectangle(0.0, 0.0, width, 1.0);
     let _ = cr.fill();
     let font = pango::FontDescription::from_string("Sans 9");
-    let (left, right, bad) = status_texts(app);
-    let layouts: Vec<pango::Layout> = right.iter().map(|s| text_layout(ctx, &font, s, 400.0)).collect();
-    let widths: Vec<f64> = layouts.iter().map(|l| l.pixel_size().0 as f64).collect();
-    // In a narrow window things give way, the least needed first (as on Windows): the indentation, the line endings,
-    // the language. The caret's place keeps its room (a message gets as much).
+    let (left, mut right, bad) = status_texts(app);
+    // In a narrow window things give way, the least needed first (as on Windows): the counts, the indentation, the
+    // line endings, the language. The caret's place keeps its room (a message gets as much).
     let keep = (text_layout(ctx, &font, &left, 4000.0).pixel_size().0 as f64).min(180.0);
-    let mut shown = vec![true; right.len()];
-    for k in [0, 2, 1] {
-        let used: f64 = widths.iter().zip(&shown).filter(|(_, s)| **s).map(|(w, _)| w + 24.0).sum();
-        if keep <= width - 12.0 - used - 16.0 {
+    let fits = |right: &[(StatusItem, String)]| {
+        let used: f64 = right.iter().map(|(_, s)| text_layout(ctx, &font, s, 4000.0).pixel_size().0 as f64 + 24.0).sum();
+        keep <= width - 12.0 - used - 16.0
+    };
+    if !fits(&right) {
+        if let Some(last) = right.last_mut() {
+            last.1 = size_text(app.tab().doc.len());
+        }
+    }
+    for less in [StatusItem::Indent, StatusItem::Eol, StatusItem::Lang] {
+        if fits(&right) {
             break;
         }
-        if let Some(s) = shown.get_mut(k) {
-            *s = false;
-        }
+        right.retain(|(k, _)| *k != less);
     }
     let mut items = Vec::new();
     let mut x = width - 12.0;
-    for (k, l) in layouts.iter().enumerate().rev().filter(|(k, _)| shown[*k]) {
-        let w = widths[k];
+    for (k, s) in right.iter().rev() {
+        let l = text_layout(ctx, &font, s, 400.0);
+        let w = l.pixel_size().0 as f64;
         x -= w;
-        draw_text(cr, l, x, height / 2.0, t.text_dim);
-        items.push((k, x - 8.0, w + 16.0));
+        let color = if matches!(k, StatusItem::Overtype | StatusItem::ReadOnly) { t.text } else { t.text_dim };
+        draw_text(cr, &l, x, height / 2.0, color);
+        items.push((*k, x - 8.0, w + 16.0));
         x -= 24.0;
     }
     let l = text_layout(ctx, &font, &left, (x - 16.0).max(40.0));

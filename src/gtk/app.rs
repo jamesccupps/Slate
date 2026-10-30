@@ -177,6 +177,12 @@ pub enum Cmd {
     FontSize(u8),
     /// Format → Formatting indent: spaces per level when JSON and XML are formatted.
     JsonIndent(u32),
+    /// View → Show whitespace.
+    ToggleWhitespace,
+    /// Insert: typing replaces the characters after the caret (the status bar says OVR).
+    ToggleOvertype,
+    /// The menu bar's button: the light theme or the dark one.
+    ToggleTheme,
 }
 
 pub struct SaveTask {
@@ -427,13 +433,20 @@ pub struct App {
     /// The status bar's column (document version, caret, column) and selection size (version, start, end,
     /// characters), counted once for each.
     pub col_cache: std::cell::Cell<Option<(u64, u64, u64)>>,
-    pub sel_cache: std::cell::Cell<Option<(u64, u64, u64, u64)>>,
+    pub sel_cache: std::cell::Cell<Option<(u64, u64, u64, edit::Counts)>>,
     /// CSV and TSV: the caret's field as the status bar says it, for (tab, document version, caret).
     pub field_cache: std::cell::RefCell<Option<((u64, u64, u64), Option<String>)>>,
     /// `slate --wait`: a wait file to delete once all of its tabs are closed (`open_hinted`).
     pub waits: Vec<(PathBuf, Vec<u64>)>,
     /// The tabs Close other / saved / all tabs still has to close (`close_next`).
     pub closing: Vec<u64>,
+    /// Insert pressed: typing replaces characters (for every tab, as on Windows).
+    pub overtype: bool,
+    /// The shown document's characters and words (tab id, document version, counts: `doc_counts_now`), and a count
+    /// running on another thread for a bigger one, and since when the text it waits for is as it is.
+    pub doc_counts: Option<(u64, u64, edit::Counts)>,
+    count_job: Option<(Job<Option<edit::Counts>>, u64, u64)>,
+    count_wait: Option<(u64, Instant)>,
 }
 
 fn now_text() -> String {
@@ -488,6 +501,10 @@ impl App {
             field_cache: Default::default(),
             waits: Vec::new(),
             closing: Vec::new(),
+            overtype: false,
+            doc_counts: None,
+            count_job: None,
+            count_wait: None,
         };
         app.apply_theme();
         app
@@ -944,8 +961,78 @@ impl App {
 
     /// Picks up finished background work (called when a job says it's done, and by a timer while any runs).
     /// Returns whether anything still runs.
+    /// Counts the shown document's characters and words for the status bar: at once when it's small, on another
+    /// thread up to 64 MiB once the typing pauses (meanwhile the tab's last count stands), not for a bigger one or
+    /// one still being read. Returns whether it should be looked at again in a moment (a count waits or runs).
+    pub fn doc_counts_now(&mut self) -> bool {
+        const AT_ONCE: u64 = 1 << 20;
+        const MAX: u64 = 64 << 20;
+        let tab = &self.tabs[self.active];
+        let (id, version, len) = (tab.id, tab.doc.version, tab.doc.len());
+        let last = self.doc_counts.filter(|c| c.0 == id);
+        if last.is_some_and(|c| c.1 == version) || !tab.doc.is_ready() || tab.loading() || len > MAX {
+            return false;
+        }
+        if len <= AT_ONCE {
+            self.doc_counts = Some((id, version, edit::count(&tab.doc.read(0, len))));
+            return false;
+        }
+        if self.count_job.is_some() {
+            return true;
+        }
+        // (counting again after an edit waits until the typing stops a moment: the count's snapshot of the text ends
+        // the piece the typing goes into)
+        if last.is_some() {
+            match self.count_wait {
+                Some((v, at)) if v == version && at.elapsed() >= Duration::from_millis(700) => {}
+                Some((v, _)) if v == version => return true,
+                _ => {
+                    self.count_wait = Some((version, Instant::now()));
+                    return true;
+                }
+            }
+        }
+        let snap = self.tabs[self.active].doc.snapshot();
+        let job = Job::spawn(len, self.notify.clone(), move |ctx| {
+            let mut c = edit::Counter::default();
+            let mut pos = 0;
+            while pos < snap.len() {
+                if ctx.cancelled() {
+                    return None;
+                }
+                let end = (pos + (1 << 20)).min(snap.len());
+                snap.chunks(pos, end, &mut |b| {
+                    c.feed(b);
+                    true
+                });
+                pos = end;
+                ctx.set(pos);
+            }
+            Some(c.finish())
+        });
+        self.count_job = Some((job, id, version));
+        true
+    }
+
+    /// The document's counts for the status bar (the tab's last, while it's counted again).
+    pub fn counts_shown(&self) -> Option<edit::Counts> {
+        self.doc_counts.filter(|c| c.0 == self.tab().id).map(|c| c.2)
+    }
+
     pub fn poll_jobs(&mut self) -> bool {
         let mut running = false;
+        if let Some((job, id, version)) = self.count_job.as_mut() {
+            match job.take() {
+                Some(r) => {
+                    if let Some(c) = r {
+                        self.doc_counts = Some((*id, *version, c));
+                    }
+                    self.count_job = None;
+                    self.dirty_view = true;
+                }
+                None => running = true,
+            }
+        }
         let ids: Vec<u64> = self.tabs.iter().map(|t| t.id).collect();
         for id in ids {
             if let Some(i) = self.index_of(id) {
@@ -1518,10 +1605,13 @@ impl App {
             self.block_edit(b, edit::BlockEdit::Put(vec![text.as_bytes()]));
             return;
         }
+        let overtype = self.overtype;
         let tab = &mut self.tabs[self.active];
         let sel = tab.view.sel;
         let bytes = text.as_bytes();
-        let new = if bytes.len() == 1 && matches!(bytes[0], b'}' | b']' | b')') {
+        let new = if overtype && !text.contains(['\r', '\n']) {
+            edit::overtype(&mut tab.doc, sel, bytes)
+        } else if bytes.len() == 1 && matches!(bytes[0], b'}' | b']' | b')') {
             edit::close_bracket(&mut tab.doc, sel, bytes[0])
                 .unwrap_or_else(|| edit::replace_selection(&mut tab.doc, sel, bytes, EditKind::Typing))
         } else {
@@ -1765,6 +1855,10 @@ impl App {
                     self.after_edit(true);
                 }
             }
+            Key::Insert | Key::KP_Insert if !ctrl && !shift && !alt => self.exec(Cmd::ToggleOvertype),
+            // (as on Windows: Ctrl+Insert copies, Shift+Insert pastes)
+            Key::Insert | Key::KP_Insert if ctrl && !shift && !alt => self.exec(Cmd::Copy),
+            Key::Insert | Key::KP_Insert if shift && !ctrl && !alt => self.exec(Cmd::Paste),
             Key::Escape => {
                 if self.find.open {
                     self.exec(Cmd::CloseFind);
@@ -2222,6 +2316,21 @@ impl App {
                 self.settings.font_size = n as f32;
                 self.settings.save();
                 self.restyle = true;
+            }
+            Cmd::ToggleWhitespace => {
+                self.settings.show_whitespace = !self.settings.show_whitespace;
+                self.style.show_whitespace = self.settings.show_whitespace;
+                self.settings.save();
+            }
+            Cmd::ToggleTheme => {
+                let to = if self.theme.dark { ThemeMode::Light } else { ThemeMode::Dark };
+                self.exec(Cmd::Theme(to));
+                self.flash(if to == ThemeMode::Dark { "Dark theme" } else { "Light theme" }, false);
+            }
+            Cmd::ToggleOvertype => {
+                self.overtype = !self.overtype;
+                let msg = if self.overtype { "Overtype: typing replaces characters (Insert turns it off)" } else { "Overtype off" };
+                self.flash(msg, false);
             }
             Cmd::JsonIndent(n) => {
                 self.settings.json_indent = n.clamp(1, 8);

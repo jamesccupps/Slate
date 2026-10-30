@@ -44,6 +44,8 @@ pub struct Style {
     pub tab_size: u32,
     pub wrap: bool,
     pub line_numbers: bool,
+    /// Dots for spaces, arrows for tabs and a mark for each line break (View → Show whitespace).
+    pub show_whitespace: bool,
 }
 
 impl Style {
@@ -59,7 +61,7 @@ impl Style {
         probe.set_text("MMMMMMMMMM");
         let char_w = (probe.pixel_size().0 as f64 / 10.0).max(1.0);
         let row_h = (asc + desc).ceil().max(px(m.height()).ceil()) + 2.0;
-        Style { font, char_w, row_h, baseline: ((row_h - asc - desc) / 2.0 + asc).round(), tab_size, wrap, line_numbers }
+        Style { font, char_w, row_h, baseline: ((row_h - asc - desc) / 2.0 + asc).round(), tab_size, wrap, line_numbers, show_whitespace: false }
     }
 }
 
@@ -240,6 +242,8 @@ pub struct View {
     pub composing: Option<edit::Composing>,
     /// The caret's segment laid out with it (by everything its layout depends on).
     composed: Option<(u64, Rc<Lay>)>,
+    /// The bracket pair at the caret, for (document version, caret).
+    bracket: Option<((u64, u64), Option<(u64, u64)>)>,
 }
 
 impl Default for View {
@@ -349,6 +353,7 @@ impl View {
             scope: None,
             composing: None,
             composed: None,
+            bracket: None,
         }
     }
 
@@ -928,7 +933,87 @@ impl View {
     #[allow(clippy::too_many_arguments)]
     /// `wrong`: words spelled wrong, underlined with a wavy line.
     #[allow(clippy::too_many_arguments)]
-    pub fn paint(&mut self, cx: &Ctx, cr: &cairo::Context, ox: f64, focused: bool, caret_on: bool, matches: &[(u64, u64)], marks: &[(u64, u64, u32)], wrong: &[(u64, u64)]) {
+    /// The bracket next to the caret and the one it pairs with (`edit::matching_bracket`), worked out once per caret
+    /// place and text.
+    fn brackets_at(&mut self, doc: &Document, caret: u64) -> Option<(u64, u64)> {
+        let key = (doc.version, caret);
+        if let Some((k, v)) = self.bracket {
+            if k == key {
+                return v;
+            }
+        }
+        let v = edit::matching_bracket(doc, caret);
+        self.bracket = Some((key, v));
+        v
+    }
+
+    /// Faint dots for spaces, arrows for tabs, a mark for spaces that only look like spaces (non-breaking and the
+    /// like: `text::is_odd_space`), and after each line a mark for its line break (↵ CRLF, ↓ LF), on the rows on
+    /// screen; of a long row without word wrap, only the part in view.
+    fn paint_whitespace(&self, cx: &Ctx, cr: &cairo::Context, rows: &[VisRow], x0: f64) {
+        let row_h = cx.style.row_h;
+        let dot = (cx.style.char_w * 0.16).clamp(1.5, 3.0);
+        let pad = cx.style.char_w * 2.0;
+        let (vx0, vx1) = (self.scroll_x - pad, self.scroll_x + cx.width + pad);
+        set_color(cr, cx.theme.whitespace);
+        cr.set_line_width(1.0);
+        let mark = |s: &str| {
+            let l = pango::Layout::new(cx.pango);
+            l.set_font_description(Some(&cx.style.font));
+            l.set_text(s);
+            l
+        };
+        let (crlf, lf) = (mark("\u{21B5}"), mark("\u{2193}"));
+        for r in rows {
+            let lay = &r.lay;
+            let (la, lb) = lay.line_range(r.line);
+            let (a, b) = if cx.style.wrap { (la, lb) } else { (lay.index_at(r.line, vx0).max(la), lay.index_at(r.line, vx1).min(lb)) };
+            let text = lay.layout.text();
+            let s = text.as_bytes();
+            let mid = r.y + row_h / 2.0;
+            let mut i = a.max(0) as usize;
+            while i < (b as usize).min(s.len()) {
+                let (c, n) = text::decode_char(&s[i..]);
+                if c == ' ' || c == '\t' || text::is_odd_space(c) {
+                    let x = lay.x_of(i as i32);
+                    let w = lay.x_of((i + n) as i32) - x;
+                    let x = x0 + x;
+                    if c == ' ' {
+                        cr.arc(x + w / 2.0, mid, dot / 2.0, 0.0, std::f64::consts::TAU);
+                        let _ = cr.fill();
+                    } else if c == '\t' && w > 4.0 {
+                        let (a, b) = (x + 2.0, x + w - 2.0);
+                        let head = (row_h * 0.18).min((b - a) / 2.0);
+                        cr.move_to(a, mid);
+                        cr.line_to(b, mid);
+                        cr.move_to(b - head, mid - head);
+                        cr.line_to(b, mid);
+                        cr.line_to(b - head, mid + head);
+                        let _ = cr.stroke();
+                    } else if w > 3.0 {
+                        let (a, b) = (x + w * 0.2, x + w * 0.8);
+                        let (y, up) = (mid + row_h * 0.16, row_h * 0.12);
+                        cr.move_to(a, y - up);
+                        cr.line_to(a, y);
+                        cr.line_to(b, y);
+                        cr.line_to(b, y - up);
+                        let _ = cr.stroke();
+                    }
+                }
+                i += n.max(1);
+            }
+            // after the line: its line break
+            if r.line + 1 == lay.lines() && r.seg.line_end && r.seg.eol > 0 {
+                let x = lay.x_of(lb);
+                if x >= vx0 && x <= vx1 {
+                    cr.move_to(x0 + x + 1.0, r.y + 1.0);
+                    pangocairo::functions::show_layout(cr, if r.seg.eol == 2 { &crlf } else { &lf });
+                }
+            }
+        }
+    }
+
+    pub fn paint(&mut self, cx: &Ctx, cr: &cairo::Context, ox: f64, focused: bool, caret_on: bool, matches: &[(u64, u64)], marks: &[(u64, u64, u32)], wrong: &[(u64, u64)], overtype: bool) {
         self.layout_rows(cx);
         let t = cx.theme;
         let row_h = cx.style.row_h;
@@ -1012,6 +1097,29 @@ impl View {
                 fill(cr, r, sa, sb, color, eol);
             }
         }
+        // the bracket next to the caret and the one it pairs with
+        if self.sel.is_empty() {
+            if let Some((a, b)) = self.brackets_at(cx.doc, caret) {
+                for p in [a, b] {
+                    for r in rows.iter() {
+                        let (la, lb) = r.lay.line_range(r.line);
+                        let (sa, sb) = (r.seg.start + r.lay.rel(la), r.seg.start + r.lay.rel(lb));
+                        if p < sa || p >= sb {
+                            continue;
+                        }
+                        let x = r.lay.x_of(r.lay.disp(p - r.seg.start));
+                        let w = (r.lay.x_of(r.lay.disp(p + 1 - r.seg.start)) - x).max(2.0);
+                        let (x, y) = (x0 + x + 0.5, r.y + 0.5);
+                        set_color(cr, t.bracket_bg);
+                        cr.rectangle(x, y, w - 1.0, row_h - 1.0);
+                        let _ = cr.fill_preserve();
+                        set_color(cr, t.bracket_border);
+                        cr.set_line_width(1.0);
+                        let _ = cr.stroke();
+                    }
+                }
+            }
+        }
         // the text
         set_color(cr, t.text);
         for r in rows.iter() {
@@ -1019,6 +1127,9 @@ impl View {
             // (the line's own x in the layout: an indent, a wrapped row hanging under the indentation)
             let lx = r.lay.x_of(line.start_index()) - line_x_from_start(&r.lay, r.line);
             draw_row(cr, &r.lay, &line, x0 + lx, r.y + cx.style.baseline, ox, ox + cx.width, t.text);
+        }
+        if cx.style.show_whitespace {
+            self.paint_whitespace(cx, cr, &rows, x0);
         }
         // a column selection's carets (one on each line when it has no width)
         if let Some(b) = self.block.filter(|b| focused && b.cols().0 == b.cols().1) {
@@ -1116,9 +1227,18 @@ impl View {
                 let (a, b) = (r.seg.start + r.lay.rel(la), r.seg.start + r.lay.rel(lb));
                 let last = r.line + 1 == r.lay.lines();
                 if caret >= a && (caret < b || (caret == b && last)) {
-                    let x = r.lay.x_of(r.lay.disp(caret - r.seg.start));
+                    let i = r.lay.disp(caret - r.seg.start);
+                    let x = r.lay.x_of(i);
                     set_color(cr, t.caret);
-                    cr.rectangle((x0 + x).round(), r.y, 2.0, row_h);
+                    if overtype {
+                        // a bar under the character typing replaces (as wide as a character at a line's end)
+                        let next = r.lay.next_index(i);
+                        let w = if next > i { r.lay.x_of(next) - x } else { cx.style.char_w };
+                        let h = (row_h * 0.14).max(2.0);
+                        cr.rectangle(x0 + x, r.y + row_h - h, w.max(2.0), h);
+                    } else {
+                        cr.rectangle((x0 + x).round(), r.y, 2.0, row_h);
+                    }
                     let _ = cr.fill();
                     break;
                 }

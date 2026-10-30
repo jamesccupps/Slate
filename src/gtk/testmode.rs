@@ -64,6 +64,7 @@ fn combo(s: &str) -> Option<(gdk::Key, gdk::ModifierType, String)> {
                     "tab" => "Tab",
                     "backspace" => "BackSpace",
                     "delete" | "del" => "Delete",
+                    "insert" | "ins" => "Insert",
                     "left" => "Left",
                     "right" => "Right",
                     "up" => "Up",
@@ -289,20 +290,39 @@ async fn script(lines: Vec<String>, test: Rc<Test>) -> i32 {
                     }
                 }
             }
-            // a click on the tab strip at x (`tabclick:<x>[,<button>]`: 3 for its menu) or on the status bar's item
-            // `k` (`statusclick:<k>`: 0 indentation, 1 language, 2 line endings, 3 encoding, 5 read only)
+            // a click on the tab strip at x (`tabclick:<x>[,<button>]`: 3 for its menu) or on a status bar item
+            // (`statusclick:indent|lang|eol|encoding|readonly|ovr`)
             "tabclick" => {
                 let (x, b) = arg.split_once(',').unwrap_or((arg, "1"));
                 // (`list`: the list of all tabs' button, at the strip's end)
                 let x = if x == "list" { ui.strip.borrow().width - 14.0 } else { x.trim().parse().unwrap_or(0.0) };
                 ui.tabs_pressed(b.trim().parse().unwrap_or(1), 1, x);
             }
+            // GNOME's interface setting changed (under GSETTINGS_BACKEND=memory: the test's own): `gsettings:<key>=<value>`
+            "gsettings" => {
+                let (k, v) = arg.split_once('=').unwrap_or((arg, ""));
+                let ok = gio::SettingsSchemaSource::default()
+                    .and_then(|s| s.lookup("org.gnome.desktop.interface", true))
+                    .is_some_and(|s| s.has_key(k))
+                    && gio::Settings::new("org.gnome.desktop.interface").set_string(k, v).is_ok();
+                log(&mut out, format!("gsettings {k}: {}", if ok { "set" } else { "no such setting" }));
+                settle(50).await;
+            }
             "statusclick" => {
-                let k: usize = arg.trim().parse().unwrap_or(0);
+                use super::chrome::StatusItem;
+                let k = match arg.trim() {
+                    "indent" => StatusItem::Indent,
+                    "lang" => StatusItem::Lang,
+                    "eol" => StatusItem::Eol,
+                    "encoding" => StatusItem::Encoding,
+                    "readonly" => StatusItem::ReadOnly,
+                    "ovr" => StatusItem::Overtype,
+                    _ => StatusItem::Size,
+                };
                 let at = ui.status_items.borrow().iter().find(|(i, _, _)| *i == k).map(|&(_, x, w)| x + w / 2.0);
                 match at {
                     Some(x) => ui.status_pressed(x),
-                    None => log(&mut out, format!("statusclick: no item {k}")),
+                    None => log(&mut out, format!("statusclick: no item {k:?}")),
                 }
             }
             "cmd" => match commands().into_iter().find(|(n, _, _)| *n == arg) {
@@ -493,7 +513,7 @@ fn value(what: &str, test: &Test) -> String {
         "status" => super::chrome::status_texts(&a).0,
         "statusbar" => {
             let (l, r, _) = super::chrome::status_texts(&a);
-            format!("{l} | {}", r.join(" | "))
+            format!("{l} | {}", r.iter().map(|(_, s)| s.as_str()).collect::<Vec<_>>().join(" | "))
         }
         "title" => ui.window.title().map(|t| t.to_string()).unwrap_or_default(),
         // (whether the caret's timer runs: it stops once the caret has been still a while)

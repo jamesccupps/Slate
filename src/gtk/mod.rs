@@ -92,7 +92,11 @@ pub struct Ui {
     strip: RefCell<chrome::TabStrip>,
     first_tab: Cell<usize>,
     hover: Cell<Option<chrome::TabPart>>,
-    status_items: RefCell<Vec<(usize, f64, f64)>>,
+    status_items: RefCell<Vec<(chrome::StatusItem, f64, f64)>>,
+    /// The menu bar's light/dark button.
+    theme_btn: gtk4::Button,
+    /// A look again at the status bar's counts is due (`App::doc_counts_now`).
+    count_timer: Cell<bool>,
     /// Set while the window sets its own scrollbars and boxes (their signals then aren't the user's).
     syncing: Cell<bool>,
     scroll_acc: Cell<f64>,
@@ -513,6 +517,9 @@ fn stop_default() -> Result<usize, String> {
 /// Whether the desktop asks for dark: GNOME's color scheme, GTK's own setting, or a dark GTK theme (Raspberry Pi
 /// OS's PiXnoir).
 fn system_dark() -> bool {
+    if let Some(dark) = PORTAL_DARK.with(|p| p.get()) {
+        return dark;
+    }
     if let Some(src) = gio::SettingsSchemaSource::default() {
         if let Some(schema) = src.lookup("org.gnome.desktop.interface", true) {
             if schema.has_key("color-scheme") {
@@ -546,7 +553,9 @@ fn system_dark() -> bool {
 }
 
 fn make_style(pango: &pango::Context, s: &Settings) -> view::Style {
-    view::Style::new(pango, &s.font, (s.font_size * s.zoom) as f64, s.tab_size, s.wrap, s.line_numbers)
+    let mut style = view::Style::new(pango, &s.font, (s.font_size * s.zoom) as f64, s.tab_size, s.wrap, s.line_numbers);
+    style.show_whitespace = s.show_whitespace;
+    style
 }
 
 fn hex(argb: u32) -> String {
@@ -660,8 +669,19 @@ pub fn window(application: &gtk4::Application, test: Option<Rc<testmode::Test>>)
     let middle = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
     middle.append(&text);
     middle.append(&vbar);
+    // the light/dark switch at the menu bar's end, as on Windows (View → Theme has the system setting too)
+    let theme_btn = gtk4::Button::from_icon_name("weather-clear-night-symbolic");
+    theme_btn.add_css_class("flat");
+    theme_btn.add_css_class("slate-theme");
+    theme_btn.set_focusable(false);
+    theme_btn.set_valign(gtk4::Align::Center);
+    let menu_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+    menu_row.add_css_class("slate-menurow");
+    menubar.set_hexpand(true);
+    menu_row.append(&menubar);
+    menu_row.append(&theme_btn);
     let root = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
-    root.append(&menubar);
+    root.append(&menu_row);
     // Tabs in the title bar (the setting as Slate starts): the strip and the desktop's own window buttons are the
     // window's title bar, which GTK draws; else the strip goes under the menu bar.
     if settings.tabs_in_title_bar {
@@ -738,6 +758,8 @@ pub fn window(application: &gtk4::Application, test: Option<Rc<testmode::Test>>)
         first_tab: Cell::new(0),
         hover: Cell::new(None),
         status_items: RefCell::new(Vec::new()),
+        theme_btn: theme_btn.clone(),
+        count_timer: Cell::new(false),
         syncing: Cell::new(false),
         scroll_acc: Cell::new(0.0),
         drag_origin: Cell::new((0.0, 0.0)),
@@ -1143,18 +1165,102 @@ fn connect(ui: &Rc<Ui>, prev: &gtk4::Button, next: &gtk4::Button, lines_btn: &gt
             ui.text.queue_draw();
         }
     });
+    ui.theme_btn.connect_clicked(|_| {
+        if let Some(ui) = get_ui() {
+            ui.command(Cmd::ToggleTheme);
+        }
+    });
+    // The system's light or dark, followed while Slate runs: a GTK theme switched, GNOME's style (its color-scheme
+    // key, which other desktops set too) and the desktop portal's color scheme (KDE and others).
     if let Some(gs) = gtk4::Settings::default() {
-        gs.connect_gtk_theme_name_notify(|_| {
-            if let Some(ui) = get_ui() {
-                let dark = system_dark();
-                ui.with(|a| {
-                    a.system_dark = dark;
-                    a.apply_theme();
-                });
-                ui.apply_theme();
-            }
-        });
+        gs.connect_gtk_theme_name_notify(|_| system_theme_changed());
     }
+    if let Some(schema) = gio::SettingsSchemaSource::default().and_then(|s| s.lookup("org.gnome.desktop.interface", true)) {
+        if schema.has_key("color-scheme") {
+            let gs = gio::Settings::new("org.gnome.desktop.interface");
+            gs.connect_changed(Some("color-scheme"), |_, _| system_theme_changed());
+            // (a GSettings dropped tells nothing any more)
+            DESKTOP_SETTINGS.with(|d| *d.borrow_mut() = Some(gs));
+        }
+    }
+    if ui.test.is_none() {
+        follow_portal_scheme();
+    }
+}
+
+thread_local! {
+    /// GNOME's interface settings, kept while Slate runs (for their changes: `connect`).
+    static DESKTOP_SETTINGS: RefCell<Option<gio::Settings>> = const { RefCell::new(None) };
+    /// The desktop portal's color scheme: dark (true), light (false), or no preference / no portal (None).
+    static PORTAL_DARK: Cell<Option<bool>> = const { Cell::new(None) };
+}
+
+/// The system went light or dark (or its theme changed): Slate follows when its theme is the system's.
+fn system_theme_changed() {
+    if let Some(ui) = get_ui() {
+        let dark = system_dark();
+        ui.with(|a| {
+            a.system_dark = dark;
+            a.apply_theme();
+        });
+        ui.apply_theme();
+    }
+}
+
+/// The desktop portal's `org.freedesktop.appearance` `color-scheme` (1 dark, 2 light, 0 none), read once (without
+/// holding up the start) and followed through its SettingChanged signal.
+fn follow_portal_scheme() {
+    fn scheme(v: &glib::Variant) -> Option<bool> {
+        // (Read wraps the value in a variant or two: unwrapped down to the number)
+        let mut v = v.clone();
+        while let Some(inner) = v.as_variant() {
+            v = inner;
+        }
+        match v.get::<u32>() {
+            Some(1) => Some(true),
+            Some(2) => Some(false),
+            _ => None,
+        }
+    }
+    gio::bus_get(gio::BusType::Session, gio::Cancellable::NONE, |bus| {
+        let Ok(bus) = bus else { return };
+        #[allow(deprecated)]
+        bus.signal_subscribe(
+            Some("org.freedesktop.portal.Desktop"),
+            Some("org.freedesktop.portal.Settings"),
+            Some("SettingChanged"),
+            Some("/org/freedesktop/portal/desktop"),
+            Some("org.freedesktop.appearance"),
+            gio::DBusSignalFlags::NONE,
+            |_, _, _, _, _, params| {
+                if let Some((_, key, v)) = params.get::<(String, String, glib::Variant)>() {
+                    if key == "color-scheme" {
+                        PORTAL_DARK.with(|p| p.set(scheme(&v)));
+                        system_theme_changed();
+                    }
+                }
+            },
+        );
+        bus.call(
+            Some("org.freedesktop.portal.Desktop"),
+            "/org/freedesktop/portal/desktop",
+            "org.freedesktop.portal.Settings",
+            "Read",
+            Some(&("org.freedesktop.appearance", "color-scheme").to_variant()),
+            None,
+            gio::DBusCallFlags::NONE,
+            2000,
+            gio::Cancellable::NONE,
+            |r| {
+                let Ok(r) = r else { return };
+                let found = scheme(&r.child_value(0));
+                if found.is_some() && found != PORTAL_DARK.with(|p| p.get()) {
+                    PORTAL_DARK.with(|p| p.set(found));
+                    system_theme_changed();
+                }
+            },
+        );
+    });
 }
 
 /// The actions behind the menus and shortcuts.
@@ -1251,6 +1357,10 @@ fn commands() -> Vec<(&'static str, Cmd, &'static [&'static str])> {
         ("clear-recent", Cmd::ClearRecent, &[]),
         ("open-data-folder", Cmd::OpenDataFolder, &[]),
         ("report-problem", Cmd::ReportProblem, &[]),
+        ("show-whitespace", Cmd::ToggleWhitespace, &[]),
+        // (Insert: `App::on_key`, so it stays the find boxes' own there)
+        ("overtype", Cmd::ToggleOvertype, &[]),
+        ("toggle-theme", Cmd::ToggleTheme, &[]),
     ]
 }
 
@@ -1283,7 +1393,7 @@ fn mono_families(ctx: &pango::Context, current: &str) -> Vec<String> {
 
 /// Menu items that show a check mark: their actions have a true/false state (`Ui::sync_menu`).
 const CHECKED: &[&str] =
-    &["wrap", "line-numbers", "spell-check", "title-bar-tabs", "theme-system", "theme-light", "theme-dark", "eol-lf", "eol-crlf", "read-only", "restore-session"];
+    &["wrap", "line-numbers", "show-whitespace", "spell-check", "title-bar-tabs", "theme-system", "theme-light", "theme-dark", "eol-lf", "eol-crlf", "read-only", "restore-session"];
 
 fn actions(ui: &Rc<Ui>) {
     // (in place of the window's own "win" group: menus and shortcuts find these the same way)
@@ -1448,7 +1558,17 @@ fn menu_model(recent: &gio::Menu, format_extra: &gio::Menu, fonts: &[String]) ->
     edit.append_section(None, &section(&[("Time/date", "date-time")]));
     bar.append_submenu(Some("_Edit"), &edit);
     let view = gio::Menu::new();
-    view.append_section(None, &section(&[("Word wrap", "wrap"), ("Line numbers", "line-numbers"), ("Spell check", "spell-check"), ("Tabs in the title bar", "title-bar-tabs"), ("Character at the caret", "char-info")]));
+    view.append_section(
+        None,
+        &section(&[
+            ("Word wrap", "wrap"),
+            ("Line numbers", "line-numbers"),
+            ("Show whitespace", "show-whitespace"),
+            ("Spell check", "spell-check"),
+            ("Tabs in the title bar", "title-bar-tabs"),
+            ("Character at the caret", "char-info"),
+        ]),
+    );
     view.append_section(None, &section(&[("Show only matching lines", "filter-lines"), ("Show lines not matching", "filter-lines-not"), ("Clear highlights", "clear-highlights")]));
     let zoom = section(&[("Zoom in", "zoom-in"), ("Zoom out", "zoom-out"), ("Reset zoom", "zoom-reset")]);
     let rest = gio::Menu::new();
@@ -2207,15 +2327,13 @@ impl Ui {
         let items = self.status_items.borrow().clone();
         let Some(&(k, ix, iw)) = items.iter().find(|(_, ix, iw)| x >= *ix && x < ix + iw) else { return };
         let menu = match k {
-            0 => indent_menu(),
-            1 => lang_menu(),
-            2 => eol_menu(),
-            3 => encoding_menu(),
-            5 => {
-                self.command(Cmd::ToggleReadOnly);
-                return;
-            }
-            _ => return,
+            chrome::StatusItem::Indent => indent_menu(),
+            chrome::StatusItem::Lang => lang_menu(),
+            chrome::StatusItem::Eol => eol_menu(),
+            chrome::StatusItem::Encoding => encoding_menu(),
+            chrome::StatusItem::ReadOnly => return self.command(Cmd::ToggleReadOnly),
+            chrome::StatusItem::Overtype => return self.command(Cmd::ToggleOvertype),
+            chrome::StatusItem::Size => return,
         };
         self.popup(&self.status_menu, &menu, gdk::Rectangle::new(ix as i32, 0, iw as i32, chrome::STATUS_H as i32));
     }
@@ -2305,7 +2423,8 @@ impl Ui {
              .slate-bar button.toggle {{ min-width: 0; padding-left: 6px; padding-right: 6px; }}
              .slate-notice {{ background-color: {notice}; color: {text}; padding: 6px 12px; }}
              .slate-notice label {{ color: {text}; }}
-             menubar {{ background-color: {frame}; color: {text}; }}
+             menubar, .slate-menurow {{ background-color: {frame}; color: {text}; }}
+             .slate-theme {{ min-height: 0; min-width: 0; padding: 2px 8px; margin: 0 4px; color: {text}; }}
              .slate-titlebar, .slate-titlebar:backdrop {{ background-color: {frame}; background-image: none; box-shadow: none; }}
              .slate-titlebar windowcontrols button {{ color: {text}; }}
              menubar > item {{ color: {text}; }}
@@ -2381,6 +2500,15 @@ impl Ui {
             a.apply_theme();
         }
         a.keep_count();
+        if a.doc_counts_now() && !self.count_timer.get() {
+            self.count_timer.set(true);
+            glib::timeout_add_local_once(Duration::from_millis(350), || {
+                if let Some(ui) = get_ui() {
+                    ui.count_timer.set(false);
+                    ui.poll();
+                }
+            });
+        }
         self.sync_menu(&a);
         if std::mem::take(&mut a.reveal_pending) {
             let center = std::mem::take(&mut a.reveal_center);
@@ -2465,6 +2593,7 @@ impl Ui {
         let checks = [
             ("wrap", a.style.wrap),
             ("line-numbers", a.style.line_numbers),
+            ("show-whitespace", a.settings.show_whitespace),
             ("spell-check", a.settings.spell_check),
             ("title-bar-tabs", a.settings.tabs_in_title_bar),
             ("theme-system", theme == ThemeMode::System),
@@ -2490,6 +2619,12 @@ impl Ui {
         self.set_action_state("font-size", (a.settings.font_size.round() as i32).to_variant());
         self.set_action_state("font", a.settings.font.to_variant());
         self.set_action_state("show-tab", (a.active as i32).to_variant());
+        // (what the button switches to)
+        let (icon, tip) = if a.theme.dark { ("weather-clear-symbolic", "Light theme") } else { ("weather-clear-night-symbolic", "Dark theme") };
+        if self.theme_btn.icon_name().as_deref() != Some(icon) {
+            self.theme_btn.set_icon_name(icon);
+            self.theme_btn.set_tooltip_text(Some(tip));
+        }
         // Formatting indent: in the Format menu for JSON and XML only
         let structured = matches!(tab.lang, Lang::Json | Lang::Xml);
         if self.format_extra_shown.get() != structured {
@@ -2604,7 +2739,8 @@ impl Ui {
                 });
             }
         }
-        a.with_view(&g, |v, cx| v.paint(cx, cr, gw + PAD, focused, caret_on, &matches, &marks, &wrong));
+        let overtype = a.overtype;
+        a.with_view(&g, |v, cx| v.paint(cx, cr, gw + PAD, focused, caret_on, &matches, &marks, &wrong, overtype));
         if gw > 0.0 {
             let t = a.theme.clone();
             set_color(cr, t.surface);
