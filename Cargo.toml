@@ -61,6 +61,7 @@ features = [
     "Win32_System_LibraryLoader",
     "Win32_System_Memory",
     "Win32_System_Ole",
+    "Win32_System_Recovery",
     "Win32_Networking_WinHttp",
     "Win32_Security_Cryptography",
     "Win32_Security_Cryptography_Catalog",

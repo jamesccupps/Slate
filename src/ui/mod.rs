@@ -1526,6 +1526,14 @@ pub fn run(raw: Vec<std::ffi::OsString>) -> i32 {
     let s = settings::Settings::load();
     let hwnd = create_window(hinst, &s);
     gfx::early_window(hwnd);
+    // Windows starts it again after it restarts for an update, its tabs back from the session, as Notepad (when
+    // "restart apps" is on in Windows' sign-in options); never after a crash or a hang, which could go round and
+    // round. Not a Slate running as administrator (that would ask at sign-in) or one that opened on its own.
+    if !settings::guest() && !win::elevated() {
+        use windows::Win32::System::Recovery::{RESTART_NO_CRASH, RESTART_NO_HANG, RegisterApplicationRestart};
+        // (a switch, so the restart's command line isn't empty; `run` drops switches it doesn't know)
+        let _ = unsafe { RegisterApplicationRestart(w!("--restarted"), RESTART_NO_CRASH | RESTART_NO_HANG) };
+    }
     let cell = make_app(hwnd);
     {
         let mut a = cell.borrow_mut();
