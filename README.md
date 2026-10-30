@@ -46,12 +46,17 @@ JSON file opens instantly, scrolls smoothly, and can be searched, edited, format
   (iCalendar, vCard) and Visual Studio solutions. Block comments and multi-line strings are followed correctly.
 - Line tools: sort lines (`file2` before `file10`), remove duplicate or blank lines, trim spaces at line ends;
   UPPERCASE / lowercase / Title Case; comment or uncomment lines with Ctrl+/; duplicate, delete and move lines.
+- *Format → Convert*: Base64, URL encoding and JSON string escapes, each way, on the selection (or the whole text);
+  and the SHA-256 of the selection or the file, to copy.
+- EditorConfig: a project's `.editorconfig` sets the indentation of its files, the line endings and encoding of new
+  ones, and a line break at the end when they're saved.
 - CSV and TSV: check (every row as many fields as the first, quotes where they may be, with the line and column of
   a mistake; a 300 MB file in about 0.2 s), sort the rows by the caret's column (numbers and dates by value, the
   header row staying on top, rows with line breaks in quotes kept whole), and the column's name in the status bar.
 - JSON and XML: format (pretty-print), minify and check, also for JSON Lines; a path bar showing where the caret
-  is (`data › [1203] › name`, `catalog › book[3] › title`; copy it as a JSON path or XPath) and a structure panel to
-  browse objects, arrays and elements, fast on huge files.
+  is (`data › [1203] › name`, `catalog › book[3] › title`; copy it as a JSON path or XPath), a structure panel to
+  browse objects, arrays and elements, fast on huge files, and Go to line takes a path too (`data[1203].name`,
+  `/catalog/book[3]/title`).
 - Print (Ctrl+P): the file or the selection, in its colors (or black), with line numbers and the file's name and
   page numbers (each can be left out); long lines go on in the next row, breaking between words. Print preview
   shows the pages as they'll print, and Page setup the paper and margins. *Microsoft Print to PDF* (Windows) and
@@ -82,7 +87,8 @@ JSON file opens instantly, scrolls smoothly, and can be searched, edited, format
   an *Update* button appears in the status bar. One click downloads it, checks it against the release's checksum
   (and, from 0.8.1, that it's signed by the same publisher) and restarts Slate with your tabs (and their unsaved
   text) back where they were. If the new version can't start, the old one comes back by itself. *Help → Check for
-  updates…* does it on demand. (On Linux, `apt` keeps Slate up to date.)
+  updates…* does it on demand. (On Linux, `apt` keeps Slate up to date.) When Windows restarts for an update, Slate
+  opens again with its tabs, as Notepad does (with *Restart apps* on in Windows' sign-in options).
 - Screen readers on Windows (Narrator, NVDA, JAWS) read the text through UI Automation: the line, word or character
   at the cursor as it moves, the selection and edits, and the tab's name when another tab gets the keyboard; huge
   files too. Not yet: the tab strip, status bar and menu bar, and Linux (Orca)
@@ -112,7 +118,8 @@ The usual ones work as in Notepad (Ctrl+N, O, S, F, H, G, Z, Y, A, X, C, V), plu
 | Ctrl+F2 / F2 / Shift+F2 | Bookmark the line / next / previous bookmark |
 | Alt+Z | Word wrap |
 | Ctrl+Plus / Ctrl+Minus / Ctrl+0 | Zoom in / out / reset |
-| Ctrl+Shift+O | JSON and XML structure panel (Windows) |
+| Ctrl+Shift+O | JSON and XML structure panel |
+| Insert | Overtype on / off |
 | F5 | Insert the time and date |
 
 *Help → Keyboard shortcuts* lists them all. On Linux, Alt+1 … Alt+9 go to a tab too.
@@ -160,26 +167,20 @@ and code files when they're double-clicked. The package also adds Slate's own ap
 `sudo apt install ./slate-linux-arm64.deb`) and `.tar.gz` files with the same program to run without installing
 (those don't update). Its settings, session and `crash.log` are in `~/.local/share/slate`.
 
-The Linux version has the same engine, file handling, colors, find and replace, line tools and JSON/XML tools as on
-Windows, in a GTK window. Not on Linux yet:
+The Linux version has the same engine, file handling, colors, find and replace, line tools, JSON/XML tools, menus
+and status bar as on Windows, in a GTK window, and follows the desktop's light or dark style as it changes. Not on
+Linux yet:
 
-- the JSON/XML path bar and structure panel;
-- show whitespace, the matching bracket highlighted, overtype, high contrast and the theme button;
-- word and character counts, and changing the encoding or indentation from the status bar;
-- the Encoding, Reopen with encoding, Indentation, Font and JSON indentation menus (the font, the indentation and
-  JSON's are set in `settings.json`);
-- Close other / saved / all tabs, the list of all tabs, the tab's own menu, Reload, Show in folder and Copy file
-  path, and clearing the Open recent list;
-- *File → Restore last session* (`restore_session` in `settings.json`), *Help → Open settings folder*, *Help →
-  Report a problem…* and crash dumps;
-- keeping unsaved changes to documents over 64 MB between runs (closing asks about them instead).
+- high contrast;
+- keeping unsaved changes to documents over 64 MB between runs (closing asks about them instead);
+- screen readers (Orca) and crash dumps (`crash.log` only).
 
 ## Where Slate keeps things
 
 - Settings, the session (open tabs and unsaved text) and `crash.log` are in `%LOCALAPPDATA%\JamesCupps\Slate`
-  (*Help → Open settings folder*; on Linux `~/.local/share/slate`). *File → Restore last session* (Windows; on Linux
-  `restore_session` in `settings.json`) turns the session off: closing then asks about unsaved changes, like Notepad
-  used to.
+  (*Help → Open settings folder*; on Linux `~/.local/share/slate`; Slate 0.15 and older kept them in
+  `%LOCALAPPDATA%\Slate`, and moves them by itself). *File → Restore last session* turns the session off: closing
+  then asks about unsaved changes, like Notepad used to.
 - **Portable mode:** put an empty file named `Slate.portable` next to `Slate.exe`, and Slate keeps all of that, and
   its temporary files, in a `data` folder beside it instead (handy on a USB stick or a fast drive).
 - Slate running as administrator keeps its own session, apart from the normal one.
@@ -189,7 +190,7 @@ Windows, in a GTK window. Not on Linux yet:
 The update check is one request to `api.github.com` for the latest release of this repository; it sends nothing
 about you or your files. Turn it off with *Help → Check for updates automatically*. Slate doesn't send anything
 else anywhere. If it crashes, it writes `crash.log` (and on Windows a small crash dump) in its settings folder, and
-only there; *Help → Report a problem…* (Windows) opens a GitHub issue form with the version filled in, which you can
+only there; *Help → Report a problem…* opens a GitHub issue form with the version filled in, which you can
 edit and send yourself, attaching those files if you like.
 
 ## Uninstalling

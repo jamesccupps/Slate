@@ -314,6 +314,19 @@ lighter one on dark), `src/settings.rs` (data folder: `%LOCALAPPDATA%\JamesCupps
     `Last` while Slate runs, the margins in the settings) and Print (on to `print_tab`); the window is never
     narrower than its bar (`min_width`: narrower, Page setup slid under Print and Close). On Linux it's GTK's (`PrintOperationAction::Preview`: the desktop's
     previewer), and File → Page setup GTK's dialog (`print_run_page_setup_dialog_async`, kept while Slate runs).
+  - `src/structure.rs` (shared) — the JSON and XML structure: the path at the caret, the panel's rows (lazy child
+    lists from `core::jsonnav`/`xmlnav`, ranges of 100, what's open kept across edits by path and place), and Go to
+    line's paths (`find_path`: `data[1203].name`, `["my key"]`, `/catalog/book[3]/title`). Each app draws it:
+    `ui/structure.rs` (Direct2D; it `pub use`s the model) and `gtk/structure.rs` (cairo).
+  - `src/convert.rs` (shared) — Format → Convert: Base64 (either alphabet, padding optional, wrapped), URL
+    encoding (`+` stays `+`), JSON string escapes (surrogate pairs), each way, up to `CONVERT_MAX` (16 MiB) at once,
+    an undoable edit selecting the result; SHA-256 (its own, tested against the standard vectors) of the selection
+    or the text on another thread (`TaskKind::Hash`), shown in a box with Copy.
+  - `src/editorconfig.rs` (shared) — `.editorconfig` files from the file's folder up to `root = true` (globs `*`,
+    `**`, `?`, `[…]`, `{a,b}`, `{1..9}`; a nearer file and a later section win; `unset`). Applied (`edit::
+    editorconfig_of`) as a file is read: its indentation (over the guess, unless the user picked one); for a new or
+    empty document its line endings and encoding; and at saving `insert_final_newline` (`edit::final_newline`, an
+    edit of its own). `trim_trailing_whitespace` isn't.
   - `src/spell.rs` (shared, beside `core`) — spell check: which words of the rows on screen are checked
     (`words_in`: all of plain text, Markdown's prose — not code blocks, `markdown_code`, inline code or links —,
     comments in code; never data files; a word is letters with apostrophes inside, not next to a digit, `_`, `/`,
@@ -359,9 +372,16 @@ lighter one on dark), `src/settings.rs` (data folder: `%LOCALAPPDATA%\JamesCupps
     while the tabs are put back: still there at the next start, the session goes into `crashed-<time>/`; that and
     `damaged/` are deleted 30 days later),
     `testmode.rs` (`slate --test script` under Xvfb: commands at the top of the file; shots through
-    `WidgetPaintable`). Not on Linux yet: the structure panel and path bar, show whitespace, bracket matching,
-    overtype, high contrast, word counts, the Encoding / Indentation / Font menus, big unsaved documents in the
-    session (README lists it all). Help → Open files with Slate… (`make_default`) makes Slate the default for the
+    `WidgetPaintable`), `structure.rs` (the path bar over the text and the panel beside it, drawn with cairo; the
+    panel's left edge resizes it, `structure_width`). Menus whose items are values (encodings, indentation, fonts,
+    sizes, the tab list) are stateful actions with a target (`valued` in `actions`); View's JSON/XML items and
+    Format's Formatting indent are sections `sync_menu` fills for the language. The status bar's items are
+    `chrome::StatusItem`s; counts (`App::doc_counts_now`) at once up to 1 MiB, on another thread up to 64 MiB once
+    typing pauses. The theme follows the system's light or dark live: GTK's theme name, GNOME's `color-scheme`
+    (gio::Settings kept in a thread-local) and the desktop portal's (`follow_portal_scheme`: read once without
+    waiting, then its SettingChanged). Close other / saved / all tabs (`App::closing`, `close_next`) close one by one,
+    an unsaved one asked about first (Save as answered, then on; Cancel stops). Not on Linux yet: high contrast, big
+    unsaved documents in the session (README lists it all). Help → Open files with Slate… (`make_default`) makes Slate the default for the
     desktop file's MimeType list through GIO (`~/.config/mimeapps.list`; Linux lets an app do that itself); Stop
     opening files with Slate… takes only Slate's entries out of that file (GIO's reset would forget other apps' too).
     File dialogs (`FileChooserNative`) must be kept alive until answered (`keep_until_answered`): GTK drops them
@@ -409,7 +429,11 @@ lighter one on dark), `src/settings.rs` (data folder: `%LOCALAPPDATA%\JamesCupps
     through IMM32: see Design decisions); `spell.rs` (Windows' spell checker); `session.rs` (tabs and
     unsaved text kept between runs; a path that isn't valid Unicode is kept as UTF-16 units, `os::json_path`, and
     arguments, drops and handed-over paths stay `OsString`s); `settings.rs` (data folder, portable mode); `install.rs`
-    ("Open with" entries
+    (Slate's own keys are named for its publisher: `Software\JamesCupps\Slate`, RegisteredApplications
+    `JamesCupps.Slate`, `*\shell\JamesCupps.Slate`, `Uninstall\JamesCupps.Slate`; 0.15.0 and older used plain "Slate",
+    which `move_names` copies over with RegCopyTreeW and deletes, only what's Slate's, at a start with no other Slate
+    and at `--install`; the ProgID `Slate.TextFile` stays, as renaming it would undo people's Default apps choices;
+    "Open with" entries
     in HKCU, never for what Windows runs when it's double-clicked, `NOT_REGISTERED`: .bat, .cmd, .vbs, .js, .reg,
     .py…, nor .ts — registered, they made Windows ask how to open a .bat with only Slate offered, and 0.8.2 takes
     that back once at start, a choice of Slate for .bat/.cmd included; Windows lets only the person choose the app
@@ -731,6 +755,12 @@ lighter one on dark), `src/settings.rs` (data folder: `%LOCALAPPDATA%\JamesCupps
   text), `imemsg:start|pre|<text>|<cursor>|<clauses>|commit|<text>|end` (the input method's signals on the window's
   input context; `pre` as GTK gives a preedit), `rmenu:<x>,<y>[|<label>]` (the text's menu's spelling part),
   `print:wrong`, `print:speller`, `down:<x>,<y>[,alt]` / `move:<x>,<y>` / `up:[ctrl]` (the left button in the text, the gutter included),
+  `act:<action>=<value>` (a menu item with a value: `act:save-encoding=ansi`, `act:font-size=14`, `act:show-tab=2`),
+  `tabclick:<x>[,<button>]` (`list` for the tab list's button; 3 for a tab's menu) and `statusclick:indent|lang|eol|
+  encoding|readonly|ovr` (menus are listed in `print:asked`, not shown), `pathclick:<i>` / `rowclick:<k>[,chevron|
+  double]` (the path bar and the panel), `gsettings:<key>=<value>` (GNOME's interface settings, under
+  `GSETTINGS_BACKEND=memory`; the image needs gsettings-desktop-schemas), `print:encoding`, `indent`, `font`,
+  `settings`, `strip`, `path`, `rows`, `shown`,
   `set:print_colors=false` and the other print options.
 - Measuring: `t:<label>` marks; `print:startup` (each startup step in ms since the process was created: `warp`,
   `device`, `first frame` or `first frame (WARP)` and the switch; a hidden test window gets no WM_PAINT, so the

@@ -568,6 +568,8 @@ pub fn make_default(cell: &Cell) {
 /// does (its folder, the Start menu, "Open with", Installed apps), with nothing shown and Default apps not opened.
 /// True when all of it worked (the exit code says so).
 pub fn install_quiet() -> bool {
+    // (a winget upgrade from 0.15.0 or older: its keys under the new names, not twice in Installed apps)
+    move_names();
     match install_exe() {
         Ok(exe) => {
             start_menu_shortcut(&exe);

@@ -194,26 +194,33 @@ buttons, with Snap layouts; Linux: the strip and the desktop's window buttons as
 
 ## Soon
 
-Nothing waiting: the *Soon* list of 0.13.0 is done (0.13.0, 0.14.0, 0.15.0). The next picks come from *Next* and
-*Later*.
+Nothing waiting: the *Soon* list of 0.13.0 is done (0.13.0, 0.14.0, 0.15.0), and 0.16.0 took the Linux list and a
+few small items from *Later*. The next picks come from *Next* and *Later*.
+
+## 0.16.0
+
+Linux caught up with Windows: the JSON/XML path bar and structure panel (the structure model now shared,
+`src/structure.rs`), show whitespace, the matching bracket, overtype, word and character counts, the Encoding,
+Indentation, Font and Formatting indent menus and the status bar's, Reload, Show in folder, Copy file path, Close
+other / saved / all tabs, the tab's menu and the list of tabs, Restore last session, Open settings folder, Report a
+problem, the theme button, and the desktop's light or dark followed while running. Both apps: Format → Convert
+(Base64, URL encoding, JSON escapes, SHA-256), EditorConfig, Go to line with a JSON or XML path. Windows: Slate's
+data folder and registry keys named for its publisher (`%LOCALAPPDATA%\JamesCupps\Slate`, moved once from plain
+"Slate"), and started again with its tabs after Windows restarts for an update. Details in the
+[0.16.0 release notes](release-notes-0.16.0.md).
 
 ## Later
 
-- **Linux, the rest (M each unless said):** the JSON/XML structure panel and path bar; keeping big unsaved documents in the session
-  (`.pieces`/`.data`, as on Windows); show whitespace, bracket matching, overtype, word counts and the tab list (S
-  each); the status bar's encoding and indentation menus, the Encoding, Indentation and Font menus, Close other /
-  saved / all tabs and the tab's menu, Reload, Show in folder, Copy file path (S each); following GNOME's dark/light
-  switch while running (S); Flatpak or AppImage for distributions without GTK 4.8 (S–M); an accessibility pass with
-  Orca (M; GTK 4.8 has no accessible text for a custom-drawn view: GTK 4.14's `GtkAccessibleText`).
+- **Linux, the rest:** keeping big unsaved documents in the session (`.pieces`/`.data`, as on Windows: its engine in
+  `ui/session.rs` shared, with a restore flow for GTK) (M); high contrast (S); Flatpak or AppImage for distributions
+  without GTK 4.8 (S–M); an accessibility pass with Orca (M; GTK 4.8 has no accessible text for a custom-drawn view:
+  GTK 4.14's `GtkAccessibleText`).
 - **Maybe: a Markdown preview** (a rendered view next to the text, off by default) (M). Only if people ask for
   it: Slate is meant to stay quick and open anything, so it must cost nothing while it isn't used.
-- JSON and XML: **go to a path** typed in Go to line (`data[1203].name`, `/catalog/book[3]/title`) (S).
-- **EditorConfig** (`.editorconfig`: indentation, line endings, a final newline, the encoding) (S).
 - **A command palette** (Ctrl+Shift+P) over every command and setting (M; on Linux it would also be the settings
   window it hasn't got).
 - **Two views of one document**, one above the other (M). **Compare** with the file as saved, or two tabs (M–L, up
   to some size).
-- Format → Convert: Base64, URL encoding, JSON string escapes, and SHA-256 of the selection or the file (S each).
 - Several windows; drag a tab out into its own window (L).
 - A hex view for binary files (M). Files with only CR line endings converted on open (S).
 - Smooth scrolling (M). Right-to-left text (S–M). Any font and size (S).
@@ -263,8 +270,7 @@ Nothing waiting: the *Soon* list of 0.13.0 is done (0.13.0, 0.14.0, 0.15.0). The
 - Updates: when closing is cancelled after an update was put in place, the next start should still be watched (and
   undone if it fails), and a setting a newer version wrote that this one can't read should survive this one saving
   (it matters when an update is undone) (S each).
-- Restart after Windows restarts for an update, with the tabs back, as Notepad does (`RegisterApplicationRestart`)
-  (S). A new version that hangs while starting should be undone like one that fails (S). A file handed to a Slate
+- A new version that hangs while starting should be undone like one that fails (S). A file handed to a Slate
   that answers too late (after 10 s) opens in both windows (S).
 - Size: of the 3.4 MB, regex's Unicode tables are 380 KB. Without the age, boolean-property and break tables
   (`\p{Age=…}`, `\p{Alphabetic}`, `\p{Emoji}`, grapheme/word/sentence break classes) it's 155 KB smaller; without
@@ -284,8 +290,6 @@ start and heavier, and turn it into another IDE. Slate is the editor that opens 
 - Test on what the development PC doesn't have: a FAT/exFAT drive, a Chinese/Japanese/Korean system locale, the
   "Use UTF-8 worldwide" option, a high-DPI second monitor and a taskbar on the side (S each).
 - Check on a real screen whether switching the theme with the find bar open repaints its boxes (S).
-- Install: the registry keys, ProgID and data folder are all named just "Slate": decide on final names before many
-  people install it, since renaming later needs a migration.
 
 ## Known limits
 
