@@ -1274,9 +1274,21 @@ impl App {
             Ok(Loading::Converting(job)) => self.tabs[i].convert = Some(job),
             Err(_) if opened.creatable => {
                 // a new file: saving creates it
+                let (ec, eol, charset) = edit::editorconfig_of(&opened.path, self.settings.tab_size);
                 let tab = &mut self.tabs[i];
                 tab.doc.path = Some(opened.path.clone());
                 tab.lang = detect(Some(&opened.path), &tab.doc);
+                // (as EditorConfig says, if it does)
+                if let Some(e) = eol {
+                    tab.doc.eol = e;
+                }
+                if let Some(c) = charset {
+                    tab.doc.encoding = c;
+                    tab.doc.bom = matches!(c, Encoding::Utf8Bom | Encoding::Utf16Le | Encoding::Utf16Be);
+                }
+                if let Some(ind) = ec.filter(|_| !tab.indent_picked) {
+                    tab.indent = ind;
+                }
                 let name = tab.title();
                 self.flash(format!("{name} is a new file: saving creates it."), false);
             }
@@ -1314,8 +1326,22 @@ impl App {
             doc.path = tab.doc.path.clone();
         }
         tab.lang = if tab.lang_picked { tab.lang } else { detect(doc.path.as_deref(), &doc) };
+        // EditorConfig first, the project's own rule (and for a new file, its line endings and encoding)
+        let (ec, eol, charset) = match doc.path.as_deref() {
+            Some(p) => edit::editorconfig_of(p, self.settings.tab_size),
+            None => (None, None, None),
+        };
+        if doc.is_empty() && !doc.is_dirty() {
+            if let Some(e) = eol {
+                doc.eol = e;
+            }
+            if let Some(c) = charset {
+                doc.encoding = c;
+                doc.bom = matches!(c, Encoding::Utf8Bom | Encoding::Utf16Le | Encoding::Utf16Be);
+            }
+        }
         let head = doc.read(0, (64 << 10).min(doc.len()));
-        if let Some(ind) = edit::detect_indent(&head).filter(|_| !tab.indent_picked) {
+        if let Some(ind) = ec.or_else(|| edit::detect_indent(&head)).filter(|_| !tab.indent_picked) {
             tab.indent = ind;
         }
         tab.doc = doc;
@@ -1373,6 +1399,11 @@ impl App {
         if !tab.doc.is_ready() || tab.loading() {
             self.flash("Still opening the file — try saving again in a moment.", true);
             return;
+        }
+        // (EditorConfig's insert_final_newline)
+        let eol = tab.doc.eol.as_bytes().to_vec();
+        if !tab.read_only && tab.filter.is_none() && edit::final_newline(&mut tab.doc, &path, &eol) {
+            tab.sync_view();
         }
         let snap = tab.doc.snapshot();
         let state = tab.doc.state_id();

@@ -240,8 +240,27 @@ impl App {
 
     /// Looks at how tab `i`'s text is indented (after opening or loading it), unless the user picked it.
     fn detect_indent(&mut self, i: usize) {
+        let width = self.settings.tab_size;
         let t = &mut self.tabs[i];
+        // EditorConfig first, the project's own rule (and for a new file, its line endings and encoding)
+        let (ec, eol, charset) = match t.doc.path.as_deref() {
+            Some(p) => editor::editorconfig_of(p, width),
+            None => (None, None, None),
+        };
+        if t.doc.is_empty() && !t.doc.is_dirty() {
+            if let Some(e) = eol {
+                t.doc.eol = e;
+            }
+            if let Some(c) = charset {
+                t.doc.encoding = c;
+                t.doc.bom = matches!(c, Encoding::Utf8Bom | Encoding::Utf16Le | Encoding::Utf16Be);
+            }
+        }
         if !t.indent_picked {
+            if ec.is_some() {
+                t.indent = ec;
+                return;
+            }
             let head = t.doc.read(0, t.doc.len().min(256 << 10));
             t.indent = editor::detect_indent(&head);
         }
@@ -1087,6 +1106,11 @@ impl App {
         if !tab.doc.is_ready() || tab.load_job.is_some() || tab.restore.is_some() {
             self.flash("Still opening the file — try saving again in a moment.", true);
             return false;
+        }
+        // (EditorConfig's insert_final_newline)
+        let eol = tab.doc.eol.as_bytes().to_vec();
+        if !tab.read_only && tab.filter.is_none() && editor::final_newline(&mut tab.doc, &path, &eol) {
+            tab.sync_view();
         }
         let snap = tab.doc.snapshot();
         let state = tab.doc.state_id();

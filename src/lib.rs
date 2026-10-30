@@ -4,6 +4,7 @@
 pub mod convert;
 pub mod core;
 pub mod edit;
+pub mod editorconfig;
 pub mod highlight;
 pub mod print;
 pub mod settings;

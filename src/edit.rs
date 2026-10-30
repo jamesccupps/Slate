@@ -17,7 +17,7 @@ use crate::core::io::MEM_LIMIT;
 use crate::core::job::Ctx;
 use crate::core::lines::LineOp;
 use crate::core::source::{IndexBuilder, Source, create_temp_file};
-use crate::core::text::{self, is_continuation, utf8_len};
+use crate::core::text::{self, Encoding, Eol, is_continuation, utf8_len};
 use crate::highlight::{self, CommentStyle, Lang, State as HlState};
 
 pub const SEG: u64 = 8192;
@@ -1027,6 +1027,34 @@ pub fn char_start(doc: &Document, pos: u64) -> u64 {
         p -= 1;
     }
     p
+}
+
+/// EditorConfig's `insert_final_newline` as a file is saved: a line break (`eol`) added at the end of a text that
+/// doesn't end with one, as an edit of its own (undone like any). Returns whether it added one.
+pub fn final_newline(doc: &mut Document, path: &std::path::Path, eol: &[u8]) -> bool {
+    let len = doc.len();
+    if len == 0 || matches!(doc.byte_at(len - 1), Some(b'\n' | b'\r')) || crate::editorconfig::for_file(path).final_newline != Some(true) {
+        return false;
+    }
+    let sel = Sel::at(len);
+    doc.begin(EditKind::Other, sel);
+    doc.insert(len, eol);
+    doc.end(sel);
+    doc.seal();
+    true
+}
+
+/// What EditorConfig says about a file at `path` for its indentation (`default_width` when it gives the kind and not
+/// the width), and for a new (empty) document its line endings and encoding: (indentation, line endings, encoding).
+pub fn editorconfig_of(path: &std::path::Path, default_width: u32) -> (Option<Indent>, Option<Eol>, Option<Encoding>) {
+    let p = crate::editorconfig::for_file(path);
+    let indent = match (p.spaces, p.indent_size) {
+        (Some(true), n) => Some(Indent::Spaces(n.unwrap_or(default_width))),
+        (Some(false), _) => Some(Indent::Tabs),
+        (None, Some(n)) => Some(Indent::Spaces(n)),
+        (None, None) => None,
+    };
+    (indent, p.eol, p.charset)
 }
 
 /// Characters and words in a text (the status bar's counts).
