@@ -92,15 +92,15 @@ jobs:
           if ($p.ExitCode -ne 0) { throw "--install failed (exit code $($p.ExitCode))" }
           $exe = Join-Path $env:LOCALAPPDATA 'Programs\Slate\Slate.exe'
           $lnk = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Slate.lnk'
-          $un = Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Slate'
+          $un = Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Slate Text Editor'
           "$($un.DisplayName) $($un.DisplayVersion) by $($un.Publisher): $($un.QuietUninstallString)"
           if (!(Test-Path $exe) -or !(Test-Path $lnk)) { throw "--install didn't put Slate in place" }
           $v = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
           if ($un.DisplayVersion -ne $v) { throw "Installed apps says $($un.DisplayVersion), not $v" }
           if (!(Has "$classes\.txt\OpenWithProgids" 'Slate.TextFile')) { throw "Slate isn't in .txt's Open with" }
           if (Has "$classes\.bat\OpenWithProgids" 'Slate.TextFile') { throw "Slate is still registered for .bat" }
-          if (Has 'HKCU:\Software\Slate\Capabilities\FileAssociations' '.bat') { throw ".bat is in Slate's Default apps list" }
-          if (!(Has 'HKCU:\Software\Slate\Capabilities\FileAssociations' '.txt')) { throw ".txt isn't in Slate's Default apps list" }
+          if (Has 'HKCU:\Software\Slate Text Editor\Capabilities\FileAssociations' '.bat') { throw ".bat is in Slate's Default apps list" }
+          if (!(Has 'HKCU:\Software\Slate Text Editor\Capabilities\FileAssociations' '.txt')) { throw ".txt isn't in Slate's Default apps list" }
           if (Test-Path -LiteralPath "$fileExts\.bat\UserChoice") { throw "Slate is still chosen to open .bat files" }
           # Help > Stop opening files with Slate (--unassociate): Open with, Edit with Slate, Default apps and a choice
           # of Slate go; Slate stays installed.
@@ -109,19 +109,59 @@ jobs:
           if ($p.ExitCode -ne 0) { throw "--unassociate failed (exit code $($p.ExitCode))" }
           if (Has "$classes\.txt\OpenWithProgids" 'Slate.TextFile') { throw "--unassociate left Slate in .txt's Open with" }
           if (Test-Path -LiteralPath "$fileExts\.conf\UserChoice") { throw "--unassociate left the choice of Slate for .conf" }
-          if (Has 'HKCU:\Software\RegisteredApplications' 'Slate') { throw "--unassociate left Slate in Default apps" }
-          if (Test-Path -LiteralPath "$classes\*\shell\Slate") { throw "--unassociate left Edit with Slate" }
+          if (Has 'HKCU:\Software\RegisteredApplications' 'Slate Text Editor') { throw "--unassociate left Slate in Default apps" }
+          if (Test-Path -LiteralPath "$classes\*\shell\Slate Text Editor") { throw "--unassociate left Edit with Slate" }
           if (Test-Path -LiteralPath "$classes\Slate.TextFile") { throw "--unassociate left Slate's file type" }
-          if (!(Test-Path $lnk) -or !(Test-Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Slate')) { throw "--unassociate took Slate off the Start menu or Installed apps" }
+          if (!(Test-Path $lnk) -or !(Test-Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Slate Text Editor')) { throw "--unassociate took Slate off the Start menu or Installed apps" }
           $p = Start-Process -FilePath $exe -ArgumentList '--uninstall', '--quiet' -Wait -PassThru -NoNewWindow
           if ($p.ExitCode -ne 0) { throw "--uninstall failed (exit code $($p.ExitCode))" }
-          if (Test-Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Slate') { throw "--uninstall left the Installed apps entry" }
+          if (Test-Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Slate Text Editor') { throw "--uninstall left the Installed apps entry" }
           if (Test-Path $lnk) { throw "--uninstall left the Start menu entry" }
           # the installed copy goes too, a moment after it ended (renamed at once, then deleted; its folder with it)
           if (Test-Path $exe) { throw "--uninstall left $exe" }
           $gone = $false
           foreach ($k in 1..20) { if (!(Test-Path (Split-Path $exe))) { $gone = $true; break }; Start-Sleep -Seconds 1 }
           if (!$gone) { throw "--uninstall left Slate's folder: $(Get-ChildItem (Split-Path $exe) -Name)" }
+
+      - name: Update from 0.15.0 (what it registered under plain "Slate" names moves to "Slate Text Editor"; the runner is thrown away after)
+        shell: pwsh
+        timeout-minutes: 3
+        run: |
+          $classes = 'HKCU:\Software\Classes'
+          $un = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall'
+          function Has($path, $name) { (Get-ItemProperty -LiteralPath $path -ErrorAction SilentlyContinue).PSObject.Properties.Name -contains $name }
+          # 0.15.0 installed as winget does it, from its release
+          $old = Join-Path $env:RUNNER_TEMP 'slate-0.15.0'
+          New-Item -ItemType Directory -Force $old | Out-Null
+          $url = 'https://github.com/jamesccupps/Slate/releases/download/v0.15.0'
+          Invoke-WebRequest "$url/Slate.exe" -OutFile "$old\Slate.exe"
+          Invoke-WebRequest "$url/Slate.exe.sha256" -OutFile "$old\Slate.exe.sha256"
+          $want = ((Get-Content "$old\Slate.exe.sha256" -Raw).Trim() -split '\s+')[0]
+          if ((Get-FileHash "$old\Slate.exe" -Algorithm SHA256).Hash -ne $want) { throw "0.15.0's Slate.exe doesn't match its .sha256" }
+          $p = Start-Process -FilePath "$old\Slate.exe" -ArgumentList '--install' -Wait -PassThru -NoNewWindow
+          if ($p.ExitCode -ne 0) { throw "0.15.0's --install failed (exit code $($p.ExitCode))" }
+          if (!(Test-Path -LiteralPath "$un\Slate") -or !(Test-Path 'HKCU:\Software\Slate\Capabilities') -or !(Test-Path -LiteralPath "$classes\*\shell\Slate")) { throw "0.15.0 didn't register under its names" }
+          # this one installed over it (a winget upgrade; an update in Slate moves them at its next start the same way)
+          $p = Start-Process -FilePath target\release\Slate.exe -ArgumentList '--install' -Wait -PassThru -NoNewWindow
+          if ($p.ExitCode -ne 0) { throw "--install over 0.15.0 failed (exit code $($p.ExitCode))" }
+          foreach ($k in "$un\Slate", 'HKCU:\Software\Slate', "$classes\*\shell\Slate") {
+            if (Test-Path -LiteralPath $k) { throw "the update left $k" }
+          }
+          if (Has 'HKCU:\Software\RegisteredApplications' 'Slate') { throw "the update left Slate's old name in Default apps" }
+          $v = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          $entry = Get-ItemProperty -LiteralPath "$un\Slate Text Editor"
+          "$($entry.DisplayName) $($entry.DisplayVersion) by $($entry.Publisher): $($entry.QuietUninstallString)"
+          if ($entry.DisplayVersion -ne $v) { throw "Installed apps says $($entry.DisplayVersion), not $v" }
+          if ((Get-ItemProperty 'HKCU:\Software\RegisteredApplications').'Slate Text Editor' -ne 'Software\Slate Text Editor\Capabilities') { throw "Default apps doesn't list Slate under its new name" }
+          if (!(Has 'HKCU:\Software\Slate Text Editor\Capabilities\FileAssociations' '.txt')) { throw ".txt isn't in Slate's Default apps list" }
+          if ((Get-ItemProperty 'HKCU:\Software\Slate Text Editor').Registration -ne 2) { throw "the note that the old file types were cleaned up didn't move" }
+          if (!(Test-Path -LiteralPath "$classes\*\shell\Slate Text Editor\command")) { throw "Edit with Slate isn't there under its new name" }
+          $exe = Join-Path $env:LOCALAPPDATA 'Programs\Slate\Slate.exe'
+          $p = Start-Process -FilePath $exe -ArgumentList '--uninstall', '--quiet' -Wait -PassThru -NoNewWindow
+          if ($p.ExitCode -ne 0) { throw "--uninstall failed (exit code $($p.ExitCode))" }
+          foreach ($k in "$un\Slate Text Editor", 'HKCU:\Software\Slate Text Editor', "$classes\*\shell\Slate Text Editor") {
+            if (Test-Path -LiteralPath $k) { throw "--uninstall left $k" }
+          }
 
       - name: Package
         shell: pwsh

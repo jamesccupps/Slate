@@ -104,8 +104,8 @@ icons) and a tarball, each with a `.sha256`.
 
 5. winget: the package is `JamesCupps.Slate` in microsoft/winget-pkgs (first submitted with 0.8.1, moved to 0.8.2 before it was merged, as 0.8.1's --install registered .bat:
    microsoft/winget-pkgs#449740, from the user's fork `jamesccupps/winget-pkgs`). Its installer is the release's
-   `Slate.exe`, `InstallerType: exe`, `Scope: user`, silent switch `--install`, `ProductCode: Slate` (the Installed
-   apps key), `UpgradeBehavior: install`. Each new version needs its own manifest PR (three files under
+   `Slate.exe`, `InstallerType: exe`, `Scope: user`, silent switch `--install`, `ProductCode: Slate Text Editor` (the
+   Installed apps key; `Slate` up to 0.15.0), `UpgradeBehavior: install`. Each new version needs its own manifest PR (three files under
    `manifests/j/JamesCupps/Slate/<version>/`, with the new `InstallerUrl` and `InstallerSha256`; `winget validate
    --manifest <folder>` first); Microsoft's pipeline installs it in a sandbox and merges it. Slate updates itself
    anyway, so a winget PR per release only matters for new installs and `winget upgrade`.
