@@ -3483,12 +3483,26 @@ impl Ui {
                 let mut parts = answer.trim().split(':');
                 let line = parts.next().and_then(|s| s.replace([',', ' ', '.'], "").parse::<u64>().ok());
                 let col = parts.next().and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(1);
-                if let Some(line) = line {
-                    self.with(|a| {
-                        let i = a.active;
-                        a.tabs[i].goto = Some((line.max(1), col.max(1)));
-                        a.goto_now(i);
-                    });
+                match line {
+                    Some(line) => {
+                        self.with(|a| {
+                            let i = a.active;
+                            a.tabs[i].goto = Some((line.max(1), col.max(1)));
+                            a.goto_now(i);
+                        });
+                    }
+                    // (JSON and XML: a path)
+                    None if !answer.trim().is_empty() => {
+                        let text = answer.trim().to_string();
+                        self.with(|a| {
+                            if a.tab().lang.has_structure() {
+                                a.go_to_path(&text);
+                            } else {
+                                a.flash("Type a line number", true);
+                            }
+                        });
+                    }
+                    None => {}
                 }
             }
             _ => {}

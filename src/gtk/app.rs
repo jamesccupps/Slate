@@ -1034,6 +1034,18 @@ impl App {
         self.dirty_view = true;
     }
 
+    /// Go to line with a JSON or XML path (`data[3].name`, `/catalog/book[3]`): its value.
+    pub fn go_to_path(&mut self, text: &str) {
+        let notify = self.notify.clone();
+        let tab = &mut self.tabs[self.active];
+        tab.structure.set_lang(tab.lang);
+        match tab.structure.find_path(&mut tab.doc, text, &notify) {
+            crate::structure::PathFound::At(a, b, container) => self.jump_to_value(a, b, container),
+            crate::structure::PathFound::NotFound(why) => self.flash(why, true),
+            crate::structure::PathFound::Reading => self.flash("Still reading the structure — try again in a moment.", true),
+        }
+    }
+
     /// A click on the path bar's segment `i`: its value.
     pub fn jump_path(&mut self, i: usize) {
         let tab = self.tab();

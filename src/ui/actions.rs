@@ -3280,6 +3280,10 @@ impl App {
             None => (digits(text.trim()), None),
         };
         let Some(line) = line else {
+            // (JSON and XML: a path, `data[3].name`, `/catalog/book[3]`)
+            if self.tab().lang.has_structure() {
+                return self.go_to_path(text.trim());
+            }
             self.flash("Type a line number", true);
             return;
         };
@@ -4764,6 +4768,24 @@ impl App {
         self.restart_caret();
         win::set_focus(self.hwnd);
         self.invalidate();
+    }
+
+    /// Go to line with a JSON or XML path: its value.
+    fn go_to_path(&mut self, text: &str) {
+        let notify = self.notify.clone();
+        let tab = &mut self.tabs[self.active];
+        tab.structure.set_lang(tab.lang);
+        match tab.structure.find_path(&mut tab.doc, text, &notify) {
+            crate::structure::PathFound::At(a, b, container) => {
+                self.close_find();
+                self.jump_to_value(a, b, container);
+            }
+            crate::structure::PathFound::NotFound(why) => self.flash(why, true),
+            crate::structure::PathFound::Reading => {
+                self.flash("Still reading the structure — try again in a moment.", true);
+                self.timer(TIMER_JOBS, 100);
+            }
+        }
     }
 
     fn jump_path(&mut self, i: usize) {

@@ -438,6 +438,59 @@ impl Structure {
         if self.path_for == Some((caret, doc.version)) { self.path.clone() } else { None }
     }
 
+    /// Go to line's path (`data[1203].name`, `["my key"][0]`; XML: `/catalog/book[3]/title`): where its value is.
+    /// `Reading`: a container on the way is being read in the background (ask again once `poll` has it).
+    pub fn find_path(&mut self, doc: &mut Document, text: &str, notify: &Notify) -> PathFound {
+        self.sync(doc);
+        let parts = if self.xml { parse_xpath(text) } else { parse_json_path(text) };
+        let Some(parts) = parts.filter(|p| !p.is_empty()) else {
+            return PathFound::NotFound(if self.xml { "Type a line number or an XML path (/catalog/book[3])" } else { "Type a line number or a JSON path (data[3].name)" }.into());
+        };
+        let (mut open, mut end) = (None, doc.len());
+        let mut k = 0;
+        let mut root_entered = false;
+        loop {
+            let Some(ch) = self.ensure(doc, open, end, None, notify) else { return PathFound::Reading };
+            // (a normal JSON document is one value: its insides are the path's first level, as the path bar shows)
+            if !self.xml && open.is_none() && ch.count == 1 && !root_entered {
+                root_entered = true;
+                if let Some(c) = ch.get(&*doc, 0).filter(|c| is_container(doc, c.start)) {
+                    (open, end) = (Some(c.start), c.end);
+                    continue;
+                }
+            }
+            let part = &parts[k];
+            let found = match part {
+                PathPart::Index(i) => ch.get(&*doc, *i).filter(|_| !ch.is_object || self.xml),
+                PathPart::Key(key) if ch.is_object => find_child(&ch, doc, |c| c.key_range().is_some_and(|(a, b)| jsonnav::key_text(&doc.read(a, b)) == *key)),
+                PathPart::Key(_) => None,
+                PathPart::Elem(name, ord) => {
+                    let mut n = 0;
+                    find_child(&ch, doc, |c| {
+                        if xmlnav::name_at(&*doc, c.start) == *name {
+                            n += 1;
+                        }
+                        n == *ord
+                    })
+                }
+            };
+            let Some(c) = found else {
+                let here = parts[..k].iter().map(PathPart::label).collect::<Vec<_>>().join("");
+                return PathFound::NotFound(format!("No {} {}", part.label(), if here.is_empty() { "at the top".to_string() } else { format!("in {here}") }));
+            };
+            k += 1;
+            let container = self.xml || is_container(doc, c.start);
+            if k == parts.len() {
+                return PathFound::At(c.start, c.end, container);
+            }
+            if !container {
+                let here = parts[..k].iter().map(PathPart::label).collect::<Vec<_>>().join("");
+                return PathFound::NotFound(format!("{here} has nothing inside"));
+            }
+            (open, end) = (Some(c.start), c.end);
+        }
+    }
+
     /// Expands the tree down to the caret's node and selects it. What the last reveal opened closes again (unless the
     /// user opened or closed it since), so following the caret through thousands of records doesn't leave them all
     /// open (and the tree slow to rebuild).
@@ -683,6 +736,117 @@ fn empty_row(depth: u16, text: &str) -> Row {
     }
 }
 
+/// What `Structure::find_path` came to: the value's range (and whether it's a container), why there's none, or
+/// still reading.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PathFound {
+    At(u64, u64, bool),
+    NotFound(String),
+    Reading,
+}
+
+/// One step of a path typed in Go to line.
+#[derive(Debug, PartialEq, Eq)]
+enum PathPart {
+    Key(String),
+    Index(u64),
+    /// XML: an element by its name, the `n`th of that name (from 1).
+    Elem(String, u64),
+}
+
+impl PathPart {
+    fn label(&self) -> String {
+        match self {
+            PathPart::Key(k) => format!(".{k}"),
+            PathPart::Index(i) => format!("[{i}]"),
+            PathPart::Elem(n, 1) => format!("/{n}"),
+            PathPart::Elem(n, o) => format!("/{n}[{o}]"),
+        }
+    }
+}
+
+fn is_container(doc: &Document, start: u64) -> bool {
+    matches!(doc.byte_at(start), Some(b'{' | b'['))
+}
+
+/// The first child of `ch` (in order) that `f` says yes to, read a few thousand at a time.
+fn find_child(ch: &Children, doc: &Document, mut f: impl FnMut(&jsonnav::Child) -> bool) -> Option<jsonnav::Child> {
+    let mut a = 0;
+    while a < ch.count {
+        let b = (a + 4096).min(ch.count);
+        if let Some(c) = ch.range(doc, a, b).into_iter().find(|c| f(c)) {
+            return Some(c);
+        }
+        a = b;
+    }
+    None
+}
+
+/// `data[1203].name`, `$.data[0]`, `["my key"]`, `.a.b` (as Copy JSON path writes them, and JSONPath's `$`).
+fn parse_json_path(text: &str) -> Option<Vec<PathPart>> {
+    let t = text.trim();
+    let t = t.strip_prefix('$').unwrap_or(t);
+    let b: Vec<char> = t.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            '.' => i += 1,
+            '[' => {
+                let close = b[i..].iter().position(|&c| c == ']')? + i;
+                let inner: String = b[i + 1..close].iter().collect();
+                let inner = inner.trim();
+                if let Some(q) = inner.chars().next().filter(|&c| c == '"' || c == '\'') {
+                    // a quoted key: up to its closing quote (`\` escapes), which may be past the first `]`
+                    let mut key = String::new();
+                    let mut j = i + 1;
+                    while j < b.len() && b[j] != q {
+                        j += 1;
+                    }
+                    j += 1;
+                    while j < b.len() && b[j] != q {
+                        if b[j] == '\\' && j + 1 < b.len() {
+                            j += 1;
+                        }
+                        key.push(b[j]);
+                        j += 1;
+                    }
+                    let close = b[j..].iter().position(|&c| c == ']')? + j;
+                    out.push(PathPart::Key(key));
+                    i = close + 1;
+                } else {
+                    out.push(PathPart::Index(inner.parse().ok()?));
+                    i = close + 1;
+                }
+            }
+            _ => {
+                let s = i;
+                while i < b.len() && b[i] != '.' && b[i] != '[' {
+                    i += 1;
+                }
+                out.push(PathPart::Key(b[s..i].iter().collect::<String>().trim().to_string()));
+            }
+        }
+    }
+    Some(out)
+}
+
+/// `/catalog/book[3]/title` (as Copy XML path writes it; the leading `/` may be left out).
+fn parse_xpath(text: &str) -> Option<Vec<PathPart>> {
+    let mut out = Vec::new();
+    for step in text.trim().split('/').filter(|s| !s.is_empty()) {
+        let (name, ord) = match step.split_once('[') {
+            Some((n, rest)) => (n, rest.strip_suffix(']')?.trim().parse::<u64>().ok().filter(|&o| o > 0)?),
+            None => (step, 1),
+        };
+        if name.is_empty() || name.contains(char::is_whitespace) {
+            return None;
+        }
+        out.push(PathPart::Elem(name.to_string(), ord));
+    }
+    Some(out)
+}
+
 /// A size as the status bar says it ("1.5 MB").
 fn size_text(n: u64) -> String {
     const K: f64 = 1024.0;
@@ -813,6 +977,33 @@ mod tests {
         assert_eq!(s.rows.iter().map(|r| r.label.as_str()).collect::<Vec<_>>(), ["a", "b"]);
         s.update_path(&mut d, 18, &n);
         assert_eq!(jsonnav::path_string(s.path.as_ref().unwrap()), "b[1]");
+    }
+
+    #[test]
+    fn paths_typed_in_go_to_line_are_found() {
+        let n = notify();
+        let text = br#"{"meta": {"n": 3}, "data": [{"id": 1}, {"id": 2, "tags": ["x", "y"]}], "my key": [true], "1234": null}"#;
+        let mut d = Document::from_text(text);
+        let mut s = Structure::default();
+        let at = |s: &mut Structure, d: &mut Document, p: &str| match s.find_path(d, p, &n) {
+            PathFound::At(a, b, _) => String::from_utf8_lossy(&d.read(a, b)).into_owned(),
+            other => format!("{other:?}"),
+        };
+        assert_eq!(at(&mut s, &mut d, "data[1].tags[1]"), "\"y\"");
+        assert_eq!(at(&mut s, &mut d, "$.meta.n"), "3");
+        assert_eq!(at(&mut s, &mut d, r#"["my key"][0]"#), "true");
+        assert_eq!(at(&mut s, &mut d, r#"["1234"]"#), "null");
+        assert_eq!(at(&mut s, &mut d, "data[1]"), r#"{"id": 2, "tags": ["x", "y"]}"#);
+        assert_eq!(at(&mut s, &mut d, "data[5]"), r#"NotFound("No [5] in .data")"#);
+        assert_eq!(at(&mut s, &mut d, "meta.n.x"), r#"NotFound(".meta.n has nothing inside")"#);
+        assert!(matches!(s.find_path(&mut d, "data[", &n), PathFound::NotFound(_)));
+        // XML
+        let mut d = Document::from_text(br#"<catalog><book id="1"><title>A</title></book><book id="2"><title>B</title></book></catalog>"#);
+        let mut s = Structure::default();
+        s.set_lang(Lang::Xml);
+        assert_eq!(at(&mut s, &mut d, "/catalog/book[2]/title"), "<title>B</title>");
+        assert_eq!(at(&mut s, &mut d, "catalog/book"), r#"<book id="1"><title>A</title></book>"#);
+        assert_eq!(at(&mut s, &mut d, "/catalog/book[3]"), r#"NotFound("No /book[3] in /catalog")"#);
     }
 
     fn labels(s: &Structure) -> Vec<&str> {
