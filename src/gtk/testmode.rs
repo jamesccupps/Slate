@@ -271,6 +271,40 @@ async fn script(lines: Vec<String>, test: Rc<Test>) -> i32 {
                     failures += 1;
                 }
             },
+            // an action that takes a value (a menu's item of a list: `act:save-encoding=ansi`, `act:font-size=14`)
+            "act" => {
+                let (name, v) = arg.split_once('=').unwrap_or((arg, ""));
+                match ui.win_actions.lookup_action(name) {
+                    Some(a) => {
+                        let v = if a.parameter_type().is_some_and(|t| t == *glib::VariantTy::INT32) {
+                            v.parse::<i32>().unwrap_or(0).to_variant()
+                        } else {
+                            v.to_variant()
+                        };
+                        a.activate(Some(&v));
+                    }
+                    None => {
+                        log(&mut out, format!("unknown action {name}"));
+                        failures += 1;
+                    }
+                }
+            }
+            // a click on the tab strip at x (`tabclick:<x>[,<button>]`: 3 for its menu) or on the status bar's item
+            // `k` (`statusclick:<k>`: 0 indentation, 1 language, 2 line endings, 3 encoding, 5 read only)
+            "tabclick" => {
+                let (x, b) = arg.split_once(',').unwrap_or((arg, "1"));
+                // (`list`: the list of all tabs' button, at the strip's end)
+                let x = if x == "list" { ui.strip.borrow().width - 14.0 } else { x.trim().parse().unwrap_or(0.0) };
+                ui.tabs_pressed(b.trim().parse().unwrap_or(1), 1, x);
+            }
+            "statusclick" => {
+                let k: usize = arg.trim().parse().unwrap_or(0);
+                let at = ui.status_items.borrow().iter().find(|(i, _, _)| *i == k).map(|&(_, x, w)| x + w / 2.0);
+                match at {
+                    Some(x) => ui.status_pressed(x),
+                    None => log(&mut out, format!("statusclick: no item {k}")),
+                }
+            }
             "cmd" => match commands().into_iter().find(|(n, _, _)| *n == arg) {
                 Some((_, cmd, _)) => ui.command(cmd),
                 None => {
@@ -488,6 +522,22 @@ fn value(what: &str, test: &Test) -> String {
             v.join(" ")
         }
         "notice" => tab.notice.clone().unwrap_or_default(),
+        "encoding" => tab.doc.encoding.label(),
+        "indent" => format!("{:?}{}", tab.indent, if tab.indent_picked { " (picked)" } else { "" }),
+        "font" => format!("{} {}", a.settings.font, a.settings.font_size),
+        "settings" => format!(
+            "restore_session {} json_indent {} tab_size {} use_spaces {} recent {}",
+            a.settings.restore_session,
+            a.settings.json_indent,
+            a.settings.tab_size,
+            a.settings.use_spaces,
+            a.settings.recent.len()
+        ),
+        // (the tab strip as drawn: tabs shown and whether the arrows and the list are there)
+        "strip" => {
+            let s = ui.strip.borrow();
+            format!("{} of {} shown{} in {}", s.tabs.len(), a.tabs.len(), if s.arrows { ", arrows" } else { "" }, s.width)
+        }
         // `--wait`s noted: their tabs
         "waits" => format!("{:?}", a.waits.iter().map(|(_, ids)| ids.len()).collect::<Vec<_>>()),
         // the find and replace boxes, and Find in selection's range

@@ -23,7 +23,7 @@ use gtk4::{cairo, gdk, gio, glib, pango};
 use crate::core::document::Sel;
 use crate::core::job::Notify;
 use crate::core::lines::{CaseOp, LineOp};
-use crate::core::text::Eol;
+use crate::core::text::{Encoding, Eol};
 use crate::highlight::Lang;
 use crate::settings::{Settings, ThemeMode};
 
@@ -80,6 +80,11 @@ pub struct Ui {
     /// The notice's Save as… button (after a save that failed).
     notice_save_as: gtk4::Button,
     status_menu: gtk4::PopoverMenu,
+    /// The tab's own menu (a right-click on it) and the list of all tabs (the strip's button when they don't fit).
+    tab_menu: gtk4::PopoverMenu,
+    /// Format → Formatting indent, there only for JSON and XML (`Ui::sync_menu` fills it).
+    format_extra: gio::Menu,
+    format_extra_shown: Cell<bool>,
     im: gtk4::IMMulticontext,
     /// The press on the tab strip being handled (for the window menu, which wants the event).
     tab_event: std::cell::Cell<Option<gdk::Event>>,
@@ -404,6 +409,37 @@ fn run_request(application: &gtk4::Application, args: Vec<std::ffi::OsString>, r
 /// chooser was taken down at once (GTK 4.8 then said "The folder contents could not be displayed"). The response
 /// handler holds this reference and lets it go once the dialog is answered.
 #[allow(deprecated)]
+/// File → Show in folder: the file manager shows the file selected in its folder (the FileManager1 D-Bus
+/// interface, which Files, Dolphin, Nemo, Caja and PCManFM have), else the folder is opened.
+fn reveal_file(path: &std::path::Path) {
+    let uri = gio::File::for_path(path).uri().to_string();
+    let folder = path.parent().map(|p| gio::File::for_path(p).uri().to_string());
+    gio::bus_get(gio::BusType::Session, gio::Cancellable::NONE, move |bus| {
+        let fallback = move || {
+            if let Some(f) = folder {
+                let _ = gio::AppInfo::launch_default_for_uri(&f, gio::AppLaunchContext::NONE);
+            }
+        };
+        let Ok(bus) = bus else { return fallback() };
+        bus.call(
+            Some("org.freedesktop.FileManager1"),
+            "/org/freedesktop/FileManager1",
+            "org.freedesktop.FileManager1",
+            "ShowItems",
+            Some(&(vec![uri], "").to_variant()),
+            None,
+            gio::DBusCallFlags::NONE,
+            5000,
+            gio::Cancellable::NONE,
+            move |r| {
+                if r.is_err() {
+                    fallback();
+                }
+            },
+        );
+    });
+}
+
 fn keep_until_answered(chooser: &gtk4::FileChooserNative) -> RefCell<Option<gtk4::FileChooserNative>> {
     RefCell::new(Some(chooser.clone()))
 }
@@ -612,7 +648,8 @@ pub fn window(application: &gtk4::Application, test: Option<Rc<testmode::Test>>)
     notice.set_visible(false);
 
     let recent_menu = gio::Menu::new();
-    let menubar = gtk4::PopoverMenuBar::from_model(Some(&menu_model(&recent_menu)));
+    let format_extra = gio::Menu::new();
+    let menubar = gtk4::PopoverMenuBar::from_model(Some(&menu_model(&recent_menu, &format_extra, &mono_families(&text.pango_context(), &settings.font))));
     // A menu bar item clicked kept the keyboard once its menu closed (typing went nowhere, as Ctrl+N's new tab
     // showed): as on Windows, the keyboard stays in the text, and the menus open in popovers of their own.
     let mut item = menubar.first_child();
@@ -647,6 +684,9 @@ pub fn window(application: &gtk4::Application, test: Option<Rc<testmode::Test>>)
     let status_menu = gtk4::PopoverMenu::from_model(None::<&gio::MenuModel>);
     status_menu.set_parent(&status);
     status_menu.set_has_arrow(false);
+    let tab_menu = gtk4::PopoverMenu::from_model(None::<&gio::MenuModel>);
+    tab_menu.set_parent(&tabs);
+    tab_menu.set_has_arrow(false);
 
     let im = gtk4::IMMulticontext::new();
     let css = gtk4::CssProvider::new();
@@ -688,6 +728,9 @@ pub fn window(application: &gtk4::Application, test: Option<Rc<testmode::Test>>)
         notice_label,
         notice_save_as,
         status_menu,
+        tab_menu,
+        format_extra,
+        format_extra_shown: Cell::new(false),
         im,
         tab_event: std::cell::Cell::new(None),
         css,
@@ -1197,11 +1240,50 @@ fn commands() -> Vec<(&'static str, Cmd, &'static [&'static str])> {
         ("next-bookmark", Cmd::NextBookmark, &["F2"]),
         ("prev-bookmark", Cmd::PrevBookmark, &["<Shift>F2"]),
         ("clear-bookmarks", Cmd::ClearBookmarks, &[]),
+        ("reload", Cmd::Reload, &[]),
+        ("reveal-file", Cmd::RevealFile, &[]),
+        ("copy-path", Cmd::CopyPath, &[]),
+        ("close-others", Cmd::CloseOthers, &[]),
+        ("close-right", Cmd::CloseRight, &[]),
+        ("close-saved", Cmd::CloseSaved, &[]),
+        ("close-all", Cmd::CloseAll, &[]),
+        ("restore-session", Cmd::ToggleRestoreSession, &[]),
+        ("clear-recent", Cmd::ClearRecent, &[]),
+        ("open-data-folder", Cmd::OpenDataFolder, &[]),
+        ("report-problem", Cmd::ReportProblem, &[]),
     ]
 }
 
+/// Format → Encoding's items: an encoding as a menu item's target, and back.
+const ENCODINGS: &[(Encoding, &str)] = &[
+    (Encoding::Utf8, "utf8"),
+    (Encoding::Utf8Bom, "utf8-bom"),
+    (Encoding::Utf16Le, "utf16le"),
+    (Encoding::Utf16Be, "utf16be"),
+    (Encoding::Ansi, "ansi"),
+];
+
+fn encoding_key(e: Encoding) -> &'static str {
+    ENCODINGS.iter().find(|(x, _)| *x == e).map_or("utf8", |(_, k)| k)
+}
+
+/// The monospaced font families for View → Font: the system's own ("Monospace") first, then the others by name
+/// (and the one in the settings, if it's neither).
+fn mono_families(ctx: &pango::Context, current: &str) -> Vec<String> {
+    let mut v: Vec<String> = ctx.list_families().iter().filter(|f| f.is_monospace()).map(|f| f.name().to_string()).collect();
+    v.sort_by_key(|n| n.to_lowercase());
+    v.dedup();
+    v.retain(|n| n != "Monospace");
+    v.insert(0, "Monospace".into());
+    if !v.iter().any(|n| n == current) {
+        v.push(current.to_string());
+    }
+    v
+}
+
 /// Menu items that show a check mark: their actions have a true/false state (`Ui::sync_menu`).
-const CHECKED: &[&str] = &["wrap", "line-numbers", "spell-check", "title-bar-tabs", "theme-system", "theme-light", "theme-dark", "eol-lf", "eol-crlf", "read-only"];
+const CHECKED: &[&str] =
+    &["wrap", "line-numbers", "spell-check", "title-bar-tabs", "theme-system", "theme-light", "theme-dark", "eol-lf", "eol-crlf", "read-only", "restore-session"];
 
 fn actions(ui: &Rc<Ui>) {
     // (in place of the window's own "win" group: menus and shortcuts find these the same way)
@@ -1243,6 +1325,59 @@ fn actions(ui: &Rc<Ui>) {
         }
     });
     ui.win_actions.add_action(&lang);
+    // Values picked from a list (their state is the one in use: the menu shows a dot at it)
+    let valued = |name: &str, ty: &glib::VariantTy, state: glib::Variant, f: fn(&Ui, &glib::Variant)| {
+        let a = gio::SimpleAction::new_stateful(name, Some(ty), &state);
+        a.connect_activate(move |_, v| {
+            if let (Some(ui), Some(v)) = (get_ui(), v) {
+                f(&ui, v);
+            }
+        });
+        ui.win_actions.add_action(&a);
+    };
+    valued("save-encoding", glib::VariantTy::STRING, "utf8".to_variant(), |ui, v| {
+        if let Some(&(e, _)) = v.get::<String>().and_then(|k| ENCODINGS.iter().find(|(_, x)| *x == k)) {
+            ui.command(Cmd::SaveEncoding(e));
+        }
+    });
+    valued("reopen-encoding", glib::VariantTy::STRING, "".to_variant(), |ui, v| {
+        if let Some(&(e, _)) = v.get::<String>().and_then(|k| ENCODINGS.iter().find(|(_, x)| *x == k)) {
+            ui.command(Cmd::ReopenEncoding(e));
+        }
+    });
+    valued("indent", glib::VariantTy::STRING, "spaces".to_variant(), |ui, v| {
+        ui.command(Cmd::IndentSpaces(v.get::<String>().as_deref() != Some("tabs")));
+    });
+    valued("tab-size", glib::VariantTy::INT32, 4i32.to_variant(), |ui, v| {
+        if let Some(n) = v.get::<i32>() {
+            ui.command(Cmd::TabSize(n.clamp(1, 16) as u32));
+        }
+    });
+    valued("json-indent", glib::VariantTy::INT32, 2i32.to_variant(), |ui, v| {
+        if let Some(n) = v.get::<i32>() {
+            ui.command(Cmd::JsonIndent(n.clamp(1, 8) as u32));
+        }
+    });
+    valued("font-size", glib::VariantTy::INT32, 11i32.to_variant(), |ui, v| {
+        if let Some(n) = v.get::<i32>() {
+            ui.command(Cmd::FontSize(n.clamp(6, 72) as u8));
+        }
+    });
+    valued("font", glib::VariantTy::STRING, "".to_variant(), |ui, v| {
+        if let Some(f) = v.get::<String>() {
+            ui.with(|a| {
+                a.settings.font = f;
+                a.settings.save();
+                a.restyle = true;
+                a.dirty_view = true;
+            });
+        }
+    });
+    valued("show-tab", glib::VariantTy::INT32, 0i32.to_variant(), |ui, v| {
+        if let Some(i) = v.get::<i32>() {
+            ui.command(Cmd::ShowTab(i.max(0) as usize));
+        }
+    });
     let recent = gio::SimpleAction::new("open-recent", Some(glib::VariantTy::STRING));
     recent.connect_activate(|_, v| {
         let Some(p) = v.and_then(|v| v.get::<String>()) else { return };
@@ -1279,16 +1414,24 @@ fn section(items: &[(&str, &str)]) -> gio::Menu {
     m
 }
 
-fn menu_model(recent: &gio::Menu) -> gio::Menu {
+fn menu_model(recent: &gio::Menu, format_extra: &gio::Menu, fonts: &[String]) -> gio::Menu {
     let bar = gio::Menu::new();
     let file = gio::Menu::new();
     let open = section(&[("New tab", "new-tab"), ("Open…", "open")]);
     open.append_submenu(Some("Open recent"), recent);
+    open.append_section(None, &section(&[("Reopen closed tab", "reopen-closed")]));
     file.append_section(None, &open);
     file.append_section(None, &section(&[("Save", "save"), ("Save as…", "save-as"), ("Save all", "save-all")]));
     file.append_section(None, &section(&[("Print…", "print"), ("Print preview…", "print-preview"), ("Page setup…", "page-setup")]));
-    file.append_section(None, &section(&[("Read only", "read-only")]));
-    file.append_section(None, &section(&[("Close tab", "close-tab"), ("Reopen closed tab", "reopen-closed"), ("Quit", "quit")]));
+    file.append_section(
+        None,
+        &section(&[("Reload from disk", "reload"), ("Show in folder", "reveal-file"), ("Copy file path", "copy-path"), ("Read only", "read-only")]),
+    );
+    file.append_section(
+        None,
+        &section(&[("Close tab", "close-tab"), ("Close other tabs", "close-others"), ("Close saved tabs", "close-saved"), ("Close all tabs", "close-all")]),
+    );
+    file.append_section(None, &section(&[("Restore last session", "restore-session"), ("Quit", "quit")]));
     bar.append_submenu(Some("_File"), &file);
     let edit = gio::Menu::new();
     edit.append_section(None, &section(&[("Undo", "undo"), ("Redo", "redo")]));
@@ -1307,9 +1450,13 @@ fn menu_model(recent: &gio::Menu) -> gio::Menu {
     let view = gio::Menu::new();
     view.append_section(None, &section(&[("Word wrap", "wrap"), ("Line numbers", "line-numbers"), ("Spell check", "spell-check"), ("Tabs in the title bar", "title-bar-tabs"), ("Character at the caret", "char-info")]));
     view.append_section(None, &section(&[("Show only matching lines", "filter-lines"), ("Show lines not matching", "filter-lines-not"), ("Clear highlights", "clear-highlights")]));
-    view.append_section(None, &section(&[("Zoom in", "zoom-in"), ("Zoom out", "zoom-out"), ("Reset zoom", "zoom-reset")]));
+    let zoom = section(&[("Zoom in", "zoom-in"), ("Zoom out", "zoom-out"), ("Reset zoom", "zoom-reset")]);
+    let rest = gio::Menu::new();
+    rest.append_submenu(Some("Zoom"), &zoom);
+    rest.append_submenu(Some("Font"), &font_menu(fonts));
     let theme = section(&[("Use system setting", "theme-system"), ("Light", "theme-light"), ("Dark", "theme-dark")]);
-    view.append_submenu(Some("Theme"), &theme);
+    rest.append_submenu(Some("Theme"), &theme);
+    view.append_section(None, &rest);
     bar.append_submenu(Some("_View"), &view);
     let format = gio::Menu::new();
     format.append_section(None, &section(&[("Format JSON", "json-format"), ("Minify JSON", "json-minify"), ("Check JSON", "json-check")]));
@@ -1318,19 +1465,97 @@ fn menu_model(recent: &gio::Menu) -> gio::Menu {
         None,
         &section(&[("Check CSV / TSV", "csv-check"), ("Sort by this column, A to Z", "csv-sort"), ("Sort by this column, Z to A", "csv-sort-desc")]),
     );
+    format.append_section(None, format_extra);
     let rest = gio::Menu::new();
     rest.append_submenu(Some("Language"), &lang_menu());
     rest.append_submenu(Some("Line endings"), &eol_menu());
+    rest.append_submenu(Some("Encoding"), &encoding_menu());
+    rest.append_submenu(Some("Indentation"), &indent_menu());
     format.append_section(None, &rest);
     bar.append_submenu(Some("F_ormat"), &format);
     let help = gio::Menu::new();
-    help.append_section(None, &section(&[("Keyboard shortcuts", "shortcuts"), ("Open files with Slate…", "make-default"), ("Stop opening files with Slate…", "stop-default"), ("About Slate", "about")]));
+    help.append_section(None, &section(&[("Keyboard shortcuts", "shortcuts"), ("Open files with Slate…", "make-default"), ("Stop opening files with Slate…", "stop-default")]));
+    help.append_section(None, &section(&[("Open settings folder", "open-data-folder"), ("Report a problem…", "report-problem")]));
+    help.append_section(None, &section(&[("About Slate", "about")]));
     bar.append_submenu(Some("_Help"), &help);
     bar
 }
 
 fn eol_menu() -> gio::Menu {
     section(&[("Windows (CRLF)", "eol-crlf"), ("Unix (LF)", "eol-lf")])
+}
+
+/// A menu's item labels, those in its sections too (a section's own label in brackets), for tests.
+fn menu_labels(menu: &gio::Menu) -> Vec<String> {
+    let label = |m: &gio::Menu, k: i32| m.item_attribute_value(k, "label", None).and_then(|v| v.get::<String>());
+    let mut v = Vec::new();
+    for k in 0..menu.n_items() {
+        match menu.item_link(k, "section").and_then(|s| s.downcast::<gio::Menu>().ok()) {
+            Some(s) => {
+                if let Some(l) = label(menu, k) {
+                    v.push(format!("[{l}]"));
+                }
+                v.extend((0..s.n_items()).filter_map(|j| label(&s, j)));
+            }
+            None => v.extend(label(menu, k)),
+        }
+    }
+    v
+}
+
+/// A menu item that runs action `action` with `target` (the action's state shows which is in use).
+fn valued_item<T: ToVariant>(label: &str, action: &str, target: T) -> gio::MenuItem {
+    let item = gio::MenuItem::new(Some(label), None);
+    item.set_action_and_target_value(Some(&format!("win.{action}")), Some(&target.to_variant()));
+    item
+}
+
+/// Format → Encoding (also the status bar's): what the text is saved with, and its file read again as another.
+fn encoding_menu() -> gio::Menu {
+    let m = gio::Menu::new();
+    let save = gio::Menu::new();
+    for &(e, k) in ENCODINGS {
+        save.append_item(&valued_item(&e.label(), "save-encoding", k));
+    }
+    m.append_section(Some("Save with"), &save);
+    let reopen = gio::Menu::new();
+    for &(e, k) in ENCODINGS.iter().filter(|(e, _)| *e != Encoding::Utf8Bom) {
+        reopen.append_item(&valued_item(&e.label(), "reopen-encoding", k));
+    }
+    m.append_section(Some("Reopen as"), &reopen);
+    m
+}
+
+/// Format → Indentation (also the status bar's).
+fn indent_menu() -> gio::Menu {
+    let m = gio::Menu::new();
+    let kind = gio::Menu::new();
+    kind.append_item(&valued_item("Spaces", "indent", "spaces"));
+    kind.append_item(&valued_item("Tabs", "indent", "tabs"));
+    m.append_section(None, &kind);
+    let width = gio::Menu::new();
+    for n in [2i32, 4, 8] {
+        width.append_item(&valued_item(&format!("Width {n}"), "tab-size", n));
+    }
+    m.append_section(None, &width);
+    m
+}
+
+/// View → Font: the monospaced families, and sizes.
+fn font_menu(fonts: &[String]) -> gio::Menu {
+    let m = gio::Menu::new();
+    let families = gio::Menu::new();
+    for f in fonts {
+        // (an underscore would be taken for an access key)
+        families.append_item(&valued_item(&f.replace('_', "__"), "font", f.as_str()));
+    }
+    m.append_section(None, &families);
+    let sizes = gio::Menu::new();
+    for n in [9i32, 10, 11, 12, 14, 16, 18, 20, 24] {
+        sizes.append_item(&valued_item(&format!("{n} pt"), "font-size", n));
+    }
+    m.append_section(None, &sizes);
+    m
 }
 
 /// File → Open recent: the files opened last (`Ui::sync_menu` keeps it current).
@@ -1351,6 +1576,8 @@ fn fill_recent(menu: &gio::Menu, recent: &[PathBuf]) {
     }
     if menu.n_items() == 0 {
         menu.append(Some("No recent files"), None);
+    } else {
+        menu.append_section(None, &section(&[("Clear list", "clear-recent")]));
     }
 }
 
@@ -1913,6 +2140,30 @@ impl Ui {
             (Some(chrome::TabPart::Tab(i)), 1) => {
                 self.with(|a| a.activate(i));
             }
+            (Some(chrome::TabPart::Tab(i) | chrome::TabPart::Close(i)), 3) => {
+                self.with(|a| a.activate(i));
+                let menu = gio::Menu::new();
+                menu.append_section(
+                    None,
+                    &section(&[("Close", "close-tab"), ("Close others", "close-others"), ("Close tabs to the right", "close-right"), ("Close saved", "close-saved"), ("Close all", "close-all")]),
+                );
+                menu.append_section(None, &section(&[("Reopen closed tab", "reopen-closed")]));
+                menu.append_section(None, &section(&[("Copy path", "copy-path"), ("Show in folder", "reveal-file")]));
+                let tx = self.strip.borrow().tabs.iter().find(|t| t.0 == i).map_or(x, |t| t.1);
+                self.popup_tab_menu(&menu, tx.max(x - 40.0));
+                return;
+            }
+            (Some(chrome::TabPart::List), 1) => {
+                let menu = gio::Menu::new();
+                if let Ok(a) = self.app.try_borrow() {
+                    for (i, t) in a.tabs.iter().enumerate() {
+                        let dirty = if t.doc.is_dirty() { "  \u{25CF}" } else { "" };
+                        menu.append_item(&valued_item(&format!("{}{dirty}", t.title().replace('_', "__")), "show-tab", i as i32));
+                    }
+                }
+                self.popup_tab_menu(&menu, x);
+                return;
+            }
             (Some(chrome::TabPart::Tab(i)) | Some(chrome::TabPart::Close(i)), 2) | (Some(chrome::TabPart::Close(i)), 1) => {
                 self.with(|a| a.close_tab(i));
             }
@@ -1935,21 +2186,38 @@ impl Ui {
         self.text.grab_focus();
     }
 
+    /// The tab's menu or the list of tabs, under the strip at `x`.
+    fn popup_tab_menu(&self, menu: &gio::Menu, x: f64) {
+        let at = gdk::Rectangle::new(x as i32, (chrome::TAB_H - 4.0) as i32, 1, 1);
+        self.popup(&self.tab_menu, menu, at);
+    }
+
+    /// Shows a menu of the tab strip or the status bar. A test lists its items (`print:asked`) instead.
+    fn popup(&self, pop: &gtk4::PopoverMenu, menu: &gio::Menu, at: gdk::Rectangle) {
+        if let Some(test) = &self.test {
+            test.asked.borrow_mut().push(format!("menu: {}", menu_labels(menu).join(" | ")));
+            return;
+        }
+        pop.set_menu_model(Some(menu));
+        pop.set_pointing_to(Some(&at));
+        pop.popup();
+    }
+
     fn status_pressed(&self, x: f64) {
         let items = self.status_items.borrow().clone();
         let Some(&(k, ix, iw)) = items.iter().find(|(_, ix, iw)| x >= *ix && x < ix + iw) else { return };
         let menu = match k {
+            0 => indent_menu(),
             1 => lang_menu(),
             2 => eol_menu(),
+            3 => encoding_menu(),
             5 => {
                 self.command(Cmd::ToggleReadOnly);
                 return;
             }
             _ => return,
         };
-        self.status_menu.set_menu_model(Some(&menu));
-        self.status_menu.set_pointing_to(Some(&gdk::Rectangle::new(ix as i32, 0, iw as i32, chrome::STATUS_H as i32)));
-        self.status_menu.popup();
+        self.popup(&self.status_menu, &menu, gdk::Rectangle::new(ix as i32, 0, iw as i32, chrome::STATUS_H as i32));
     }
 
     /// The spelling part of the text's menu for a word spelled wrong at (`x`, `y`) in the text area: (label, action).
@@ -2205,11 +2473,36 @@ impl Ui {
             ("eol-lf", tab.doc.eol == Eol::Lf),
             ("eol-crlf", tab.doc.eol == Eol::Crlf),
             ("read-only", tab.read_only || tab.filter.is_some()),
+            ("restore-session", a.settings.restore_session),
         ];
         for (name, on) in checks {
             self.set_action_state(name, on.to_variant());
         }
         self.set_action_state("set-lang", tab.lang.label().to_variant());
+        self.set_action_state("save-encoding", encoding_key(tab.doc.encoding).to_variant());
+        self.set_action_state("indent", if tab.indent == crate::edit::Indent::Tabs { "tabs" } else { "spaces" }.to_variant());
+        let width = match tab.indent {
+            crate::edit::Indent::Spaces(n) => n,
+            crate::edit::Indent::Tabs => a.settings.tab_size,
+        };
+        self.set_action_state("tab-size", (width as i32).to_variant());
+        self.set_action_state("json-indent", (a.settings.json_indent as i32).to_variant());
+        self.set_action_state("font-size", (a.settings.font_size.round() as i32).to_variant());
+        self.set_action_state("font", a.settings.font.to_variant());
+        self.set_action_state("show-tab", (a.active as i32).to_variant());
+        // Formatting indent: in the Format menu for JSON and XML only
+        let structured = matches!(tab.lang, Lang::Json | Lang::Xml);
+        if self.format_extra_shown.get() != structured {
+            self.format_extra.remove_all();
+            if structured {
+                let widths = gio::Menu::new();
+                for n in [2i32, 3, 4, 8] {
+                    widths.append_item(&valued_item(&format!("{n} spaces"), "json-indent", n));
+                }
+                self.format_extra.append_submenu(Some("Formatting indent"), &widths);
+            }
+            self.format_extra_shown.set(structured);
+        }
         // JSON's and XML's items only for those files; Open files or Stop opening files with Slate, whichever applies
         let default = self.is_default.get();
         let csv = matches!(tab.lang, Lang::Csv | Lang::CsvSemi | Lang::Tsv);
@@ -2225,6 +2518,12 @@ impl Ui {
             ("csv-sort-desc", csv),
             ("make-default", !default),
             ("stop-default", default),
+            // (greyed out for a tab without a file)
+            ("reload", tab.doc.path.is_some()),
+            ("reveal-file", tab.doc.path.is_some()),
+            ("copy-path", tab.doc.path.is_some()),
+            ("reopen-encoding", tab.doc.path.is_some()),
+            ("reopen-closed", !a.closed.is_empty()),
         ];
         for (name, enabled) in on {
             if let Some(action) = self.win_actions.lookup_action(name).and_downcast::<gio::SimpleAction>() {
@@ -2594,6 +2893,19 @@ impl Ui {
             Ask::Print { preview, .. } => print::run(self, None, preview),
             Ask::PageSetup => print::page_setup(self),
             Ask::Shortcuts => self.show_shortcuts(),
+            Ask::Reload { tab, encoding } => {
+                let Some(name) = self.app.borrow().index_of(tab).map(|i| self.app.borrow().tabs[i].title()) else { return };
+                self.dialog(&format!("Reload {name} and lose your changes?"), "", &[("Cancel", "cancel"), ("Reload", "reload")], move |answer| {
+                    if let Some(ui) = get_ui() {
+                        ui.answer(Ask::Reload { tab, encoding }, answer);
+                    }
+                });
+            }
+            Ask::RevealFile(path) => reveal_file(&path),
+            Ask::OpenUri(uri) => {
+                #[allow(deprecated)]
+                gtk4::show_uri(Some(&self.window), &uri, gdk::CURRENT_TIME);
+            }
         }
     }
 
@@ -2671,7 +2983,10 @@ impl Ui {
             }
             Ask::SaveAs { tab, close_after } => {
                 if answer.is_empty() {
-                    self.with(|a| a.quitting = false);
+                    self.with(|a| {
+                        a.quitting = false;
+                        a.closing.clear();
+                    });
                     return;
                 }
                 let path = PathBuf::from(answer);
@@ -2680,18 +2995,42 @@ impl Ui {
                         let enc = a.tabs[i].doc.encoding;
                         a.start_save(i, path, enc, close_after, false);
                     }
+                    // (Close other / saved / all tabs carries on)
+                    a.close_next();
                 });
+            }
+            Ask::Reload { tab, encoding } => {
+                if answer == "reload" {
+                    self.with(|a| {
+                        if let Some(i) = a.index_of(tab) {
+                            a.activate(i);
+                            a.reload(i, encoding);
+                        }
+                    });
+                }
             }
             Ask::CloseUnsaved { tab } => {
                 self.with(|a| {
                     let Some(i) = a.index_of(tab) else { return };
+                    a.closing.retain(|&t| t != tab);
                     match answer {
-                        "save" => a.exec_save(i, true),
+                        "save" => {
+                            let asks = a.tabs[i].doc.path.is_none();
+                            a.exec_save(i, true);
+                            // (Close other / saved / all tabs carries on; after Save as, once it's answered)
+                            if !asks {
+                                a.close_next();
+                            }
+                        }
                         "dont" => {
                             a.tabs[i].doc.mark_saved();
                             a.remove_tab(i);
+                            a.close_next();
                         }
-                        _ => a.quitting = false,
+                        _ => {
+                            a.quitting = false;
+                            a.closing.clear();
+                        }
                     }
                 });
                 let quitting = self.app.try_borrow().is_ok_and(|a| a.quitting);

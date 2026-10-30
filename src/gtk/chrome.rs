@@ -20,9 +20,10 @@ pub enum TabPart {
     Tab(usize),
     Close(usize),
     Plus,
-    /// The arrows to scroll tabs that don't fit.
+    /// The arrows to scroll tabs that don't fit, and the list of them all.
     Left,
     Right,
+    List,
 }
 
 /// Where the tabs are drawn: (tab, x, width), the "+" button's x, and whether there are more than fit.
@@ -37,7 +38,7 @@ pub struct TabStrip {
 /// How the tabs are laid out in `width`, starting at tab `first` (when they don't all fit).
 pub fn tab_strip(app: &App, width: f64, first: &mut usize) -> TabStrip {
     let n = app.tabs.len().max(1);
-    let arrows_w = 2.0 * 28.0;
+    let arrows_w = 3.0 * 28.0;
     let avail = (width - PLUS_W - 8.0).max(TAB_MIN_W);
     let w = (avail / n as f64).clamp(TAB_MIN_W, TAB_MAX_W);
     let mut strip = TabStrip { width, ..Default::default() };
@@ -79,12 +80,16 @@ pub fn tab_part_at(strip: &TabStrip, x: f64) -> Option<TabPart> {
         return Some(TabPart::Plus);
     }
     if strip.arrows {
-        let right = strip.width - 28.0;
-        if x >= right - 28.0 && x < right {
+        // [<] [>] [v] at the end
+        let list = strip.width - 28.0;
+        if x >= list - 56.0 && x < list - 28.0 {
             return Some(TabPart::Left);
         }
-        if x >= right {
+        if x >= list - 28.0 && x < list {
             return Some(TabPart::Right);
+        }
+        if x >= list {
+            return Some(TabPart::List);
         }
     }
     None
@@ -222,15 +227,29 @@ pub fn paint_tabs(cr: &cairo::Context, ctx: &pango::Context, app: &App, strip: &
     cr.line_to(mx, my + 6.0);
     let _ = cr.stroke();
     if strip.arrows {
-        let right = strip.width - 28.0;
-        for (k, x) in [right - 28.0, right].into_iter().enumerate() {
-            let my = 6.0 + (height - 6.0) / 2.0;
+        let list = strip.width - 28.0;
+        let my = 6.0 + (height - 6.0) / 2.0;
+        for (part, x) in [(TabPart::Left, list - 56.0), (TabPart::Right, list - 28.0), (TabPart::List, list)] {
+            if hover == Some(part) {
+                set_color(cr, t.hover);
+                rounded(cr, x + 2.0, my - 12.0, 24.0, 24.0, 5.0);
+                let _ = cr.fill();
+            }
             set_color(cr, t.text_dim);
             let mx = x + 14.0;
-            let d = if k == 0 { -1.0 } else { 1.0 };
-            cr.move_to(mx - 2.0 * d, my - 5.0);
-            cr.line_to(mx + 3.0 * d, my);
-            cr.line_to(mx - 2.0 * d, my + 5.0);
+            match part {
+                TabPart::List => {
+                    cr.move_to(mx - 5.0, my - 2.0);
+                    cr.line_to(mx, my + 3.0);
+                    cr.line_to(mx + 5.0, my - 2.0);
+                }
+                _ => {
+                    let d = if part == TabPart::Left { -1.0 } else { 1.0 };
+                    cr.move_to(mx - 2.0 * d, my - 5.0);
+                    cr.line_to(mx + 3.0 * d, my);
+                    cr.line_to(mx - 2.0 * d, my + 5.0);
+                }
+            }
             let _ = cr.stroke();
         }
     }

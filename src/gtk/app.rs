@@ -56,6 +56,12 @@ pub enum Ask {
     Print { pages: u64, preview: bool },
     /// File → Page setup (GTK's dialog).
     PageSetup,
+    /// Read the tab's file again and lose its unsaved changes? (`encoding`: read as that: Reopen as.)
+    Reload { tab: u64, encoding: Option<Encoding> },
+    /// File → Show in folder: the file manager shows the file.
+    RevealFile(PathBuf),
+    /// A link or a folder opened with the desktop's app for it (Help → Report a problem…, Open settings folder).
+    OpenUri(String),
 }
 
 /// A menu command or shortcut.
@@ -140,6 +146,37 @@ pub enum Cmd {
     NextBookmark,
     PrevBookmark,
     ClearBookmarks,
+    /// File → Reload from disk; Format → Encoding → Reopen as: the file read again (in that encoding).
+    Reload,
+    ReopenEncoding(Encoding),
+    /// Format → Encoding → Save with: how the text is saved from now on.
+    SaveEncoding(Encoding),
+    /// File → Show in folder, Copy file path.
+    RevealFile,
+    CopyPath,
+    /// Close the other tabs, those to the right of the one shown, the saved ones, all of them (one by one, an
+    /// unsaved one asked about first: Cancel stops; `App::close_next`).
+    CloseOthers,
+    CloseRight,
+    CloseSaved,
+    CloseAll,
+    /// The list of all tabs (when they don't fit): show this one.
+    ShowTab(usize),
+    /// File → Restore last session.
+    ToggleRestoreSession,
+    /// File → Open recent → Clear list.
+    ClearRecent,
+    /// Help → Open settings folder, Report a problem….
+    OpenDataFolder,
+    ReportProblem,
+    /// Format → Indentation: spaces (true) or tabs, for this document (picked: not guessed again) and new ones; how
+    /// wide a tab shows, and a level of spaces.
+    IndentSpaces(bool),
+    TabSize(u32),
+    /// View → Font: the size in points (the family is the `font` action's).
+    FontSize(u8),
+    /// Format → Formatting indent: spaces per level when JSON and XML are formatted.
+    JsonIndent(u32),
 }
 
 pub struct SaveTask {
@@ -202,6 +239,8 @@ pub struct Tab {
     /// The user picked the language (it's not detected again on saving under another name).
     pub lang_picked: bool,
     pub indent: Indent,
+    /// The user picked the indentation (Format → Indentation): it's not guessed again when the file is read again.
+    pub indent_picked: bool,
     load: Option<Job<Opened>>,
     convert: Option<Job<std::io::Result<Document>>>,
     index: Option<Job<bool>>,
@@ -393,6 +432,8 @@ pub struct App {
     pub field_cache: std::cell::RefCell<Option<((u64, u64, u64), Option<String>)>>,
     /// `slate --wait`: a wait file to delete once all of its tabs are closed (`open_hinted`).
     pub waits: Vec<(PathBuf, Vec<u64>)>,
+    /// The tabs Close other / saved / all tabs still has to close (`close_next`).
+    pub closing: Vec<u64>,
 }
 
 fn now_text() -> String {
@@ -446,6 +487,7 @@ impl App {
             sel_cache: Default::default(),
             field_cache: Default::default(),
             waits: Vec::new(),
+            closing: Vec::new(),
         };
         app.apply_theme();
         app
@@ -521,6 +563,7 @@ impl App {
             lang: Lang::Plain,
             lang_picked: false,
             indent,
+            indent_picked: false,
             load: None,
             convert: None,
             index: None,
@@ -1077,7 +1120,7 @@ impl App {
         }
         tab.lang = if tab.lang_picked { tab.lang } else { detect(doc.path.as_deref(), &doc) };
         let head = doc.read(0, (64 << 10).min(doc.len()));
-        if let Some(ind) = edit::detect_indent(&head) {
+        if let Some(ind) = edit::detect_indent(&head).filter(|_| !tab.indent_picked) {
             tab.indent = ind;
         }
         tab.doc = doc;
@@ -1242,6 +1285,48 @@ impl App {
             return;
         }
         self.remove_tab(i);
+    }
+
+    /// Closes the tabs `closing` lists (Close other / saved / all tabs) one after another; an unsaved one is asked
+    /// about first, and its answer carries on (Cancel stops: `closing` is emptied).
+    pub fn close_next(&mut self) {
+        while let Some(&id) = self.closing.first() {
+            let Some(i) = self.index_of(id) else {
+                self.closing.remove(0);
+                continue;
+            };
+            if self.tabs[i].doc.is_dirty() && !self.tabs[i].saving() {
+                self.asks.push(Ask::CloseUnsaved { tab: id });
+                return;
+            }
+            self.closing.remove(0);
+            self.close_tab(i);
+        }
+    }
+
+    /// Reads tab `i`'s file again (in `force`'s encoding, else as it's found to be), the view where it was (at the
+    /// end if the caret was there); what wasn't saved goes.
+    pub fn reload(&mut self, i: usize, force: Option<Encoding>) {
+        let notify = self.notify.clone();
+        let tab = &mut self.tabs[i];
+        let Some(path) = tab.doc.path.clone() else { return };
+        if tab.save.is_some() || tab.task.is_some() {
+            // (what's read now could be from before the save, which then lands on another document)
+            self.flash("Still busy with this tab — reload when it's done.", true);
+            return;
+        }
+        if tab.reload.is_none() || tab.load.is_none() {
+            tab.reload = Some(tab.view.sel.caret >= tab.doc.len() && !tab.doc.is_empty());
+        }
+        tab.goto = None;
+        tab.notice = None;
+        tab.notice_save_as = false;
+        tab.convert = None;
+        tab.seen_disk = None;
+        let prev = tab.doc.buffer().sources().iter().find(|s| s.file_path() == Some(path.as_path())).cloned();
+        tab.load = Some(Job::spawn(fileio::OPEN_STEPS, notify.clone(), move |ctx| fileio::reload(&path, notify, prev, force, ctx)));
+        self.session_dirty = true;
+        self.dirty_view = true;
     }
 
     pub fn remove_tab(&mut self, i: usize) {
@@ -2032,6 +2117,117 @@ impl App {
             Cmd::ClearBookmarks => {
                 self.tabs[self.active].view.bookmarks.clear();
                 self.session_dirty = true;
+            }
+            Cmd::Reload | Cmd::ReopenEncoding(_) => {
+                let force = match cmd {
+                    Cmd::ReopenEncoding(e) => Some(e),
+                    _ => None,
+                };
+                let tab = self.tab();
+                if tab.doc.path.is_none() {
+                    return;
+                }
+                if tab.doc.is_dirty() && !tab.saving() {
+                    let tab = tab.id;
+                    self.asks.push(Ask::Reload { tab, encoding: force });
+                    return;
+                }
+                self.reload(self.active, force);
+            }
+            Cmd::SaveEncoding(e) => {
+                let tab = &mut self.tabs[self.active];
+                if tab.doc.encoding != e {
+                    tab.doc.encoding = e;
+                    tab.doc.bom = matches!(e, Encoding::Utf8Bom | Encoding::Utf16Le | Encoding::Utf16Be);
+                    tab.doc.mark_dirty();
+                    self.session_dirty = true;
+                    self.flash(format!("Will be saved as {}", e.label()), false);
+                }
+            }
+            Cmd::RevealFile => {
+                if let Some(p) = self.tab().doc.path.clone() {
+                    self.asks.push(Ask::RevealFile(p));
+                }
+            }
+            Cmd::CopyPath => {
+                if let Some(p) = self.tab().doc.path.clone() {
+                    self.copied_line = None;
+                    self.copy_out = Some(p.to_string_lossy().into_owned());
+                    self.flash("Path copied", false);
+                }
+            }
+            Cmd::CloseOthers | Cmd::CloseRight | Cmd::CloseSaved | Cmd::CloseAll => {
+                let (active, keep) = (self.active, self.tab().id);
+                self.closing = self
+                    .tabs
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, t)| match cmd {
+                        Cmd::CloseOthers => t.id != keep,
+                        Cmd::CloseRight => *i > active,
+                        // (not those with unsaved changes, nor those still busy opening, saving or converting)
+                        Cmd::CloseSaved => !(t.doc.is_dirty() || t.busy()),
+                        _ => true,
+                    })
+                    .map(|(_, t)| t.id)
+                    .collect();
+                self.close_next();
+            }
+            Cmd::ShowTab(i) => self.activate(i.min(self.tabs.len() - 1)),
+            Cmd::ToggleRestoreSession => {
+                self.settings.restore_session = !self.settings.restore_session;
+                self.settings.save();
+                self.session_dirty = true;
+                let msg = if self.settings.restore_session {
+                    "Slate will open with these tabs (and their unsaved changes) next time"
+                } else {
+                    "Slate will open with a new tab next time; closing asks about unsaved changes"
+                };
+                self.flash(msg, false);
+            }
+            Cmd::ClearRecent => {
+                self.settings.recent.clear();
+                self.settings.save();
+            }
+            Cmd::OpenDataFolder => {
+                let d = crate::settings::data_dir();
+                let _ = std::fs::create_dir_all(&d);
+                if let Ok(uri) = gtk4::glib::filename_to_uri(&d, None) {
+                    self.asks.push(Ask::OpenUri(uri.to_string()));
+                }
+            }
+            Cmd::ReportProblem => self.asks.push(Ask::OpenUri(report_url())),
+            Cmd::IndentSpaces(spaces) => {
+                let tab = &mut self.tabs[self.active];
+                tab.indent = match (spaces, tab.indent) {
+                    (false, _) => Indent::Tabs,
+                    (true, Indent::Spaces(n)) => Indent::Spaces(n),
+                    (true, Indent::Tabs) => Indent::Spaces(self.settings.tab_size),
+                };
+                tab.indent_picked = true;
+                self.settings.use_spaces = spaces;
+                self.settings.save();
+            }
+            Cmd::TabSize(n) => {
+                let tab = &mut self.tabs[self.active];
+                if let Indent::Spaces(_) = tab.indent {
+                    tab.indent = Indent::Spaces(n);
+                    tab.indent_picked = true;
+                }
+                self.settings.tab_size = n;
+                self.settings.save();
+                self.restyle = true;
+            }
+            Cmd::FontSize(n) => {
+                self.settings.font_size = n as f32;
+                self.settings.save();
+                self.restyle = true;
+            }
+            Cmd::JsonIndent(n) => {
+                self.settings.json_indent = n.clamp(1, 8);
+                self.settings.save();
+                let n = self.settings.json_indent as u64;
+                self.flash(format!("Formatting indents by {}", edit::plural(n, "space", "spaces")), false);
             }
         }
         self.dirty_title = true;
@@ -2895,6 +3091,25 @@ impl App {
         }
         false
     }
+}
+
+/// Help → Report a problem…: GitHub's new issue page, the version and system filled in (the user sees it all, and
+/// sends it, or doesn't, themselves).
+pub fn report_url() -> String {
+    // (`/etc/os-release` names the system: "Debian GNU/Linux 12 (bookworm)")
+    let system = std::fs::read_to_string("/etc/os-release")
+        .ok()
+        .and_then(|s| s.lines().find_map(|l| l.strip_prefix("PRETTY_NAME=").map(|v| v.trim_matches('"').to_string())))
+        .unwrap_or_else(|| "Linux".into());
+    let body = format!(
+        "**What happened?**\n\n\n**What did you expect?**\n\n\n**How to make it happen, if you know:**\n1. \n\n---\n\
+         Slate {} on {system} ({})\n\n\
+         If Slate crashed: crash.log in Slate's settings folder (Help → Open settings folder) helps find out why. It \
+         can contain bits of the text you had open, so attach it only if that's all right.",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::ARCH
+    );
+    format!("https://github.com/jamesccupps/Slate/issues/new?body={}", crate::convert::url_encode(body.as_bytes()))
 }
 
 /// The language of a document, from its file's name and first bytes.
