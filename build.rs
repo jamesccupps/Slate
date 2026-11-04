@@ -141,7 +141,7 @@ fn version_info(version: &str) -> Vec<u8> {
         ("FileDescription", "Slate"),
         ("FileVersion", version),
         ("InternalName", "Slate"),
-        ("LegalCopyright", "Copyright (c) 2026 jamesccupps. MIT license."),
+        ("LegalCopyright", "Copyright (c) 2026 James Cupps. MIT license."),
         ("OriginalFilename", "Slate.exe"),
         ("ProductName", "Slate"),
         ("ProductVersion", version),
