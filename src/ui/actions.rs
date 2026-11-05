@@ -69,6 +69,8 @@ pub const TIMER_STRUCTURE: usize = 11;
 pub const TIMER_UNCLOAK: usize = 12;
 /// The window has shown: spell check's checker is made (`App::speller`).
 pub const TIMER_SPELL: usize = 13;
+/// Drawing couldn't start (the graphics device was lost, during a resize say): paint again from a fresh target.
+pub const TIMER_REPAINT: usize = 14;
 
 const BIG_CLIPBOARD: u64 = 64 << 20;
 /// What the status bar says when the clipboard couldn't be written.
@@ -238,15 +240,35 @@ impl App {
         self.indent_of(self.active)
     }
 
+    /// What EditorConfig says for `path` (tab `i`'s file, or where it's being saved), if it's known yet: a file read
+    /// brings it (`Opened::editorconfig`); else it's looked up on another thread (never on this one: a folder on a
+    /// share that dropped can take a minute to answer), and the indentation is worked out again once it's there.
+    fn editorconfig_for(&mut self, i: usize, path: &Path) -> Option<crate::editorconfig::Props> {
+        let notify = self.notify.clone();
+        let t = &mut self.tabs[i];
+        if let Some((p, props)) = &t.editorconfig {
+            if p == path {
+                return Some(*props);
+            }
+        }
+        if !t.editorconfig_job.as_ref().is_some_and(|(p, _)| p == path) {
+            let p = path.to_path_buf();
+            t.editorconfig_job = Some((p.clone(), Job::spawn(0, notify, move |_| crate::editorconfig::for_file(&p))));
+            self.timer(TIMER_JOBS, 100);
+        }
+        None
+    }
+
     /// Looks at how tab `i`'s text is indented (after opening or loading it), unless the user picked it.
     fn detect_indent(&mut self, i: usize) {
         let width = self.settings.tab_size;
-        let t = &mut self.tabs[i];
         // EditorConfig first, the project's own rule (and for a new file, its line endings and encoding)
-        let (ec, eol, charset) = match t.doc.path.as_deref() {
-            Some(p) => editor::editorconfig_of(p, width),
-            None => (None, None, None),
+        let ec = match self.tabs[i].doc.path.clone() {
+            Some(p) => self.editorconfig_for(i, &p).unwrap_or_default(),
+            None => Default::default(),
         };
+        let (ec, eol, charset) = editor::editorconfig_of(&ec, width);
+        let t = &mut self.tabs[i];
         if t.doc.is_empty() && !t.doc.is_dirty() {
             if let Some(e) = eol {
                 t.doc.eol = e;
@@ -630,6 +652,9 @@ impl App {
         // (the file it read: `notes.txt` for `notes.txt:120`)
         if self.tabs[i].reload.is_none() && !opened.path.as_os_str().is_empty() {
             self.tabs[i].doc.path = Some(opened.path.clone());
+        }
+        if !opened.path.as_os_str().is_empty() {
+            self.tabs[i].editorconfig = Some((opened.path.clone(), opened.editorconfig));
         }
         let loading = match opened.loading {
             Ok(l) => l,
@@ -1092,6 +1117,8 @@ impl App {
         lossy_ok: bool,
     ) -> bool {
         let notify = self.notify.clone();
+        // (EditorConfig's insert_final_newline, if it's known for that file yet)
+        let final_newline = self.editorconfig_for(i, &path).and_then(|p| p.final_newline) == Some(true);
         let tab = &mut self.tabs[i];
         if let Some(st) = tab.save.as_mut() {
             // Already saving: save the newer text right after (to the same file only).
@@ -1109,7 +1136,7 @@ impl App {
         }
         // (EditorConfig's insert_final_newline)
         let eol = tab.doc.eol.as_bytes().to_vec();
-        if !tab.read_only && tab.filter.is_none() && editor::final_newline(&mut tab.doc, &path, &eol) {
+        if !tab.read_only && tab.filter.is_none() && editor::final_newline(&mut tab.doc, final_newline, &eol) {
             tab.sync_view();
         }
         let snap = tab.doc.snapshot();
@@ -1118,7 +1145,7 @@ impl App {
         let p = path.clone();
         let bom = tab.doc.bom;
         let saving = snap.clone();
-        let damaged = tab.doc.bad_units > 0 && !lossy_ok;
+        let damaged = (tab.doc.bad_units > 0 || tab.doc.suspect) && !lossy_ok;
         let job = Job::spawn(snap.len(), notify, move |ctx| {
             if damaged {
                 return Err(SaveError::Lossy);
@@ -1190,7 +1217,7 @@ impl App {
             if tab.doc.disk != Some(c.old) || tab.busy() {
                 continue;
             }
-            if (c.now == Some(c.old) && !c.in_place) || tab.seen_disk == Some(c.now) {
+            if (c.now.is_some_and(|n| c.old.same(n)) && !c.in_place) || tab.seen_disk == Some(c.now) {
                 continue;
             }
             let dirty = tab.doc.is_dirty();
@@ -1410,6 +1437,18 @@ impl App {
         if self.tabs.get(i).map(|t| t.id) != Some(id) {
             return running;
         }
+        // EditorConfig looked up: the indentation by it (and a new file's line endings and encoding)
+        if let Some((path, job)) = self.tabs[i].editorconfig_job.as_mut() {
+            match job.take() {
+                Some(props) => {
+                    let path = path.clone();
+                    self.tabs[i].editorconfig_job = None;
+                    self.tabs[i].editorconfig = Some((path, props));
+                    self.detect_indent(i);
+                }
+                None => running = true,
+            }
+        }
         // Newline index.
         if let Some(job) = self.tabs[i].index_job.as_mut() {
             if job.take().is_some() {
@@ -1550,6 +1589,7 @@ impl App {
                 tab.doc.mark_saved_at(st.state);
                 // (parts of a damaged file are saved as U+FFFD now, as the user agreed: the file has what the text has)
                 tab.doc.bad_units = 0;
+                tab.doc.suspect = false;
                 tab.seen_disk = None;
                 // A big file: the text reads from the saved file from now on (what was typed meanwhile aside).
                 if let Some((src, start, nl)) = saved.rebase {
@@ -1638,6 +1678,8 @@ impl App {
                         return false;
                     }
                     SaveError::ReadOnly => "This file is read-only, so it couldn't be saved.".to_string(),
+                    // (Linux only)
+                    SaveError::Owner => format!("Couldn't save: {e}"),
                     SaveError::Io(m) => format!("Couldn't save: {m}"),
                 };
                 self.tabs[i].notice = Some(Notice {
@@ -4053,6 +4095,10 @@ impl App {
                     self.invalidate();
                 }
             }
+            TIMER_REPAINT => {
+                self.kill_timer(id);
+                self.invalidate();
+            }
             TIMER_JOBS => self.poll_jobs(),
             TIMER_DISK => {
                 self.check_disk();
@@ -5898,14 +5944,31 @@ fn tab_index(cell: &Cell, id: u64) -> Option<usize> {
 /// save it as UTF-8 instead (carrying on with closing, if that's what it was for), save as ANSI anyway (the
 /// characters become "?"; the tab then stays open, with the text still in it), or don't save.
 fn ask_lossy(cell: &Cell, id: u64) {
-    let (hwnd, title, (path, close_after, closing, enc), damaged) = {
+    let (hwnd, title, (path, close_after, closing, enc), damaged, suspect) = {
         let mut a = cell.borrow_mut();
         let hwnd = a.hwnd;
         let Some(t) = a.tabs.iter_mut().find(|t| t.id == id) else { return };
         let Some(ask) = t.ask_lossy.take() else { return };
         let damaged = (t.doc.bad_units > 0).then(|| (t.doc.bad_units, t.doc.encoding));
-        (hwnd, t.title(), ask, damaged)
+        let suspect = t.doc.suspect;
+        (hwnd, t.title(), ask, damaged, suspect)
     };
+    if suspect {
+        // Text was put in after part of the file couldn't be read: it may hold the blank bytes that read gave.
+        let q = format!("Part of {title} couldn't be read while it was edited");
+        let detail = "An edit since may have copied blank bytes from where it couldn't be read (a network drive that \
+                      dropped, or a part another program had locked), and saving would write them over what the file \
+                      has. Reload it from disk to start again from what's there now.";
+        let choice = win::ask(hwnd, "Slate", &q, detail, &["&Save anyway", "Cancel"]);
+        let Some(i) = tab_index(cell, id) else { return };
+        if choice == Some(0) {
+            let started = cell.borrow_mut().start_save_lossy(i, path, enc, close_after, true);
+            if started && closing {
+                run_cmd(cell, Cmd::Exit);
+            }
+        }
+        return;
+    }
     if let Some((n, enc)) = damaged {
         // A file that wasn't all text in its encoding: what wasn't shows as U+FFFD, and can't be saved back.
         let q = format!("Parts of {title} weren't {} text", enc.label());

@@ -184,17 +184,20 @@ fn notifier() -> Notify {
     })
 }
 
-/// SIGTERM, SIGHUP or SIGINT (the system stopping Slate) write the session and end, on the main loop.
+/// SIGTERM, SIGHUP or SIGINT write the session, on the main loop. SIGTERM (the system stopping Slate) then ends it;
+/// SIGHUP (the terminal it was started from closed) and SIGINT (Ctrl+C there) do too unless there's unsaved work the
+/// session can't keep, which is asked about as closing the window asks.
 fn stop_on_signals() {
     use std::sync::atomic::{AtomicI32, Ordering};
     static PIPE: AtomicI32 = AtomicI32::new(-1);
-    extern "C" fn on_signal(_: libc::c_int) {
+    extern "C" fn on_signal(signal: libc::c_int) {
         // (only what's safe in a signal handler: a write, errno kept)
         unsafe {
             let errno = *libc::__errno_location();
             let fd = PIPE.load(Ordering::Relaxed);
             if fd >= 0 {
-                libc::write(fd, b"x".as_ptr().cast(), 1);
+                let b = signal as u8;
+                libc::write(fd, (&b as *const u8).cast(), 1);
             }
             *libc::__errno_location() = errno;
         }
@@ -209,18 +212,23 @@ fn stop_on_signals() {
         let mut b = [0u8; 1];
         loop {
             match unsafe { libc::read(read_end, b.as_mut_ptr().cast(), 1) } {
-                1 => break,
+                1 => {}
                 n if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted => continue,
                 _ => return,
             }
+            let stop = b[0] == libc::SIGTERM as u8;
+            glib::MainContext::default().invoke(move || {
+                if let Some(ui) = get_ui() {
+                    if ui.ending() && !stop {
+                        ui.window.present();
+                        ui.try_quit();
+                    } else {
+                        ui.closing.set(true);
+                        ui.gtk_app.quit();
+                    }
+                }
+            });
         }
-        glib::MainContext::default().invoke(|| {
-            if let Some(ui) = get_ui() {
-                ui.ending();
-                ui.closing.set(true);
-                ui.gtk_app.quit();
-            }
-        });
     });
     if waiting.is_err() {
         return;
@@ -298,6 +306,7 @@ pub fn run(args: Vec<std::ffi::OsString>) -> i32 {
         return testmode::run(&args);
     }
     std::panic::set_hook(Box::new(|info| log_crash(&info.to_string())));
+    crate::settings::make_data_dir();
     // `--read-only`, `--wait` and `-` (standard input): `run_request`
     let mut args = args;
     let mut flag = |f: &str| args.iter().position(|a| a == f).map(|i| args.remove(i)).is_some();
@@ -365,7 +374,7 @@ fn run_request(application: &gtk4::Application, args: Vec<std::ffi::OsString>, r
             })
         })
         .collect();
-    let handed = crate::settings::data_dir().join("handed");
+    let handed = crate::settings::make_data_dir().join("handed");
     let _ = std::fs::create_dir_all(&handed);
     let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
     let token = format!("{}-{stamp}", std::process::id());
@@ -377,7 +386,15 @@ fn run_request(application: &gtk4::Application, args: Vec<std::ffi::OsString>, r
         let mut text = Vec::new();
         let _ = std::io::Read::read_to_end(&mut std::io::stdin(), &mut text);
         let p = handed.join(format!("stdin-{token}.txt"));
-        if std::fs::write(&p, &text).is_ok() {
+        // (its owner's only: what's piped in may be a secret, `pass show x | slate -`)
+        use std::os::unix::fs::OpenOptionsExt;
+        let written = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&p)
+            .and_then(|mut f| std::io::Write::write_all(&mut f, &text));
+        if written.is_ok() {
             files.push(gio::File::for_path(&p));
             hint.push_str(&format!("text={token};"));
         }
@@ -2048,8 +2065,8 @@ impl Ui {
 
     /// The desktop session is ending (logging out, shutting down) or Slate was told to stop: the session is written
     /// now, so everything up to the last key comes back next time. Unsaved work it can't keep makes logging out wait
-    /// (where the session manager does), and the window shows it.
-    pub fn ending(&self) {
+    /// (where the session manager does), and the window shows it. Returns whether there is such work.
+    pub fn ending(&self) -> bool {
         let unkept = self
             .guarded(|a| {
                 if self.test.is_none() {
@@ -2071,6 +2088,7 @@ impl Ui {
             }
             self.window.present();
         }
+        unkept
     }
 
     fn save_settings(&self, a: &mut App) {
@@ -3212,10 +3230,10 @@ impl Ui {
                 );
             }
             Ask::Lossy { tab, path, encoding, close_after } => {
-                let (title, bad) = {
+                let (title, bad, suspect) = {
                     let a = self.app.borrow();
                     match a.index_of(tab) {
-                        Some(i) => (a.tabs[i].title(), a.tabs[i].doc.bad_units),
+                        Some(i) => (a.tabs[i].title(), a.tabs[i].doc.bad_units, a.tabs[i].doc.suspect),
                         None => return,
                     }
                 };
@@ -3225,7 +3243,17 @@ impl Ui {
                         ui.answer(ask.clone(), answer);
                     }
                 };
-                if bad > 0 {
+                if suspect {
+                    // Text was put in after part of the file couldn't be read: it may hold the blank bytes that read gave.
+                    self.dialog(
+                        &format!("Part of {title} couldn't be read while it was edited"),
+                        "An edit since may have copied blank bytes from where it couldn't be read (a network drive that \
+                         dropped, or a file that shrank), and saving would write them over what the file has. Reload it \
+                         from disk to start again from what's there now.",
+                        &[("Cancel", "cancel"), ("Save anyway", "damaged")],
+                        done,
+                    );
+                } else if bad > 0 {
                     // A file that wasn't all text in its encoding: what wasn't shows as U+FFFD, and can't be saved back.
                     let what = if bad == 1 { "One place shows".to_string() } else { format!("{bad} places show") };
                     self.dialog(
@@ -3245,6 +3273,21 @@ impl Ui {
                         done,
                     );
                 }
+            }
+            Ask::Owner { tab, path, encoding, close_after } => {
+                let Some(title) = self.app.borrow().index_of(tab).map(|i| self.app.borrow().tabs[i].title()) else { return };
+                let ask = Ask::Owner { tab, path, encoding, close_after };
+                self.dialog(
+                    &format!("Saving would change who owns {title}"),
+                    "It belongs to another user, or to a group you aren't in. Slate saves by putting a new file in its \
+                     place, which would be yours, so people who can open it now may not be able to afterwards.",
+                    &[("Cancel", "cancel"), ("Save anyway", "owner")],
+                    move |answer: &str| {
+                        if let Some(ui) = get_ui() {
+                            ui.answer(ask.clone(), answer);
+                        }
+                    },
+                );
             }
             Ask::GotoLine => self.goto_dialog(),
             Ask::Quit => self.try_quit(),
@@ -3465,7 +3508,9 @@ impl Ui {
                     let Some(i) = a.index_of(tab) else { return };
                     match answer {
                         // (a damaged file, saved as it reads now: closing carries on)
-                        "damaged" | "anyway" if a.tabs[i].doc.bad_units > 0 => a.start_save(i, path, encoding, close_after, true),
+                        "damaged" | "anyway" if a.tabs[i].doc.bad_units > 0 || a.tabs[i].doc.suspect => {
+                            a.start_save(i, path, encoding, close_after, true)
+                        }
                         // ANSI with "?" in it: the tab (and the window) stay open, the text still in it
                         "anyway" => {
                             a.quitting = false;
@@ -3476,6 +3521,17 @@ impl Ui {
                             a.start_save(i, path, crate::core::text::Encoding::Utf8, close_after, false);
                         }
                         _ => a.quitting = false,
+                    }
+                });
+            }
+            Ask::Owner { tab, path, encoding, close_after } => {
+                self.with(|a| {
+                    let Some(i) = a.index_of(tab) else { return };
+                    if answer == "owner" {
+                        a.tabs[i].owner_ok = Some(path.clone());
+                        a.start_save(i, path, encoding, close_after, false);
+                    } else {
+                        a.quitting = false;
                     }
                 });
             }

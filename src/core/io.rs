@@ -108,12 +108,14 @@ pub struct Opened {
     pub creatable: bool,
     /// It can't be written (read-only on disk, or another's): its tab opens read only.
     pub read_only: bool,
+    /// What EditorConfig says for it (read here, on the job's thread: its folders can be slow to answer).
+    pub editorconfig: crate::editorconfig::Props,
 }
 
 impl Failure for Opened {
     fn failure(msg: &str) -> Opened {
         let loading = Err(io::Error::other(msg.to_string()));
-        Opened { path: PathBuf::new(), loading, canon: None, binary: false, creatable: false, read_only: false }
+        Opened { path: PathBuf::new(), loading, canon: None, binary: false, creatable: false, read_only: false, editorconfig: Default::default() }
     }
 }
 
@@ -130,6 +132,7 @@ pub fn open(path: &Path, notify: Notify, create: bool, ctx: &Ctx) -> Opened {
         binary: there && looks_binary(path),
         creatable: create && missing && path.parent().is_some_and(Path::is_dir),
         read_only: there && !os::can_write(path),
+        editorconfig: crate::editorconfig::for_file(path),
     }
 }
 
@@ -144,10 +147,20 @@ pub fn open_either(path: &Path, or: &Path, notify: Notify, create: bool, ctx: &C
     }
 }
 
+/// Whether saving `path` keeps who owns it. On Linux a save puts a new file in its place, which is this user's, in this
+/// user's group unless the old one's is a group this user is in (`copy_identity` gives it that); only root can give a
+/// file away. So a file of another user's that this one may write (a shared group's, an ACL's), or of a group this user
+/// isn't in, would change hands: the web server's group, the colleague the file was shared by, losing access. True for a
+/// file that isn't there, and on Windows (a new file there gets the old one's permissions).
+pub fn owner_kept(path: &Path) -> bool {
+    os::owner_kept(path)
+}
+
 /// Reads `path` again (see `open_with`), on another thread like `open`.
 pub fn reload(path: &Path, notify: Notify, prev: Option<Arc<Source>>, force: Option<Encoding>, ctx: &Ctx) -> Opened {
     let loading = open_with(path, notify, prev, force, ctx);
-    Opened { path: path.to_path_buf(), loading, canon: None, binary: false, creatable: false, read_only: false }
+    let editorconfig = crate::editorconfig::for_file(path);
+    Opened { path: path.to_path_buf(), loading, canon: None, binary: false, creatable: false, read_only: false, editorconfig }
 }
 
 /// Opens `path`. `prev` is the source of the same file opened earlier (a reload): if the file only grew, its
@@ -383,6 +396,8 @@ pub enum SaveError {
     Lossy,
     /// Another program wrote into a file the text is read from (see `Source::changed_in_place`).
     Changed,
+    /// Linux: saving would change who owns the file (`owner_kept`); nothing was written.
+    Owner,
     Io(String),
 }
 
@@ -397,6 +412,7 @@ impl std::fmt::Display for SaveError {
                 "Another program changed this file while it was open. Slate reads big files from disk, so the parts \
                  you didn't edit aren't your version any more, and saving would mix the two. Nothing was saved."
             ),
+            SaveError::Owner => write!(f, "Saving would change who owns this file."),
             SaveError::Io(s) => write!(f, "{s}"),
         }
     }
@@ -1036,6 +1052,10 @@ pub fn save(
                 .into(),
         ));
     };
+    // The original's permissions on the temp file before anything is written into it, so a private file's new text
+    // is never readable by those its folder lets read (a big save takes a while). Where they can't be, ReplaceFile
+    // puts it in place (`special`), which keeps them.
+    let kept = old.is_none() || place::keep_permissions(&target, &file, &temp_path);
 
     let result = (|| -> Result<(Option<IndexBuilder>, bool), SaveError> {
         let mut w = BufWriter::with_capacity(1 << 20, &file);
@@ -1069,8 +1089,8 @@ pub fn save(
     // Swap the new file into place: on Windows a POSIX rename (atomic, and it replaces a file still open with
     // delete sharing, as Slate keeps big files); where the file system doesn't have those (network shares, FAT
     // drives) a plain rename, and if that can't replace the file because Slate still has it open, ReplaceFile.
-    // (the original's permissions kept on the new file; where they can't be, ReplaceFile tries)
-    let special = old.as_ref().is_some_and(|m| place::special(&target, m) || !place::keep_permissions(&target, &file, &temp_path));
+    // (the original's permissions kept on the new file; where they couldn't be, ReplaceFile tries)
+    let special = old.as_ref().is_some_and(|m| place::special(&target, m) || !kept);
     let (renamed, written, set_aside, why) = place::swap_in(file, &temp_path, &target, old.is_some(), special, dir);
     if !renamed {
         let _ = fs::remove_file(&temp_path);

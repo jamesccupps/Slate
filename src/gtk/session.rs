@@ -62,6 +62,12 @@ struct SessionTab {
     /// File → Read only.
     #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
     read_only: Option<bool>,
+    /// What its file looked like when the text was read or saved (as Windows keeps it), so a change made while Slate
+    /// was closed is noticed (and nothing is asked of the file system at the start).
+    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    disk_len: Option<u64>,
+    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    disk_modified_ms: Option<u64>,
     /// The starts of the lines bookmarked.
     #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
     bookmarks: Option<Vec<u64>>,
@@ -309,6 +315,8 @@ fn plan(app: &mut App) -> Option<Plan> {
             bom: tab.doc.bom,
             eol: Some(tab.doc.eol),
             read_only: tab.read_only.then_some(true),
+            disk_len: tab.doc.disk.map(|x| x.len),
+            disk_modified_ms: tab.doc.disk.map(|x| x.modified.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)),
             bookmarks: (!marks.is_empty()).then_some(marks),
             ..Default::default()
         };
@@ -535,10 +543,12 @@ pub fn restore(app: &mut App, watch: bool) {
                 if let Some(e) = st.eol {
                     tab.doc.eol = e;
                 }
-                // what's on disk, so a change by another program is noticed
-                if let Some(p) = &path {
-                    tab.doc.disk = crate::core::io::disk_info(p);
-                }
+                // what its file looked like then, so a change by another program since is noticed (a session from 0.16.0
+                // or older kept none: what's there now)
+                tab.doc.disk = match (st.disk_len, st.disk_modified_ms) {
+                    (Some(len), Some(ms)) => Some(crate::core::document::DiskInfo { len, modified: UNIX_EPOCH + Duration::from_millis(ms) }),
+                    _ => path.as_deref().and_then(crate::core::io::disk_info),
+                };
                 let len = tab.doc.len();
                 tab.view.sel = Sel::new(st.anchor.min(len), st.caret.min(len));
                 tab.view.top = st.top.min(len);

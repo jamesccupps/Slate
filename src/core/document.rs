@@ -9,7 +9,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::buffer::{Buffer, Piece, Snapshot};
 use super::source::Source;
@@ -115,6 +115,18 @@ pub struct DiskInfo {
     pub modified: SystemTime,
 }
 
+impl DiskInfo {
+    /// Whether the file looks as it did when this was taken (`now`: what it looks like now). The session keeps the
+    /// time in whole milliseconds (the file system has 100 ns or 1 ns): a time on a millisecond, as one read from the
+    /// session is, matches any time within that millisecond. (Compared exactly, every tab put back with unsaved
+    /// changes said another program had changed its file.)
+    pub fn same(self, now: DiskInfo) -> bool {
+        let ns = |t: SystemTime| t.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+        let (a, b) = (ns(self.modified), ns(now.modified));
+        self.len == now.len && (a == b || (a % 1_000_000 == 0 && a / 1_000_000 == b / 1_000_000))
+    }
+}
+
 pub struct Document {
     buf: Buffer,
     /// While the main source is still being indexed: that source and where the document starts in it (after a BOM).
@@ -143,6 +155,12 @@ pub struct Document {
     /// Parts of the file that weren't text in its encoding (UTF-16 halves of characters without their other half,
     /// an odd byte at the end): they read as U+FFFD and can't be saved back as they were, so saving asks first.
     pub bad_units: u64,
+    /// Text was put in after a read of the file failed (`Buffer::all_read_errors` went up): a failed read gives zeros,
+    /// and an edit that copies text (Indent, a line tool, Paste of a copy) may have put them in, where nothing would
+    /// show it any more (the part that failed may not be used now). Saving asks first; a save clears it.
+    pub suspect: bool,
+    /// `all_read_errors` at the last insert.
+    errors_seen: u64,
 }
 
 impl Default for Document {
@@ -178,6 +196,8 @@ impl Document {
             eol: Eol::NATIVE,
             disk: None,
             bad_units: 0,
+            suspect: false,
+            errors_seen: 0,
         }
     }
 
@@ -539,6 +559,11 @@ impl Document {
         if text.is_empty() {
             return;
         }
+        let errors = self.buf.all_read_errors();
+        if errors > self.errors_seen {
+            self.suspect = true;
+        }
+        self.errors_seen = errors;
         let pieces = self.buf.insert(at, text);
         self.changes.push(Change { at, del: 0, ins: text.len() as u64 });
         self.record(Op::Insert { at, pieces });
@@ -701,6 +726,27 @@ mod tests {
 
     fn text(d: &Document) -> String {
         String::from_utf8(d.read(0, d.len())).unwrap()
+    }
+
+    #[test]
+    fn text_put_in_after_a_failed_read_is_suspect() {
+        use std::io::Write;
+        // a file source that says it's longer than its file: reading its end fails, giving zeros
+        let (mut f, path) = crate::core::source::create_temp_file().unwrap();
+        f.write_all(&vec![b'x'; 300_000]).unwrap();
+        let src = Arc::new(Source::from_file(f, 400_000, path, true, None));
+        let mut d = Document::from_buffer(Buffer::from_source(src, 0));
+        d.begin(EditKind::Other, Sel::at(0));
+        d.insert(0, b"typed");
+        d.end(Sel::at(0));
+        assert!(!d.suspect);
+        // Indent-like: the part that failed read, then put back in place of itself (no piece of the file left there)
+        let copy = d.read(350_000, 350_010);
+        d.begin(EditKind::Other, Sel::at(0));
+        d.delete(350_000, 350_010);
+        d.insert(350_000, &copy);
+        d.end(Sel::at(0));
+        assert!(d.suspect && d.read(350_000, 350_010) == vec![0; 10]);
     }
 
     #[test]

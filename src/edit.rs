@@ -1029,11 +1029,12 @@ pub fn char_start(doc: &Document, pos: u64) -> u64 {
     p
 }
 
-/// EditorConfig's `insert_final_newline` as a file is saved: a line break (`eol`) added at the end of a text that
-/// doesn't end with one, as an edit of its own (undone like any). Returns whether it added one.
-pub fn final_newline(doc: &mut Document, path: &std::path::Path, eol: &[u8]) -> bool {
+/// EditorConfig's `insert_final_newline` as a file is saved (`wanted`: it says so for that file): a line break (`eol`)
+/// added at the end of a text that doesn't end with one, as an edit of its own (undone like any). Returns whether it
+/// added one.
+pub fn final_newline(doc: &mut Document, wanted: bool, eol: &[u8]) -> bool {
     let len = doc.len();
-    if len == 0 || matches!(doc.byte_at(len - 1), Some(b'\n' | b'\r')) || crate::editorconfig::for_file(path).final_newline != Some(true) {
+    if !wanted || len == 0 || matches!(doc.byte_at(len - 1), Some(b'\n' | b'\r')) {
         return false;
     }
     let sel = Sel::at(len);
@@ -1044,10 +1045,9 @@ pub fn final_newline(doc: &mut Document, path: &std::path::Path, eol: &[u8]) -> 
     true
 }
 
-/// What EditorConfig says about a file at `path` for its indentation (`default_width` when it gives the kind and not
-/// the width), and for a new (empty) document its line endings and encoding: (indentation, line endings, encoding).
-pub fn editorconfig_of(path: &std::path::Path, default_width: u32) -> (Option<Indent>, Option<Eol>, Option<Encoding>) {
-    let p = crate::editorconfig::for_file(path);
+/// What EditorConfig's `p` says for indentation (`default_width` when it gives the kind and not the width), and for a
+/// new (empty) document its line endings and encoding: (indentation, line endings, encoding).
+pub fn editorconfig_of(p: &crate::editorconfig::Props, default_width: u32) -> (Option<Indent>, Option<Eol>, Option<Encoding>) {
     let indent = match (p.spaces, p.indent_size) {
         (Some(true), n) => Some(Indent::Spaces(n.unwrap_or(default_width))),
         (Some(false), _) => Some(Indent::Tabs),

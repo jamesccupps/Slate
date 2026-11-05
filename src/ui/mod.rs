@@ -1506,8 +1506,9 @@ pub fn run(raw: Vec<std::ffi::OsString>) -> i32 {
         Running::Took(_) => return 0,
         Running::No => {
             // What 0.15.0 and older named plain "Slate" (the data folder, registry keys) moves to Slate's own names,
-            // once, while no other Slate runs (it would go on using the old ones).
-            if !other_slate_running() {
+            // once, while no other Slate runs (it would go on using the old ones). Not right after an update: the
+            // version before may yet go back in place, and it knows only the old names.
+            if !updated && update_failed.is_none() && !other_slate_running() {
                 settings::move_data_dir();
                 install::move_names();
             }

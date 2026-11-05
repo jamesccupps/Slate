@@ -672,6 +672,12 @@ impl Buffer {
         }
     }
 
+    /// Total read errors of all its sources, the ones the current content doesn't use any more too (but not those let
+    /// go of: `release_unused`).
+    pub fn all_read_errors(&self) -> u64 {
+        self.sources.iter().enumerate().filter(|&(i, _)| i as u32 != self.add_id).map(|(_, s)| s.read_errors()).sum()
+    }
+
     /// Total read errors of the sources the current content uses (see `Source::read_errors`).
     pub fn read_errors(&self) -> u64 {
         self.with_used(|used| {

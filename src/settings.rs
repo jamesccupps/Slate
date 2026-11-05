@@ -215,11 +215,28 @@ fn move_data_dir_in(new: &std::path::Path, old: &std::path::Path) -> bool {
 /// How big crash.log gets before it starts over (the one before kept as crash.log.old).
 const CRASH_LOG_MAX: u64 = 1 << 20;
 
+/// Makes the data folder if it isn't there, and returns it. On Linux it's its owner's only (0700): it holds unsaved
+/// text, text piped in, the find history (one made by 0.16.0 or older was 0755, readable by other users: made the
+/// owner's).
+pub fn make_data_dir() -> PathBuf {
+    let dir = data_dir();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        let _ = std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir);
+        if std::fs::metadata(&dir).is_ok_and(|m| m.permissions().mode() & 0o077 != 0) {
+            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
 /// Adds `line` to crash.log in the data folder. A panic that comes back at every repaint would otherwise make it grow
 /// for as long as Slate runs: past `CRASH_LOG_MAX` it starts over, keeping the last one beside it.
 pub fn append_crash_log(line: &str) {
-    let dir = data_dir();
-    let _ = std::fs::create_dir_all(&dir);
+    let dir = make_data_dir();
     append_capped(&dir.join("crash.log"), line, CRASH_LOG_MAX);
 }
 
@@ -276,10 +293,10 @@ impl Settings {
         if !persist() {
             return;
         }
-        let dir = data_dir();
-        let _ = std::fs::create_dir_all(&dir);
+        let dir = make_data_dir();
         let Ok(json) = serde_json::to_vec_pretty(self) else { return };
-        let tmp = dir.join("settings.json.tmp");
+        // (named for this process: an administrator's Slate and another one saving at once each write their own)
+        let tmp = dir.join(format!("settings.json.{}.tmp", std::process::id()));
         // On the disk before it takes the name (after a power cut a renamed file can otherwise come back empty).
         let written = std::fs::File::create(&tmp).and_then(|mut f| f.write_all(&json).and_then(|_| f.sync_all()));
         if written.is_ok() {

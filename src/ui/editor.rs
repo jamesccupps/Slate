@@ -1264,15 +1264,20 @@ impl View {
         }
 
         // High contrast: selected text in the highlight's own text color (where the selection has the highlight
-        // color), drawn again over the rest.
-        if t.hc && !sel.is_empty() && (focused || sel_is_match) {
+        // color), drawn again over the rest. Other themes: the current match's text in one dark color on its orange.
+        let over = if t.hc && !sel.is_empty() && (focused || sel_is_match) {
+            Some(t.selection_text)
+        } else {
+            sel_is_match.then_some(t.match_current_text)
+        };
+        if let Some(color) = over {
             for (rc, k) in self.range_rects(cx, sel.start(), sel.end(), ox, false) {
                 let r = &self.rows[k];
                 let p = r.lay.part_of_row(r.row);
                 let (x, y) = (ox + p.x, r.y - (r.row - p.row0) as f32 * row_h);
                 g.push_clip(rc);
                 let ink = Ink { color_glyphs: !r.lay.plain, ..Default::default() };
-                g.draw_layout_in(&p.layout, x, y, t.selection_text, rc, ink);
+                g.draw_layout_in(&p.layout, x, y, color, rc, ink);
                 g.pop_clip();
             }
         }

@@ -572,6 +572,10 @@ pub fn set_aside(name: &str) {
 }
 
 fn set_aside_in(d: &Path, name: &str) {
+    // (only a file of the session folder's own: a name from a damaged session.json could be a path elsewhere)
+    if name.is_empty() || name.contains(['/', '\\', ':']) || name.starts_with('.') {
+        return;
+    }
     let to = d.join("damaged").join(name);
     let _ = fs::create_dir_all(d.join("damaged"));
     if fs::rename(d.join(name), &to).is_ok() {

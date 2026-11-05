@@ -156,6 +156,7 @@ fn busy(cell: &Cell) -> bool {
             || t.find_all.is_some()
             || t.structure.busy()
             || t.structure.pausing()
+            || t.editorconfig_job.is_some()
     }) || a.disk_job.is_some()
         || a.count_job.is_some()
         || matches!(a.update, super::app::UpdateState::Checking { .. } | super::app::UpdateState::Downloading { .. })
@@ -687,6 +688,7 @@ fn describe(cell: &Cell, what: &str) -> String {
                     ("find", t.find_job.is_some()),
                     ("find all tabs", t.find_all.is_some()),
                     ("structure", t.structure.busy()),
+                    ("editorconfig", t.editorconfig_job.is_some()),
                 ];
                 v.extend(parts.iter().filter(|p| p.1).map(|p| p.0));
             }

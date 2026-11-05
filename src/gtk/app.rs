@@ -44,6 +44,8 @@ pub enum Ask {
     CloseUnsaved { tab: u64 },
     /// Saving in ANSI would turn characters into "?" (or a damaged UTF-16 file can't be saved back as it was).
     Lossy { tab: u64, path: PathBuf, encoding: Encoding, close_after: bool },
+    /// Saving would change who owns the file (`fileio::owner_kept`): save anyway?
+    Owner { tab: u64, path: PathBuf, encoding: Encoding, close_after: bool },
     GotoLine,
     /// Quit once the unsaved tabs that can't be kept are dealt with.
     Quit,
@@ -260,6 +262,10 @@ pub struct Tab {
     pub indent: Indent,
     /// The user picked the indentation (Format → Indentation): it's not guessed again when the file is read again.
     pub indent_picked: bool,
+    /// What EditorConfig says for a path (its file's, or where it was saved), and a look on another thread for one it
+    /// doesn't know yet (`App::editorconfig_for`).
+    editorconfig: Option<(PathBuf, crate::editorconfig::Props)>,
+    editorconfig_job: Option<(PathBuf, Job<crate::editorconfig::Props>)>,
     load: Option<Job<Opened>>,
     convert: Option<Job<std::io::Result<Document>>>,
     index: Option<Job<bool>>,
@@ -271,6 +277,8 @@ pub struct Tab {
     pub notice: Option<String>,
     /// The notice is about a save that failed: it offers Save as….
     pub notice_save_as: bool,
+    /// The file the user said to save even though it changes who owns it (`Ask::Owner`).
+    pub owner_ok: Option<PathBuf>,
     /// Line (and column) to go to once the document is there (`slate file.txt:120`).
     pub goto: Option<(u64, u64)>,
     /// What was last seen on disk (a change already told about isn't told again).
@@ -602,6 +610,8 @@ impl App {
             lang_picked: false,
             indent,
             indent_picked: false,
+            editorconfig: None,
+            editorconfig_job: None,
             load: None,
             convert: None,
             index: None,
@@ -610,6 +620,7 @@ impl App {
             filter_again: false,
             notice: None,
             notice_save_as: false,
+            owner_ok: None,
             goto: None,
             seen_disk: None,
             backup: None,
@@ -645,7 +656,12 @@ impl App {
             tab.indent = i;
         }
         self.tabs.push(tab);
-        self.tabs.len() - 1
+        let i = self.tabs.len() - 1;
+        // (EditorConfig's indentation once it's looked up: never on this thread)
+        if let Some(p) = path {
+            self.editorconfig_for(i, &p);
+        }
+        i
     }
 
     /// Opens files (or switches to the tab that has one open already); an untouched empty tab gives way to the
@@ -946,8 +962,9 @@ impl App {
 
     /// Whether anything runs in the background (test mode waits for it).
     pub fn busy(&self) -> bool {
-        self.tabs.iter().any(|t| t.busy() || t.index.is_some() || t.structure.busy() || t.structure.pausing())
-            || self.count_job.is_some()
+        self.tabs.iter().any(|t| {
+            t.busy() || t.index.is_some() || t.structure.busy() || t.structure.pausing() || t.editorconfig_job.is_some()
+        }) || self.count_job.is_some()
             || self.find_running()
             || self.disk_job.is_some()
             || self.session_job.is_some()
@@ -1161,8 +1178,59 @@ impl App {
         running
     }
 
+    /// What EditorConfig says for `path` (tab `i`'s file, or where it's being saved), if it's known yet: a file read
+    /// brings it (`Opened::editorconfig`); else it's looked up on another thread (a folder on a share that dropped can
+    /// take a minute to answer), and the indentation follows it once it's there.
+    fn editorconfig_for(&mut self, i: usize, path: &Path) -> Option<crate::editorconfig::Props> {
+        let notify = self.notify.clone();
+        let t = &mut self.tabs[i];
+        if let Some((p, props)) = &t.editorconfig {
+            if p == path {
+                return Some(*props);
+            }
+        }
+        if !t.editorconfig_job.as_ref().is_some_and(|(p, _)| p == path) {
+            let p = path.to_path_buf();
+            t.editorconfig_job = Some((p.clone(), Job::spawn(0, notify, move |_| crate::editorconfig::for_file(&p))));
+        }
+        None
+    }
+
+    /// EditorConfig's answer for tab `i`'s file came: its indentation (unless the user picked one), and for an empty
+    /// new document its line endings and encoding.
+    fn apply_editorconfig(&mut self, i: usize) {
+        let tab = &mut self.tabs[i];
+        let Some((p, props)) = tab.editorconfig.as_ref().filter(|(p, _)| Some(p) == tab.doc.path.as_ref()) else { return };
+        let _ = p;
+        let (ec, eol, charset) = edit::editorconfig_of(props, self.settings.tab_size);
+        if tab.doc.is_empty() && !tab.doc.is_dirty() {
+            if let Some(e) = eol {
+                tab.doc.eol = e;
+            }
+            if let Some(c) = charset {
+                tab.doc.encoding = c;
+                tab.doc.bom = matches!(c, Encoding::Utf8Bom | Encoding::Utf16Le | Encoding::Utf16Be);
+            }
+        }
+        if let Some(ind) = ec.filter(|_| !tab.indent_picked) {
+            tab.indent = ind;
+        }
+        self.dirty_view = true;
+    }
+
     fn poll_tab(&mut self, i: usize) -> bool {
         let mut running = false;
+        if let Some((path, job)) = self.tabs[i].editorconfig_job.as_mut() {
+            match job.take() {
+                Some(props) => {
+                    let path = path.clone();
+                    self.tabs[i].editorconfig_job = None;
+                    self.tabs[i].editorconfig = Some((path, props));
+                    self.apply_editorconfig(i);
+                }
+                None => running = true,
+            }
+        }
         if let Some(job) = self.tabs[i].load.as_mut() {
             match job.take() {
                 Some(opened) => {
@@ -1240,6 +1308,9 @@ impl App {
     fn opened(&mut self, i: usize, opened: Opened) -> bool {
         self.dirty_title = true;
         self.dirty_view = true;
+        if !opened.path.as_os_str().is_empty() {
+            self.tabs[i].editorconfig = Some((opened.path.clone(), opened.editorconfig));
+        }
         let id = self.tabs[i].id;
         let reading_again = self.tabs[i].reload.is_some();
         if opened.loading.is_ok() {
@@ -1286,7 +1357,7 @@ impl App {
             Ok(Loading::Converting(job)) => self.tabs[i].convert = Some(job),
             Err(_) if opened.creatable => {
                 // a new file: saving creates it
-                let (ec, eol, charset) = edit::editorconfig_of(&opened.path, self.settings.tab_size);
+                let (ec, eol, charset) = edit::editorconfig_of(&opened.editorconfig, self.settings.tab_size);
                 let tab = &mut self.tabs[i];
                 tab.doc.path = Some(opened.path.clone());
                 tab.lang = detect(Some(&opened.path), &tab.doc);
@@ -1338,11 +1409,10 @@ impl App {
             doc.path = tab.doc.path.clone();
         }
         tab.lang = if tab.lang_picked { tab.lang } else { detect(doc.path.as_deref(), &doc) };
-        // EditorConfig first, the project's own rule (and for a new file, its line endings and encoding)
-        let (ec, eol, charset) = match doc.path.as_deref() {
-            Some(p) => edit::editorconfig_of(p, self.settings.tab_size),
-            None => (None, None, None),
-        };
+        // EditorConfig first, the project's own rule (and for a new file, its line endings and encoding): what the file
+        // read brought (`opened`)
+        let props = tab.editorconfig.as_ref().filter(|(p, _)| Some(p) == doc.path.as_ref()).map(|(_, e)| *e).unwrap_or_default();
+        let (ec, eol, charset) = edit::editorconfig_of(&props, self.settings.tab_size);
         if doc.is_empty() && !doc.is_dirty() {
             if let Some(e) = eol {
                 doc.eol = e;
@@ -1403,6 +1473,7 @@ impl App {
 
     pub fn start_save(&mut self, i: usize, path: PathBuf, encoding: Encoding, close_after: bool, lossy_ok: bool) {
         let notify = self.notify.clone();
+        let final_newline = self.editorconfig_for(i, &path).and_then(|p| p.final_newline) == Some(true);
         let tab = &mut self.tabs[i];
         if tab.save.is_some() {
             self.flash("Still saving — try again when it's done.", true);
@@ -1412,9 +1483,9 @@ impl App {
             self.flash("Still opening the file — try saving again in a moment.", true);
             return;
         }
-        // (EditorConfig's insert_final_newline)
+        // (EditorConfig's insert_final_newline, if it's known for that file yet)
         let eol = tab.doc.eol.as_bytes().to_vec();
-        if !tab.read_only && tab.filter.is_none() && edit::final_newline(&mut tab.doc, &path, &eol) {
+        if !tab.read_only && tab.filter.is_none() && edit::final_newline(&mut tab.doc, final_newline, &eol) {
             tab.sync_view();
         }
         let snap = tab.doc.snapshot();
@@ -1422,10 +1493,14 @@ impl App {
         let version = tab.doc.version;
         let bom = tab.doc.bom;
         let p = path.clone();
-        let damaged = tab.doc.bad_units > 0 && !lossy_ok;
+        let damaged = (tab.doc.bad_units > 0 || tab.doc.suspect) && !lossy_ok;
+        let owner_ok = tab.owner_ok.as_deref() == Some(path.as_path());
         let job = Job::spawn(snap.len(), notify, move |ctx| {
             if damaged {
                 return Err(SaveError::Lossy);
+            }
+            if !owner_ok && !fileio::owner_kept(&p) {
+                return Err(SaveError::Owner);
             }
             fileio::save(&snap, &p, encoding, bom, lossy_ok, ctx)
         });
@@ -1456,6 +1531,7 @@ impl App {
                 tab.doc.disk = saved.disk;
                 tab.doc.mark_saved_at(st.state);
                 tab.doc.bad_units = 0;
+                tab.doc.suspect = false;
                 tab.seen_disk = None;
                 if let Some((src, start, nl)) = saved.rebase {
                     if tab.doc.version == st.version {
@@ -1490,6 +1566,10 @@ impl App {
             Err(SaveError::Lossy) => {
                 let tab = self.tabs[i].id;
                 self.asks.push(Ask::Lossy { tab, path: st.path, encoding: st.encoding, close_after: st.close_after });
+            }
+            Err(SaveError::Owner) => {
+                let tab = self.tabs[i].id;
+                self.asks.push(Ask::Owner { tab, path: st.path, encoding: st.encoding, close_after: st.close_after });
             }
             Err(SaveError::Cancelled) => {
                 self.flash("Saving was cancelled.", false);
@@ -3397,7 +3477,8 @@ impl App {
         for (id, now) in found {
             let Some(i) = self.index_of(id) else { continue };
             let tab = &mut self.tabs[i];
-            if tab.busy() || tab.index.is_some() || now == tab.doc.disk || tab.seen_disk == Some(now) {
+            let same = now == tab.doc.disk || tab.doc.disk.zip(now).is_some_and(|(old, n)| old.same(n));
+            if tab.busy() || tab.index.is_some() || same || tab.seen_disk == Some(now) {
                 continue;
             }
             self.disk_found = true;

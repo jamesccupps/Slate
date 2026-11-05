@@ -142,7 +142,7 @@ there); the JSON outline for the path bar takes ~2 s more in the background and 
 Shared by both platforms: `src/core` (the engine), `src/highlight*` (colors), `src/edit.rs` (editing operations,
 display segments, coloring checkpoints, the transform sink), `src/theme.rs` (palettes; Windows' high contrast and
 accent stay Windows-only: the accent in the shade Windows 11's apps use on the theme, from Windows' accent palette, a
-lighter one on dark), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate Text Editor` — 0.15.0 and older used `%LOCALAPPDATA%\Slate`, which `move_data_dir` moves at a start when no other Slate runs —, `$XDG_DATA_HOME/slate` or
+lighter one on dark), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate Text Editor` — 0.15.0 and older used `%LOCALAPPDATA%\Slate`, which `move_data_dir` moves at a start when no other Slate runs, not right after an update (which may yet be undone) —, `$XDG_DATA_HOME/slate` or
 `~/.local/share/slate` on Linux, or the portable `data` folder). Windows: `src/ui`. Linux: `src/gtk`.
 
 - `src/core/` — the engine, no UI. Unit-tested (`cargo test --lib`). What it asks the OS for goes through `os.rs`
@@ -153,12 +153,17 @@ lighter one on dark), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate Text
   file), then gets the old file's owner, then its permissions (in that order: a chown clears setuid; setuid and setgid
   only when the owner and group could be kept, as `cp -p`), then its extended attributes (ACLs, SELinux labels; not
   IMA's and EVM's, the kernel's for the old content; a hard link is split, as by any rename), all before the fsync and
-  the rename; ANSI there is Windows-1252 from a
+  the rename. As the new file is this user's, a file of another user's that this one may write (a group's, an ACL's)
+  or of a group this user isn't in would change hands: `io::owner_kept` says so, and the GTK app asks first
+  (`SaveError::Owner`, `Ask::Owner`, `Tab::owner_ok`). The data folder is the user's only (0700,
+  `settings::make_data_dir`), and text piped in (`handed/stdin-*`) 0600; ANSI there is Windows-1252 from a
   built-in table (checked against Windows' own by a test on Windows). New documents get `Eol::NATIVE`.
   - `source.rs` — immutable byte sources: memory, or a file read on demand via a 64 KiB block cache (opened with
     full sharing, never locked). Newline index = cumulative count per 64 KiB block, built in the background; a file
     that only grew (a log) reuses the old index if sampled blocks (and the old last, incomplete block) still match.
-    Reads never fail: missing bytes read as zeros and bump `read_errors` (save refuses to write then). Index reads
+    Reads never fail: missing bytes read as zeros and bump `read_errors` (save refuses to write then; and since an edit
+    can copy such zeros into text that isn't read from the file any more, a document an insert was made in after
+    `Buffer::all_read_errors` went up is `Document::suspect`: saving asks first, as for `bad_units`). Index reads
     are tried again; one that keeps failing stops the index (`index_error`: the doc stays pending), never a guessed
     count. Each file source keeps its file's stamp through its own handle (size, write/change times):
     `changed_in_place` tells another program writing into that file (the text read from it isn't the user's any
@@ -191,7 +196,9 @@ lighter one on dark), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate Text
     (entries of its own, a protected list, or a file moved in from another folder with that folder's entries still
     marked inherited), `place::keep_permissions` copies it onto the temp file as it is (SetKernelObjectSecurity, which
     doesn't work inherited entries out again from the folder as SetSecurityInfo and ReplaceFile do; through a handle
-    of its own with WRITE_DAC), checks it, and only if that fails goes the ReplaceFile way. An encrypted file in a
+    of its own with WRITE_DAC), checks it, and only if that fails goes the ReplaceFile way; done before anything is
+    written into the temp file, so a private file's new text is never readable by those its folder lets read. An
+    encrypted file in a
     folder where Windows can't make an encrypted temp file isn't saved (it would be on the disk unencrypted): the
     message says so;
     a set-aside original ReplaceFile couldn't put back is never hidden+temporary, which is what marks a deletable
@@ -200,7 +207,9 @@ lighter one on dark), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate Text
     "invalid name" (a stream `120` of type `5`).
   - `search.rs` — byte-regex search in windows with an overlap after each (a match running into a window's end is
     searched again in a bigger one): find next/prev, count all, streaming replace-all (the text between matches is
-    copied from the window searched). Plain text without Whole word skips the regex where that's faster, finding
+    copied from the window searched). A regex's `\n` is `(?:\r?\n)` and a class leaving `\n` out leaves `\r` out too
+    (`line_breaks_either`: a replacement's `\n` is the text's line break, so in CRLF text `\n+` → `\n` left stray
+    `\r`s; matchers are shared by all tabs, so it isn't per document). Plain text without Whole word skips the regex where that's faster, finding
     exactly what it would (`Literal`, a test compares them, `ſ` and the Kelvin sign included): Match case by
     `memmem`; ignoring case, an ASCII query whose longest run of letters and digits isn't at its start
     (`"status":"refunded"`) by that run first, then the query in a window around each place (5x faster in a JSON
@@ -323,10 +332,14 @@ lighter one on dark), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate Text
     an undoable edit selecting the result; SHA-256 (its own, tested against the standard vectors) of the selection
     or the text on another thread (`TaskKind::Hash`), shown in a box with Copy.
   - `src/editorconfig.rs` (shared) — `.editorconfig` files from the file's folder up to `root = true` (globs `*`,
-    `**`, `?`, `[…]`, `{a,b}`, `{1..9}`; a nearer file and a later section win; `unset`). Applied (`edit::
-    editorconfig_of`) as a file is read: its indentation (over the guess, unless the user picked one); for a new or
-    empty document its line endings and encoding; and at saving `insert_final_newline` (`edit::final_newline`, an
-    edit of its own). `trim_trailing_whitespace` isn't.
+    `**`, `?`, `[…]`, `{a,b}`, `{1..9}`; a nearer file and a later section win; `unset`). Each glob is made into one
+    regex (`glob_to_regex`, as EditorConfig's C library does: `/**/` also no folder, a `{n..m}` a group checked
+    after; braces nested deeper than 32 match nothing): trying each `{a,b}` choice in turn was exponential. Never read
+    on the UI thread: a file read brings it (`Opened::editorconfig`, worked out on the open job's thread), any other
+    path is looked up on another thread (`App::editorconfig_for`, kept per tab with the path it's for). Applied
+    (`edit::editorconfig_of`): its indentation (over the guess, unless the user picked one); for a new or empty
+    document its line endings and encoding; and at saving `insert_final_newline` (`edit::final_newline`, an edit of
+    its own) when it's known for that path by then. `trim_trailing_whitespace` isn't.
   - `src/spell.rs` (shared, beside `core`) — spell check: which words of the rows on screen are checked
     (`words_in`: all of plain text, Markdown's prose — not code blocks, `markdown_code`, inline code or links —,
     comments in code; never data files; a word is letters with apostrophes inside, not next to a digit, `_`, `/`,
@@ -353,9 +366,10 @@ lighter one on dark), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate Text
     turned off, `hidden-when`), File → Open recent; Ctrl+1–9 and Alt+1–9 for tabs, Shift+Alt+F formats JSON or XML;
     a panic in a callback would abort (GTK can't pass it on): `Ui::guarded` catches it around the app's work (logged in
     crash.log by the panic hook, the session written, the window says so), drawing only logs; SIGTERM, SIGHUP and SIGINT
-    (`stop_on_signals`: the handler writes a byte to a pipe, a thread asleep on it `invoke`s the rest on the main
-    loop) and the session manager's `query-end` write the session first
-    (`ending`), and logging out waits while unsaved work the session can't keep is open), `app.rs` the state and
+    (`stop_on_signals`: the handler writes the signal's number to a pipe, a thread asleep on it `invoke`s the rest on
+    the main loop) and the session manager's `query-end` write the session first
+    (`ending`), and logging out waits while unsaved work the session can't keep is open; SIGTERM then ends Slate,
+    SIGHUP and SIGINT (the terminal closed, Ctrl+C) only when there's no such work, else they ask as closing does), `app.rs` the state and
     commands (`App`, `Tab`, `Cmd`; what needs a dialog is queued in `asks`, `Ask::Quit` only after a save that closing
     waited for, so dialogs never pile up; a tab another program changed is read again keeping its view, following the
     end of a log; "Open already?" by name, then by the canonical path once read, never asking the file system on the
@@ -366,7 +380,9 @@ lighter one on dark), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate Text
     selection's size counted once per caret place and text; in a narrow window the indentation, the line endings and
     the language give way first; a message stands where the caret's place does, and goes when another tab is shown), `session.rs` (`session.json` and a copy per unsaved tab
     up to 64 MiB; bigger ones are asked about; Windows' rules: lenient reading per tab and value, session.json.bak,
-    only copies this Slate wrote or read are deleted, copies no tab names come back as tabs, names `tab-<time>-<pid>-<n>`
+    only copies this Slate wrote or read are deleted, copies no tab names come back as tabs, each tab's file's stamp
+    kept as Windows does (`disk_len`, `disk_modified_ms`: a change while Slate was closed is noticed; a stamp in whole
+    milliseconds matches within that millisecond, `DiskInfo::same`), names `tab-<time>-<pid>-<n>`
     and only `tab-…txt` read, written every 5 s on another thread when it changed and in place on closing (a write
     that fails leaves the tab's last copy listed, and closing then asks about every unsaved tab), a `restoring` mark
     while the tabs are put back: still there at the next start, the session goes into `crashed-<time>/`; that and
@@ -446,7 +462,9 @@ lighter one on dark), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate Text
     part, every UserChoice naming Slate included, and Slate stays installed; `--uninstall --quiet` removes it all, the
     installed copy too when it's the one running, by a hidden `cmd` once it has ended (the paths in environment
     variables read with `!`, `cleanup_command`, so no folder name is taken as a command); CI runs all three on a
-    runner); `update.rs` (updates from GitHub releases: WinHTTP, SHA-256 check, from 0.8.1 the same
+    runner); `update.rs` (updates from GitHub releases: WinHTTP, SHA-256 check, from 0.16.1 the download's own
+    version (its VS_FIXEDFILEINFO, `file_version`) must be the release's, so a release can't hand out an older signed
+    build under a higher tag; from 0.8.1 the same
     publisher's signature when the running exe's own signature checks out (`signer_of`: WinVerifyTrust, no online
     revocation lookup; the name, and from 0.9.1 the identity usages too; from 0.12.2 a running exe whose signature
     Windows can't check, for any reason but "not signed", installs nothing by itself: `Signature::Unverified`), swap

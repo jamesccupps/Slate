@@ -40,10 +40,12 @@ impl Version {
         Some(Version(num()?, num()?, num()?))
     }
 
-    /// This Slate's version (tests can pretend to be an older one).
+    /// This Slate's version (test mode can pretend to be an older one; a stray variable outside it would have the
+    /// latest release offered for ever).
     pub fn current() -> Version {
         std::env::var("SLATE_UPDATE_TEST_VERSION")
             .ok()
+            .filter(|_| super::win::testing())
             .and_then(|v| Version::parse(&v))
             .or_else(|| Version::parse(env!("CARGO_PKG_VERSION")))
             .unwrap_or(Version(0, 0, 0))
@@ -213,6 +215,11 @@ pub fn download(rel: &Release, ctx: &Ctx) -> Result<PathBuf, String> {
     if !exe.starts_with(b"MZ") || sha256(&exe) != Some(want) {
         return Err("The download doesn't match the release's checksum, so it wasn't installed".into());
     }
+    // (its own version, which its signature covers, must be the release's: else whoever could publish a release could
+    // hand every copy an older signed Slate under a higher number, after which none would update again)
+    if file_version(&exe) != Some(rel.version) {
+        return Err(format!("The download isn't Slate {} as the release says, so it wasn't installed", rel.version));
+    }
     let me = std::env::current_exe().map_err(|e| e.to_string())?;
     let dir = me.parent().ok_or("Can't tell where Slate is")?;
     let tmp = dir.join(format!("Slate.update-{}.exe", std::process::id()));
@@ -231,6 +238,15 @@ pub fn download(rel: &Release, ctx: &Ctx) -> Result<PathBuf, String> {
         return Err(e);
     }
     Ok(tmp)
+}
+
+/// The version an exe's version resource gives (VS_FIXEDFILEINFO, which starts with its signature and its structure's
+/// version, 1.0: build.rs writes it).
+fn file_version(exe: &[u8]) -> Option<Version> {
+    let at = memchr::memmem::find(exe, &[0xBD, 0x04, 0xEF, 0xFE, 0x00, 0x00, 0x01, 0x00])? + 8;
+    let word = |i: usize| Some(u32::from_le_bytes(exe.get(i..i + 4)?.try_into().ok()?));
+    let (ms, ls) = (word(at)?, word(at + 4)?);
+    Some(Version(ms >> 16, ms & 0xFFFF, ls >> 16))
 }
 
 /// Who signed a file: the certificate's name ("James Cupps") and the identity behind it. Artifact Signing's
@@ -534,6 +550,17 @@ mod tests {
         assert_eq!(Version::parse(""), None);
         assert!(Version(0, 10, 0) > Version(0, 9, 9));
         assert_eq!(Version(1, 2, 3).to_string(), "1.2.3");
+    }
+
+    #[test]
+    fn an_exes_own_version_is_read() {
+        // (as build.rs writes VS_FIXEDFILEINFO: signature, structure version, file version)
+        let mut exe = b"MZ...".to_vec();
+        exe.extend_from_slice(&[0xBD, 0x04, 0xEF, 0xFE, 0x00, 0x00, 0x01, 0x00]);
+        exe.extend_from_slice(&16u32.to_le_bytes());
+        exe.extend_from_slice(&(1u32 << 16).to_le_bytes());
+        assert_eq!(file_version(&exe), Some(Version(0, 16, 1)));
+        assert_eq!(file_version(b"MZ without one"), None);
     }
 
     #[test]

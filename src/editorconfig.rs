@@ -157,93 +157,149 @@ fn apply_file(raw: &mut Raw, text: &[u8], rel: &str) {
 /// the path from the `.editorconfig`'s folder (a leading `/` only anchors it there).
 fn section_matches(glob: &str, rel: &str) -> bool {
     if glob.contains('/') {
+        // (both from the folder's own `/`, as EditorConfig's C library has them: so `**/x` and `/**/` can stand for no
+        // folder at all)
         let g = glob.strip_prefix('/').unwrap_or(glob);
-        glob_match(g.as_bytes(), rel.as_bytes())
+        glob_match(&format!("/{g}"), &format!("/{rel}"))
     } else {
         // (the name, in this folder or any below: `**/` before it)
         let name = rel.rsplit('/').next().unwrap_or(rel);
-        glob_match(glob.as_bytes(), name.as_bytes())
+        glob_match(glob, name)
     }
 }
 
-/// EditorConfig's globs: `*` (not `/`), `**` (anything), `?`, `[abc]`, `[!abc]`, `[a-z]`, `{a,b}`, `{1..9}`, `\` to
-/// take the next character as it is.
-fn glob_match(g: &[u8], s: &[u8]) -> bool {
-    // braces first: each choice tried in turn
-    if let Some((a, b)) = brace(g) {
-        let inner = &g[a + 1..b];
-        let (pre, post) = (&g[..a], &g[b + 1..]);
-        if let Some((lo, hi)) = num_range(inner) {
-            // {1..9}: a number in range, there
-            let digits: usize = s.iter().skip(pre.len().min(s.len())).take_while(|c| c.is_ascii_digit() || **c == b'-').count();
-            return (1..=digits).any(|n| {
-                let at = s.len().min(pre.len());
-                std::str::from_utf8(&s[at..at + n]).ok().and_then(|t| t.parse::<i64>().ok()).is_some_and(|v| v >= lo && v <= hi)
-                    && glob_match(pre, &s[..at])
-                    && glob_match(post, &s[at + n..])
-            });
-        }
-        return split_choices(inner).iter().any(|c| {
-            let mut whole = pre.to_vec();
-            whole.extend_from_slice(c);
-            whole.extend_from_slice(post);
-            glob_match(&whole, s)
-        });
+/// How deep braces may be nested in a glob (a deeper one matches nothing).
+const BRACES_MAX: usize = 32;
+
+/// EditorConfig's globs: `*` (not `/`), `**` (anything; `/**/` also no folder), `?`, `[abc]`, `[!abc]`, `[a-z]`,
+/// `{a,b}`, `{1..9}` (a whole number in that range), `\` to take the next character as it is. Made into one regex, as
+/// EditorConfig's own C library does: matched in time linear in the name however many braces there are (trying each
+/// choice of each `{a,b}` in turn took twice as long for each: a header of 40 never finished, on the UI thread).
+fn glob_match(glob: &str, s: &str) -> bool {
+    let mut re = String::from("^");
+    let mut ranges = Vec::new();
+    let g: Vec<char> = glob.chars().collect();
+    if !glob_to_regex(&g, &mut re, &mut ranges, 0) {
+        return false;
     }
-    wild(g, s)
+    re.push('$');
+    let Ok(r) = regex::RegexBuilder::new(&re).size_limit(1 << 20).build() else { return false };
+    let Some(c) = r.captures(s) else { return false };
+    // (each `{n..m}` a group: its number in range)
+    ranges.iter().enumerate().all(|(k, &(lo, hi))| {
+        c.get(k + 1).and_then(|m| m.as_str().parse::<i64>().ok()).is_some_and(|v| v >= lo && v <= hi)
+    })
 }
 
-/// The first `{…}` with a `,` or `..` in it (as positions of its braces).
-fn brace(g: &[u8]) -> Option<(usize, usize)> {
+/// Writes glob `g` as a regex into `re`, each `{n..m}` a group with its range in `ranges`. False when braces are nested
+/// deeper than `BRACES_MAX`.
+fn glob_to_regex(g: &[char], re: &mut String, ranges: &mut Vec<(i64, i64)>, depth: usize) -> bool {
+    if depth > BRACES_MAX {
+        return false;
+    }
     let mut i = 0;
     while i < g.len() {
         match g[i] {
-            b'\\' => i += 1,
-            b'{' => {
-                let mut depth = 0;
-                let mut j = i;
-                while j < g.len() {
-                    match g[j] {
-                        b'\\' => j += 1,
-                        b'{' => depth += 1,
-                        b'}' => {
-                            depth -= 1;
-                            if depth == 0 {
-                                let inner = &g[i + 1..j];
-                                if inner.contains(&b',') || num_range(inner).is_some() {
-                                    return Some((i, j));
-                                }
-                                break;
+            '\\' if i + 1 < g.len() => {
+                literal(re, g[i + 1]);
+                i += 2;
+                continue;
+            }
+            '/' if g[i..].starts_with(&['/', '*', '*', '/']) => {
+                re.push_str("(?:/|/.*/)");
+                i += 4;
+                continue;
+            }
+            '*' if g.get(i + 1) == Some(&'*') => {
+                re.push_str(".*");
+                i += 2;
+                continue;
+            }
+            '*' => re.push_str("[^/]*"),
+            '?' => re.push_str("[^/]"),
+            '[' => match class(&g[i..], re) {
+                Some(len) => {
+                    i += len;
+                    continue;
+                }
+                None => literal(re, '['),
+            },
+            '{' => {
+                if let Some(close) = closing_brace(g, i) {
+                    let inner = &g[i + 1..close];
+                    if let Some((lo, hi)) = num_range(inner) {
+                        re.push_str("([+-]?[0-9]+)");
+                        ranges.push((lo, hi));
+                        i = close + 1;
+                        continue;
+                    }
+                    let choices = split_choices(inner);
+                    if choices.len() > 1 {
+                        re.push_str("(?:");
+                        for (k, c) in choices.iter().enumerate() {
+                            if k > 0 {
+                                re.push('|');
+                            }
+                            if !glob_to_regex(c, re, ranges, depth + 1) {
+                                return false;
                             }
                         }
-                        _ => {}
+                        re.push(')');
+                        i = close + 1;
+                        continue;
                     }
-                    j += 1;
+                }
+                // (`{single}` and a `{` without its `}`: as they are)
+                literal(re, '{');
+            }
+            c => literal(re, c),
+        }
+        i += 1;
+    }
+    true
+}
+
+fn literal(re: &mut String, c: char) {
+    re.push_str(&regex::escape(c.encode_utf8(&mut [0; 4])));
+}
+
+/// The `}` closing the `{` at `g[open]`.
+fn closing_brace(g: &[char], open: usize) -> Option<usize> {
+    let mut depth = 0;
+    let mut j = open;
+    while j < g.len() {
+        match g[j] {
+            '\\' => j += 1,
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(j);
                 }
             }
             _ => {}
         }
-        i += 1;
+        j += 1;
     }
     None
 }
 
-/// `{a,b,{c,d}}`'s choices (a nested brace stays whole for later).
-fn split_choices(inner: &[u8]) -> Vec<Vec<u8>> {
+/// `{a,b,{c,d}}`'s choices (a nested brace stays whole, made a regex of its own in turn).
+fn split_choices(inner: &[char]) -> Vec<Vec<char>> {
     let mut out = vec![Vec::new()];
     let mut depth = 0;
     let mut i = 0;
     while i < inner.len() {
         let c = inner[i];
         match c {
-            b'\\' if i + 1 < inner.len() => {
+            '\\' if i + 1 < inner.len() => {
                 out.last_mut().unwrap().extend_from_slice(&inner[i..i + 2]);
                 i += 2;
                 continue;
             }
-            b'{' => depth += 1,
-            b'}' => depth -= 1,
-            b',' if depth == 0 => {
+            '{' => depth += 1,
+            '}' => depth -= 1,
+            ',' if depth == 0 => {
                 out.push(Vec::new());
                 i += 1;
                 continue;
@@ -257,98 +313,60 @@ fn split_choices(inner: &[u8]) -> Vec<Vec<u8>> {
 }
 
 /// `{num1..num2}`'s numbers.
-fn num_range(inner: &[u8]) -> Option<(i64, i64)> {
-    let s = std::str::from_utf8(inner).ok()?;
+fn num_range(inner: &[char]) -> Option<(i64, i64)> {
+    let s: String = inner.iter().collect();
     let (a, b) = s.split_once("..")?;
     Some((a.parse().ok()?, b.parse().ok()?))
 }
 
-/// `*`, `**`, `?`, `[…]` and `\` (no braces left).
-fn wild(g: &[u8], s: &[u8]) -> bool {
-    let (mut gi, mut si) = (0, 0);
-    // where to go back to after a `*` (or `**`) that matched too little
-    let mut back: Option<(usize, usize, bool)> = None;
-    while si < s.len() {
-        if gi < g.len() {
-            match g[gi] {
-                b'*' => {
-                    let double = g.get(gi + 1) == Some(&b'*');
-                    gi += if double { 2 } else { 1 };
-                    back = Some((gi, si, double));
-                    continue;
-                }
-                b'?' if s[si] != b'/' => {
-                    gi += 1;
-                    si += 1;
-                    continue;
-                }
-                b'[' => {
-                    if let Some((ok, len)) = class(&g[gi..], s[si]) {
-                        if ok && s[si] != b'/' {
-                            gi += len;
-                            si += 1;
-                            continue;
-                        }
-                    } else if s[si] == b'[' {
-                        gi += 1;
-                        si += 1;
-                        continue;
-                    }
-                }
-                b'\\' if gi + 1 < g.len() && g[gi + 1] == s[si] => {
-                    gi += 2;
-                    si += 1;
-                    continue;
-                }
-                c if c != b'\\' && c == s[si] => {
-                    gi += 1;
-                    si += 1;
-                    continue;
-                }
-                _ => {}
-            }
-        }
-        // no match here: the last star takes one more character (a single one never takes `/`)
-        match back {
-            Some((bg, bs, double)) if double || s[bs] != b'/' => {
-                back = Some((bg, bs + 1, double));
-                gi = bg;
-                si = bs + 1;
-            }
-            _ => return false,
+/// A `[…]` class at the start of `g`, written into `re` as one; its length in the glob (None: not a class, as with no
+/// `]`, or with a `/` in it, which a class never matches: then the `[` is just a character).
+fn class(g: &[char], re: &mut String) -> Option<usize> {
+    let negate = matches!(g.get(1), Some('!') | Some('^'));
+    let start = if negate { 2 } else { 1 };
+    // (a `]` first in it is one of its characters)
+    let mut end = start;
+    loop {
+        match g.get(end)? {
+            ']' if end > start => break,
+            '\\' => end += 2,
+            _ => end += 1,
         }
     }
-    g[gi..].iter().all(|&c| c == b'*')
-}
-
-/// A `[…]` class at the start of `g`: whether `c` is in it, and its length (None: not a class, no `]`).
-fn class(g: &[u8], c: u8) -> Option<(bool, usize)> {
-    let mut i = 1;
-    let negate = matches!(g.get(i), Some(b'!') | Some(b'^'));
+    let body = &g[start..end];
+    if body.contains(&'/') {
+        return None;
+    }
+    re.push('[');
     if negate {
-        i += 1;
+        // (nor `/`, which only `**` matches)
+        re.push_str("^/");
     }
-    let mut hit = false;
-    let mut first = true;
-    while i < g.len() {
-        let x = g[i];
-        if x == b']' && !first {
-            return Some((hit != negate, i + 1));
-        }
-        first = false;
-        if g.get(i + 1) == Some(&b'-') && g.get(i + 2).is_some_and(|&y| y != b']') {
-            if (x..=g[i + 2]).contains(&c) {
-                hit = true;
-            }
-            i += 3;
+    let mut k = 0;
+    while k < body.len() {
+        let c = body[k];
+        if c == '\\' && k + 1 < body.len() {
+            k += 1;
+        } else if c == '-' && k > 0 && k + 1 < body.len() {
+            // (a range, `a-z`)
+            re.push('-');
+            k += 1;
             continue;
         }
-        if x == c {
-            hit = true;
+        if "\\[]^-&~".contains(body[k]) {
+            re.push('\\');
         }
-        i += 1;
+        re.push(body[k]);
+        k += 1;
     }
-    None
+    re.push(']');
+    Some(end + 1)
+}
+
+impl crate::core::job::Failure for Props {
+    fn failure(_: &str) -> Props {
+        Props::default()
+    }
 }
 
 #[cfg(test)]
@@ -368,6 +386,19 @@ mod tests {
         assert!(m("file{1..3}.txt", "file2.txt") && !m("file{1..3}.txt", "file4.txt"));
         assert!(m("{package.json,.travis.yml}", "package.json") && m("?.md", "a.md") && !m("?.md", "ab.md"));
         assert!(m("[[]x].txt", "[x].txt") || m("\\[x\\].txt", "[x].txt"));
+        // `/**/` is also no folder; a range after a star; a class with `/` in it is just characters
+        assert!(m("lib/**/*.js", "lib/a/b/c.js") && m("lib/**/*.js", "lib/c.js") && !m("lib/**/*.js", "src/lib/c.js"));
+        assert!(m("**/x.c", "x.c") && m("**/x.c", "a/x.c"));
+        assert!(m("*{1..3}.log", "app2.log") && !m("*{1..3}.log", "app4.log") && m("v{-2..2}", "v-1"));
+        assert!(m("{a,{b,c}}.txt", "c.txt") && !m("{a,{b,c}}.txt", "d.txt") && m("{x}", "{x}"));
+        assert!(!m("[a/]b", "ab") && m("a[!b]c", "axc") && !m("a[!b]c", "abc") && m("[a-c]", "b") && !m("[a-c]", "d"));
+        // many braces: as quick as a few (each a choice tried in turn took twice as long for each)
+        let t = std::time::Instant::now();
+        let glob = "{a,b}".repeat(40);
+        assert!(!m(&glob, &"a".repeat(39)) && m(&glob, &"ab".repeat(20)));
+        assert!(t.elapsed() < std::time::Duration::from_secs(1));
+        // braces nested deeper than that: matches nothing
+        assert!(!m(&format!("{}x{}", "{a,".repeat(40), "}".repeat(40)), "x"));
     }
 
     #[test]

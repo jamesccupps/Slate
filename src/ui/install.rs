@@ -523,15 +523,22 @@ pub fn unassociate() {
         forget_choice(ext);
     }
     unsafe {
-        for k in [
+        let mut keys = vec![
             format!(r"Software\Classes\{PROGID}"),
             r"Software\Classes\Applications\Slate.exe".to_string(),
             VERB.to_string(),
             CAPABILITIES.to_string(),
-            // (what 0.15.0 and older called them, if they're still there)
-            OLD_VERB.to_string(),
-            format!(r"{OLD_APP_KEY}\Capabilities"),
-        ] {
+        ];
+        // (what 0.15.0 and older called them, if they're still there: only Slate's, not another program's of that
+        // name)
+        if read_str(&format!(r"{OLD_VERB}\command"), "").is_some_and(|c| c.to_ascii_lowercase().contains("slate.exe\" \"%1\"")) {
+            keys.push(OLD_VERB.to_string());
+        }
+        let old_caps = format!(r"{OLD_APP_KEY}\Capabilities");
+        if read_str(&old_caps, "ApplicationDescription").as_deref() == Some(DESCRIPTION) {
+            keys.push(old_caps);
+        }
+        for k in keys {
             let _ = RegDeleteTreeW(HKEY_CURRENT_USER, &HSTRING::from(k));
         }
     }

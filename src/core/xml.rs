@@ -95,6 +95,9 @@ pub struct Formatter<'w> {
     attrs: Vec<u8>,
     /// Where the current attribute name starts in `attrs`.
     attr: usize,
+    /// The hashes of the tag's attribute names so far: a name is compared with the earlier ones only when its hash is
+    /// one of theirs (comparing each with all before it took ~10^11 steps for a tag of 200,000, Cancel unheard).
+    attr_hashes: std::collections::HashSet<u64>,
     /// The name in the current end tag.
     end: Vec<u8>,
     /// Whitespace since the last markup, held back until we know whether it belongs to text (dropped if markup
@@ -232,6 +235,7 @@ impl<'w> Formatter<'w> {
             stack: Vec::new(),
             attrs: Vec::new(),
             attr: 0,
+            attr_hashes: std::collections::HashSet::new(),
             end: Vec::new(),
             ws: Vec::new(),
             text: false,
@@ -369,6 +373,7 @@ impl<'w> Formatter<'w> {
         self.stack.push((self.names.len(), self.mark));
         self.names.push(b);
         self.attrs.clear();
+        self.attr_hashes.clear();
         self.stats.elements += 1;
         self.stats.max_depth = self.stats.max_depth.max(self.stack.len());
         self.st = St::StartName;
@@ -378,7 +383,9 @@ impl<'w> Formatter<'w> {
     /// The name of an attribute is complete: it must not repeat an earlier one in the tag.
     fn attr_name(&mut self) -> Result<(), XmlError> {
         let (seen, name) = self.attrs.split_at(self.attr);
-        if seen.split(|&c| c == 0).any(|n| n == name) {
+        // (FNV-1a)
+        let h = name.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &c| (h ^ c as u64).wrapping_mul(0x100_0000_01b3));
+        if !self.attr_hashes.insert(h) && seen.split(|&c| c == 0).any(|n| n == name) {
             let msg = format!("Attribute {} appears twice in <{}>", show(name), show(self.top()));
             return Err(err(self.name_at, msg));
         }
@@ -1112,6 +1119,11 @@ mod tests {
                 assert_eq!(fmt(mode, src).unwrap_err(), e, "{src}");
             }
         }
+        // a tag of many attributes: each one's name is still checked against all before it
+        let many: String = (0..20_000).map(|k| format!(" a{k}=\"\"")).collect();
+        assert!(fmt(Mode::Validate, &format!("<a{many}/>")).is_ok());
+        let e = fmt(Mode::Validate, &format!("<a{many} a7=\"\"/>")).unwrap_err();
+        assert_eq!(e.msg, "Attribute a7 appears twice in <a>");
         // with a DOCTYPE, other entities may be declared (here or in an external DTD)
         assert!(fmt(Mode::Validate, "<!DOCTYPE a><a b=\"&amp;&#60;&#x3C;&ns:x-1;\">&lt;&#0123;&#xaF;</a>").is_ok());
         assert!(fmt(Mode::Validate, "<a>&lt;&gt;&amp;&quot;&apos; ]] > ]>]</a>").is_ok());

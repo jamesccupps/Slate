@@ -143,9 +143,59 @@ fn is_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
+/// A regex's `\n` as a line break of either kind: `\r?\n` (so in a CRLF text Find `\n+`, Replace `\n` doesn't
+/// leave stray `\r`s, as a replacement's `\n` is the text's own line break; in an LF text it finds what it did), and
+/// `\r` too where a class leaves out `\n` (`[^\n]`). Escapes, and classes that take `\n` in, stay as they are.
+fn line_breaks_either(p: &str) -> String {
+    let c: Vec<char> = p.chars().collect();
+    let mut out = String::with_capacity(p.len() + 8);
+    // (inside a class: how deep, and whether the outermost one leaves its characters out)
+    let (mut depth, mut negated) = (0usize, false);
+    let mut i = 0;
+    while i < c.len() {
+        match c[i] {
+            '\\' if i + 1 < c.len() => {
+                match (c[i + 1], depth) {
+                    ('n', 0) => out.push_str(r"(?:\r?\n)"),
+                    ('n', _) if negated => out.push_str(r"\n\r"),
+                    (x, _) => {
+                        out.push('\\');
+                        out.push(x);
+                    }
+                }
+                i += 2;
+                continue;
+            }
+            '[' => {
+                out.push('[');
+                i += 1;
+                if depth == 0 {
+                    negated = c.get(i) == Some(&'^');
+                }
+                depth += 1;
+                // (`[^` and a `]` first are part of the class)
+                if c.get(i) == Some(&'^') {
+                    out.push('^');
+                    i += 1;
+                }
+                if c.get(i) == Some(&']') {
+                    out.push(']');
+                    i += 1;
+                }
+                continue;
+            }
+            ']' if depth > 0 => depth -= 1,
+            _ => {}
+        }
+        out.push(c[i]);
+        i += 1;
+    }
+    out
+}
+
 /// The regex a query is: its text (escaped unless it's a regex), whole words when asked.
 fn pattern(q: &Query) -> String {
-    let mut pat = if q.regex { q.text.clone() } else { regex::escape(&q.text) };
+    let mut pat = if q.regex { line_breaks_either(&q.text) } else { regex::escape(&q.text) };
     if q.whole_word {
         if q.regex {
             pat = format!(r"\b(?:{pat})\b");
@@ -1381,6 +1431,21 @@ mod tests {
         let last = memchr::memmem::rfind(&text, b"needle1").unwrap() as u64;
         assert_eq!(m.find_back(&snap, 0, snap.len(), None), Some((last, last + 7)));
         assert_eq!(m.find_back(&snap, 0, first + 6, None), None);
+    }
+
+    #[test]
+    fn a_regex_line_break_is_either_kind() {
+        let snap = fragmented(b"a\r\n\r\nb\r\nc\nd");
+        // `\n` takes the `\r` before it with it
+        let m = Matcher::new(&Query { regex: true, ..q(r"\n+") }).unwrap();
+        assert_eq!(m.find_fwd(&snap, 0, snap.len(), None), Some((1, 5)));
+        let m = Matcher::new(&Query { regex: true, ..q(r"b\nc\nd") }).unwrap();
+        assert_eq!(m.find_fwd(&snap, 0, snap.len(), None), Some((5, 11)));
+        // a class without `\n` is without `\r` too; escapes and classes with `\n` in them stay
+        let m = Matcher::new(&Query { regex: true, ..q(r"[^\n]+") }).unwrap();
+        assert_eq!(m.find_fwd(&snap, 0, snap.len(), None), Some((0, 1)));
+        assert_eq!(line_breaks_either(r"\\n[\n]x[^a\n]\t"), r"\\n[\n]x[^a\n\r]\t");
+        assert_eq!(line_breaks_either(r"[]\n][^]\n]"), r"[]\n][^]\n\r]");
     }
 
     #[test]

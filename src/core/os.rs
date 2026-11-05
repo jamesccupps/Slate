@@ -111,6 +111,11 @@ mod imp {
         !std::fs::metadata(path).is_ok_and(|m| m.permissions().readonly())
     }
 
+    /// (`io::owner_kept`: a new file in the old one's place keeps its permissions here)
+    pub fn owner_kept(_: &Path) -> bool {
+        true
+    }
+
     /// Options for opening a file without blocking anyone else from reading, writing, renaming or deleting it.
     pub fn shared() -> OpenOptions {
         let mut o = OpenOptions::new();
@@ -275,6 +280,26 @@ mod imp {
         use std::os::unix::ffi::OsStrExt;
         let Ok(c) = std::ffi::CString::new(path.as_os_str().as_bytes()) else { return true };
         unsafe { libc::access(c.as_ptr(), libc::W_OK) == 0 }
+    }
+
+    /// Whether a new file of this user's in `path`'s place could have its owner and group (see `io::owner_kept`).
+    pub fn owner_kept(path: &Path) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        let Ok(m) = std::fs::metadata(path) else { return true };
+        let uid = unsafe { libc::geteuid() };
+        if uid == 0 {
+            return true;
+        }
+        if m.uid() != uid {
+            return false;
+        }
+        if m.gid() == unsafe { libc::getegid() } {
+            return true;
+        }
+        let n = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+        let mut groups = vec![0 as libc::gid_t; n.max(0) as usize];
+        let n = unsafe { libc::getgroups(groups.len() as libc::c_int, groups.as_mut_ptr()) };
+        n > 0 && groups[..n as usize].contains(&m.gid())
     }
 
     /// Options for opening a file (on Unix nobody is ever blocked by an open file).

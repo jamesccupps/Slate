@@ -514,6 +514,19 @@ fn date_key(s: &[u8], day_first: bool) -> Option<((u32, u32, u32), &[u8])> {
     Some(((y, m, d), &s[i..]))
 }
 
+/// The order of two non-empty fields for Sort by column, given their dates (`SortRow::date`, 0 for none): dates
+/// first, by date and then what follows (a time); then numbers by value and text the way people sort
+/// (`natural_cmp`). Dates are a group of their own so the order is a total one: a date compared with a number as text
+/// went round in a circle (`12/31/2025` < `01/01/2026` < `5` < `12/31/2025`), and a sort may panic on that.
+fn key_order(x: &[u8], y: &[u8], dx: u32, dy: u32, day_first: bool) -> Ordering {
+    match (dx != 0, dy != 0) {
+        (true, true) => dx.cmp(&dy).then_with(|| field_order(x, y, day_first)),
+        (true, false) => Ordering::Less,
+        (false, true) => Ordering::Greater,
+        (false, false) => natural_cmp(x.trim_ascii(), y.trim_ascii()).then_with(|| x.cmp(y)),
+    }
+}
+
 /// The order of two fields: dates by date, numbers by value, text the way people sort (`natural_cmp`).
 fn field_order(a: &[u8], b: &[u8], day_first: bool) -> Ordering {
     if let (Some((x, xr)), Some((y, yr))) = (date_key(a, day_first), date_key(b, day_first)) {
@@ -578,12 +591,7 @@ pub fn sort_by_column(
             (false, true) => Ordering::Less,
             (true, true) => a.n.cmp(&b.n),
             _ => {
-                let o = if a.date != 0 && b.date != 0 {
-                    // (the same day: by what follows, a time)
-                    a.date.cmp(&b.date).then_with(|| field_order(x, y, day_first))
-                } else {
-                    natural_cmp(x.trim_ascii(), y.trim_ascii()).then_with(|| x.cmp(y))
-                };
+                let o = key_order(x, y, a.date, b.date, day_first);
                 (if desc { o.reverse() } else { o }).then(a.n.cmp(&b.n))
             }
         }
@@ -631,6 +639,35 @@ mod tests {
             c.feed(std::slice::from_ref(b))?;
         }
         c.finish()
+    }
+
+    #[test]
+    fn sort_keys_are_in_a_total_order() {
+        // dates, numbers and text mixed in one column: a sort needs a consistent order (or it may panic)
+        let parts = ["12/31/2025", "01/01/2026", "5", "05", "1/2/2024 10:00", "1/2/2024 9:00", "abc", "-3", "x1", "2.5"];
+        let mut r = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = || {
+            r ^= r << 13;
+            r ^= r >> 7;
+            r ^= r << 17;
+            r
+        };
+        let fields: Vec<String> =
+            (0..120).map(|_| (0..1 + next() % 2).map(|_| parts[(next() % parts.len() as u64) as usize]).collect::<Vec<_>>().join(" ")).collect();
+        for day_first in [false, true] {
+            let date = |f: &str| date_key(f.as_bytes(), day_first).map_or(0, |((y, m, d), _)| y * 10000 + m * 100 + d);
+            let ord = |a: &str, b: &str| key_order(a.as_bytes(), b.as_bytes(), date(a), date(b), day_first);
+            for a in &fields {
+                for b in &fields {
+                    assert_eq!(ord(a, b), ord(b, a).reverse(), "{a} {b}");
+                    for c in fields.iter().take(40) {
+                        if ord(a, b).is_le() && ord(b, c).is_le() {
+                            assert!(ord(a, c).is_le(), "{a} <= {b} <= {c}");
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]

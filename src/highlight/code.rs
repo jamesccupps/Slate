@@ -1113,7 +1113,8 @@ fn word_hash(w: &[u8]) -> (u8, u16) {
 /// `<<EOF`, `<<-'EOF'`, `<<"END"` (shell) or `<<~SQL` (Ruby) at `i`: (where the opener ends, the end word, whether
 /// that may be indented).
 fn heredoc_open<'t>(sx: &Syntax, t: &'t [u8], i: usize) -> Option<(usize, &'t [u8], bool)> {
-    if !t[i..].starts_with(b"<<") || at(t, i + 2) == b'<' {
+    // (`<<<` is a here-string: neither at its first `<` nor at its second)
+    if !t[i..].starts_with(b"<<") || at(t, i + 2) == b'<' || (i > 0 && t[i - 1] == b'<') {
         return None;
     }
     let mut j = i + 2;
@@ -3108,6 +3109,8 @@ mod tests {
         assert_eq!(end_state(Lang::Shell, src), State::START);
         let v = view(Lang::Shell, "cat <<-'END' | sort\n\tit's\n\tEND\nls # c\n");
         assert!(line_has(&v[0], "<<-'END'", Tok::Str) && line_has(&v[3], "# c", Tok::Comment));
+        // a here-string (`<<<`) is no heredoc
+        assert!(line_has(&view(Lang::Shell, "read -r a b <<< \"$line\"\necho 'a' # c\n")[1], "# c", Tok::Comment));
         // `<<` in arithmetic is a shift
         assert!(line_has(&view(Lang::Shell, "echo $(( x << Y ))\necho 'a'\n")[1], "'a'", Tok::Str));
         // escapes outside quotes, and $'…' with escapes

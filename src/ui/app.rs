@@ -254,6 +254,10 @@ pub struct Tab {
     pub read_only: bool,
     /// A tab of matching lines (View → Show only matching lines): read only, not kept for next time.
     pub filter: Option<FilterOf>,
+    /// What EditorConfig says for a path (its file's, or where it was saved), and a look on another thread for one it
+    /// doesn't know yet (`App::editorconfig_for`).
+    pub editorconfig: Option<(PathBuf, crate::editorconfig::Props)>,
+    pub editorconfig_job: Option<(PathBuf, Job<crate::editorconfig::Props>)>,
 }
 
 /// What a tab of matching lines shows: lines of the tab `source`, `map` saying which line there each line here is.
@@ -350,6 +354,8 @@ impl Tab {
             restore: None,
             read_only: false,
             filter: None,
+            editorconfig: None,
+            editorconfig_job: None,
         }
     }
 
@@ -1165,6 +1171,10 @@ impl App {
         // (drawn with WARP while the graphics driver loaded: on to the card once its device is ready)
         self.g.switch_to_gpu();
         if self.g.ensure_target(self.hwnd, w, h, self.dpi as f32).is_err() {
+            // (the device lost while the swap chain resized, or no target to be had: a fresh one in a moment, not
+            // the dead one again at every paint, which left the window frozen)
+            self.g.discard_target();
+            self.timer(super::actions::TIMER_REPAINT, 250);
             return;
         }
         // Cached text layouts hold brushes of the old target.
@@ -1949,7 +1959,7 @@ impl App {
                 return Some((format!("Searching… {:.0}%", j.fraction() * 100.0), false));
             }
         }
-        if tab.doc.read_errors() > 0 {
+        if tab.doc.read_errors() > 0 || tab.doc.suspect {
             return Some(("Part of the file couldn't be read (it may have changed on disk).".into(), true));
         }
         None
