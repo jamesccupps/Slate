@@ -262,10 +262,14 @@ impl App {
     /// Looks at how tab `i`'s text is indented (after opening or loading it), unless the user picked it.
     fn detect_indent(&mut self, i: usize) {
         let width = self.settings.tab_size;
-        // EditorConfig first, the project's own rule (and for a new file, its line endings and encoding)
-        let ec = match self.tabs[i].doc.path.clone() {
-            Some(p) => self.editorconfig_for(i, &p).unwrap_or_default(),
-            None => Default::default(),
+        // EditorConfig first, the project's own rule (and for a new file, its line endings and encoding). (Not looked
+        // up for a tab whose file is about to be read, empty until then: reading it brings it.)
+        let t = &self.tabs[i];
+        let ec = match t.doc.path.clone() {
+            Some(p) if !t.doc.is_empty() || t.doc.is_dirty() || t.editorconfig.is_some() => {
+                self.editorconfig_for(i, &p).unwrap_or_default()
+            }
+            _ => Default::default(),
         };
         let (ec, eol, charset) = editor::editorconfig_of(&ec, width);
         let t = &mut self.tabs[i];

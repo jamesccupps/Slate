@@ -95,8 +95,11 @@ pub struct Formatter<'w> {
     attrs: Vec<u8>,
     /// Where the current attribute name starts in `attrs`.
     attr: usize,
-    /// The hashes of the tag's attribute names so far: a name is compared with the earlier ones only when its hash is
-    /// one of theirs (comparing each with all before it took ~10^11 steps for a tag of 200,000, Cancel unheard).
+    /// How many attribute names the tag has had so far, and past `ATTRS_COMPARED` their hashes: a name is compared
+    /// with the earlier ones only when its hash is one of theirs (comparing each with all before it took ~10^11 steps
+    /// for a tag of 200,000, Cancel unheard). A tag with a few is compared directly (hashing every attribute made
+    /// Check of a 197 MB file 7% slower).
+    attr_count: usize,
     attr_hashes: std::collections::HashSet<u64>,
     /// The name in the current end tag.
     end: Vec<u8>,
@@ -153,6 +156,8 @@ pub const NOT_UTF8: &str =
 /// Check: an XML declaration that isn't at the very start.
 const LATE_DECLARATION: &str = "The XML declaration (<?xml ...?>) can only be at the very start of the file";
 const MAX_WS: usize = 1 << 20;
+/// A tag's attribute names compared with each other directly up to this many; past it, by their hashes first.
+const ATTRS_COMPARED: usize = 16;
 /// Deeper elements aren't indented any further, so absurdly deep input can't turn into gigabytes of spaces.
 const MAX_INDENT: usize = 100;
 
@@ -235,6 +240,7 @@ impl<'w> Formatter<'w> {
             stack: Vec::new(),
             attrs: Vec::new(),
             attr: 0,
+            attr_count: 0,
             attr_hashes: std::collections::HashSet::new(),
             end: Vec::new(),
             ws: Vec::new(),
@@ -373,6 +379,7 @@ impl<'w> Formatter<'w> {
         self.stack.push((self.names.len(), self.mark));
         self.names.push(b);
         self.attrs.clear();
+        self.attr_count = 0;
         self.attr_hashes.clear();
         self.stats.elements += 1;
         self.stats.max_depth = self.stats.max_depth.max(self.stack.len());
@@ -384,8 +391,18 @@ impl<'w> Formatter<'w> {
     fn attr_name(&mut self) -> Result<(), XmlError> {
         let (seen, name) = self.attrs.split_at(self.attr);
         // (FNV-1a)
-        let h = name.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &c| (h ^ c as u64).wrapping_mul(0x100_0000_01b3));
-        if !self.attr_hashes.insert(h) && seen.split(|&c| c == 0).any(|n| n == name) {
+        let hash = |n: &[u8]| n.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &c| (h ^ c as u64).wrapping_mul(0x100_0000_01b3));
+        self.attr_count += 1;
+        if self.attr_count == ATTRS_COMPARED + 1 {
+            // (the earlier names' hashes: from here on those are compared)
+            self.attr_hashes.extend(seen.split(|&c| c == 0).filter(|n| !n.is_empty()).map(hash));
+        }
+        let twice = if self.attr_count <= ATTRS_COMPARED {
+            seen.split(|&c| c == 0).any(|n| n == name)
+        } else {
+            !self.attr_hashes.insert(hash(name)) && seen.split(|&c| c == 0).any(|n| n == name)
+        };
+        if twice {
             let msg = format!("Attribute {} appears twice in <{}>", show(name), show(self.top()));
             return Err(err(self.name_at, msg));
         }
