@@ -102,8 +102,9 @@ icons) and a tarball, each with a `.sha256`.
    (`543472F1…46F8`) and, from 0.9.1, a backup (`1A06C0D8…96AF`, made in a throwaway container: Git Bash's
    gpg-agent hangs on this PC), whose private half the user keeps offline.
 
-5. winget: the package is `JamesCupps.Slate` in microsoft/winget-pkgs (first submitted with 0.8.1, moved to 0.8.2 before it was merged, as 0.8.1's --install registered .bat:
-   microsoft/winget-pkgs#449740, from the user's fork `jamesccupps/winget-pkgs`). Its installer is the release's
+5. winget: the package is `JamesCupps.Slate` in microsoft/winget-pkgs (first submitted with 0.8.1, moved to 0.8.2 before it was merged, as 0.8.1's --install registered .bat,
+   then to 0.16.1 on 2026-11-06, still unmerged: microsoft/winget-pkgs#449740, from the user's fork
+   `jamesccupps/winget-pkgs`, branch `JamesCupps.Slate-0.8.1`). Its installer is the release's
    `Slate.exe`, `InstallerType: exe`, `Scope: user`, silent switch `--install`, `ProductCode: Slate Text Editor` (the
    Installed apps key; `Slate` up to 0.15.0), `UpgradeBehavior: install`. Each new version needs its own manifest PR (three files under
    `manifests/j/JamesCupps/Slate/<version>/`, with the new `InstallerUrl` and `InstallerSha256`; `winget validate
