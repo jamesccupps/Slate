@@ -110,6 +110,15 @@ icons) and a tarball, each with a `.sha256`.
    `manifests/j/JamesCupps/Slate/<version>/`, with the new `InstallerUrl` and `InstallerSha256`; `winget validate
    --manifest <folder>` first); Microsoft's pipeline installs it in a sandbox and merges it. Slate updates itself
    anyway, so a winget PR per release only matters for new installs and `winget upgrade`.
+6. Scoop: Slate is `slate` in the user's bucket `jamesccupps/scoop-bucket` (`bucket/slate.json`: the release's
+   `Slate.exe`, its hash read from `Slate.exe.sha256`; README and website show `scoop bucket add jamesccupps
+   https://github.com/jamesccupps/scoop-bucket` + `scoop install jamesccupps/slate`). The bucket's Excavator workflow
+   updates the manifest from each GitHub release by itself (every 4 hours), so a release needs no Scoop work, as long as:
+   - releases are tagged `vX.Y.Z` and published as the latest release (never a pre-release);
+   - the file names stay `Slate.exe` and `Slate.exe.sha256` (no zip), and the `.sha256` keeps being published with it;
+   - files are signed BEFORE publishing (the `sign` job does it), and a file on a release that's out is never
+     replaced: Scoop and winget have recorded its hash. Fix a bad file with a new version;
+   - if a file name ever has to change, `bucket/slate.json` in jamesccupps/scoop-bucket changes in the same change.
 
 What the updater reads from a release can never change, as every version out there reads it: the tag `vX.Y.Z` (no
 pre-release suffix), assets named exactly `Slate.exe` and `Slate.exe.sha256` (`<64 hex digits>  Slate.exe`), this

@@ -65,6 +65,12 @@
   .btn.ghost { background: transparent; color: #fff; border: 1px solid rgba(255,255,255,.45); font-weight: 500; font-size: 15px; padding: 10px 16px; }
   .btn.ghost:hover { background: rgba(255,255,255,.1); }
   .btn small { font-weight: 400; opacity: .75; font-size: 13px; }
+  .scoop { margin-top: 16px; max-width: 620px; }
+  .scoop p { margin: 0; color: #a9c6e2; font-size: 14px; }
+  .scoop a { color: #d8e8f7; }
+  .scoop pre { background: rgba(0,0,0,.3); border-color: rgba(255,255,255,.18); color: #e6eef7; }
+  .scoop .copy { background: rgba(255,255,255,.12); border-color: rgba(255,255,255,.3); color: #fff; }
+  .scoop .copy:hover { border-color: rgba(255,255,255,.6); }
   .sub { color: #a9c6e2; font-size: 14px; margin-top: 12px; }
   .sub a { color: #d8e8f7; }
   .demo { margin: 34px 0 0; }
@@ -106,6 +112,11 @@
       <a class="btn" id="primary" href="https://github.com/jamesccupps/Slate/releases/latest/download/Slate.exe">Download for Windows <small id="primary-note">Slate.exe, signed</small></a>
       <a class="btn ghost" id="secondary" href="#linux">Linux and Raspberry Pi</a>
       <a class="btn ghost" href="https://github.com/jamesccupps/Slate">Source on GitHub</a>
+    </div>
+    <div class="scoop" id="scoop">
+      <p>Or with <a href="https://scoop.sh">Scoop</a> (new to Scoop? its site shows how to get it):</p>
+      <div class="cmd"><button class="copy" type="button">Copy</button><pre>scoop bucket add jamesccupps https://github.com/jamesccupps/scoop-bucket
+scoop install jamesccupps/slate</pre></div>
     </div>
     <p class="sub"><span id="version">Free and open source (MIT).</span> Windows 10 and 11 (64-bit); Debian 12, Raspberry Pi OS 12, Ubuntu 24.04 and newer. <a href="https://github.com/jamesccupps/Slate/releases">All releases</a></p>
     <div class="demo"><img src="images/slate-demo.gif" width="1264" height="797" alt="Slate opening an 810 MB JSON file, jumping to its last line, finding 435,571 matches in 0.3 seconds, and showing the structure of a 2-million-item list"></div>
@@ -175,6 +186,8 @@ sudo apt update && sudo apt install slate</pre></div>
   var mac = /Mac/i.test(platform) && !phone;
   var primary = document.getElementById("primary"), note = document.getElementById("primary-note");
   var secondary = document.getElementById("secondary");
+  // (the Scoop lines belong with the Windows button: not there on Linux or a phone)
+  if (linux || phone) document.getElementById("scoop").style.display = "none";
   if (linux) {
     primary.href = "#linux";
     primary.firstChild.nodeValue = "Install on Linux ";

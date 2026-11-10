@@ -135,6 +135,18 @@ certificate is new, Windows' SmartScreen may still show "Windows protected your 
 info* → *Run anyway*. Each release lists the SHA-256 of `Slate.exe` (in `Slate.exe.sha256`) if you want to check
 the download.
 
+### Install with Scoop
+
+Slate is also in my [Scoop](https://scoop.sh) bucket (new to Scoop? its site shows how to get it):
+
+```
+scoop bucket add jamesccupps https://github.com/jamesccupps/scoop-bucket
+scoop install jamesccupps/slate
+```
+
+Scoop checks the download against the release's SHA-256 and adds Slate to the Start menu (Scoop Apps).
+`scoop update slate` gets a new version; Slate also updates itself as usual.
+
 ### Linux and Raspberry Pi
 
 Slate runs on 64-bit Linux with GTK 4.8 or newer: Debian 12, Raspberry Pi OS 12 (Bookworm, on a Raspberry Pi 4 or
@@ -197,8 +209,8 @@ edit and send yourself, attaching those files if you like.
 
 To keep Slate but stop it opening files when they're double-clicked: *Help → Stop opening files with Slate…*; the
 file types you set to open with Slate go back to Windows' own choice. To remove it: if you used *Open files with
-Slate…* (or winget), Windows Settings → Apps → Installed apps → Slate → Uninstall removes it. Otherwise just delete
-`Slate.exe`. Your settings and unsaved text stay in `%LOCALAPPDATA%\Slate Text Editor` (or the portable `data` folder): delete
+Slate…* (or winget), Windows Settings → Apps → Installed apps → Slate → Uninstall removes it. With Scoop:
+`scoop uninstall slate`. Otherwise just delete `Slate.exe`. Your settings and unsaved text stay in `%LOCALAPPDATA%\Slate Text Editor` (or the portable `data` folder): delete
 that too if you don't need them any more. On Linux: `sudo apt remove slate`.
 
 ## License
