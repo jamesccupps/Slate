@@ -70,7 +70,7 @@ icons) and a tarball, each with a `.sha256`.
    and newer) test, build, run `tests/smoke-linux.txt` under Xvfb and package (a build that isn't from a tag as
    `<version>~dev<run>`, just below the release, so a test package installs over the last release and the release
    over it); then a release job (the only one
-   with write access) drafts the release with `Slate.exe`, `Slate.exe.sha256` and the `.deb`s and tarballs (with
+   with write access) drafts the release, titled "Slate X.Y.Z", with `Slate.exe`, `Slate.exe.sha256` and the `.deb`s and tarballs (with
    their `.sha256`). The user publishes it — Slate's updater (`src/ui/update.rs`) only sees published releases.
    Before the draft, the `sign` job signs `Slate.exe` in Azure Artifact Signing (account `SlateAccount`, certificate
    profile `Slate`), checks the signature, runs the smoke test on the signed exe and hashes it again.

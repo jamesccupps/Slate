@@ -353,5 +353,6 @@ jobs:
             fi
             gh release upload "$tag" out/* --clobber
           else
-            gh release create "$tag" out/* --draft --title "Slate $tag" "$@"
+            # (titled "Slate X.Y.Z", like the user's other repos; the tag keeps its v)
+            gh release create "$tag" out/* --draft --title "Slate ${tag#v}" "$@"
           fi
