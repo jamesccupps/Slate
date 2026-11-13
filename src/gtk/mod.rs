@@ -639,9 +639,9 @@ pub fn window(application: &gtk4::Application, test: Option<Rc<testmode::Test>>)
 
     // the find bar
     let find_entry = gtk4::Entry::builder().placeholder_text("Find").hexpand(true).build();
-    let case_btn = text_toggle("Aa", "Match case");
-    let word_btn = text_toggle("ab", "Whole word");
-    let regex_btn = text_toggle(".*", "Regular expression");
+    let case_btn = text_toggle("Aa", "Match case (Alt+C)");
+    let word_btn = text_toggle("ab", "Whole word (Alt+W)");
+    let regex_btn = text_toggle(".*", "Regular expression (Alt+R)");
     let sel_btn = gtk4::ToggleButton::new();
     sel_btn.set_icon_name("edit-select-all-symbolic");
     sel_btn.set_tooltip_text(Some("Find in selection (Alt+S)"));
@@ -1916,8 +1916,9 @@ const SHORTCUTS: &str = "Slate keyboard shortcuts
   Ctrl+F / Ctrl+H          Find / replace
   F3 / Shift+F3            Next / previous match (in the find box: Enter / Shift+Enter)
   Ctrl+Alt+Enter           Replace all
+  Alt+C / Alt+W / Alt+R    Match case / whole word / regular expression (in the find box)
   Alt+S                    Find in selection (in the find box)
-  Alt+A                    Next / previous match through all open tabs (in the find box: on or off)
+  Alt+A                   Next / previous match through all open tabs (in the find box: on or off)
   Alt+H                    Highlight the search in every tab, in a color of its own (in the find box)
   Alt+drag, Shift+Alt+arrows  Column selection (type, paste, delete on every line)
   Up / Down                The searches (or replacements) before (in the find box)
@@ -1981,6 +1982,19 @@ impl Ui {
             }
             gdk::Key::s | gdk::Key::S if state.contains(gdk::ModifierType::ALT_MASK) => {
                 self.sel_btn.set_active(!self.sel_btn.is_active());
+                glib::Propagation::Stop
+            }
+            // Match case, whole word, regular expression (as on Windows)
+            gdk::Key::c | gdk::Key::C if state.contains(gdk::ModifierType::ALT_MASK) => {
+                self.case_btn.set_active(!self.case_btn.is_active());
+                glib::Propagation::Stop
+            }
+            gdk::Key::w | gdk::Key::W if state.contains(gdk::ModifierType::ALT_MASK) => {
+                self.word_btn.set_active(!self.word_btn.is_active());
+                glib::Propagation::Stop
+            }
+            gdk::Key::r | gdk::Key::R if state.contains(gdk::ModifierType::ALT_MASK) => {
+                self.regex_btn.set_active(!self.regex_btn.is_active());
                 glib::Propagation::Stop
             }
             gdk::Key::a | gdk::Key::A if state.contains(gdk::ModifierType::ALT_MASK) => {
