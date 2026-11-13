@@ -209,6 +209,13 @@ data folder and registry keys named "Slate Text Editor" (`%LOCALAPPDATA%\Slate T
 plain "Slate"), and started again with its tabs after Windows restarts for an update. Details in the
 [0.16.0 release notes](release-notes-0.16.0.md).
 
+## 0.17.0: Linux on a real desktop
+
+Linux checked on Ubuntu 24.04 with GNOME on Wayland (scaling 100% to 200%, logging out and back, a reboot, the file
+manager, the dialogs) and timed against Windows on the same PC: high contrast, GNOME's Dark back to Light followed,
+Alt+C / Alt+W / Alt+R in the find box, keyboard selections pasted with a middle click; the engine as fast as on
+Windows. Details in the [0.17.0 release notes](release-notes-0.17.0.md).
+
 ## Later
 
 - **Linux, the rest:** keeping big unsaved documents in the session (`.pieces`/`.data`, as on Windows: its engine in
