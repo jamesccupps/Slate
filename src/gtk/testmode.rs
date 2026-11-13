@@ -7,9 +7,9 @@
 //! (`ctrl+shift+k`, `enter`, `pagedown`, `f3`), `findkey:<combo>` / `replacekey:<combo>` (in the find or replace
 //! box: `up`, `alt+s`), `cmd:<action>` (a menu action's name: `save`, `json-format`...),
 //! `find:<text>`, `replace:<text>`, `goto:<line>`, `answer:save,dont,cancel` (or a path for Open and Save as),
-//! `jobs:counts` (also the status bar's word count), `lang:<name>`, `set:wrap=true` (also `line_numbers`, `font_size`, `high_contrast`: the desktop's, as if switched;
-//! `print:contrast` says what's drawn), `gsettings:<key>=<value>` (GNOME's), `wait:<ms>`, `jobs` (wait for background
-//! work), `shot:<file.png>`, `print:<what>` (`text`, `sel`, `status`, `title`, `tabs`, `lang`, `asked`,
+//! `lang:<name>`, `set:wrap=true` (also `line_numbers`, `font_size`, `high_contrast`: the desktop's, as if
+//! switched; `print:contrast` says what's drawn), `gsettings:<key>=<value>` (GNOME's), `wait:<ms>`, `jobs` (wait for
+//! background work; `jobs:counts`: the status bar's word count too), `shot:<file.png>`, `print:<what>` (`text`, `sel`, `status`, `title`, `tabs`, `lang`, `asked`,
 //! `clipboard`, `find`, `dirty`, `top`, `session`: the session folder's files, `notice`, `composing`),
 //! `imemsg:start|pre|<text>|<cursor>|<clauses>|commit|<text>|end` (an input method), `expect:<what>=<value>`,
 //! `t:<label>` (a timing mark), `persist`, `session:save|soon|restore` (`soon`: on another thread, as the timer

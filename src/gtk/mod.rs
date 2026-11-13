@@ -128,6 +128,8 @@ pub struct Ui {
     closing: Cell<bool>,
     /// The text was drawn once (the tabs from the session are shown: `session::restored`).
     painted: Cell<bool>,
+    /// The selection last made the primary selection (tab, start, end): a new one is, once (`refresh_now`).
+    primary_sel: Cell<(u64, u64, u64)>,
     /// Logging out waits while there's unsaved work the session can't keep (the session manager's cookie).
     inhibited: Cell<Option<u32>>,
     /// Questions (and Save as) open now: the window's close button doesn't start another round of them meanwhile.
@@ -878,6 +880,7 @@ pub fn window(application: &gtk4::Application, test: Option<Rc<testmode::Test>>)
         css_dark: Cell::new(None),
         closing: Cell::new(false),
         painted: Cell::new(false),
+        primary_sel: Cell::new((0, 0, 0)),
         inhibited: Cell::new(None),
         asking: Cell::new(0),
         recent_menu,
@@ -2390,6 +2393,7 @@ impl Ui {
         let text = self.app.try_borrow().ok().and_then(|a| {
             let tab = a.tab();
             let sel = tab.view.sel;
+            self.primary_sel.set((tab.id, sel.start(), sel.end()));
             (!sel.is_empty() && sel.end() - sel.start() <= 4 << 20)
                 .then(|| String::from_utf8_lossy(&tab.doc.read(sel.start(), sel.end())).into_owned())
         });
@@ -2823,6 +2827,22 @@ impl Ui {
                             }
                         }
                     });
+                }
+            }
+        }
+        // A new selection (made with the keys, Select all, Find...) becomes the primary selection, what a middle click
+        // pastes, as in GTK's own text boxes; one the mouse is still making becomes it when the button is let go.
+        if self.test.is_none() {
+            let tab = a.tab();
+            let sel = tab.view.sel;
+            let now = (tab.id, sel.start(), sel.end());
+            if !sel.is_empty() && tab.view.drag.is_none() && self.primary_sel.get() != now {
+                self.primary_sel.set(now);
+                if sel.end() - sel.start() <= 4 << 20 {
+                    let t = String::from_utf8_lossy(&tab.doc.read(sel.start(), sel.end())).into_owned();
+                    if let Some(d) = gdk::Display::default() {
+                        d.primary_clipboard().set_text(&t);
+                    }
                 }
             }
         }
