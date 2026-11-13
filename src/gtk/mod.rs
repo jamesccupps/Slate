@@ -560,6 +560,10 @@ fn system_dark() -> bool {
                 match s.string("color-scheme").as_str() {
                     "prefer-dark" => return true,
                     "prefer-light" => return false,
+                    // GNOME's own Light style is "default" (no preference): light there, unless its GTK theme is a
+                    // dark one. (Going on to GTK's prefer-dark below, read once at the start, kept Slate dark after
+                    // GNOME went from Dark back to Light.)
+                    _ if on_gnome() => return gtk4::Settings::default().is_some_and(|gs| dark_theme_name(&gs)),
                     _ => {}
                 }
             }
@@ -576,13 +580,20 @@ fn system_dark() -> bool {
         c.set(Some(v));
         v
     });
-    if prefers {
-        return true;
-    }
+    prefers || dark_theme_name(&gs)
+}
+
+/// A dark GTK theme (Adwaita-dark, Yaru-dark, Raspberry Pi OS's PiXnoir, HighContrastInverse).
+fn dark_theme_name(gs: &gtk4::Settings) -> bool {
     gs.gtk_theme_name().is_some_and(|n| {
         let n = n.to_ascii_lowercase();
         n.contains("dark") || n.contains("noir") || n.contains("inverse")
     })
+}
+
+/// Running on GNOME (Ubuntu's says "ubuntu:GNOME").
+fn on_gnome() -> bool {
+    std::env::var("XDG_CURRENT_DESKTOP").is_ok_and(|d| d.split(':').any(|x| x.eq_ignore_ascii_case("GNOME")))
 }
 
 /// Whether the desktop asks for high contrast: the desktop portal's contrast (KDE and others), GNOME's
