@@ -1130,6 +1130,30 @@ impl View {
             let lx = r.lay.x_of(line.start_index()) - line_x_from_start(&r.lay, r.line);
             draw_row(cr, &r.lay, &line, x0 + lx, r.y + cx.style.baseline, ox, ox + cx.width, t.text);
         }
+        // high contrast: the selected text drawn again over the selection in the highlight's own text color (black
+        // on its blue was 3.3:1), as on Windows
+        if t.hc && focused && sb > sa {
+            for r in rows.iter() {
+                let (la, lb) = r.lay.line_range(r.line);
+                let (ra, rb) = (r.seg.start + r.lay.rel(la), r.seg.start + r.lay.rel(lb));
+                let (a, b) = (sa.max(ra), sb.min(rb));
+                if b <= a {
+                    continue;
+                }
+                let Some(line) = r.lay.layout.line_readonly(r.line as i32) else { continue };
+                let (ia, ib) = (r.lay.disp(a - r.seg.start), r.lay.disp(b - r.seg.start));
+                let _ = cr.save();
+                for p in line.x_ranges(ia, ib).chunks(2) {
+                    let (xa, xb) = (p[0] as f64 / pango::SCALE as f64, p[1] as f64 / pango::SCALE as f64);
+                    cr.rectangle(x0 + xa, r.y, (xb - xa).max(1.0), row_h);
+                }
+                cr.clip();
+                set_color(cr, t.selection_text);
+                let lx = r.lay.x_of(line.start_index()) - line_x_from_start(&r.lay, r.line);
+                draw_row(cr, &r.lay, &line, x0 + lx, r.y + cx.style.baseline, ox, ox + cx.width, t.selection_text);
+                let _ = cr.restore();
+            }
+        }
         if cx.style.show_whitespace {
             self.paint_whitespace(cx, cr, &rows, x0);
         }

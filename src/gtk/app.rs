@@ -429,6 +429,8 @@ pub struct App {
     pub closed: Vec<PathBuf>,
     /// The system wants dark (when the theme follows it).
     pub system_dark: bool,
+    /// The desktop's high contrast is on (then Slate is drawn in `Theme::high_contrast_fixed`).
+    pub system_hc: bool,
     /// The window should be drawn again / its title and menus updated.
     pub dirty_view: bool,
     pub dirty_title: bool,
@@ -507,6 +509,7 @@ impl App {
             focused: true,
             closed: Vec::new(),
             system_dark,
+            system_hc: false,
             dirty_view: true,
             dirty_title: true,
             copy_out: None,
@@ -549,7 +552,14 @@ impl App {
 
     pub fn apply_theme(&mut self) {
         let accent = crate::theme::rgb(0x3584E4);
-        self.theme = if self.dark() { Theme::dark(accent) } else { Theme::light(accent) };
+        self.theme = if self.system_hc {
+            // (the desktop's high contrast wins over Slate's own light or dark, as on Windows: dark if the desktop is)
+            Theme::high_contrast_fixed(self.system_dark)
+        } else if self.dark() {
+            Theme::dark(accent)
+        } else {
+            Theme::light(accent)
+        };
         for t in &mut self.tabs {
             t.view.clear_cache();
         }

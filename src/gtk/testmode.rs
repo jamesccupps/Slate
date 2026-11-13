@@ -303,10 +303,14 @@ async fn script(lines: Vec<String>, test: Rc<Test>) -> i32 {
             // GNOME's interface setting changed (under GSETTINGS_BACKEND=memory: the test's own): `gsettings:<key>=<value>`
             "gsettings" => {
                 let (k, v) = arg.split_once('=').unwrap_or((arg, ""));
-                let ok = gio::SettingsSchemaSource::default()
-                    .and_then(|s| s.lookup("org.gnome.desktop.interface", true))
-                    .is_some_and(|s| s.has_key(k))
-                    && gio::Settings::new("org.gnome.desktop.interface").set_string(k, v).is_ok();
+                // (GNOME's interface settings; its accessibility ones for high-contrast)
+                let schema = if k == "high-contrast" { "org.gnome.desktop.a11y.interface" } else { "org.gnome.desktop.interface" };
+                let ok = gio::SettingsSchemaSource::default().and_then(|s| s.lookup(schema, true)).is_some_and(|s| s.has_key(k))
+                    && if k == "high-contrast" {
+                        gio::Settings::new(schema).set_boolean(k, v == "true").is_ok()
+                    } else {
+                        gio::Settings::new(schema).set_string(k, v).is_ok()
+                    };
                 log(&mut out, format!("gsettings {k}: {}", if ok { "set" } else { "no such setting" }));
                 settle(50).await;
             }
@@ -586,6 +590,7 @@ fn value(what: &str, test: &Test) -> String {
         "top" => format!("{}+{}", tab.view.top, tab.view.top_row),
         "wrap" => a.settings.wrap.to_string(),
         "theme" => if a.theme.dark { "dark" } else { "light" }.to_string(),
+        "contrast" => if a.theme.hc { "high" } else { "normal" }.to_string(),
         // the files in the session folder
         "session" => {
             let mut v: Vec<String> = std::fs::read_dir(crate::settings::data_dir().join("session"))

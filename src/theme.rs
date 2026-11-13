@@ -1,7 +1,7 @@
 //! Colors and sizes, shared by the Windows and Linux windows. Light and dark palettes follow Windows 11 Notepad's
 //! look: the active tab, menu bar and text area share one surface; the tab strip and status bar sit on a slightly
 //! darker (or lighter) frame. While Windows' high contrast is on, every color comes from Windows instead
-//! (`Theme::high_contrast`).
+//! (`Theme::high_contrast`); on Linux the desktop's high contrast gives fixed ones (`Theme::high_contrast_fixed`).
 
 use crate::highlight::Tok;
 
@@ -284,12 +284,31 @@ impl Theme {
     /// its contrast.
     #[cfg(windows)]
     pub fn high_contrast() -> Theme {
-        let window = sys_color(COLOR_WINDOW);
-        let text = sys_color(COLOR_WINDOWTEXT);
-        let hl = sys_color(COLOR_HIGHLIGHT);
-        let hl_text = sys_color(COLOR_HIGHLIGHTTEXT);
-        let gray = sys_color(COLOR_GRAYTEXT);
-        let link = sys_color(COLOR_HOTLIGHT);
+        Theme::contrast(
+            sys_color(COLOR_WINDOW),
+            sys_color(COLOR_WINDOWTEXT),
+            sys_color(COLOR_HIGHLIGHT),
+            sys_color(COLOR_HIGHLIGHTTEXT),
+            sys_color(COLOR_GRAYTEXT),
+            sys_color(COLOR_HOTLIGHT),
+        )
+    }
+
+    /// Linux: the desktop's high contrast (GNOME's switch, the portal's contrast or a HighContrast GTK theme) has
+    /// no colors to read, so these are GTK's own high-contrast ones: black on white, or white on black, with GNOME's
+    /// blue selection under white text (6.4:1) and gray text at 8:1 or more.
+    #[cfg(target_os = "linux")]
+    pub fn high_contrast_fixed(dark: bool) -> Theme {
+        if dark {
+            Theme::contrast(rgb(0x000000), rgb(0xFFFFFF), rgb(0x1A5FB4), rgb(0xFFFFFF), rgb(0xB0B0B0), rgb(0x99C1F1))
+        } else {
+            Theme::contrast(rgb(0xFFFFFF), rgb(0x000000), rgb(0x1A5FB4), rgb(0xFFFFFF), rgb(0x505050), rgb(0x1A5FB4))
+        }
+    }
+
+    /// The high-contrast palette from six colors: the window, its text, the highlight and the text on it, gray
+    /// (disabled) text and links.
+    fn contrast(window: u32, text: u32, hl: u32, hl_text: u32, gray: u32, link: u32) -> Theme {
         Theme {
             dark: luminance(window) < 0.5,
             hc: true,

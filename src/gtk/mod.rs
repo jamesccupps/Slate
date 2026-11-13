@@ -581,8 +581,22 @@ fn system_dark() -> bool {
     }
     gs.gtk_theme_name().is_some_and(|n| {
         let n = n.to_ascii_lowercase();
-        n.contains("dark") || n.contains("noir")
+        n.contains("dark") || n.contains("noir") || n.contains("inverse")
     })
+}
+
+/// Whether the desktop asks for high contrast: the desktop portal's contrast (KDE and others), GNOME's
+/// accessibility switch (Settings → Accessibility → High contrast), or a high-contrast GTK theme.
+fn system_high_contrast() -> bool {
+    if PORTAL_HC.with(|p| p.get()) == Some(true) {
+        return true;
+    }
+    if let Some(schema) = gio::SettingsSchemaSource::default().and_then(|s| s.lookup("org.gnome.desktop.a11y.interface", true)) {
+        if schema.has_key("high-contrast") && gio::Settings::new("org.gnome.desktop.a11y.interface").boolean("high-contrast") {
+            return true;
+        }
+    }
+    gtk4::Settings::default().and_then(|gs| gs.gtk_theme_name()).is_some_and(|n| n.to_ascii_lowercase().contains("highcontrast"))
 }
 
 fn make_style(pango: &pango::Context, s: &Settings) -> view::Style {
@@ -761,6 +775,10 @@ pub fn window(application: &gtk4::Application, test: Option<Rc<testmode::Test>>)
 
     let style = make_style(&text.pango_context(), &settings);
     let mut app = App::new(settings, style, notifier(), system_dark());
+    app.system_hc = system_high_contrast();
+    if app.system_hc {
+        app.apply_theme();
+    }
     app.disk_notify = Some(disk_notifier());
     session::restore(&mut app, test.is_none());
     if app.tabs.is_empty() {
@@ -1332,47 +1350,53 @@ fn connect(ui: &Rc<Ui>, prev: &gtk4::Button, next: &gtk4::Button, lines_btn: &gt
             ui.command(Cmd::ToggleTheme);
         }
     });
-    // The system's light or dark, followed while Slate runs: a GTK theme switched, GNOME's style (its color-scheme
-    // key, which other desktops set too) and the desktop portal's color scheme (KDE and others).
+    // The system's light or dark and its high contrast, followed while Slate runs: a GTK theme switched, GNOME's
+    // style (its color-scheme key, which other desktops set too) and accessibility switch, and the desktop portal's
+    // color scheme and contrast (KDE and others).
     if let Some(gs) = gtk4::Settings::default() {
         gs.connect_gtk_theme_name_notify(|_| system_theme_changed());
     }
-    if let Some(schema) = gio::SettingsSchemaSource::default().and_then(|s| s.lookup("org.gnome.desktop.interface", true)) {
-        if schema.has_key("color-scheme") {
-            let gs = gio::Settings::new("org.gnome.desktop.interface");
-            gs.connect_changed(Some("color-scheme"), |_, _| system_theme_changed());
-            // (a GSettings dropped tells nothing any more)
-            DESKTOP_SETTINGS.with(|d| *d.borrow_mut() = Some(gs));
+    for (schema_id, key) in [("org.gnome.desktop.interface", "color-scheme"), ("org.gnome.desktop.a11y.interface", "high-contrast")] {
+        if let Some(schema) = gio::SettingsSchemaSource::default().and_then(|s| s.lookup(schema_id, true)) {
+            if schema.has_key(key) {
+                let gs = gio::Settings::new(schema_id);
+                gs.connect_changed(Some(key), |_, _| system_theme_changed());
+                // (a GSettings dropped tells nothing any more)
+                DESKTOP_SETTINGS.with(|d| d.borrow_mut().push(gs));
+            }
         }
     }
     if ui.test.is_none() {
-        follow_portal_scheme();
+        follow_portal_appearance();
     }
 }
 
 thread_local! {
-    /// GNOME's interface settings, kept while Slate runs (for their changes: `connect`).
-    static DESKTOP_SETTINGS: RefCell<Option<gio::Settings>> = const { RefCell::new(None) };
+    /// GNOME's interface and accessibility settings, kept while Slate runs (for their changes: `connect`).
+    static DESKTOP_SETTINGS: RefCell<Vec<gio::Settings>> = const { RefCell::new(Vec::new()) };
     /// The desktop portal's color scheme: dark (true), light (false), or no preference / no portal (None).
     static PORTAL_DARK: Cell<Option<bool>> = const { Cell::new(None) };
+    /// The desktop portal's contrast: high (true), normal (false), or not given (None).
+    static PORTAL_HC: Cell<Option<bool>> = const { Cell::new(None) };
 }
 
-/// The system went light or dark (or its theme changed): Slate follows when its theme is the system's.
+/// The system went light or dark, or high contrast on or off (or its theme changed): Slate follows.
 fn system_theme_changed() {
     if let Some(ui) = get_ui() {
-        let dark = system_dark();
+        let (dark, hc) = (system_dark(), system_high_contrast());
         ui.with(|a| {
             a.system_dark = dark;
+            a.system_hc = hc;
             a.apply_theme();
         });
         ui.apply_theme();
     }
 }
 
-/// The desktop portal's `org.freedesktop.appearance` `color-scheme` (1 dark, 2 light, 0 none), read once (without
-/// holding up the start) and followed through its SettingChanged signal.
-fn follow_portal_scheme() {
-    fn scheme(v: &glib::Variant) -> Option<bool> {
+/// The desktop portal's `org.freedesktop.appearance` `color-scheme` (1 dark, 2 light, 0 none) and `contrast` (1 high,
+/// 0 none), read once (without holding up the start) and followed through its SettingChanged signal.
+fn follow_portal_appearance() {
+    fn number(v: &glib::Variant) -> Option<u32> {
         // (Read wraps the value in a variant or two: unwrapped down to the number; asked of anything but a variant,
         // GLib logs a CRITICAL, as every start on GNOME did)
         let mut v = v.clone();
@@ -1382,11 +1406,17 @@ fn follow_portal_scheme() {
                 None => break,
             }
         }
-        match v.get::<u32>() {
+        v.get::<u32>()
+    }
+    fn scheme(v: &glib::Variant) -> Option<bool> {
+        match number(v) {
             Some(1) => Some(true),
             Some(2) => Some(false),
             _ => None,
         }
+    }
+    fn contrast(v: &glib::Variant) -> Option<bool> {
+        number(v).map(|n| n == 1)
     }
     gio::bus_get(gio::BusType::Session, gio::Cancellable::NONE, |bus| {
         let Ok(bus) = bus else { return };
@@ -1400,32 +1430,38 @@ fn follow_portal_scheme() {
             gio::DBusSignalFlags::NONE,
             |_, _, _, _, _, params| {
                 if let Some((_, key, v)) = params.get::<(String, String, glib::Variant)>() {
-                    if key == "color-scheme" {
-                        PORTAL_DARK.with(|p| p.set(scheme(&v)));
-                        system_theme_changed();
+                    match key.as_str() {
+                        "color-scheme" => PORTAL_DARK.with(|p| p.set(scheme(&v))),
+                        "contrast" => PORTAL_HC.with(|p| p.set(contrast(&v))),
+                        _ => return,
                     }
-                }
-            },
-        );
-        bus.call(
-            Some("org.freedesktop.portal.Desktop"),
-            "/org/freedesktop/portal/desktop",
-            "org.freedesktop.portal.Settings",
-            "Read",
-            Some(&("org.freedesktop.appearance", "color-scheme").to_variant()),
-            None,
-            gio::DBusCallFlags::NONE,
-            2000,
-            gio::Cancellable::NONE,
-            |r| {
-                let Ok(r) = r else { return };
-                let found = scheme(&r.child_value(0));
-                if found.is_some() && found != PORTAL_DARK.with(|p| p.get()) {
-                    PORTAL_DARK.with(|p| p.set(found));
                     system_theme_changed();
                 }
             },
         );
+        for key in ["color-scheme", "contrast"] {
+            bus.call(
+                Some("org.freedesktop.portal.Desktop"),
+                "/org/freedesktop/portal/desktop",
+                "org.freedesktop.portal.Settings",
+                "Read",
+                Some(&("org.freedesktop.appearance", key).to_variant()),
+                None,
+                gio::DBusCallFlags::NONE,
+                2000,
+                gio::Cancellable::NONE,
+                move |r| {
+                    // (an older portal has no contrast: an error, nothing changes)
+                    let Ok(r) = r else { return };
+                    let cell = if key == "contrast" { &PORTAL_HC } else { &PORTAL_DARK };
+                    let found = if key == "contrast" { contrast(&r.child_value(0)) } else { scheme(&r.child_value(0)) };
+                    if found.is_some() && found != cell.with(|p| p.get()) {
+                        cell.with(|p| p.set(found));
+                        system_theme_changed();
+                    }
+                },
+            );
+        }
     });
 }
 
