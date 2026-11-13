@@ -65,6 +65,12 @@ jobs:
         # tested, uploaded and signed. Fails if it isn't there.
         run: ./scripts/load-config.ps1 -Exe target/release/Slate.exe
 
+      - name: Its version, read as the copies out there read it before they install it
+        shell: pwsh
+        # 0.16.1 and 0.17.0 take the first VS_FIXEDFILEINFO head in a download: it must be in the resources and say
+        # Cargo.toml's version, else they refuse the update (scripts/check-version.ps1, src/ui/update.rs file_version).
+        run: ./scripts/check-version.ps1 -Exe target/release/Slate.exe
+
       - name: Smoke test (the built Slate.exe, in its test mode)
         shell: pwsh
         timeout-minutes: 5
@@ -239,6 +245,7 @@ jobs:
           $s = Get-AuthenticodeSignature out\Slate.exe
           "$($s.Status): $($s.SignerCertificate.Subject)"
           if ($s.Status -ne 'Valid') { throw "Slate.exe isn't validly signed: $($s.StatusMessage)" }
+          ./scripts/check-version.ps1 -Exe out\Slate.exe
           $dir = Join-Path $env:RUNNER_TEMP smoke
           New-Item -ItemType Directory -Force $dir | Out-Null
           $env:SLATE_DATA_DIR = Join-Path $dir data

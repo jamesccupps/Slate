@@ -36,6 +36,8 @@ through the link path counted as someone else's and every link failed ("cannot f
   PC): a newer one only on purpose, raised there and here together (`rustup update`), never whatever "stable" is on
   the day a tag is built. (No `rust-toolchain.toml`: it would make every local build fetch a second toolchain.)
 - `build.rs` writes the resource object (manifest, icon, version info) itself; there is no rc.exe/windres.
+- `scripts/check-version.ps1 -Exe <exe>` runs after every release build too, after `load-config.ps1` (below): the
+  version as the copies out there read it (see "What the updater reads" under Releasing).
 - `scripts/load-config.ps1 -Exe <exe>` runs after every release build (CI's, and `build.cmd`'s): GNU ld doesn't fill in
   the PE's load configuration, so the script points it at `_load_config_used` in `src/main.rs`, whose
   DependentLoadFlags (LOAD_LIBRARY_SEARCH_SYSTEM32) make Windows take the DLLs Slate.exe imports from System32 only,
@@ -122,7 +124,12 @@ icons) and a tarball, each with a `.sha256`.
 
 What the updater reads from a release can never change, as every version out there reads it: the tag `vX.Y.Z` (no
 pre-release suffix), assets named exactly `Slate.exe` and `Slate.exe.sha256` (`<64 hex digits>  Slate.exe`), this
-repository, `/releases/latest`. Slate.exe stays the x64 build. The updater never goes back to a lower version, so a
+repository, `/releases/latest`; and Slate.exe's version where 0.16.1 and 0.17.0 look for it: the FIRST place in the
+file of VS_FIXEDFILEINFO's 8-byte head (signature + structure version), which must be its version resource. Their
+own code held those bytes as one constant (in `.rdata`, before the resources), so they refused every update until
+0.17.1, whose `update::file_version` reads the resource section only and never holds the 8 bytes together;
+`scripts/check-version.ps1` checks every build (CI's, the signed exe, `build.cmd`'s) the old way and fails it if
+that doesn't give Cargo.toml's version. Slate.exe stays the x64 build. The updater never goes back to a lower version, so a
 bad release is fixed by publishing a higher one; a new version that doesn't start is undone on the user's PC by the
 version before it (see update.rs). A copy deployed from a local build also updates itself from GitHub once a higher
 version is published (unless its automatic check is off). Nor can who signs it: from 0.9.1 the updater wants the

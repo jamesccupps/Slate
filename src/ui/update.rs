@@ -241,10 +241,29 @@ pub fn download(rel: &Release, ctx: &Ctx) -> Result<PathBuf, String> {
 }
 
 /// The version an exe's version resource gives (VS_FIXEDFILEINFO, which starts with its signature and its structure's
-/// version, 1.0: build.rs writes it).
+/// version, 1.0: build.rs writes it), looked for in its resource section only.
+///
+/// Those 8 bytes are never one constant in Slate's code: 0.16.1 and 0.17.0 had them as one and took the first place
+/// they were in a download, which was that constant (in `.rdata`, before the resources), so they refused every update
+/// ("The download isn't Slate … as the release says"). They still read a download that way, so a release must have
+/// the 8 bytes once, in its version resource: `scripts/check-version.ps1` makes sure of that in every build.
 fn file_version(exe: &[u8]) -> Option<Version> {
-    let at = memchr::memmem::find(exe, &[0xBD, 0x04, 0xEF, 0xFE, 0x00, 0x00, 0x01, 0x00])? + 8;
     let word = |i: usize| Some(u32::from_le_bytes(exe.get(i..i + 4)?.try_into().ok()?));
+    let half = |i: usize| Some(u16::from_le_bytes(exe.get(i..i + 2)?.try_into().ok()?) as usize);
+    // the PE's section table: the resources' place in the file
+    let pe = word(0x3C)? as usize;
+    if exe.get(pe..pe + 4)? != b"PE\0\0" {
+        return None;
+    }
+    let (count, optional) = (half(pe + 6)?, half(pe + 20)?);
+    let rsrc = (0..count).map(|k| pe + 24 + optional + k * 40).find(|&s| exe.get(s..s + 8) == Some(b".rsrc\0\0\0"))?;
+    let (from, len) = (word(rsrc + 20)? as usize, word(rsrc + 16)? as usize);
+    let res = exe.get(from..from.checked_add(len)?.min(exe.len()))?;
+    // (the head put together while running, so the program never holds it as one constant)
+    let mut head = [0u8; 8];
+    head[..4].copy_from_slice(&std::hint::black_box(0xFEEF_04BDu32).to_le_bytes());
+    head[4..].copy_from_slice(&std::hint::black_box(0x0001_0000u32).to_le_bytes());
+    let at = from + memchr::memmem::find(res, &head)? + 8;
     let (ms, ls) = (word(at)?, word(at + 4)?);
     Some(Version(ms >> 16, ms & 0xFFFF, ls >> 16))
 }
@@ -552,14 +571,34 @@ mod tests {
         assert_eq!(Version(1, 2, 3).to_string(), "1.2.3");
     }
 
+    /// A minimal exe: MZ, a PE header with one section, `.rsrc`, holding `body`, and `before` ahead of it.
+    fn fake_exe(before: &[u8], body: &[u8]) -> Vec<u8> {
+        let mut exe = vec![0u8; 0x200];
+        exe[..2].copy_from_slice(b"MZ");
+        exe[0x3C..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+        exe[0x80..0x84].copy_from_slice(b"PE\0\0");
+        exe[0x86..0x88].copy_from_slice(&1u16.to_le_bytes());
+        // (no optional header: the section table follows at once)
+        let s = 0x98;
+        exe[s..s + 8].copy_from_slice(b".rsrc\0\0\0");
+        exe[s + 16..s + 20].copy_from_slice(&(body.len() as u32).to_le_bytes());
+        exe[s + 20..s + 24].copy_from_slice(&((0x200 + before.len()) as u32).to_le_bytes());
+        exe.extend_from_slice(before);
+        exe.extend_from_slice(body);
+        exe
+    }
+
     #[test]
     fn an_exes_own_version_is_read() {
-        // (as build.rs writes VS_FIXEDFILEINFO: signature, structure version, file version)
-        let mut exe = b"MZ...".to_vec();
-        exe.extend_from_slice(&[0xBD, 0x04, 0xEF, 0xFE, 0x00, 0x00, 0x01, 0x00]);
-        exe.extend_from_slice(&16u32.to_le_bytes());
-        exe.extend_from_slice(&(1u32 << 16).to_le_bytes());
-        assert_eq!(file_version(&exe), Some(Version(0, 16, 1)));
+        // (as build.rs writes VS_FIXEDFILEINFO: signature, structure version, file version 0.minor.patch)
+        let head = [0xFEEF_04BDu32.to_le_bytes(), 0x0001_0000u32.to_le_bytes()].concat();
+        let info = |minor: u32, patch: u32| [head.clone(), minor.to_le_bytes().to_vec(), (patch << 16).to_le_bytes().to_vec()].concat();
+        assert_eq!(file_version(&fake_exe(b"", &info(17, 1))), Some(Version(0, 17, 1)));
+        // The same 8 bytes before the resources aren't its version: 0.16.1 and 0.17.0 held them as a constant there
+        // and read "ginning" after them as theirs.
+        let constant = [head.clone(), b"ginning!".to_vec()].concat();
+        assert_eq!(file_version(&fake_exe(&constant, &info(17, 1))), Some(Version(0, 17, 1)));
+        assert_eq!(file_version(&fake_exe(&info(16, 1), b"no version in the resources")), None);
         assert_eq!(file_version(b"MZ without one"), None);
     }
 

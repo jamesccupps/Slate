@@ -15,6 +15,9 @@ if errorlevel 1 exit /b 1
 rem (Windows takes its DLLs from System32 only: see scripts\load-config.ps1)
 powershell -NoProfile -ExecutionPolicy Bypass -File "%HERE%scripts\load-config.ps1" -Exe "%HERE%target\release\Slate.exe"
 if errorlevel 1 exit /b 1
+rem (its version as the copies out there read it before they install an update: see scripts\check-version.ps1)
+powershell -NoProfile -ExecutionPolicy Bypass -File "%HERE%scripts\check-version.ps1" -Exe "%HERE%target\release\Slate.exe"
+if errorlevel 1 exit /b 1
 if not exist "%HERE%dist" mkdir "%HERE%dist"
 copy /y "%HERE%target\release\Slate.exe" "%HERE%dist\Slate.exe" >nul
 echo Built dist\Slate.exe
