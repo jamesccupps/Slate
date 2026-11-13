@@ -12,7 +12,9 @@
 //! `clipboard`, `find`, `dirty`, `top`, `session`: the session folder's files, `notice`, `composing`),
 //! `imemsg:start|pre|<text>|<cursor>|<clauses>|commit|<text>|end` (an input method), `expect:<what>=<value>`,
 //! `t:<label>` (a timing mark), `persist`, `session:save|soon|restore` (`soon`: on another thread, as the timer
-//! does), `printpdf:<file>[|selection]` (the tab printed into a PDF file, no dialog), `quit`.
+//! does), `printpdf:<file>[|selection]` (the tab printed into a PDF file, no dialog), `saveas:<file>`,
+//! `scrollto:<0..1>` (the scrollbar dragged there), `quit`. For the benchmarks shared with Windows, `print:` also
+//! knows `lines`, `len`, `topline`, `mem` and `startup`.
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -354,6 +356,18 @@ async fn script(lines: Vec<String>, test: Rc<Test>) -> i32 {
                 test.answers.borrow_mut().push_front(arg.to_string());
                 ui.command(Cmd::GotoLine);
             }
+            // saveas:<file>: Save as, answered with that file
+            "saveas" => {
+                let path = std::path::absolute(arg).unwrap_or_else(|_| PathBuf::from(arg));
+                test.answers.borrow_mut().push_front(path.to_string_lossy().into_owned());
+                ui.command(Cmd::SaveAs);
+            }
+            // scrollto:<0..1>: the scrollbar moved to that fraction, as a drag would
+            "scrollto" => {
+                let f: f64 = arg.parse().unwrap_or(0.5);
+                let adj = ui.vbar.adjustment();
+                adj.set_value((adj.upper() - adj.page_size()).max(0.0) * f.clamp(0.0, 1.0));
+            }
             "answer" => {
                 let mut a = test.answers.borrow_mut();
                 for x in arg.split(',') {
@@ -540,6 +554,35 @@ fn value(what: &str, test: &Test) -> String {
         "clipboard" => test.clipboard.borrow().clone(),
         "find" => format!("{:?}", a.find.found.as_ref().map(|f| f.1.count)),
         "dirty" => tab.doc.is_dirty().to_string(),
+        "lines" => tab.doc.line_count().map(|n| n.to_string()).unwrap_or_else(|| "?".into()),
+        "len" => tab.doc.len().to_string(),
+        "topline" => tab.doc.line_of(tab.view.top).map(|l| (l + 1).to_string()).unwrap_or_default(),
+        // (as Windows prints it, for the same benchmarks: resident anonymous memory as "private", what's resident
+        // and its peak)
+        "mem" => {
+            let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+            let mb = |key: &str| {
+                status
+                    .lines()
+                    .find_map(|l| l.strip_prefix(key))
+                    .and_then(|v| v.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
+                    .unwrap_or(0)
+                    >> 10
+            };
+            format!("private {} MB, working set {} MB, peak {} MB", mb("RssAnon:"), mb("VmRSS:"), mb("VmHWM:"))
+        }
+        // (milliseconds since the process started, as the kernel counts it: in steps of a clock tick)
+        "startup" => {
+            let stat = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
+            // (the fields after the name in brackets; the start time is the 22nd field)
+            let start = stat.rsplit_once(')').and_then(|(_, r)| r.split_whitespace().nth(19)?.parse::<f64>().ok());
+            let up = std::fs::read_to_string("/proc/uptime").ok().and_then(|u| u.split_whitespace().next()?.parse::<f64>().ok());
+            let tick = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as f64;
+            match (start, up) {
+                (Some(s), Some(u)) => format!("now {:.1}", (u - s / tick) * 1000.0),
+                _ => "?".into(),
+            }
+        }
         "top" => format!("{}+{}", tab.view.top, tab.view.top_row),
         "wrap" => a.settings.wrap.to_string(),
         "theme" => if a.theme.dark { "dark" } else { "light" }.to_string(),

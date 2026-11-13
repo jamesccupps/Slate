@@ -1373,10 +1373,14 @@ fn system_theme_changed() {
 /// holding up the start) and followed through its SettingChanged signal.
 fn follow_portal_scheme() {
     fn scheme(v: &glib::Variant) -> Option<bool> {
-        // (Read wraps the value in a variant or two: unwrapped down to the number)
+        // (Read wraps the value in a variant or two: unwrapped down to the number; asked of anything but a variant,
+        // GLib logs a CRITICAL, as every start on GNOME did)
         let mut v = v.clone();
-        while let Some(inner) = v.as_variant() {
-            v = inner;
+        while v.is_type(glib::VariantTy::VARIANT) {
+            match v.as_variant() {
+                Some(inner) => v = inner,
+                None => break,
+            }
         }
         match v.get::<u32>() {
             Some(1) => Some(true),
