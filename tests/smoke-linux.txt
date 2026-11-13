@@ -94,3 +94,11 @@ expect:bookmarks=3
 cmd:read-only
 type:x
 expect:text=one apple\ntwo\nthree apple\nfour
+# The desktop's high contrast: Slate's own colors give way to it, and come back after
+set:high_contrast=true
+expect:contrast=high
+cmd:select-all
+shot:smoke-contrast.png
+set:high_contrast=false
+expect:contrast=normal
+expect:theme=light

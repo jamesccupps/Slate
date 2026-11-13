@@ -7,7 +7,8 @@
 //! (`ctrl+shift+k`, `enter`, `pagedown`, `f3`), `findkey:<combo>` / `replacekey:<combo>` (in the find or replace
 //! box: `up`, `alt+s`), `cmd:<action>` (a menu action's name: `save`, `json-format`...),
 //! `find:<text>`, `replace:<text>`, `goto:<line>`, `answer:save,dont,cancel` (or a path for Open and Save as),
-//! `lang:<name>`, `set:wrap=true` (also `line_numbers`, `font_size`), `wait:<ms>`, `jobs` (wait for background
+//! `lang:<name>`, `set:wrap=true` (also `line_numbers`, `font_size`, `high_contrast`: the desktop's, as if switched;
+//! `print:contrast` says what's drawn), `gsettings:<key>=<value>` (GNOME's), `wait:<ms>`, `jobs` (wait for background
 //! work), `shot:<file.png>`, `print:<what>` (`text`, `sel`, `status`, `title`, `tabs`, `lang`, `asked`,
 //! `clipboard`, `find`, `dirty`, `top`, `session`: the session folder's files, `notice`, `composing`),
 //! `imemsg:start|pre|<text>|<cursor>|<clauses>|commit|<text>|end` (an input method), `expect:<what>=<value>`,
@@ -400,6 +401,11 @@ async fn script(lines: Vec<String>, test: Rc<Test>) -> i32 {
                         "font_size" => {
                             a.settings.font_size = v.parse().unwrap_or(11.0);
                             a.restyle = true;
+                        }
+                        // (the desktop's high contrast, as if it were switched on or off)
+                        "high_contrast" => {
+                            a.system_hc = v == "true";
+                            a.apply_theme();
                         }
                         "print_colors" => a.settings.print_colors = v == "true",
                         "print_line_numbers" => a.settings.print_line_numbers = v == "true",

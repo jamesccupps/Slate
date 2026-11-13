@@ -161,6 +161,14 @@ pub fn paint_tabs(cr: &cairo::Context, ctx: &pango::Context, app: &App, strip: &
             set_color(cr, t.surface);
             rounded(cr, x + 2.0, top, w - 4.0, height - top + 8.0, 8.0);
             let _ = cr.fill();
+            if t.hc {
+                // (high contrast: the tab and the strip are one color, so its outline shows which tab it is; the
+                // bottom edge lies below the strip)
+                set_color(cr, t.border);
+                cr.set_line_width(1.5);
+                rounded(cr, x + 2.75, top + 0.75, w - 5.5, height - top + 8.0, 8.0);
+                let _ = cr.stroke();
+            }
         } else if matches!(hover, Some(TabPart::Tab(j)) | Some(TabPart::Close(j)) if j == i) {
             set_color(cr, t.hover);
             rounded(cr, x + 2.0, top + 2.0, w - 4.0, height - top - 6.0, 6.0);
