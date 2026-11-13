@@ -180,10 +180,9 @@ and code files when they're double-clicked. The package also adds Slate's own ap
 (those don't update). Its settings, session and `crash.log` are in `~/.local/share/slate`.
 
 The Linux version has the same engine, file handling, colors, find and replace, line tools, JSON/XML tools, menus
-and status bar as on Windows, in a GTK window, and follows the desktop's light or dark style as it changes. Not on
-Linux yet:
+and status bar as on Windows, in a GTK window, and follows the desktop's light or dark style and its high contrast
+as they change. Not on Linux yet:
 
-- high contrast;
 - keeping unsaved changes to documents over 64 MB between runs (closing asks about them instead);
 - screen readers (Orca) and crash dumps (`crash.log` only).
 

@@ -212,7 +212,7 @@ plain "Slate"), and started again with its tabs after Windows restarts for an up
 ## Later
 
 - **Linux, the rest:** keeping big unsaved documents in the session (`.pieces`/`.data`, as on Windows: its engine in
-  `ui/session.rs` shared, with a restore flow for GTK) (M); high contrast (S); Flatpak or AppImage for distributions
+  `ui/session.rs` shared, with a restore flow for GTK) (M); Flatpak or AppImage for distributions
   without GTK 4.8 (S–M); an accessibility pass with Orca (M; GTK 4.8 has no accessible text for a custom-drawn view:
   GTK 4.14's `GtkAccessibleText`).
 - **Maybe: a Markdown preview** (a rendered view next to the text, off by default) (M). Only if people ask for

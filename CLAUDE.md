@@ -404,10 +404,15 @@ lighter one on dark), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate Text
     Format's Formatting indent are sections `sync_menu` fills for the language. The status bar's items are
     `chrome::StatusItem`s; counts (`App::doc_counts_now`) at once up to 1 MiB, on another thread up to 64 MiB once
     typing pauses. The theme follows the system's light or dark live: GTK's theme name, GNOME's `color-scheme`
-    (gio::Settings kept in a thread-local) and the desktop portal's (`follow_portal_scheme`: read once without
-    waiting, then its SettingChanged). Close other / saved / all tabs (`App::closing`, `close_next`) close one by one,
-    an unsaved one asked about first (Save as answered, then on; Cancel stops). Not on Linux yet: high contrast, big
-    unsaved documents in the session (README lists it all). Help → Open files with Slate… (`make_default`) makes Slate the default for the
+    (gio::Settings kept in a thread-local; on GNOME its "default" is its Light style, so `system_dark` doesn't go on
+    to GTK's prefer-dark, read once at the start) and the desktop portal's (`follow_portal_appearance`: read once
+    without waiting, then its SettingChanged). High contrast likewise (`system_high_contrast`: GNOME's
+    `org.gnome.desktop.a11y.interface high-contrast`, the portal's `contrast`, a HighContrast GTK theme): then
+    `Theme::high_contrast_fixed` (black on white or white on black, by the desktop's dark), selected text drawn again
+    in `selection_text`, the active tab outlined; test mode: `set:high_contrast=true`, `print:contrast`. Selections
+    made any way become the primary selection (middle-click paste: `refresh_now`, the mouse's on release). Close other
+    / saved / all tabs (`App::closing`, `close_next`) close one by one, an unsaved one asked about first (Save as
+    answered, then on; Cancel stops). Not on Linux yet: big unsaved documents in the session (README lists it all). Help → Open files with Slate… (`make_default`) makes Slate the default for the
     desktop file's MimeType list through GIO (`~/.config/mimeapps.list`; Linux lets an app do that itself); Stop
     opening files with Slate… takes only Slate's entries out of that file (GIO's reset would forget other apps' too).
     File dialogs (`FileChooserNative`) must be kept alive until answered (`keep_until_answered`): GTK drops them
