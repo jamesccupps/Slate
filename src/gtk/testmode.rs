@@ -7,7 +7,7 @@
 //! (`ctrl+shift+k`, `enter`, `pagedown`, `f3`), `findkey:<combo>` / `replacekey:<combo>` (in the find or replace
 //! box: `up`, `alt+s`), `cmd:<action>` (a menu action's name: `save`, `json-format`...),
 //! `find:<text>`, `replace:<text>`, `goto:<line>`, `answer:save,dont,cancel` (or a path for Open and Save as),
-//! `lang:<name>`, `set:wrap=true` (also `line_numbers`, `font_size`, `high_contrast`: the desktop's, as if switched;
+//! `jobs:counts` (also the status bar's word count), `lang:<name>`, `set:wrap=true` (also `line_numbers`, `font_size`, `high_contrast`: the desktop's, as if switched;
 //! `print:contrast` says what's drawn), `gsettings:<key>=<value>` (GNOME's), `wait:<ms>`, `jobs` (wait for background
 //! work), `shot:<file.png>`, `print:<what>` (`text`, `sel`, `status`, `title`, `tabs`, `lang`, `asked`,
 //! `clipboard`, `find`, `dirty`, `top`, `session`: the session folder's files, `notice`, `composing`),
@@ -136,12 +136,12 @@ async fn settle(ms: u64) {
     glib::timeout_future(Duration::from_millis(ms)).await;
 }
 
-async fn jobs() {
+async fn jobs(counts: bool) {
     let start = Instant::now();
     loop {
         settle(15).await;
         let Some(ui) = get_ui() else { return };
-        let busy = ui.app.try_borrow().map(|a| a.busy()).unwrap_or(true);
+        let busy = ui.app.try_borrow().map(|a| a.busy() || (counts && a.counting())).unwrap_or(true);
         if !busy || start.elapsed() > Duration::from_secs(120) {
             ui.refresh();
             return;
@@ -422,7 +422,7 @@ async fn script(lines: Vec<String>, test: Rc<Test>) -> i32 {
                 settle(20).await;
             }
             "wait" => settle(arg.parse().unwrap_or(100)).await,
-            "jobs" => jobs().await,
+            "jobs" => jobs(arg == "counts").await,
             "shot" => {
                 // (a window that's being resized or mapped draws nothing for a moment: tried again then)
                 let mut r = Err(String::new());

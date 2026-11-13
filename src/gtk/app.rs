@@ -970,14 +970,19 @@ impl App {
         self.asks.push(Ask::Print { pages, preview });
     }
 
-    /// Whether anything runs in the background (test mode waits for it).
+    /// Whether anything runs in the background (test mode's `jobs` waits for it). Not the status bar's word count,
+    /// which nothing waits for (as Windows' test mode: the same benchmarks timed it on Linux only); `counting`.
     pub fn busy(&self) -> bool {
         self.tabs.iter().any(|t| {
             t.busy() || t.index.is_some() || t.structure.busy() || t.structure.pausing() || t.editorconfig_job.is_some()
-        }) || self.count_job.is_some()
-            || self.find_running()
+        }) || self.find_running()
             || self.disk_job.is_some()
             || self.session_job.is_some()
+    }
+
+    /// The status bar's word count runs (test mode's `jobs:counts` waits for it too).
+    pub fn counting(&self) -> bool {
+        self.count_job.is_some()
     }
 
     /// Goes to the line asked for (`Tab::goto`) in tab `i` now, and shows it.
