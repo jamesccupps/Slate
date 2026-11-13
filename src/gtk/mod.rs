@@ -300,7 +300,34 @@ fn shell_dir() -> Option<PathBuf> {
     std::env::current_dir().ok()
 }
 
+/// Startup steps and when they were done, for `print:startup` in test mode (as Windows' `ui::mark`).
+static MARKS: std::sync::Mutex<Vec<(&'static str, Instant)>> = std::sync::Mutex::new(Vec::new());
+
+pub fn mark(what: &'static str) {
+    if let Ok(mut m) = MARKS.lock() {
+        m.push((what, Instant::now()));
+    }
+}
+
+/// The startup marks so far, as milliseconds since the process started (the kernel counts that in clock ticks, so
+/// all of them are off by the same few milliseconds).
+pub fn marks() -> Vec<(&'static str, f64)> {
+    let now = Instant::now();
+    let stat = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
+    // (the fields after the name in brackets; the start time is the 22nd field)
+    let start = stat.rsplit_once(')').and_then(|(_, r)| r.split_whitespace().nth(19)?.parse::<f64>().ok());
+    let up = std::fs::read_to_string("/proc/uptime").ok().and_then(|u| u.split_whitespace().next()?.parse::<f64>().ok());
+    let tick = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as f64;
+    let age = match (start, up) {
+        (Some(s), Some(u)) => (u - s / tick) * 1000.0,
+        _ => 0.0,
+    };
+    let marks = MARKS.lock().map(|m| m.clone()).unwrap_or_default();
+    marks.into_iter().map(|(w, t)| (w, age - (now - t).as_secs_f64() * 1000.0)).collect()
+}
+
 pub fn run(args: Vec<std::ffi::OsString>) -> i32 {
+    mark("run");
     if args.first().is_some_and(|a| a == "--test") {
         let args: Vec<String> = args[1..].iter().map(|a| a.to_string_lossy().into_owned()).collect();
         return testmode::run(&args);
@@ -639,6 +666,7 @@ pub fn window(application: &gtk4::Application, test: Option<Rc<testmode::Test>>)
     if let Some(ui) = get_ui() {
         return ui;
     }
+    mark("app");
     let settings = Settings::load();
     let (w, h, maximized) = match settings.window {
         Some(p) => (p.w.max(400), p.h.max(300), p.maximized),
@@ -899,6 +927,7 @@ pub fn window(application: &gtk4::Application, test: Option<Rc<testmode::Test>>)
     ui.apply_theme();
     ui.text.grab_focus();
     ui.refresh();
+    mark("window");
     ui
 }
 
@@ -3057,8 +3086,11 @@ impl Ui {
     fn paint_text(&self, area: &gtk4::DrawingArea, cr: &cairo::Context, w: f64, h: f64) {
         // (a panic while drawing is only logged: showing a message would draw, and fail, again)
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.paint_text_now(area, cr, w, h)));
-        if !self.painted.replace(true) && self.test.is_none() {
-            session::restored();
+        if !self.painted.replace(true) {
+            mark("painted");
+            if self.test.is_none() {
+                session::restored();
+            }
         }
     }
 

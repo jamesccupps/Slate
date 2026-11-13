@@ -581,17 +581,10 @@ fn value(what: &str, test: &Test) -> String {
             };
             format!("private {} MB, working set {} MB, peak {} MB", mb("RssAnon:"), mb("VmRSS:"), mb("VmHWM:"))
         }
-        // (milliseconds since the process started, as the kernel counts it: in steps of a clock tick)
+        // (milliseconds since the process started: the start's steps, then this command)
         "startup" => {
-            let stat = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
-            // (the fields after the name in brackets; the start time is the 22nd field)
-            let start = stat.rsplit_once(')').and_then(|(_, r)| r.split_whitespace().nth(19)?.parse::<f64>().ok());
-            let up = std::fs::read_to_string("/proc/uptime").ok().and_then(|u| u.split_whitespace().next()?.parse::<f64>().ok());
-            let tick = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as f64;
-            match (start, up) {
-                (Some(s), Some(u)) => format!("now {:.1}", (u - s / tick) * 1000.0),
-                _ => "?".into(),
-            }
+            super::mark("now");
+            super::marks().iter().map(|(w, ms)| format!("{w} {ms:.1}")).collect::<Vec<_>>().join(" | ")
         }
         "top" => format!("{}+{}", tab.view.top, tab.view.top_row),
         "wrap" => a.settings.wrap.to_string(),
