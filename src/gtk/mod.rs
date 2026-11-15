@@ -334,10 +334,36 @@ pub fn run(args: Vec<std::ffi::OsString>) -> i32 {
         let args: Vec<String> = args[1..].iter().map(|a| a.to_string_lossy().into_owned()).collect();
         return testmode::run(&args);
     }
+    // `--` ends the switches: what's after it are files, also names that start with "-" (made `./-name`)
+    let (mut args, files_after): (Vec<std::ffi::OsString>, Vec<std::ffi::OsString>) = match args.iter().position(|a| a == "--") {
+        Some(i) => {
+            let mut before = args;
+            let after = before.split_off(i);
+            let after = after[1..].iter().map(|a| if a.to_string_lossy().starts_with('-') { std::path::Path::new(".").join(a).into_os_string() } else { a.clone() }).collect();
+            (before, after)
+        }
+        None => (args, Vec::new()),
+    };
+    let lossy: Vec<String> = args.iter().map(|a| a.to_string_lossy().into_owned()).collect();
+    if lossy.iter().any(|a| a == "--version" || a == "-V") {
+        print!("{}", crate::cli::version_text());
+        return 0;
+    }
+    if lossy.iter().any(|a| a == "--help" || a == "-h") {
+        print!("{}", crate::cli::help_text());
+        return 0;
+    }
+    // (GApplication's own switches stay usable; any other is said, not passed on: GApplication would end with its own
+    // "Unknown option" and help that doesn't list Slate's)
+    let known = ["--read-only", "--wait", "--gapplication-service", "--help-gapplication"];
+    if let Some(a) = crate::cli::unknown_switch(&lossy, &known) {
+        eprintln!("slate: there's no switch {a} (slate --help lists them; -- before a file named like one)");
+        return 2;
+    }
     std::panic::set_hook(Box::new(|info| log_crash(&info.to_string())));
     crate::settings::make_data_dir();
+    args.extend(files_after);
     // `--read-only`, `--wait` and `-` (standard input): `run_request`
-    let mut args = args;
     let mut flag = |f: &str| args.iter().position(|a| a == f).map(|i| args.remove(i)).is_some();
     let (read_only, wait, stdin) = (flag("--read-only"), flag("--wait"), flag("-"));
     let application = gtk4::Application::builder().application_id(APP_ID).flags(gio::ApplicationFlags::HANDLES_OPEN).build();
@@ -359,7 +385,12 @@ pub fn run(args: Vec<std::ffi::OsString>) -> i32 {
         }
     });
     if read_only || wait || stdin {
-        return run_request(&application, args, read_only, wait, stdin);
+        let code = run_request(&application, args, read_only, wait, stdin);
+        // (a GApplication that registered on D-Bus without running says on the terminal, when it's dropped, that it
+        // didn't unregister: every `git commit` with `core.editor "slate --wait"` showed it. The process ends now
+        // anyway, and the bus lets its connection go then.)
+        std::mem::forget(application);
+        return code;
     }
     let cwd = shell_dir();
     let argv: Vec<String> = std::iter::once("slate".to_string()).chain(args.into_iter().map(|a| open_arg(a, cwd.as_deref()))).collect();
@@ -412,17 +443,16 @@ fn run_request(application: &gtk4::Application, args: Vec<std::ffi::OsString>, r
         hint.push_str("read-only;");
     }
     if stdin {
-        let mut text = Vec::new();
-        let _ = std::io::Read::read_to_end(&mut std::io::stdin(), &mut text);
         let p = handed.join(format!("stdin-{token}.txt"));
-        // (its owner's only: what's piped in may be a secret, `pass show x | slate -`)
+        // (its owner's only: what's piped in may be a secret, `pass show x | slate -`; streamed into it, never held
+        // whole in memory here, however much comes)
         use std::os::unix::fs::OpenOptionsExt;
         let written = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
             .open(&p)
-            .and_then(|mut f| std::io::Write::write_all(&mut f, &text));
+            .and_then(|mut f| std::io::copy(&mut std::io::stdin().lock(), &mut f).map(|_| ()));
         if written.is_ok() {
             files.push(gio::File::for_path(&p));
             hint.push_str(&format!("text={token};"));
@@ -973,6 +1003,21 @@ fn connect(ui: &Rc<Ui>, prev: &gtk4::Button, next: &gtk4::Button, lines_btn: &gt
         if ui.key(keyval, state) { glib::Propagation::Stop } else { glib::Propagation::Proceed }
     });
     ui.text.add_controller(key);
+    // Shift+Alt+F (Format) taken before GTK looks for a mnemonic: Alt+F is the File menu's, which GTK also tried with
+    // Shift held, and said "Couldn't find a target for a mnemonic activation" on the terminal each time.
+    let format_key = gtk4::EventControllerKey::new();
+    format_key.set_propagation_phase(gtk4::PropagationPhase::Capture);
+    format_key.connect_key_pressed(|_, keyval, _, state| {
+        let mods = state & (gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::ALT_MASK | gdk::ModifierType::SHIFT_MASK | gdk::ModifierType::SUPER_MASK);
+        if mods == gdk::ModifierType::ALT_MASK | gdk::ModifierType::SHIFT_MASK && matches!(keyval, gdk::Key::f | gdk::Key::F) {
+            if let Some(ui) = get_ui() {
+                ui.win_actions.activate_action("format", None);
+            }
+            return glib::Propagation::Stop;
+        }
+        glib::Propagation::Proceed
+    });
+    ui.window.add_controller(format_key);
     ui.im.set_client_widget(Some(&ui.text));
     ui.im.connect_commit(|_, s| {
         if let Some(ui) = get_ui() {

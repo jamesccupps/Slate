@@ -168,7 +168,7 @@ impl Buffer {
     /// Calls `f` with the ids of the sources the pieces use (sorted); worked out again only after the pieces
     /// changed, so this is cheap enough for every paint.
     fn with_used<R>(&self, f: impl FnOnce(&[u32]) -> R) -> R {
-        let mut c = self.used.lock().unwrap();
+        let mut c = self.used.lock().unwrap_or_else(|e| e.into_inner());
         if c.0 != self.generation {
             let mut v: Vec<u32> = self.pieces().map(|p| p.src).collect();
             v.sort_unstable();

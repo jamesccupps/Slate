@@ -160,7 +160,8 @@ Shared by both platforms: `src/core` (the engine), `src/highlight*` (colors), `s
 display segments, coloring checkpoints, the transform sink), `src/theme.rs` (palettes; Windows' high contrast and
 accent stay Windows-only: the accent in the shade Windows 11's apps use on the theme, from Windows' accent palette, a
 lighter one on dark), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate Text Editor` — 0.15.0 and older used `%LOCALAPPDATA%\Slate`, which `move_data_dir` moves at a start when no other Slate runs, not right after an update (which may yet be undone) —, `$XDG_DATA_HOME/slate` or
-`~/.local/share/slate` on Linux, or the portable `data` folder). Windows: `src/ui`. Linux: `src/gtk`.
+`~/.local/share/slate` on Linux, or the portable `data` folder; with no home on Linux, `/tmp/slate-<uid>`, used only
+when it's this user's alone, else a guest window that keeps nothing). Windows: `src/ui`. Linux: `src/gtk`.
 
 - `src/core/` — the engine, no UI. Unit-tested (`cargo test --lib`). What it asks the OS for goes through `os.rs`
   (Windows and Unix sides: shared opens, reads at an offset, a second handle, stamps and file IDs — on Unix dev/inode
@@ -196,7 +197,8 @@ lighter one on dark), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate Text
   - `document.rs` — undo/redo steps (typing/backspace runs coalesce; `seal()` ends a run), dirty state, change log
     for views, char/word navigation. "Pending" docs: big file whose index isn't done — readable, not editable.
     `version` is unique across all documents (caches key on it).
-  - `io.rs` — open (≤64 MiB into memory; bigger = file-backed + background index; UTF-16/ANSI converted to UTF-8,
+  - `io.rs` — open (on Linux only regular files: a pipe with no writer held the reading thread for ever, a device
+    read endlessly; saving over one is refused too; ≤64 MiB into memory; bigger = file-backed + background index; UTF-16/ANSI converted to UTF-8,
     big ones into a self-deleting temp file; ANSI only if the text converts back to exactly the file's bytes, else
     it stays UTF-8 with every byte kept; `open`/`reload` do all of it, canonical path and binary check included, on
     another thread) and save (temp file `.slate-save-*.tmp` in the same folder + POSIX-
@@ -380,7 +382,7 @@ lighter one on dark), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate Text
     GApplication/D-Bus, `HANDLES_OPEN`: `run` hands it absolute paths, as GIO reads a relative `notes.txt:120` as a
     link and drops it, and a name that isn't UTF-8 as a `file://` link; menus as on Windows: JSON's and XML's items only
     for those files and Help's Open files with Slate… or Stop opening files with Slate…, whichever applies (actions
-    turned off, `hidden-when`), File → Open recent; Ctrl+1–9 and Alt+1–9 for tabs, Shift+Alt+F formats JSON or XML;
+    turned off, `hidden-when`), File → Open recent; Ctrl+1–9 and Alt+1–9 for tabs, Shift+Alt+F formats JSON or XML (taken in the window's capture phase: GTK also tried it as File's mnemonic and warned on the terminal);
     a panic in a callback would abort (GTK can't pass it on): `Ui::guarded` catches it around the app's work (logged in
     crash.log by the panic hook, the session written, the window says so), drawing only logs; SIGTERM, SIGHUP and SIGINT
     (`stop_on_signals`: the handler writes the signal's number to a pipe, a thread asleep on it `invoke`s the rest on
@@ -642,11 +644,18 @@ lighter one on dark), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate Text
   window of its own): `--wait` makes a named event `Local\Slate.Wait.<pid>.<time>` and waits on it and on the
   running Slate's process; the running one sets it when the last of those tabs closes (`App::waits`, `tab_gone`; a
   tab a duplicate open replaced passes its wait on; closing the window sets them all), and only events with that
-  prefix. Standard input's text goes in `slate-stdin-<pid>-<time>.txt` in Slate's temp folder, which the running
-  one reads and deletes (no other file). On Linux the same as the open request's hint
+  prefix. Standard input's text is streamed into `slate-stdin-<pid>-<time>.txt` in Slate's temp folder (never whole
+  in the sending process's memory: `stdin_to_file`), which the running one takes (`take_text_file`, no other file):
+  up to 64 MiB read into a new tab and deleted; bigger, opened as the file it is (read like any big file) and deleted
+  when its tab closes (`handed_text`). On Linux the same as the open request's hint
   (`slate:read-only;wait=<token>;text=<token>;`, `gtk::run_request`, `App::open_hinted`) with the text and a wait
-  file in the data folder's `handed` folder: the waiting start polls until the wait file is gone or no Slate owns
-  the application's D-Bus name (`NameHasOwner`).
+  file in the data folder's `handed` folder (`stdin-<token>.txt`, the same 64 MiB rule): the waiting start polls
+  until the wait file is gone or no Slate owns the application's D-Bus name (`NameHasOwner`), and is forgotten, not
+  dropped (a GApplication registered without running warns on the terminal when dropped: `git commit` showed it).
+  `--version`, `--help` (`cli.rs`; Windows prints to the console it was started from or where its output was sent,
+  `print_console`) and `--`, after which everything is a file. A switch Slate doesn't know: Linux says so and ends
+  (exit 2; GApplication's would end with its own help), Windows says so on the console and leaves it out, as before
+  (only `--` ones: `-name` stays a file there).
 - One Slate per user session: a second start hands its files to the running one (to a window of Slate's class whose
   process runs as the same user with the same rights: `slate_window`). A Slate running as administrator
   is separate (its own lock, window class and session), as Windows doesn't let the two talk. A second start tries
@@ -658,6 +667,9 @@ lighter one on dark), `src/settings.rs` (data folder: `%LOCALAPPDATA%\Slate Text
   with an error, it puts itself back and starts again with `--update-failed <version>` (that version isn't offered
   by the daily check again). Old copies are deleted by the next normal start. 0.2.0 starts the new one with
   `--wait-for <pid>` instead (still understood).
+- Locks that guard caches and results (`core/source.rs`, `job.rs`, `gfx.rs`…) are taken with
+  `.unwrap_or_else(|e| e.into_inner())`: their data stays valid after a panic elsewhere, and an `unwrap` would make
+  every later paint panic on the poisoned lock. A job whose thread can't be started fails as the job (`NO_THREAD`).
 - Panics in message handling are caught, logged to `crash.log` in the data folder (`settings::append_crash_log`:
   past 1 MB it starts over, the last one kept as `crash.log.old`; the panic hook logs every panic, a repaint's
   too), the session is saved and a

@@ -35,6 +35,9 @@ use super::text::{
 /// Files up to this size are read into memory.
 pub const MEM_LIMIT: u64 = 64 << 20;
 const SAMPLE: u64 = 1 << 20;
+/// Opening or saving over what isn't a file (Linux).
+#[cfg(unix)]
+const NOT_REGULAR: &str = "That isn't a regular file (it's a pipe, a device or a socket).";
 const CHUNK: u64 = 4 << 20;
 
 pub enum Loading {
@@ -176,6 +179,12 @@ pub fn open_with(
     let meta = fs::metadata(path)?;
     if meta.is_dir() {
         return Err(io::Error::other("That is a folder, not a file."));
+    }
+    // (a pipe with no writer would hold the reading thread for ever, and closing the tab couldn't stop it; a device
+    // like /dev/zero reads as size 0 and endlessly. /proc's files are regular, size 0, and read to their end.)
+    #[cfg(unix)]
+    if !meta.file_type().is_file() {
+        return Err(io::Error::other(NOT_REGULAR));
     }
     let disk = disk_info(path);
     // (a file that grew past the limit meanwhile, or was replaced by a big one, is read as a big one)
@@ -1021,6 +1030,11 @@ pub fn save(
         if m.is_dir() {
             return Err(SaveError::Io("That is a folder, not a file.".into()));
         }
+        // (a pipe or a device would be replaced by a regular file by the rename)
+        #[cfg(unix)]
+        if !m.file_type().is_file() {
+            return Err(SaveError::Io(NOT_REGULAR.into()));
+        }
         // (Linux: also a file of someone else's in a folder this user may write, which a rename would replace,
         // taking it over; Windows' `can_write` is the read-only test itself)
         if m.permissions().readonly() || !os::can_write(&target) {
@@ -1582,6 +1596,28 @@ mod tests {
             assert!(o.loading.is_ok(), "{full}: {:?}", o.loading.as_ref().err());
             assert_eq!(o.path, path);
         }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pipes_and_devices_are_neither_opened_nor_saved_over() {
+        use std::os::unix::fs::FileTypeExt;
+        let dir = test_dir("fifo");
+        let fifo = dir.join("pipe");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let notify: Notify = Arc::new(|| {});
+        // (with no writer, reading the pipe would wait for ever: the test would hang, not fail)
+        for p in [fifo.as_path(), Path::new("/dev/null")] {
+            match open_with(p, notify.clone(), None, None, &ctx()) {
+                Err(e) => assert_eq!(e.to_string(), NOT_REGULAR),
+                Ok(_) => panic!("{} opened", p.display()),
+            }
+        }
+        let mut doc = Document::from_text(b"text");
+        assert!(matches!(save(&doc.snapshot(), &fifo, Encoding::Utf8, false, false, &ctx()), Err(SaveError::Io(m)) if m == NOT_REGULAR));
+        assert!(fs::symlink_metadata(&fifo).unwrap().file_type().is_fifo());
         let _ = fs::remove_dir_all(&dir);
     }
 

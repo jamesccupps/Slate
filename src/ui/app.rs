@@ -303,6 +303,9 @@ pub struct Opts {
     pub wait: Option<String>,
     /// Text from standard input.
     pub text: Option<Vec<u8>>,
+    /// Standard input's file (`slate-stdin-*` in Slate's temp folder: `mod::stdin_to_file`), before it's taken
+    /// (`mod::take_text_file`) into `text` or, when big, opened as a file.
+    pub text_file: Option<PathBuf>,
 }
 
 /// A tab closed with File → Close (or Ctrl+W...), for Reopen closed tab: its file and where it was in it.
@@ -640,7 +643,18 @@ fn pick_family(dw: &windows::Win32::Graphics::DirectWrite::IDWriteFactory, wante
 
 impl App {
     pub fn new(hwnd: HWND, notify: Notify) -> App {
-        let g = Gfx::new().expect("Direct2D is not available");
+        let g = match Gfx::new() {
+            Ok(g) => g,
+            Err(e) => {
+                // (only a broken Windows lacks Direct2D and DirectWrite; said, as a line in crash.log alone would leave
+                // the user with a window that never showed)
+                use windows::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
+                let msg = format!("Slate can't start: Windows' Direct2D or DirectWrite isn't available ({e}).");
+                crate::settings::append_crash_log(&msg);
+                unsafe { MessageBoxW(hwnd, &windows::core::HSTRING::from(msg), windows::core::w!("Slate"), MB_OK | MB_ICONERROR) };
+                std::process::exit(1);
+            }
+        };
         let settings = Settings::load();
         let theme = make_theme(settings.theme);
         let dpi = win::dpi_of(hwnd);

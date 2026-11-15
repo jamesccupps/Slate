@@ -1,5 +1,5 @@
 #!/bin/sh
-# Packages a Linux build of Slate: a .deb (Debian 12, Raspberry Pi OS 12, Ubuntu 23.04 and newer: GTK 4.8 or later)
+# Packages a Linux build of Slate: a .deb (Debian 12, Raspberry Pi OS 12, Ubuntu 24.04 and newer: GTK 4.8 or later)
 # and a tarball of the same files, each with a .sha256 next to it. Their names have no version
 # (slate-linux-arm64.deb), so .../releases/latest/download/slate-linux-<arch>.deb always gets the newest one.
 #   packaging/linux/package.sh <binary> <version> <deb arch: amd64|arm64> <out dir>
@@ -79,11 +79,16 @@ deb [signed-by=/usr/share/keyrings/slate-archive-keyring.gpg] https://jamesccupp
 LIST
 fi
 EOF
+# (only the slate.list it added, which says so on its first line: one the user made is theirs)
 cat > "$root/DEBIAN/postrm" <<'EOF'
 #!/bin/sh
 set -e
+list=/etc/apt/sources.list.d/slate.list
 case "$1" in
-    remove|purge) rm -f /etc/apt/sources.list.d/slate.list ;;
+    remove|purge)
+        if [ -f "$list" ] && [ "$(head -n 1 "$list")" = "# Slate's updates (added by the slate package, removed with it)" ]; then
+            rm -f "$list"
+        fi ;;
 esac
 EOF
 chmod 755 "$root/DEBIAN/postinst" "$root/DEBIAN/postrm"

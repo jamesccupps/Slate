@@ -624,7 +624,7 @@ struct SingleByte {
 /// Windows-1252 is there, from `CP1252_HIGH`.
 fn single_byte(cp: u32) -> Option<Arc<SingleByte>> {
     static TABLES: Mutex<Vec<(u32, Option<Arc<SingleByte>>)>> = Mutex::new(Vec::new());
-    let mut tables = TABLES.lock().unwrap();
+    let mut tables = TABLES.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((_, t)) = tables.iter().find(|t| t.0 == cp) {
         return t.clone();
     }

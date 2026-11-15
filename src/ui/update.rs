@@ -76,14 +76,22 @@ pub fn parse_release(json: &[u8]) -> Result<Release, String> {
     let version = Version::parse(tag).ok_or_else(|| format!("The latest release has an odd version ({tag})"))?;
     let assets = v["assets"].as_array().map(Vec::as_slice).unwrap_or(&[]);
     let asset = |name: &str| assets.iter().find(|a| a["name"].as_str().is_some_and(|n| n.eq_ignore_ascii_case(name)));
-    let url = |name: &str| asset(name).and_then(|a| a["browser_download_url"].as_str()).map(String::from);
+    // (only from this repository's own release downloads, whatever the answer names)
+    let ours = format!("https://github.com/{REPO}/releases/download/");
+    let url = |name: &str| -> Result<Option<String>, String> {
+        match asset(name).and_then(|a| a["browser_download_url"].as_str()) {
+            Some(u) if u.get(..ours.len()).is_some_and(|p| p.eq_ignore_ascii_case(&ours)) => Ok(Some(u.to_string())),
+            Some(_) => Err(format!("The latest release's {name} isn't on Slate's release page, so it isn't used")),
+            None => Ok(None),
+        }
+    };
     Ok(Release {
         version,
         page: v["html_url"].as_str().unwrap_or("").to_string(),
-        exe_url: url("Slate.exe").ok_or("The latest release has no Slate.exe")?,
+        exe_url: url("Slate.exe")?.ok_or("The latest release has no Slate.exe")?,
         exe_size: asset("Slate.exe").and_then(|a| a["size"].as_u64()).unwrap_or(0),
         // (Without it the download can't be checked: such a release isn't offered.)
-        sha_url: url("Slate.exe.sha256").ok_or("The latest release has no checksum (Slate.exe.sha256)")?,
+        sha_url: url("Slate.exe.sha256")?.ok_or("The latest release has no checksum (Slate.exe.sha256)")?,
     })
 }
 
@@ -452,7 +460,7 @@ pub fn install(new_exe: &Path, version: Version) -> Result<(), String> {
     let r = swap_in(&me, new_exe, &old);
     SWAPPING.store(false, Ordering::SeqCst);
     r?;
-    *REPLACED.lock().unwrap() = Some((old, version));
+    *REPLACED.lock().unwrap_or_else(|e| e.into_inner()) = Some((old, version));
     Ok(())
 }
 
@@ -476,7 +484,7 @@ fn swap_in(me: &Path, new_exe: &Path, old: &Path) -> Result<(), String> {
 /// blocks it, or it ends with an error within a few seconds), this version goes back in place and starts instead.
 pub fn restart() {
     let Ok(me) = std::env::current_exe() else { return };
-    let replaced = REPLACED.lock().unwrap().take();
+    let replaced = REPLACED.lock().unwrap_or_else(|e| e.into_inner()).take();
     // The new one is the running Slate right away; this one only watches.
     super::release_instance_lock();
     let failed = match std::process::Command::new(&me).arg("--updated").spawn() {
@@ -605,12 +613,17 @@ mod tests {
     #[test]
     fn release_answer() {
         let json = br#"{"tag_name": "v0.3.1", "html_url": "https://github.com/jamesccupps/Slate/releases/tag/v0.3.1",
-            "assets": [{"name": "Slate.exe.sha256", "browser_download_url": "https://github.com/x/Slate.exe.sha256"},
-                       {"name": "Slate.exe", "browser_download_url": "https://github.com/x/Slate.exe"}]}"#;
+            "assets": [{"name": "Slate.exe.sha256", "browser_download_url": "https://github.com/jamesccupps/Slate/releases/download/v0.3.1/Slate.exe.sha256"},
+                       {"name": "Slate.exe", "browser_download_url": "https://github.com/jamesccupps/Slate/releases/download/v0.3.1/Slate.exe"}]}"#;
         let r = parse_release(json).unwrap();
         assert_eq!(r.version, Version(0, 3, 1));
-        assert_eq!(r.exe_url, "https://github.com/x/Slate.exe");
-        assert_eq!(r.sha_url, "https://github.com/x/Slate.exe.sha256");
+        assert_eq!(r.exe_url, "https://github.com/jamesccupps/Slate/releases/download/v0.3.1/Slate.exe");
+        assert_eq!(r.sha_url, "https://github.com/jamesccupps/Slate/releases/download/v0.3.1/Slate.exe.sha256");
+        // a download from anywhere else isn't taken, whatever the answer says
+        let elsewhere = br#"{"tag_name": "v0.3.1", "assets": [
+            {"name": "Slate.exe.sha256", "browser_download_url": "https://github.com/jamesccupps/Slate/releases/download/v0.3.1/Slate.exe.sha256"},
+            {"name": "Slate.exe", "browser_download_url": "https://github.com/someone/Slate/releases/download/v0.3.1/Slate.exe"}]}"#;
+        assert!(parse_release(elsewhere).is_err());
         assert!(parse_release(br#"{"tag_name": "v1.0.0", "assets": []}"#).is_err());
         // no checksum: not offered
         assert!(parse_release(br#"{"tag_name": "v1.0.0", "assets": [{"name": "Slate.exe", "browser_download_url": "https://x/Slate.exe"}]}"#).is_err());

@@ -399,7 +399,11 @@ impl App {
         if !self.waits.is_empty() {
             self.tab_gone(t.id);
         }
-        if let (Some(path), Some(_), None) = (&t.doc.path, t.doc.disk, &t.title_override) {
+        // (big piped-in text, opened as the file it was put in: that goes with its tab, and can't be reopened)
+        if let Some(path) = t.doc.path.clone().filter(|p| super::handed_text(p)) {
+            drop(t);
+            let _ = std::fs::remove_file(&path);
+        } else if let (Some(path), Some(_), None) = (&t.doc.path, t.doc.disk, &t.title_override) {
             self.closed_tabs.retain(|c| &c.path != path);
             self.closed_tabs.push(ClosedTab { path: path.clone(), caret: t.view.sel.caret, top: t.view.top });
             if self.closed_tabs.len() > 20 {

@@ -1,5 +1,5 @@
-//! User settings, stored as JSON in settings.json in the data folder (`data_dir`: %LOCALAPPDATA%\Slate on Windows,
-//! ~/.local/share/slate on Linux, or the `data` folder next to a portable Slate).
+//! User settings, stored as JSON in settings.json in the data folder (`data_dir`: %LOCALAPPDATA%\Slate Text Editor
+//! on Windows, ~/.local/share/slate on Linux, or the `data` folder next to a portable Slate).
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -163,12 +163,33 @@ fn find_data_dir() -> PathBuf {
     }
     // (XDG: $XDG_DATA_HOME, else ~/.local/share)
     #[cfg(not(windows))]
-    return std::env::var_os("XDG_DATA_HOME")
+    return match std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local").join("share")))
-        .unwrap_or_else(std::env::temp_dir)
-        .join("slate");
+    {
+        Some(base) => base.join("slate"),
+        // No home (`env -i`, a service): a folder of this user's own in the temp folder. A fixed `/tmp/slate` could be
+        // someone else's, made first, who could then change the session's files under Slate; one that isn't this
+        // user's alone keeps nothing (a guest window).
+        None => {
+            let d = std::env::temp_dir().join(format!("slate-{}", unsafe { libc::getuid() }));
+            if !private_dir(&d) {
+                GUEST.store(true, Ordering::Relaxed);
+            }
+            d
+        }
+    };
+}
+
+/// Makes `d` (mode 0700) if it isn't there, and says whether it's a folder of this user's that only they can use (not
+/// a link to one).
+#[cfg(not(windows))]
+fn private_dir(d: &std::path::Path) -> bool {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    let _ = std::fs::DirBuilder::new().mode(0o700).create(d);
+    std::fs::symlink_metadata(d)
+        .is_ok_and(|m| m.is_dir() && m.uid() == unsafe { libc::getuid() } && m.mode() & 0o077 == 0)
 }
 
 /// Where Windows keeps the data folder: `%LOCALAPPDATA%\Slate Text Editor` (so another program called Slate can't
@@ -322,6 +343,28 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(windows))]
+    #[test]
+    fn the_fallback_data_folder_is_used_only_when_its_this_users_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("slate-private-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let mine = base.join("mine");
+        assert!(private_dir(&mine));
+        assert!(private_dir(&mine), "made before: still fine");
+        // open to others (made first by someone, or chmod'ed): not used
+        let open = base.join("open");
+        std::fs::create_dir(&open).unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(!private_dir(&open));
+        // a link to a private folder: not used either (it could point anywhere)
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&mine, &link).unwrap();
+        assert!(!private_dir(&link));
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     #[cfg(windows)]
     #[test]

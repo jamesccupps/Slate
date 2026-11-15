@@ -15,6 +15,7 @@ pub trait Failure {
 
 /// The message for a job that panicked.
 pub const FAILED: &str = "Something went wrong (details in crash.log in the settings folder)";
+const NO_THREAD: &str = "Slate couldn't start that in the background (the system is short of memory?)";
 
 impl Failure for bool {
     fn failure(_: &str) -> bool {
@@ -81,15 +82,24 @@ impl<T: Failure + Send + 'static> Job<T> {
         let result = Arc::new(Mutex::new(None));
         let ctx = Ctx { cancel: cancel.clone(), progress: progress.clone() };
         let slot = result.clone();
+        let notify_too = notify.clone();
         let handle = std::thread::Builder::new()
             .name("slate-job".into())
             .spawn(move || {
                 let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&ctx))).unwrap_or_else(|_| T::failure(FAILED));
-                *slot.lock().unwrap() = Some(r);
+                *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(r);
                 notify();
-            })
-            .expect("spawn thread");
-        Job { total, progress, cancel, result, handle: Some(handle) }
+            });
+        // (a thread that can't be started, the system short of memory: the job is done at once, as failed)
+        let handle = match handle {
+            Ok(h) => Some(h),
+            Err(_) => {
+                *result.lock().unwrap_or_else(|e| e.into_inner()) = Some(T::failure(NO_THREAD));
+                notify_too();
+                None
+            }
+        };
+        Job { total, progress, cancel, result, handle }
     }
 
     pub fn done(&self) -> u64 {
@@ -101,12 +111,12 @@ impl<T: Failure + Send + 'static> Job<T> {
     }
 
     pub fn is_finished(&self) -> bool {
-        self.result.lock().unwrap().is_some()
+        self.result.lock().unwrap_or_else(|e| e.into_inner()).is_some()
     }
 
     /// The result, once the job has finished.
     pub fn take(&mut self) -> Option<T> {
-        let r = self.result.lock().unwrap().take();
+        let r = self.result.lock().unwrap_or_else(|e| e.into_inner()).take();
         if r.is_some() {
             if let Some(h) = self.handle.take() {
                 let _ = h.join();
@@ -120,7 +130,7 @@ impl<T: Failure + Send + 'static> Job<T> {
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
-        self.result.lock().unwrap().take()
+        self.result.lock().unwrap_or_else(|e| e.into_inner()).take()
     }
 
     pub fn cancel(&self) {

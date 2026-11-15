@@ -131,7 +131,7 @@ static MARKS: std::sync::Mutex<Vec<(&'static str, u64)>> = std::sync::Mutex::new
 
 pub fn mark(what: &'static str) {
     let t = unsafe { windows::Win32::System::SystemInformation::GetSystemTimePreciseAsFileTime() };
-    MARKS.lock().unwrap().push((what, ((t.dwHighDateTime as u64) << 32) | t.dwLowDateTime as u64));
+    MARKS.lock().unwrap_or_else(|e| e.into_inner()).push((what, ((t.dwHighDateTime as u64) << 32) | t.dwLowDateTime as u64));
 }
 
 /// The startup marks so far, as milliseconds since the process was created.
@@ -142,7 +142,7 @@ pub fn marks() -> Vec<(&'static str, f64)> {
     let process = unsafe { windows::Win32::System::Threading::GetCurrentProcess() };
     let _ = unsafe { windows::Win32::System::Threading::GetProcessTimes(process, &mut created, &mut x, &mut y, &mut z) };
     let created = ((created.dwHighDateTime as u64) << 32) | created.dwLowDateTime as u64;
-    MARKS.lock().unwrap().iter().map(|&(w, t)| (w, t.saturating_sub(created) as f64 / 10_000.0)).collect()
+    MARKS.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|&(w, t)| (w, t.saturating_sub(created) as f64 / 10_000.0)).collect()
 }
 
 /// Runs queued actions (menus, dialogs, commands) once the App isn't borrowed.
@@ -928,15 +928,72 @@ fn handed_over2(units: &[u16]) -> (Vec<PathBuf>, app::Opts) {
             opts.wait = Some(name.to_string());
         } else if let Some(file) = s.strip_prefix("text=") {
             let p = PathBuf::from(file);
-            let ours = p.parent() == Some(settings::temp_dir().as_path())
-                && p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("slate-stdin-"));
-            if ours {
-                opts.text = Some(std::fs::read(&p).unwrap_or_default());
-                let _ = std::fs::remove_file(&p);
+            if handed_text(&p) {
+                take_text_file(p, &mut opts, &mut paths);
             }
         }
     }
     (paths, opts)
+}
+
+/// A file standard input's text was put in (`stdin_to_file`): `slate-stdin-*` in Slate's temp folder.
+pub fn handed_text(p: &std::path::Path) -> bool {
+    p.parent() == Some(settings::temp_dir().as_path())
+        && p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("slate-stdin-"))
+}
+
+/// `slate -`: standard input streamed into a file of its own in Slate's temp folder (never held whole in memory
+/// here, however much comes), which the Slate that opens it takes (`take_text_file`).
+fn stdin_to_file() -> Option<PathBuf> {
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    let dir = settings::temp_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let p = dir.join(format!("slate-stdin-{}-{stamp}.txt", std::process::id()));
+    let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&p).ok()?;
+    let copied = std::io::copy(&mut std::io::stdin().lock(), &mut f);
+    drop(f);
+    match copied {
+        Ok(_) => Some(p),
+        Err(_) => {
+            let _ = std::fs::remove_file(&p);
+            None
+        }
+    }
+}
+
+/// Standard input's file `p`, taken: up to what a document holds in memory, its text goes in `opts.text` (a new tab)
+/// and the file is deleted; more is opened as the file it's in, read on another thread like any big file and never
+/// whole into memory (the file goes when its tab is closed).
+fn take_text_file(p: PathBuf, opts: &mut app::Opts, paths: &mut Vec<PathBuf>) {
+    if std::fs::metadata(&p).is_ok_and(|m| m.len() > crate::core::io::MEM_LIMIT) {
+        paths.push(p);
+    } else {
+        opts.text = Some(std::fs::read(&p).unwrap_or_default());
+        let _ = std::fs::remove_file(&p);
+    }
+}
+
+/// Prints to the console Slate was started from (`slate --version` in a terminal: a windowed program has none of its
+/// own), or where its output was sent (`slate --version > v.txt`). Nothing if neither.
+fn print_console(text: &str) {
+    use std::io::Write;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn AttachConsole(pid: u32) -> i32;
+        fn GetStdHandle(which: u32) -> isize;
+    }
+    const STD_OUTPUT_HANDLE: u32 = -11i32 as u32;
+    const ATTACH_PARENT_PROCESS: u32 = u32::MAX;
+    let h = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
+    if h != 0 && h != -1 {
+        let mut out = std::io::stdout();
+        let _ = out.write_all(text.as_bytes());
+        let _ = out.flush();
+    } else if unsafe { AttachConsole(ATTACH_PARENT_PROCESS) } != 0 {
+        if let Ok(mut con) = std::fs::OpenOptions::new().write(true).open("CONOUT$") {
+            let _ = con.write_all(text.replace('\n', "\r\n").as_bytes());
+        }
+    }
 }
 
 /// `slate --wait`: waits until the Slate that took the files sets `event` (their tabs are all closed), or ends.
@@ -1458,6 +1515,29 @@ pub fn run(raw: Vec<std::ffi::OsString>) -> i32 {
     // or by 0.2.0's updater `--wait-for <pid>` (it ends first). `--update-failed <version>`: that version didn't
     // start, and this one is back.
     let (mut args, mut raw) = (args, raw);
+    // `--` ends the switches: what's after it are files, also names that start with "-"
+    let files_after: Vec<OsString> = match args.iter().position(|a| a == "--") {
+        Some(i) => {
+            args.truncate(i);
+            raw.split_off(i).into_iter().skip(1).collect()
+        }
+        None => Vec::new(),
+    };
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        print_console(&crate::cli::version_text());
+        return 0;
+    }
+    if args.iter().any(|a| a == "--help" || a == "-h" || a == "/?") {
+        print_console(&crate::cli::help_text());
+        return 0;
+    }
+    // (one Slate doesn't know is said where it was typed, and left out, as before: a shortcut with a stray one
+    // still opens Slate)
+    // (Windows opens `-name` as a file, as it always has: only `--` ones are switches)
+    let known = ["--wait-for", "--updated", "--update-failed", "--read-only", "--wait"];
+    if let Some(a) = args.iter().find(|a| a.starts_with("--") && !known.contains(&a.as_str())) {
+        print_console(&format!("slate: there's no switch {a}, so it was left out (slate --help lists them)\n"));
+    }
     // (each switch taken out of both lists)
     let mut take = |args: &mut Vec<String>, i: usize, n: usize| {
         args.drain(i..(i + n).min(args.len()));
@@ -1492,17 +1572,23 @@ pub fn run(raw: Vec<std::ffi::OsString>) -> i32 {
     }
     if let Some(i) = args.iter().position(|a| a == "-") {
         take(&mut args, i, 1);
-        let mut text = Vec::new();
-        let _ = std::io::Read::read_to_end(&mut std::io::stdin(), &mut text);
-        opts.text = Some(text);
+        opts.text_file = stdin_to_file();
     }
-    let paths: Vec<PathBuf> = raw
+    let mut paths: Vec<PathBuf> = raw
         .iter()
         .zip(&args)
         .filter(|(_, a)| !a.starts_with("--"))
         .map(|(r, _)| std::path::absolute(r).unwrap_or_else(|_| PathBuf::from(r)))
         .collect();
-    match hand_over_request(&paths, &opts, wait.is_some()) {
+    paths.extend(files_after.iter().map(|r| std::path::absolute(r).unwrap_or_else(|_| PathBuf::from(r))));
+    let handed = hand_over_request(&paths, &opts, wait.is_some());
+    // (not taken by a running Slate: this one takes standard input's text itself)
+    if !matches!(handed, Running::Took(_)) {
+        if let Some(p) = opts.text_file.take() {
+            take_text_file(p, &mut opts, &mut paths);
+        }
+    }
+    match handed {
         Running::Took(_) => return 0,
         Running::No => {
             // What 0.15.0 and older named plain "Slate" (the data folder, registry keys) moves to Slate's own names,
@@ -1602,7 +1688,7 @@ pub fn run(raw: Vec<std::ffi::OsString>) -> i32 {
 /// that Slate says their tabs are closed, or has ended. Took: there's nothing more for this one to do.
 fn hand_over_request(paths: &[PathBuf], opts: &app::Opts, wait: bool) -> Running {
     use windows::Win32::System::Threading::CreateEventW;
-    if !wait && opts.text.is_none() && !opts.read_only {
+    if !wait && opts.text_file.is_none() && !opts.read_only {
         return forward_to_running(paths, &[], 100);
     }
     let mut extra = Vec::new();
@@ -1611,13 +1697,8 @@ fn hand_over_request(paths: &[PathBuf], opts: &app::Opts, wait: bool) -> Running
     }
     let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
     let pid = unsafe { GetCurrentProcessId() };
-    let mut text_file = None;
-    if let Some(text) = &opts.text {
-        let p = settings::temp_dir().join(format!("slate-stdin-{pid}-{stamp}.txt"));
-        if std::fs::write(&p, text).is_ok() {
-            extra.push(format!("?text={}", p.display()));
-            text_file = Some(p);
-        }
+    if let Some(p) = &opts.text_file {
+        extra.push(format!("?text={}", p.display()));
     }
     let mut event = None;
     if wait {
@@ -1672,9 +1753,6 @@ fn hand_over_request(paths: &[PathBuf], opts: &app::Opts, wait: bool) -> Running
                 unsafe {
                     let _ = windows::Win32::Foundation::CloseHandle(h);
                 }
-            }
-            if let Some(p) = text_file {
-                let _ = std::fs::remove_file(p);
             }
         }
     }
@@ -1733,10 +1811,10 @@ mod tests {
         if msg == WM_COPYDATA {
             let cds = unsafe { &*(lp.0 as *const COPYDATASTRUCT) };
             let units = unsafe { std::slice::from_raw_parts(cds.lpData as *const u16, cds.cbData as usize / 2) };
-            let mut answers = ANSWERS.lock().unwrap();
+            let mut answers = ANSWERS.lock().unwrap_or_else(|e| e.into_inner());
             let answer = if answers.len() > 1 { answers.remove(0) } else { answers[0] };
             if answer != 0 {
-                TOOK.lock().unwrap().push(String::from_utf16_lossy(units));
+                TOOK.lock().unwrap_or_else(|e| e.into_inner()).push(String::from_utf16_lossy(units));
             }
             return LRESULT(answer);
         }
@@ -1795,11 +1873,11 @@ mod tests {
         release_instance_lock();
         // one running, which isn't ready for files at first (its window is there before the rest of it)
         let held = unsafe { CreateMutexW(None, false, lock_w) }.unwrap();
-        *ANSWERS.lock().unwrap() = vec![0, 0, 1];
+        *ANSWERS.lock().unwrap_or_else(|e| e.into_inner()) = vec![0, 0, 1];
         let (stop, quit) = std::sync::mpsc::channel();
         let other = another_slate(&class, quit);
         assert!(matches!(hand_over(lock_w, class_w, &wide("b.txt\nc.txt"), 20), Running::Took(_)));
-        assert_eq!(*TOOK.lock().unwrap(), ["b.txt\nc.txt"]);
+        assert_eq!(*TOOK.lock().unwrap_or_else(|e| e.into_inner()), ["b.txt\nc.txt"]);
         // one that's closing: its window is gone, its lock still there for a moment; then this one is the Slate
         stop.send(()).unwrap();
         other.join().unwrap();
@@ -1815,6 +1893,6 @@ mod tests {
         assert!(start.elapsed() >= Duration::from_millis(250));
         closing.join().unwrap();
         release_instance_lock();
-        assert_eq!(TOOK.lock().unwrap().len(), 1);
+        assert_eq!(TOOK.lock().unwrap_or_else(|e| e.into_inner()).len(), 1);
     }
 }

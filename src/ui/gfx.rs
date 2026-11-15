@@ -201,19 +201,19 @@ const GPU_GRACE: std::time::Duration = std::time::Duration::from_millis(40);
 /// while the driver loads waits for it, so WARP made after it would come no sooner. Dropping what this returns waits
 /// for that thread (Slate never ends while the driver loads on it).
 pub fn make_device_early() -> EarlyDevice {
-    EARLY.lock().unwrap().started = true;
+    EARLY.lock().unwrap_or_else(|e| e.into_inner()).started = true;
     let made = std::thread::Builder::new().name("slate-d3d".into()).spawn(|| {
         let warp = device(D3D_DRIVER_TYPE_WARP).ok().map(Device);
         super::mark("warp");
         {
-            let mut e = EARLY.lock().unwrap();
+            let mut e = EARLY.lock().unwrap_or_else(|e| e.into_inner());
             (e.warp, e.warp_tried) = (warp, true);
         }
         EARLY_MADE.notify_all();
         let hw = device(D3D_DRIVER_TYPE_HARDWARE).ok().map(Device);
         super::mark("device");
         let window = {
-            let mut e = EARLY.lock().unwrap();
+            let mut e = EARLY.lock().unwrap_or_else(|e| e.into_inner());
             (e.hw, e.hw_tried) = (hw, true);
             e.window
         };
@@ -224,22 +224,22 @@ pub fn make_device_early() -> EarlyDevice {
         }
     });
     match made {
-        Ok(t) => *EARLY_THREAD.lock().unwrap() = Some(t),
-        Err(_) => EARLY.lock().unwrap().started = false,
+        Ok(t) => *EARLY_THREAD.lock().unwrap_or_else(|e| e.into_inner()) = Some(t),
+        Err(_) => EARLY.lock().unwrap_or_else(|e| e.into_inner()).started = false,
     }
     EarlyDevice
 }
 
 /// The window to tell when the card's device is ready (before its first paint).
 pub fn early_window(hwnd: HWND) {
-    EARLY.lock().unwrap().window = hwnd.0 as isize;
+    EARLY.lock().unwrap_or_else(|e| e.into_inner()).window = hwnd.0 as isize;
 }
 
 pub struct EarlyDevice;
 
 impl Drop for EarlyDevice {
     fn drop(&mut self) {
-        if let Some(t) = EARLY_THREAD.lock().unwrap().take() {
+        if let Some(t) = EARLY_THREAD.lock().unwrap_or_else(|e| e.into_inner()).take() {
             let _ = t.join();
         }
     }
@@ -248,7 +248,7 @@ impl Drop for EarlyDevice {
 /// A device for the window from what `make_device_early` makes, and whether it's WARP for now (the card's comes
 /// later: `gpu_ready`). None: nothing was started, or the card's was taken already (or there is none).
 fn early_device() -> Option<(ID3D11Device, bool)> {
-    let mut e = EARLY.lock().unwrap();
+    let mut e = EARLY.lock().unwrap_or_else(|e| e.into_inner());
     if !e.started {
         return None;
     }
@@ -279,7 +279,7 @@ fn early_device() -> Option<(ID3D11Device, bool)> {
 
 /// Whether the card's device is ready for a window drawn with WARP for now.
 pub fn gpu_ready() -> bool {
-    EARLY.lock().unwrap().hw.is_some()
+    EARLY.lock().unwrap_or_else(|e| e.into_inner()).hw.is_some()
 }
 
 impl Gfx {

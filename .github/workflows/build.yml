@@ -84,6 +84,19 @@ jobs:
           if (Test-Path $env:SLATE_TEST_LOG) { Get-Content $env:SLATE_TEST_LOG }
           if ($p.ExitCode -ne 0) { throw "The smoke test failed (exit code $($p.ExitCode))" }
 
+      - name: The command line (--version and --help print where the output was sent)
+        shell: pwsh
+        timeout-minutes: 2
+        run: |
+          $want = "Slate " + ((Get-Content Cargo.toml | Select-String '^version = "(.+)"').Matches[0].Groups[1].Value)
+          # (a windowed program: run with its output sent to a file, waited for)
+          Start-Process -FilePath target\release\Slate.exe -ArgumentList '--version' -Wait -NoNewWindow -RedirectStandardOutput version.txt
+          $got = (Get-Content version.txt -Raw).Trim()
+          if ($got -ne $want) { throw "slate --version printed [$got], not [$want]" }
+          Start-Process -FilePath target\release\Slate.exe -ArgumentList '--help' -Wait -NoNewWindow -RedirectStandardOutput help.txt
+          if (-not (Select-String -Path help.txt -Pattern '--read-only' -SimpleMatch -Quiet)) { throw "slate --help doesn't list --read-only" }
+          "$got; --help: $((Get-Content help.txt).Count) lines"
+
       - name: Install, stop opening files, uninstall (Slate.exe --install as winget runs it, --unassociate, --uninstall; the runner is thrown away after)
         shell: pwsh
         timeout-minutes: 2
@@ -311,6 +324,15 @@ jobs:
           xvfb-run -a "$GITHUB_WORKSPACE/target/release/Slate" --test "$GITHUB_WORKSPACE/tests/smoke-linux.txt" || status=$?
           cat log.txt || true
           if [ "$status" -ne 0 ]; then echo "The smoke test failed (exit code $status)"; exit 1; fi
+
+      - name: The command line (--version, --help, a switch it doesn't know)
+        run: |
+          want="Slate $(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+          got=$(target/release/Slate --version)
+          [ "$got" = "$want" ] || { echo "slate --version printed [$got], not [$want]"; exit 1; }
+          target/release/Slate --help | grep -q -- '--read-only' || { echo "slate --help doesn't list --read-only"; exit 1; }
+          if target/release/Slate --no-such-switch 2> /dev/null; then echo "an unknown switch didn't fail"; exit 1; fi
+          echo "$got"
 
       - name: Package
         run: |

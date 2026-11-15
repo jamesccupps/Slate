@@ -362,12 +362,12 @@ static TEMP_DIR: RwLock<Option<PathBuf>> = RwLock::new(None);
 /// Where temp files go (default: the system temp folder).
 pub fn set_temp_dir(dir: PathBuf) {
     let _ = std::fs::create_dir_all(&dir);
-    *TEMP_DIR.write().unwrap() = Some(dir);
+    *TEMP_DIR.write().unwrap_or_else(|e| e.into_inner()) = Some(dir);
 }
 
 /// A file in the temp folder that deletes itself when its handle closes (also after a crash).
 pub fn create_temp_file() -> io::Result<(File, PathBuf)> {
-    let dir = TEMP_DIR.read().unwrap().clone().unwrap_or_else(std::env::temp_dir);
+    let dir = TEMP_DIR.read().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_else(std::env::temp_dir);
     for _ in 0..100 {
         let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
         let path = dir.join(format!("slate-{}-{}.tmp", std::process::id(), n));
@@ -439,7 +439,7 @@ impl Source {
         let store = Store::File { file, bulk: OnceLock::new(), bulk_busy: AtomicBool::new(false), spare: Mutex::new(Vec::new()), cache, path, kind, opened };
         let s = Source::new(store, len, index.unwrap_or_else(NlIndex::empty));
         if indexed && kind == SourceKind::File {
-            *s.fingerprint.lock().unwrap() = s.take_fingerprint(s.len);
+            *s.fingerprint.lock().unwrap_or_else(|e| e.into_inner()) = s.take_fingerprint(s.len);
         }
         s
     }
@@ -460,7 +460,7 @@ impl Source {
         if self.is_gone() {
             return None;
         }
-        let fp = self.fingerprint.lock().unwrap().clone()?;
+        let fp = self.fingerprint.lock().unwrap_or_else(|e| e.into_inner()).clone()?;
         Some(Identity {
             path: path.clone(),
             len: fp.len,
@@ -570,7 +570,7 @@ impl Source {
         };
         // (asked on another thread every few seconds: not through the window's handle)
         let Some((now, _)) = stamp_of(self.bulk()) else { return false };
-        if now == *then || *self.verified.lock().unwrap() == Some(now) {
+        if now == *then || *self.verified.lock().unwrap_or_else(|e| e.into_inner()) == Some(now) {
             return false;
         }
         if now.size < self.len {
@@ -584,21 +584,21 @@ impl Source {
         if now.size == then.size && now.written != then.written && (now.written - then.written).abs() != HOUR {
             return true;
         }
-        let fp = self.fingerprint.lock().unwrap().clone();
+        let fp = self.fingerprint.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let same = fp.is_some_and(|fp| self.matches(&fp));
         if same {
-            *self.verified.lock().unwrap() = Some(now);
+            *self.verified.lock().unwrap_or_else(|e| e.into_inner()) = Some(now);
         }
         !same
     }
 
     /// Why the index couldn't be finished (see `build_index`), if it couldn't.
     pub fn index_error(&self) -> Option<String> {
-        self.index_error.lock().unwrap().clone()
+        self.index_error.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     fn stop_index(&self, why: String) {
-        *self.index_error.lock().unwrap() = Some(why);
+        *self.index_error.lock().unwrap_or_else(|e| e.into_inner()) = Some(why);
         self.read_errors.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -622,11 +622,11 @@ impl Source {
         self.read_errors.load(Ordering::Relaxed)
     }
     pub fn index_complete(&self) -> bool {
-        self.index.read().unwrap().complete
+        self.index.read().unwrap_or_else(|e| e.into_inner()).complete
     }
     /// Bytes covered by the newline index so far.
     pub fn indexed_bytes(&self) -> u64 {
-        let idx = self.index.read().unwrap();
+        let idx = self.index.read().unwrap_or_else(|e| e.into_inner());
         if idx.complete { self.len } else { (idx.blocks() * BLOCK).min(self.len) }
     }
     /// Zero-copy access for in-memory sources.
@@ -653,11 +653,11 @@ impl Source {
             bulk_busy.store(false, Ordering::Release);
             return ok;
         }
-        let Some(h) = spare.lock().unwrap().pop().or_else(|| os::reopen(file)) else {
+        let Some(h) = spare.lock().unwrap_or_else(|e| e.into_inner()).pop().or_else(|| os::reopen(file)) else {
             return self.file_read(self.bulk(), off, buf);
         };
         let ok = self.file_read(&h, off, buf);
-        spare.lock().unwrap().push(h);
+        spare.lock().unwrap_or_else(|e| e.into_inner()).push(h);
         ok
     }
 
@@ -684,7 +684,7 @@ impl Source {
     fn block(&self, b: u64) -> Arc<[u8]> {
         let Store::File { file, cache, .. } = &self.store else { unreachable!() };
         {
-            let mut c = cache.lock().unwrap();
+            let mut c = cache.lock().unwrap_or_else(|e| e.into_inner());
             c.tick += 1;
             let t = c.tick;
             if let Some(e) = c.map.get_mut(&b) {
@@ -702,7 +702,7 @@ impl Source {
             // refuses to write the zeros).
             return data;
         }
-        let mut c = cache.lock().unwrap();
+        let mut c = cache.lock().unwrap_or_else(|e| e.into_inner());
         if c.map.len() >= CACHE_BLOCKS {
             if let Some((&old, _)) = c.map.iter().min_by_key(|(_, v)| v.1) {
                 c.map.remove(&old);
@@ -822,7 +822,7 @@ impl Source {
             return 0;
         }
         let (lo, hi, mid) = {
-            let idx = self.index.read().unwrap();
+            let idx = self.index.read().unwrap_or_else(|e| e.into_inner());
             let lo = a.div_ceil(BLOCK);
             let hi = (b / BLOCK).min(idx.blocks());
             if hi <= lo {
@@ -860,7 +860,7 @@ impl Source {
             None,
         }
         let jump = {
-            let idx = self.index.read().unwrap();
+            let idx = self.index.read().unwrap_or_else(|e| e.into_inner());
             let lo = pos / BLOCK;
             let hi = (b / BLOCK).min(idx.blocks());
             if hi <= lo {
@@ -919,7 +919,7 @@ impl Source {
             let blk_end = ((blk + 1) * BLOCK).min(b);
             // Skip indexed runs without newlines in one go.
             {
-                let idx = self.index.read().unwrap();
+                let idx = self.index.read().unwrap_or_else(|e| e.into_inner());
                 if blk < idx.blocks() && idx.block_count(blk) == 0 {
                     let mut nb = blk + 1;
                     while nb < idx.blocks() && nb * BLOCK < b && idx.block_count(nb) == 0 {
@@ -955,7 +955,7 @@ impl Source {
             let blk = (pos - 1) / BLOCK;
             let start = a.max(blk * BLOCK);
             {
-                let idx = self.index.read().unwrap();
+                let idx = self.index.read().unwrap_or_else(|e| e.into_inner());
                 if blk < idx.blocks() && idx.block_count(blk) == 0 {
                     let mut nb = blk;
                     while nb > 0 && nb * BLOCK > a && idx.block_count(nb - 1) == 0 {
@@ -980,16 +980,16 @@ impl Source {
     /// ended it, exactly what `old` had when it was indexed; otherwise the file was rewritten and gets indexed
     /// from scratch. Returns whether it reused.
     pub fn reuse_index_from(&self, old: &Source) -> bool {
-        let Some(fp) = old.fingerprint.lock().unwrap().clone() else { return false };
+        let Some(fp) = old.fingerprint.lock().unwrap_or_else(|e| e.into_inner()).clone() else { return false };
         if fp.samples.is_empty() || fp.len != old.len || !self.matches(&fp) {
             return false;
         }
-        let o = old.index.read().unwrap();
+        let o = old.index.read().unwrap_or_else(|e| e.into_inner());
         let full = (old.len / BLOCK).min(o.blocks()) as usize;
-        let mut idx = self.index.write().unwrap();
+        let mut idx = self.index.write().unwrap_or_else(|e| e.into_inner());
         if idx.blocks() == 0 && !idx.complete && full > 0 {
             idx.cum = o.cum[..=full].to_vec();
-            *self.reused.lock().unwrap() = fp.samples;
+            *self.reused.lock().unwrap_or_else(|e| e.into_inner()) = fp.samples;
             return true;
         }
         false
@@ -1009,13 +1009,13 @@ impl Source {
             return true;
         };
         let file = self.bulk();
-        if self.index.read().unwrap().complete {
+        if self.index.read().unwrap_or_else(|e| e.into_inner()).complete {
             return true;
         }
         const CHUNK: usize = 4 << 20;
         let mut buf = vec![0u8; CHUNK];
         let (mut pos, mut count) = {
-            let idx = self.index.read().unwrap();
+            let idx = self.index.read().unwrap_or_else(|e| e.into_inner());
             (idx.blocks() * BLOCK, *idx.cum.last().unwrap())
         };
         // The fingerprint comes from the very bytes counted here (for a part reused from an earlier version of the
@@ -1023,7 +1023,7 @@ impl Source {
         let first = pos / BLOCK;
         let wanted = sample_blocks(self.len);
         let mut samples: Vec<(u64, u64)> =
-            self.reused.lock().unwrap().iter().copied().filter(|s| s.0 < first).collect();
+            self.reused.lock().unwrap_or_else(|e| e.into_inner()).iter().copied().filter(|s| s.0 < first).collect();
         if samples.is_empty() {
             for &b in wanted.iter().filter(|&&b| b < first) {
                 match self.hash_range(b * BLOCK, (b + 1) * BLOCK) {
@@ -1060,7 +1060,7 @@ impl Source {
             }
             pos += n as u64;
             progress.store(base + pos, Ordering::Relaxed);
-            let mut idx = self.index.write().unwrap();
+            let mut idx = self.index.write().unwrap_or_else(|e| e.into_inner());
             idx.cum.append(&mut pending);
         }
         samples.sort_unstable();
@@ -1073,8 +1073,8 @@ impl Source {
             self.stop_index("it changed while Slate was reading it".into());
             return false;
         }
-        *self.fingerprint.lock().unwrap() = Some(fp);
-        self.index.write().unwrap().complete = true;
+        *self.fingerprint.lock().unwrap_or_else(|e| e.into_inner()) = Some(fp);
+        self.index.write().unwrap_or_else(|e| e.into_inner()).complete = true;
         progress.store(base + self.len, Ordering::Relaxed);
         true
     }

@@ -753,8 +753,17 @@ impl App {
         let ours = |t: &String| !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit() || b == b'-');
         let text_file = text.filter(ours).map(|t| handed.join(format!("stdin-{t}.txt")));
         let before: Vec<u64> = self.tabs.iter().map(|t| t.id).collect();
-        let files: Vec<PathBuf> = paths.iter().filter(|p| Some(*p) != text_file.as_ref()).cloned().collect();
+        let mut files: Vec<PathBuf> = paths.iter().filter(|p| Some(*p) != text_file.as_ref()).cloned().collect();
         let said = self.flash.take();
+        // (more than a document holds in memory: opened as the file it's in, read on another thread like any big
+        // file, never whole into memory; the file goes when its tab is closed, `handed_text`)
+        let text_file = match text_file {
+            Some(f) if std::fs::metadata(&f).is_ok_and(|m| m.len() > crate::core::io::MEM_LIMIT) => {
+                files.push(f);
+                None
+            }
+            other => other,
+        };
         if let Some(f) = &text_file {
             if let Ok(bytes) = std::fs::read(f) {
                 let blank = self.tabs.len() == 1 && self.tabs[0].is_blank();
@@ -1668,12 +1677,20 @@ impl App {
         if !self.waits.is_empty() {
             self.tab_gone(tab.id);
         }
-        if let Some(p) = tab.doc.path.clone() {
-            self.closed.retain(|q| q != &p);
-            self.closed.push(p);
-            if self.closed.len() > 20 {
-                self.closed.remove(0);
+        match tab.doc.path.clone() {
+            // (big piped-in text, opened as the file it was put in: that goes with its tab, and can't be reopened)
+            Some(p) if handed_text(&p) => {
+                drop(tab);
+                let _ = std::fs::remove_file(&p);
             }
+            Some(p) => {
+                self.closed.retain(|q| q != &p);
+                self.closed.push(p);
+                if self.closed.len() > 20 {
+                    self.closed.remove(0);
+                }
+            }
+            None => {}
         }
         if self.tabs.is_empty() {
             self.new_untitled();
@@ -3529,6 +3546,13 @@ impl App {
 
 /// Help → Report a problem…: GitHub's new issue page, the version and system filled in (the user sees it all, and
 /// sends it, or doesn't, themselves).
+/// A file standard input's text was put in (`mod::run_request`: `handed/stdin-<token>.txt`), opened as a file
+/// because it was too big to read into memory.
+fn handed_text(p: &Path) -> bool {
+    p.parent() == Some(crate::settings::data_dir().join("handed").as_path())
+        && p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("stdin-"))
+}
+
 pub fn report_url() -> String {
     // (`/etc/os-release` names the system: "Debian GNU/Linux 12 (bookworm)")
     let system = std::fs::read_to_string("/etc/os-release")
