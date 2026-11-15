@@ -1306,7 +1306,11 @@ impl App {
             match st.job.take() {
                 Some(r) => {
                     let st = self.tabs[i].save.take().unwrap();
-                    self.finish_save(i, st, r);
+                    if !self.finish_save(i, st, r) {
+                        // (the tab was closed: the rest isn't its own any more, and `i` may be past the end)
+                        return false;
+                    }
+                    running |= self.tabs[i].save.is_some(); // saving again
                 }
                 None => running = true,
             }
@@ -1534,7 +1538,8 @@ impl App {
         self.dirty_view = true;
     }
 
-    fn finish_save(&mut self, i: usize, st: SaveTask, r: Result<Saved, SaveError>) {
+    /// Tab `i`'s save ended. Returns false if the tab is gone: it was closed once saved (`close_after`).
+    fn finish_save(&mut self, i: usize, st: SaveTask, r: Result<Saved, SaveError>) -> bool {
         match r {
             Ok(saved) => {
                 let tab = &mut self.tabs[i];
@@ -1543,7 +1548,7 @@ impl App {
                     if self.quitting && self.tabs.iter().all(|t| t.save.is_none()) {
                         self.asks.push(Ask::Quit);
                     }
-                    return;
+                    return true;
                 }
                 let ext = |p: &Path| p.extension().map(|e| e.to_ascii_lowercase());
                 let renamed = tab.doc.path.as_deref().map(ext) != Some(ext(&st.path));
@@ -1579,12 +1584,18 @@ impl App {
                 } else {
                     self.flash(format!("Saved {name}"), false);
                 }
-                if st.close_after && !self.tabs[i].doc.is_dirty() {
+                let closed = st.close_after && !self.tabs[i].doc.is_dirty();
+                if closed {
                     self.remove_tab(i);
                 }
                 // (closing waited for this save: it carries on)
                 if self.quitting && self.tabs.iter().all(|t| t.save.is_none()) {
                     self.asks.push(Ask::Quit);
+                }
+                if closed {
+                    self.dirty_title = true;
+                    self.dirty_view = true;
+                    return false;
                 }
             }
             Err(SaveError::Lossy) => {
@@ -1609,6 +1620,7 @@ impl App {
         }
         self.dirty_title = true;
         self.dirty_view = true;
+        true
     }
 
     // ---- tabs ----
@@ -1616,6 +1628,9 @@ impl App {
     /// Closes tab `i`: right away when it has nothing unsaved (or the session keeps its text: no, a closed tab's
     /// text isn't kept anywhere, so unsaved changes are asked about).
     pub fn close_tab(&mut self, i: usize) {
+        if i >= self.tabs.len() {
+            return; // (an index from the tab strip as it was last drawn)
+        }
         if let Some(st) = self.tabs[i].save.as_mut() {
             // (when nothing was typed since, it closes once saved; otherwise closing it again asks)
             st.close_after = true;
@@ -1990,14 +2005,23 @@ impl App {
             let tab = &mut self.tabs[self.active];
             let caret = tab.view.sel.caret;
             let doc = &tab.doc;
-            let mut b = tab.view.block.unwrap_or_else(|| edit::Block::at(doc.line_of(caret).unwrap_or(0), edit::col_of(doc, caret, ts)));
+            let mut b = match tab.view.block {
+                Some(b) => b,
+                None => match edit::block_at(doc, caret, ts) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        self.flash(e, true);
+                        return true;
+                    }
+                },
+            };
             let last = doc.line_of(doc.len()).unwrap_or(0);
             let (line, col) = b.caret;
             b.caret = match key {
                 Key::Up | Key::KP_Up => (line.saturating_sub(1), col),
                 Key::Down | Key::KP_Down => ((line + 1).min(last), col),
                 Key::Left | Key::KP_Left => (line, col.saturating_sub(1)),
-                _ => (line, col + 1),
+                _ => (line, (col + 1).min(edit::BLOCK_COLS_MAX)),
             };
             if b.caret.0.abs_diff(b.anchor.0) < edit::BLOCK_LINES_MAX {
                 tab.view.sel = Sel::at(edit::pos_at_col(doc, b.caret.0, b.caret.1, ts));
@@ -2188,12 +2212,21 @@ impl App {
             }
             Cmd::Copy if self.tab().view.block.is_some() => {
                 let tab = self.tab();
-                let text = edit::block_text(&tab.doc, &tab.view.block.unwrap(), self.settings.tab_size, tab.doc.eol.as_bytes());
-                self.copied_line = None;
-                self.copy_out = Some(String::from_utf8_lossy(&text).into_owned());
+                match edit::block_text(&tab.doc, &tab.view.block.unwrap(), self.settings.tab_size, tab.doc.eol.as_bytes()) {
+                    Ok(text) => {
+                        self.copied_line = None;
+                        self.copy_out = Some(String::from_utf8_lossy(&text).into_owned());
+                    }
+                    Err(e) => self.flash(e, true),
+                }
             }
             Cmd::Cut if self.tab().view.block.is_some() => {
+                self.copy_out = None;
                 self.exec(Cmd::Copy);
+                // (what wasn't copied isn't cut)
+                if self.copy_out.is_none() {
+                    return;
+                }
                 let b = self.tab().view.block.unwrap();
                 if b.cols().0 < b.cols().1 {
                     self.block_edit(b, edit::BlockEdit::Delete { back: false });
@@ -3408,6 +3441,12 @@ impl App {
         let (a, b) = (sel.start(), sel.end());
         // (onto itself: nothing)
         if sel.is_empty() || (!copy && to >= a && to <= b) || !self.editable() {
+            return;
+        }
+        // (the text is copied: as for Duplicate, not hundreds of MB of it, which a press that slips past the drag
+        // threshold in a big selection would otherwise do)
+        if b - a > edit::COPY_MAX {
+            self.flash(edit::TOO_MUCH_TEXT, true);
             return;
         }
         let tab = &mut self.tabs[self.active];

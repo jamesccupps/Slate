@@ -2813,7 +2813,13 @@ impl App {
     pub fn copy(&mut self) -> bool {
         if let Some(b) = self.tab().view.block {
             let tab = self.tab();
-            let text = crate::edit::block_text(&tab.doc, &b, self.settings.tab_size, tab.doc.eol.as_bytes());
+            let text = match crate::edit::block_text(&tab.doc, &b, self.settings.tab_size, tab.doc.eol.as_bytes()) {
+                Ok(t) => t,
+                Err(e) => {
+                    self.flash(e, true);
+                    return false;
+                }
+            };
             if !win::set_clipboard(self.hwnd, &text) {
                 self.flash(CLIPBOARD_BUSY, true);
                 return false;
@@ -3573,7 +3579,7 @@ impl App {
         if mods().alt && !gutter && clicks == 1 {
             // Alt+drag: a column selection (and Alt let go after it doesn't give the menu bar the keyboard)
             self.alt_dragged = true;
-            let col = self.col_at_x(x);
+            let col = self.col_at_x(x).min(crate::edit::BLOCK_COLS_MAX);
             let tab_size = self.settings.tab_size;
             let tab = self.tab_mut();
             let line = tab.doc.line_of(pos).unwrap_or(0);
@@ -3619,6 +3625,12 @@ impl App {
         let (a, b) = (sel.start(), sel.end());
         // (onto itself: nothing)
         if sel.is_empty() || (!copy && to >= a && to <= b) || !self.editable() {
+            return;
+        }
+        // (the text is copied: as for Duplicate, not hundreds of MB of it, which a press that slips past the drag
+        // threshold in a big selection would otherwise do)
+        if b - a > crate::edit::COPY_MAX {
+            self.flash(crate::edit::TOO_MUCH_TEXT, true);
             return;
         }
         let tab = self.tab_mut();
@@ -3849,7 +3861,7 @@ impl App {
             DragMode::Block => {
                 let line = doc.line_of(pos).unwrap_or(0);
                 let tab_size = self.settings.tab_size;
-                let col = self.col_at_x(x);
+                let col = self.col_at_x(x).min(crate::edit::BLOCK_COLS_MAX);
                 let tab = self.tab_mut();
                 if let Some(b) = tab.view.block.as_mut() {
                     // (no more lines than a column selection takes)
@@ -3872,16 +3884,23 @@ impl App {
             let tab = self.tab_mut();
             let caret = tab.view.sel.caret;
             let doc = &tab.doc;
-            let mut b = tab.view.block.unwrap_or_else(|| {
-                crate::edit::Block::at(doc.line_of(caret).unwrap_or(0), crate::edit::col_of(doc, caret, tab_size))
-            });
+            let mut b = match tab.view.block {
+                Some(b) => b,
+                None => match crate::edit::block_at(doc, caret, tab_size) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        self.flash(e, true);
+                        return true;
+                    }
+                },
+            };
             let last = doc.line_of(doc.len()).unwrap_or(0);
             let (line, col) = b.caret;
             b.caret = match k {
                 VK_UP => (line.saturating_sub(1), col),
                 VK_DOWN => ((line + 1).min(last), col),
                 VK_LEFT => (line, col.saturating_sub(1)),
-                _ => (line, col + 1),
+                _ => (line, (col + 1).min(crate::edit::BLOCK_COLS_MAX)),
             };
             if b.caret.0.abs_diff(b.anchor.0) >= crate::edit::BLOCK_LINES_MAX {
                 return true;

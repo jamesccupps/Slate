@@ -2399,7 +2399,7 @@ impl Ui {
                     // Alt+drag: a column selection
                     1 if alt => {
                         let line = cx.doc.line_of(pos).unwrap_or(0);
-                        let col = ((x + v.scroll_x) / cx.style.char_w).round().max(0.0) as u32;
+                        let col = (((x + v.scroll_x) / cx.style.char_w).round().max(0.0) as u32).min(crate::edit::BLOCK_COLS_MAX);
                         v.block = Some(crate::edit::Block::at(line, col));
                         v.sel = Sel::at(crate::edit::pos_at_col(cx.doc, line, col, cx.style.tab_size));
                         v.drag = Some(view::Drag::Block);
@@ -2505,7 +2505,7 @@ impl Ui {
                     }
                     Some(view::Drag::Block) => {
                         let line = cx.doc.line_of(pos).unwrap_or(0);
-                        let col = ((x + v.scroll_x) / cx.style.char_w).round().max(0.0) as u32;
+                        let col = (((x + v.scroll_x) / cx.style.char_w).round().max(0.0) as u32).min(crate::edit::BLOCK_COLS_MAX);
                         if let Some(b) = v.block.as_mut() {
                             let max = crate::edit::BLOCK_LINES_MAX - 1;
                             b.caret = (line.clamp(b.anchor.0.saturating_sub(max), b.anchor.0 + max), col);

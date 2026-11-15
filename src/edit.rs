@@ -418,6 +418,13 @@ pub struct Block {
 
 /// A column selection takes no more lines than this (each is worked on at every key).
 pub const BLOCK_LINES_MAX: u64 = 100_000;
+/// A column selection reaches no further right than this column: each of its lines on screen is read that far in at
+/// every paint (Alt+drag past it stops there).
+pub const BLOCK_COLS_MAX: u32 = 100_000;
+pub const BLOCK_TOO_FAR: &str = "A column selection can't start that far into a line (column 100,000 at most).";
+/// How much of a line the column helpers read at a time (a line can be hundreds of MB: they read only as far as the
+/// column they're after).
+const WALK_CHUNK: u64 = if cfg!(test) { 7 } else { 64 << 10 };
 
 impl Block {
     pub fn at(line: u64, col: u32) -> Block {
@@ -440,15 +447,55 @@ fn col_width(c: char, col: u32, tab: u32) -> u32 {
     if c == '\t' { tab.max(1) - col % tab.max(1) } else { crate::print::width(c) as u32 }
 }
 
-/// The text of line `line` (without its line break).
-fn line_text(doc: &Document, line: u64) -> Option<(u64, Vec<u8>)> {
+/// Where line `line` starts and ends (before its line break), without reading it.
+fn line_span(doc: &Document, line: u64) -> Option<(u64, u64)> {
     let start = doc.line_start(line)?;
-    let end = doc.next_newline(start).unwrap_or(doc.len());
-    let mut t = doc.read(start, end);
-    if t.last() == Some(&b'\r') {
-        t.pop();
+    let mut end = doc.next_newline(start).unwrap_or(doc.len());
+    if end > start && doc.read(end - 1, end) == b"\r" {
+        end -= 1;
     }
-    Some((start, t))
+    Some((start, end))
+}
+
+/// From `at` (at column `c`) on to column `col`, not past `end` (the line's end): the place reached and its column,
+/// short of `col` at the line's end or before a tab or wide character that would cross it. Reads the line only as
+/// far as it goes, so a column near the start of a line of hundreds of MB costs a few KB.
+fn walk_cols(doc: &Document, mut at: u64, mut c: u32, end: u64, col: u32, tab: u32) -> (u64, u32) {
+    while at < end && c < col {
+        let stop = (at + WALK_CHUNK).min(end);
+        // (a character that starts before `stop` is read whole)
+        let t = doc.read(at, (stop + 3).min(end));
+        let lim = (stop - at) as usize;
+        let mut k = 0usize;
+        while k < lim && c < col {
+            // (a byte that isn't UTF-8 is a column of its own, as it shows)
+            let (ch, n) = text::decode_char(&t[k..]);
+            let w = col_width(ch, c, tab);
+            if c + w > col {
+                return (at + k as u64, c);
+            }
+            c += w;
+            k += n.max(1);
+        }
+        at += k as u64;
+    }
+    (at, c)
+}
+
+/// Where column `col` is in the line from `start` to `end`: the place, and the columns short of it at the line's
+/// end (inside a tab or a wide character: its start).
+fn place_of_col(doc: &Document, (start, end): (u64, u64), col: u32, tab: u32) -> (u64, u32) {
+    let (at, c) = walk_cols(doc, start, 0, end, col, tab);
+    (at, if at >= end { col.saturating_sub(c) } else { 0 })
+}
+
+/// Line `line`'s part between columns `l` and `r` (`l` <= `r`), and the columns short of `l` at the line's end.
+fn line_part(doc: &Document, (start, end): (u64, u64), l: u32, r: u32, tab: u32) -> (u64, u64, u32) {
+    let (a, c) = walk_cols(doc, start, 0, end, l, tab);
+    let short = if a >= end { l.saturating_sub(c) } else { 0 };
+    // (on from where `l` was found: the line is read once)
+    let (e, _) = walk_cols(doc, a, c, end, r, tab);
+    (a, e, short)
 }
 
 /// The column after the text `t` (from a line's start).
@@ -468,26 +515,23 @@ pub fn col_of(doc: &Document, pos: u64, tab: u32) -> u32 {
     cols_of(&doc.read(doc.line_start_of(pos), pos), tab)
 }
 
-/// Where column `col` is in the text `t` (a line starting at `start`): the place, and the columns short of it at
-/// the line's end (inside a tab or a wide character: its start).
-fn place_of_col(t: &[u8], start: u64, col: u32, tab: u32) -> (u64, u32) {
-    let (mut at, mut c) = (0usize, 0u32);
-    while at < t.len() && c < col {
-        let (ch, n) = text::decode_char(&t[at..]);
-        let w = col_width(ch, c, tab);
-        if c + w > col {
-            break;
-        }
-        c += w;
-        at += n.max(1);
-    }
-    let short = if at >= t.len() { col.saturating_sub(c) } else { 0 };
-    (start + at as u64, short)
-}
-
 /// The place at column `col` of line `line` (its end if the line is shorter).
 pub fn pos_at_col(doc: &Document, line: u64, col: u32, tab: u32) -> u64 {
-    line_text(doc, line).map_or(doc.len(), |(start, t)| place_of_col(&t, start, col, tab).0)
+    line_span(doc, line).map_or(doc.len(), |span| place_of_col(doc, span, col, tab).0)
+}
+
+/// A column of carets at `caret` (Shift+Alt+arrows with no column selection yet), or why not: it's further into its
+/// line than a column selection reaches (`BLOCK_COLS_MAX`; working out the column would read all of the line before).
+pub fn block_at(doc: &Document, caret: u64, tab: u32) -> Result<Block, &'static str> {
+    // (a column is a character: four bytes at most, but for marks that sit on another)
+    if caret - doc.line_start_of(caret) > BLOCK_COLS_MAX as u64 * 4 {
+        return Err(BLOCK_TOO_FAR);
+    }
+    let col = col_of(doc, caret, tab);
+    if col > BLOCK_COLS_MAX {
+        return Err(BLOCK_TOO_FAR);
+    }
+    Ok(Block::at(doc.line_of(caret).unwrap_or(0), col))
 }
 
 /// Each line's part of the block, top to bottom (a line shorter than the left column: an empty part at its end).
@@ -495,22 +539,28 @@ pub fn block_ranges(doc: &Document, b: &Block, tab: u32) -> Vec<(u64, u64)> {
     let ((first, last), (l, r)) = (b.lines(), b.cols());
     (first..=last)
         .filter_map(|line| {
-            let (start, t) = line_text(doc, line)?;
-            Some((place_of_col(&t, start, l, tab).0, place_of_col(&t, start, r, tab).0))
+            let (a, e, _) = line_part(doc, line_span(doc, line)?, l, r, tab);
+            Some((a, e))
         })
         .collect()
 }
 
-/// The block's text: its lines' parts, a line break (`eol`) after each but the last.
-pub fn block_text(doc: &Document, b: &Block, tab: u32, eol: &[u8]) -> Vec<u8> {
-    let mut out = Vec::new();
-    for (k, (s, e)) in block_ranges(doc, b, tab).into_iter().enumerate() {
+/// The block's text: its lines' parts, a line break (`eol`) after each but the last. More than `COPY_MAX` of it:
+/// `TOO_MUCH_TEXT` (a block can be 100,000 lines of 100,000 columns).
+pub fn block_text(doc: &Document, b: &Block, tab: u32, eol: &[u8]) -> Result<Vec<u8>, &'static str> {
+    let ranges = block_ranges(doc, b, tab);
+    let size: u64 = ranges.iter().map(|(s, e)| e - s + eol.len() as u64).sum();
+    if size > COPY_MAX {
+        return Err(TOO_MUCH_TEXT);
+    }
+    let mut out = Vec::with_capacity(size as usize);
+    for (k, (s, e)) in ranges.into_iter().enumerate() {
         if k > 0 {
             out.extend_from_slice(eol);
         }
         out.extend_from_slice(&doc.read(s, e));
     }
-    out
+    Ok(out)
 }
 
 /// What a key does to every line of a column selection.
@@ -532,9 +582,9 @@ pub fn block_edit(doc: &mut Document, b: &Block, tab: u32, what: BlockEdit) -> B
     // (the column the carets end up in: as on the caret's own line)
     let mut col = l;
     for (k, line) in (first..=last).rev().map(|l| ((l - first) as usize, l)) {
-        let Some((start, t)) = line_text(doc, line) else { continue };
-        let (a, short) = place_of_col(&t, start, l, tab);
-        let (e, _) = place_of_col(&t, start, r, tab);
+        let Some(span) = line_span(doc, line) else { continue };
+        let (start, end) = span;
+        let (a, e, short) = line_part(doc, span, l, r, tab);
         let here = line == b.caret.0;
         match &what {
             BlockEdit::Put(texts) => {
@@ -552,7 +602,6 @@ pub fn block_edit(doc: &mut Document, b: &Block, tab: u32, what: BlockEdit) -> B
                 }
             }
             BlockEdit::Delete { back } => {
-                let end = start + t.len() as u64;
                 let range = match (e > a, *back) {
                     (true, _) => Some((a, e)),
                     // (a column of carets: the character before or after each; past a line's end, none)
@@ -1966,7 +2015,7 @@ mod tests {
         let all = |d: &Document| String::from_utf8(d.read(0, d.len())).unwrap();
         let mut d = Document::from_text(b"abcd\nefgh\nij\n");
         let b = Block { anchor: (0, 1), caret: (2, 3) };
-        assert_eq!(block_text(&d, &b, 4, b"\n"), b"bc\nfg\nj");
+        assert_eq!(block_text(&d, &b, 4, b"\n").unwrap(), b"bc\nfg\nj");
         // typed on every line (one past its end: padded)
         let b = block_edit(&mut d, &b, 4, BlockEdit::Put(vec![b"XY"]));
         assert_eq!(all(&d), "aXYd\neXYh\niXY\n");
@@ -1989,9 +2038,60 @@ mod tests {
         // tabs to the next stop, a wide character two columns, CRLF lines
         let d = Document::from_text("\tx\r\n日本\r\nabc".as_bytes());
         let b = Block { anchor: (0, 2), caret: (2, 5) };
-        assert_eq!(String::from_utf8(block_text(&d, &b, 4, b"\r\n")).unwrap(), "\tx\r\n本\r\nc");
+        assert_eq!(String::from_utf8(block_text(&d, &b, 4, b"\r\n").unwrap()).unwrap(), "\tx\r\n本\r\nc");
         assert_eq!(col_of(&d, 1, 4), 4);
         assert_eq!(pos_at_col(&d, 1, 2, 4), 7);
+    }
+
+    #[test]
+    fn columns_are_found_reading_a_line_in_pieces() {
+        // (the pieces are 7 bytes in tests: characters of 2, 3 and 4 bytes, a tab and bytes that aren't UTF-8 fall
+        // across their seams)
+        let line = "a\u{e9}b\t\u{65e5}\u{672c}cd\u{1F600}e\u{301}f".as_bytes().iter().copied().chain([0xFF, b'g']).collect::<Vec<u8>>();
+        let mut text = line.clone();
+        text.extend_from_slice(b"\r\nnext");
+        let d = Document::from_text(&text);
+        // what reading the whole line gives
+        let whole = |col: u32| {
+            let (mut at, mut c) = (0usize, 0u32);
+            while at < line.len() && c < col {
+                let (ch, n) = text::decode_char(&line[at..]);
+                let w = col_width(ch, c, 4);
+                if c + w > col {
+                    break;
+                }
+                c += w;
+                at += n.max(1);
+            }
+            (at as u64, if at >= line.len() { col - c } else { 0 })
+        };
+        for col in 0..30 {
+            assert_eq!(place_of_col(&d, (0, line.len() as u64), col, 4), whole(col), "column {col}");
+            assert_eq!(pos_at_col(&d, 0, col, 4), whole(col).0, "column {col}");
+            for r in col..30 {
+                let (a, e, short) = line_part(&d, (0, line.len() as u64), col, r, 4);
+                assert_eq!((a, e, short), (whole(col).0, whole(r).0, whole(col).1), "columns {col} to {r}");
+            }
+        }
+        // (the line's end is before its CR)
+        assert_eq!(line_span(&d, 0), Some((0, line.len() as u64)));
+        assert_eq!(pos_at_col(&d, 1, 2, 4), line.len() as u64 + 4);
+    }
+
+    #[test]
+    fn a_column_selection_stays_within_reach() {
+        let mut long = vec![b'x'; BLOCK_COLS_MAX as usize + 10];
+        long.extend_from_slice(b"\nshort");
+        let d = Document::from_text(&long);
+        assert_eq!(block_at(&d, 5, 4), Ok(Block::at(0, 5)));
+        assert_eq!(block_at(&d, BLOCK_COLS_MAX as u64, 4), Ok(Block::at(0, BLOCK_COLS_MAX)));
+        assert_eq!(block_at(&d, BLOCK_COLS_MAX as u64 + 1, 4), Err(BLOCK_TOO_FAR));
+        assert_eq!(block_at(&d, d.len(), 4), Ok(Block::at(1, 5)));
+        // more than COPY_MAX of a block isn't copied
+        let lines = (COPY_MAX / 1000) as usize + 2;
+        let d = Document::from_text(&vec![b'y'; 1000].iter().copied().chain([b'\n']).cycle().take(lines * 1001).collect::<Vec<u8>>());
+        assert_eq!(block_text(&d, &Block { anchor: (0, 0), caret: (lines as u64 - 1, 1000) }, 4, b"\n"), Err(TOO_MUCH_TEXT));
+        assert_eq!(block_text(&d, &Block { anchor: (0, 0), caret: (2, 2) }, 4, b"\n"), Ok(b"yy\nyy\nyy".to_vec()));
     }
 
     #[test]

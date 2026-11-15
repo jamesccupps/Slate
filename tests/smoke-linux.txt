@@ -102,3 +102,13 @@ shot:smoke-contrast.png
 set:high_contrast=false
 expect:contrast=normal
 expect:theme=light
+# Closing the rightmost tab with unsaved text and answering Save: it's saved and closed, and nothing goes wrong after
+cmd:new-tab
+answer:smoke-c.txt
+cmd:save-as
+jobs
+type:x
+answer:save
+cmd:close-tab
+jobs
+expect:status=Saved smoke-c.txt

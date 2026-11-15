@@ -703,14 +703,19 @@ when it's this user's alone, else a guest window that keeps nothing). Windows: `
   a tab to the next stop, a wide character two: what a monospace font shows; the mouse's column is its x over the
   font's character width). Alt+drag (`DragMode::Block`; Alt let go after it doesn't give the menu bar the keyboard:
   `App::alt_dragged`) or Shift+Alt+arrows (so Shift+Alt+Up/Down don't move the line) make it, at most
-  `BLOCK_LINES_MAX` lines. Typing, Paste (a text of as many lines: one each), Backspace and Delete go through
-  `edit::block_edit` (every line, bottom to top, one undo step; a line short of the column padded with spaces when
-  something is put there); Copy and Cut take `block_text`. Anything else that edits or moves the caret ends it
-  (`after_edit`, `after_move`; what keeps it sets it again after).
+  `BLOCK_LINES_MAX` lines and out to column `BLOCK_COLS_MAX` (100,000: the mouse's column stops there, and
+  Shift+Alt+arrows from a caret further in say `BLOCK_TOO_FAR`, see `edit::block_at`). Typing, Paste (a text of as
+  many lines: one each), Backspace and Delete go through `edit::block_edit` (every line, bottom to top, one undo
+  step; a line short of the column padded with spaces when something is put there); Copy and Cut take `block_text`
+  (up to `COPY_MAX`; past it nothing is copied, or cut). Anything else that edits or moves the caret ends it
+  (`after_edit`, `after_move`; what keeps it sets it again after). The column helpers (`pos_at_col`,
+  `block_ranges`, `block_edit`) read a line only as far as the column they're after, in pieces (`walk_cols`): the
+  paint calls them for every line of it on screen, and the line can be hundreds of MB.
 - Drag and drop of text (`DragMode::Text`, `view::Drag::Text`): a press inside the selection takes it once the mouse
   goes past the system's drag distance (SM_CXDRAG; GTK's `gtk-dnd-drag-threshold`), `View::drop_at` drawn as a caret
-  in the accent color; let go, the text moves there (with Ctrl, a copy) as one undo step (`drop_text`). A press that
-  doesn't move puts the caret there. Only inside Slate (not to or from other programs).
+  in the accent color; let go, the text moves there (with Ctrl, a copy) as one undo step (`drop_text`; it copies the
+  text, so more than `COPY_MAX` says `TOO_MUCH_TEXT`, as Duplicate does). A press that doesn't move puts the caret
+  there. Only inside Slate (not to or from other programs).
 - Input methods (Chinese, Japanese, Korean; `edit::Composing`, `View::composing`, both apps): what's being composed
   is never in the document (no undo step, nothing for the session, searches or screen readers); the caret's segment
   is laid out with it put in at the caret, its units mapped to the caret's byte so everything after maps as before
