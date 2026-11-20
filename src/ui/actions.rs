@@ -324,6 +324,7 @@ impl App {
             self.flash = None;
         }
         self.active = i;
+        self.follow_find_bar();
         self.reveal_active_tab();
         self.update_title();
         if self.find.open {
@@ -333,6 +334,42 @@ impl App {
         self.layout();
         self.apply_goto(i);
         self.invalidate();
+    }
+
+    /// A find bar for each tab (`Settings::find_per_tab`): the bar's state goes with the tab shown (a new tab's is
+    /// closed; Go to's bar isn't kept); the search itself is shared.
+    fn follow_find_bar(&mut self) {
+        let id = self.tab().id;
+        let old = std::mem::replace(&mut self.find_owner, id);
+        if old == id || !self.settings.find_per_tab {
+            return;
+        }
+        let state = (self.find.open && self.find.mode != BarMode::GoTo).then_some(self.find.mode);
+        if let Some(t) = self.tabs.iter_mut().find(|t| t.id == old) {
+            t.find_bar = state;
+        }
+        match self.tab().find_bar {
+            Some(mode) => {
+                self.find.open = true;
+                self.find.mode = mode;
+            }
+            None if self.find.open => {
+                let in_bar = self.in_find_bar();
+                self.find.open = false;
+                crate::edit::remember(&mut self.settings.find_history, &self.find.query.text);
+                self.find.history_at = None;
+                if in_bar {
+                    win::set_focus(self.hwnd);
+                }
+            }
+            None => {}
+        }
+    }
+
+    /// Whether the keyboard is in one of the find bar's boxes.
+    fn in_find_bar(&self) -> bool {
+        let f = win::focus();
+        self.find.open && [self.find.find_edit, self.find.replace_edit, self.find.goto_edit].contains(&f)
     }
 
     /// Goes where tab `i` was asked to go (`Tab::goto`), once it's the tab shown and its document is ready.
@@ -3453,8 +3490,12 @@ impl App {
                     FindBar::focus(next);
                     FindBar::select_all(next);
                 } else {
+                    let close = self.settings.find_close_on_leave;
                     win::set_focus(self.hwnd);
                     self.restart_caret();
+                    if close {
+                        self.close_find();
+                    }
                 }
                 self.invalidate();
                 true
@@ -3514,10 +3555,15 @@ impl App {
             }
             (0, Hit::Menu(i)) => self.pending.push(Deferred::Menu(i)),
             (0, Hit::Text) | (0, Hit::Gutter) => {
+                // (the bar closes after the click is placed where it was made, before the text moves up)
+                let close = self.settings.find_close_on_leave && self.in_find_bar();
                 win::set_focus(self.hwnd);
                 let n = self.click_count(x, y);
                 self.editor_click(x, y, n, hit == Hit::Gutter);
                 capture(self.hwnd);
+                if close {
+                    self.close_find();
+                }
             }
             (0, Hit::VBar) => {
                 self.vbar_down(y);
@@ -4434,6 +4480,19 @@ impl App {
                 self.settings.close_with_last_tab = !self.settings.close_with_last_tab;
                 self.settings_changed();
             }
+            Cmd::ToggleFindCloseOnLeave => {
+                self.settings.find_close_on_leave = !self.settings.find_close_on_leave;
+                self.settings_changed();
+            }
+            Cmd::ToggleFindPerTab => {
+                self.settings.find_per_tab = !self.settings.find_per_tab;
+                // (from now: the tabs' kept states were from the last time it was on)
+                for t in &mut self.tabs {
+                    t.find_bar = None;
+                }
+                self.find_owner = self.tab().id;
+                self.settings_changed();
+            }
             Cmd::Suggestion(i) => self.spell_replace(i as usize),
             Cmd::AddWord | Cmd::IgnoreWord => {
                 if let (Some(w), Spelling::Ready(s)) = (self.spell_word.take(), &mut self.speller) {
@@ -4882,7 +4941,11 @@ impl App {
         tab.doc.seal();
         self.with_view(|v, cx| v.reveal(cx, start, true));
         self.restart_caret();
+        let close = self.settings.find_close_on_leave && self.in_find_bar();
         win::set_focus(self.hwnd);
+        if close {
+            self.close_find();
+        }
         self.invalidate();
     }
 
@@ -5067,6 +5130,13 @@ impl App {
                     check(Cmd::ToggleWhitespace, "Show w&hitespace", "", s.show_whitespace),
                     check(Cmd::ToggleTitleBarTabs, "&Tabs in the title bar", "", s.tabs_in_title_bar && !self.theme.hc),
                     check(Cmd::ToggleCloseWithLastTab, "Close Slate with the last ta&b", "", s.close_with_last_tab),
+                    sub(
+                        "Fin&d bar",
+                        vec![
+                            check(Cmd::ToggleFindCloseOnLeave, "&Close when you click in the text", "", s.find_close_on_leave),
+                            check(Cmd::ToggleFindPerTab, "&One for each tab", "", s.find_per_tab),
+                        ],
+                    ),
                     check(Cmd::ToggleSpellCheck, if matches!(self.speller, Spelling::Unavailable) { "Spell chec&k (Windows has no dictionary for it)" } else { "Spell chec&k" }, "", s.spell_check),
                     item(Cmd::CharInfo, "&Character at the caret", ""),
                     Item::Sep,

@@ -225,6 +225,8 @@ fn cmd_of(name: &str) -> Option<Cmd> {
         "ToggleSpellCheck" => Cmd::ToggleSpellCheck,
         "ToggleTitleBarTabs" => Cmd::ToggleTitleBarTabs,
         "ToggleCloseWithLastTab" => Cmd::ToggleCloseWithLastTab,
+        "ToggleFindCloseOnLeave" => Cmd::ToggleFindCloseOnLeave,
+        "ToggleFindPerTab" => Cmd::ToggleFindPerTab,
         "AddWord" => Cmd::AddWord,
         "IgnoreWord" => Cmd::IgnoreWord,
         "ToggleLineNumbers" => Cmd::ToggleLineNumbers,
@@ -723,6 +725,8 @@ fn describe(cell: &Cell, what: &str) -> String {
             format!("private {} MB, working set {} MB, peak {} MB", c.private >> 20, c.ws >> 20, c.peak_ws >> 20)
         }
         "notice" => a.tab().notice.as_ref().map(|n| n.text.clone()).unwrap_or_default(),
+        // the find bar: closed, or its mode
+        "findbar" => if a.find.open { format!("{:?}", a.find.mode) } else { "closed".into() },
         "focus" => {
             let f = super::win::focus();
             let names = [(a.hwnd, "main"), (a.find.find_edit, "find"), (a.find.replace_edit, "replace"), (a.find.goto_edit, "goto")];

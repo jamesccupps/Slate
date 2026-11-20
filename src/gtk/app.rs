@@ -149,6 +149,10 @@ pub enum Cmd {
     TitleBarTabs,
     /// View → Close Slate with the last tab (`Settings::close_with_last_tab`).
     CloseWithLastTab,
+    /// View → Find bar: Close when you click in the text (`Settings::find_close_on_leave`), One for each tab
+    /// (`Settings::find_per_tab`).
+    FindCloseOnLeave,
+    FindPerTab,
     /// The spell check menu's suggestion (`App::spell_word`).
     Suggestion(u8),
     AddWord,
@@ -263,6 +267,8 @@ pub struct Tab {
     pub id: u64,
     pub doc: Document,
     pub view: View,
+    /// A find bar for each tab (`Settings::find_per_tab`): this tab's while another one shows (Some(replace): open).
+    pub find_bar: Option<bool>,
     pub lang: Lang,
     /// The user picked the language (it's not detected again on saving under another name).
     pub lang_picked: bool,
@@ -439,6 +445,8 @@ pub struct App {
     /// The only tab, which the user is closing with View → Close Slate with the last tab on: once it's gone (after
     /// its question, or its save), Slate quits (`remove_tab`).
     pub quit_with_tab: Option<u64>,
+    /// The tab the find bar's state (`find.open`, `find.replace`) is about (`follow_find_bar`).
+    pub find_owner: u64,
     /// The system wants dark (when the theme follows it).
     pub system_dark: bool,
     /// The desktop's high contrast is on (then Slate is drawn in `Theme::high_contrast_fixed`).
@@ -523,6 +531,7 @@ impl App {
             focused: true,
             closed: Vec::new(),
             quit_with_tab: None,
+            find_owner: 0,
             system_dark,
             system_hc: false,
             dirty_view: true,
@@ -631,6 +640,7 @@ impl App {
             id,
             doc,
             view: View::new(),
+            find_bar: None,
             lang: Lang::Plain,
             lang_picked: false,
             indent,
@@ -2456,6 +2466,19 @@ impl App {
                 self.settings.close_with_last_tab = !self.settings.close_with_last_tab;
                 self.settings.save();
             }
+            Cmd::FindCloseOnLeave => {
+                self.settings.find_close_on_leave = !self.settings.find_close_on_leave;
+                self.settings.save();
+            }
+            Cmd::FindPerTab => {
+                self.settings.find_per_tab = !self.settings.find_per_tab;
+                // (from now: the tabs' kept states were from the last time it was on)
+                for t in &mut self.tabs {
+                    t.find_bar = None;
+                }
+                self.find_owner = self.tabs[self.active].id;
+                self.settings.save();
+            }
             Cmd::TitleBarTabs => {
                 // (GTK makes a window's title bar as it's shown: the next start has it)
                 self.settings.tabs_in_title_bar = !self.settings.tabs_in_title_bar;
@@ -3255,6 +3278,35 @@ impl App {
         let version = tab.doc.version;
         self.find.count_tab = tab.id;
         self.find.count_job = Some((version, Job::spawn(snap.len(), notify, move |ctx| search::count_in(&m, &snap, a, b, ctx))));
+    }
+
+    /// A find bar for each tab (`Settings::find_per_tab`): the bar's state goes with the tab shown (a new tab's is
+    /// closed); the search itself is shared. Called as the window catches up with a change (`Ui::refresh`), so every
+    /// way of showing another tab counts; the keyboard goes back to the text if the bar it was in goes.
+    pub fn follow_find_bar(&mut self) {
+        let id = self.tabs[self.active].id;
+        let old = std::mem::replace(&mut self.find_owner, id);
+        if old == id || !self.settings.find_per_tab {
+            return;
+        }
+        let state = self.find.open.then_some(self.find.replace);
+        if let Some(t) = self.tabs.iter_mut().find(|t| t.id == old) {
+            t.find_bar = state;
+        }
+        match self.tabs[self.active].find_bar {
+            Some(replace) => {
+                self.find.open = true;
+                self.find.replace = replace;
+            }
+            None if self.find.open => {
+                self.find.open = false;
+                self.find.found = None;
+                self.find.history_at = None;
+                edit::remember(&mut self.settings.find_history, &self.find.query.text.clone());
+            }
+            None => {}
+        }
+        self.dirty_view = true;
     }
 
     /// While the find bar is open, the matches are counted (and marked) in the tab shown: again in another tab, or

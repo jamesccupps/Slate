@@ -208,6 +208,8 @@ pub struct Tab {
     pub id: u64,
     pub doc: Document,
     pub view: View,
+    /// A find bar for each tab (`Settings::find_per_tab`): this tab's, while another one shows (None: closed).
+    pub find_bar: Option<findbar::Mode>,
     pub lang: Lang,
     /// The user picked `lang` (so it isn't guessed again).
     pub lang_picked: bool,
@@ -334,6 +336,7 @@ impl Tab {
             id,
             doc,
             view: View::new(),
+            find_bar: None,
             lang: Lang::Plain,
             lang_picked: false,
             untitled: 0,
@@ -611,6 +614,8 @@ pub struct App {
     /// The only tab, which the user is closing with View → Close Slate with the last tab on: once it's gone (after
     /// its question, or its save), Slate closes (`remove_tab`).
     pub quit_with_tab: Option<u64>,
+    /// The tab the find bar's state (`find.open`, `find.mode`) is about (`App::follow_find_bar`).
+    pub find_owner: u64,
     /// `slate --wait`: an event to set once all of its tabs are closed (`Opts::wait`).
     pub waits: Vec<(String, Vec<u64>)>,
     /// The printer and its settings chosen last (File → Print).
@@ -745,6 +750,7 @@ impl App {
             keyboard_cues: super::actions::keyboard_cues(),
             closed_tabs: Vec::new(),
             quit_with_tab: None,
+            find_owner: 0,
             waits: Vec::new(),
             print_last: Default::default(),
             highlights: Vec::new(),

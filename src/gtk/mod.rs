@@ -1334,6 +1334,24 @@ fn connect(ui: &Rc<Ui>, prev: &gtk4::Button, next: &gtk4::Button, lines_btn: &gt
         ui.try_quit();
         if ui.closing.get() { glib::Propagation::Proceed } else { glib::Propagation::Stop }
     });
+    // View → Find bar → Close when you click in the text: the keyboard going from the find bar to the text closes the
+    // bar (a click, a jump from the structure panel; afterwards, so a click lands where it was made).
+    let last_focus: RefCell<Option<glib::WeakRef<gtk4::Widget>>> = RefCell::new(None);
+    ui.window.connect_focus_widget_notify(move |w| {
+        let Some(ui) = get_ui() else { return };
+        let now = GtkWindowExt::focus(w);
+        let was = last_focus.replace(now.as_ref().map(|f| f.downgrade())).and_then(|r| r.upgrade());
+        let to_text = now.as_ref().is_some_and(|f| f == ui.text.upcast_ref::<gtk4::Widget>());
+        let from_bar = was.is_some_and(|f| f.is_ancestor(&ui.find_box));
+        let wanted = ui.app.try_borrow().is_ok_and(|a| a.find.open && a.settings.find_close_on_leave);
+        if to_text && from_bar && wanted {
+            glib::idle_add_local_once(|| {
+                if let Some(ui) = get_ui() {
+                    ui.command(Cmd::CloseFind);
+                }
+            });
+        }
+    });
     ui.window.connect_is_active_notify(|_| {
         if let Some(ui) = get_ui() {
             if ui.window.is_active() {
@@ -1647,6 +1665,8 @@ fn commands() -> Vec<(&'static str, Cmd, &'static [&'static str])> {
         ("spell-check", Cmd::SpellCheck, &[]),
         ("title-bar-tabs", Cmd::TitleBarTabs, &[]),
         ("close-with-last-tab", Cmd::CloseWithLastTab, &[]),
+        ("find-close-on-leave", Cmd::FindCloseOnLeave, &[]),
+        ("find-per-tab", Cmd::FindPerTab, &[]),
         ("suggest-0", Cmd::Suggestion(0), &[]),
         ("suggest-1", Cmd::Suggestion(1), &[]),
         ("suggest-2", Cmd::Suggestion(2), &[]),
@@ -1715,7 +1735,7 @@ fn mono_families(ctx: &pango::Context, current: &str) -> Vec<String> {
 
 /// Menu items that show a check mark: their actions have a true/false state (`Ui::sync_menu`).
 const CHECKED: &[&str] =
-    &["wrap", "line-numbers", "show-whitespace", "spell-check", "title-bar-tabs", "close-with-last-tab", "theme-system", "theme-light", "theme-dark", "eol-lf", "eol-crlf", "read-only", "restore-session", "structure-panel", "path-bar"];
+    &["wrap", "line-numbers", "show-whitespace", "spell-check", "title-bar-tabs", "close-with-last-tab", "find-close-on-leave", "find-per-tab", "theme-system", "theme-light", "theme-dark", "eol-lf", "eol-crlf", "read-only", "restore-session", "structure-panel", "path-bar"];
 
 fn actions(ui: &Rc<Ui>) {
     // (in place of the window's own "win" group: menus and shortcuts find these the same way)
@@ -1881,18 +1901,18 @@ fn menu_model(recent: &gio::Menu, format_extra: &gio::Menu, view_extra: &gio::Me
     edit.append_section(None, &section(&[("Time/date", "date-time")]));
     bar.append_submenu(Some("_Edit"), &edit);
     let view = gio::Menu::new();
-    view.append_section(
-        None,
-        &section(&[
-            ("Word wrap", "wrap"),
-            ("Line numbers", "line-numbers"),
-            ("Show whitespace", "show-whitespace"),
-            ("Spell check", "spell-check"),
-            ("Tabs in the title bar", "title-bar-tabs"),
-            ("Close Slate with the last tab", "close-with-last-tab"),
-            ("Character at the caret", "char-info"),
-        ]),
-    );
+    let first = section(&[
+        ("Word wrap", "wrap"),
+        ("Line numbers", "line-numbers"),
+        ("Show whitespace", "show-whitespace"),
+        ("Spell check", "spell-check"),
+        ("Tabs in the title bar", "title-bar-tabs"),
+        ("Close Slate with the last tab", "close-with-last-tab"),
+        ("Character at the caret", "char-info"),
+    ]);
+    let find_bar = section(&[("Close when you click in the text", "find-close-on-leave"), ("One for each tab", "find-per-tab")]);
+    first.insert_submenu(6, Some("Find bar"), &find_bar);
+    view.append_section(None, &first);
     view.append_section(None, &section(&[("Show only matching lines", "filter-lines"), ("Show lines not matching", "filter-lines-not"), ("Clear highlights", "clear-highlights")]));
     view.append_section(None, view_extra);
     let zoom = section(&[("Zoom in", "zoom-in"), ("Zoom out", "zoom-out"), ("Reset zoom", "zoom-reset")]);
@@ -2933,6 +2953,7 @@ impl Ui {
         if theme_changed {
             a.apply_theme();
         }
+        a.follow_find_bar();
         a.keep_count();
         let structured = a.tab().lang.has_structure();
         let (show_path, show_panel) = (structured && a.settings.path_bar, structured && a.settings.structure_panel);
@@ -3062,6 +3083,8 @@ impl Ui {
             ("spell-check", a.settings.spell_check),
             ("title-bar-tabs", a.settings.tabs_in_title_bar),
             ("close-with-last-tab", a.settings.close_with_last_tab),
+            ("find-close-on-leave", a.settings.find_close_on_leave),
+            ("find-per-tab", a.settings.find_per_tab),
             ("theme-system", theme == ThemeMode::System),
             ("theme-light", theme == ThemeMode::Light),
             ("theme-dark", theme == ThemeMode::Dark),

@@ -44,6 +44,12 @@ pub struct Settings {
     /// View → Close Slate with the last tab: closing the only tab (Ctrl+W, its ×) closes Slate too; off, an empty tab
     /// stays, as in Notepad.
     pub close_with_last_tab: bool,
+    /// View → Find bar → Close when you click in the text: the keyboard leaving the find bar (or Go to's) for the
+    /// text closes it (issue #6). Off: it stays open until Esc.
+    pub find_close_on_leave: bool,
+    /// View → Find bar → One for each tab: each tab keeps its find bar open or closed, a new one's closed; the
+    /// search itself is shared. Off: one bar for the window, open whichever tab shows.
+    pub find_per_tab: bool,
     pub theme: ThemeMode,
     pub tab_size: u32,
     pub use_spaces: bool,
@@ -86,6 +92,8 @@ impl Default for Settings {
             spell_check: true,
             tabs_in_title_bar: true,
             close_with_last_tab: false,
+            find_close_on_leave: false,
+            find_per_tab: false,
             theme: ThemeMode::System,
             tab_size: 4,
             use_spaces: true,

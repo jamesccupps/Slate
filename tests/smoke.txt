@@ -120,3 +120,18 @@ key:ctrl+shift+m
 expect:sel=6..10
 key:ctrl+shift+m
 expect:sel=5..11
+# View → Find bar: one for each tab (a new tab's is closed), and closed by a click in the text
+cmd:ToggleFindPerTab
+find:f
+expect:findbar=Find
+cmd:NewTab
+expect:findbar=closed
+cmd:PrevTab
+expect:findbar=Find
+cmd:ToggleFindPerTab
+cmd:ToggleFindCloseOnLeave
+cmd:Find
+expect:focus=find
+click:300,250
+expect:findbar=closed
+cmd:ToggleFindCloseOnLeave

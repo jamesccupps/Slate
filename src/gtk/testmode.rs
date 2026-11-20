@@ -620,7 +620,12 @@ fn value(what: &str, test: &Test) -> String {
                 .collect();
             format!("{}{}", if s.rows_current(&tab.doc) { "" } else { "(old) " }, rows.join(" "))
         }
-        "shown" => format!("path bar {}, panel {}", ui.path_bar.is_visible(), ui.panel.is_visible()),
+        "shown" => format!(
+            "path bar {}, panel {}, find bar {}",
+            ui.path_bar.is_visible(),
+            ui.panel.is_visible(),
+            ui.find_box.is_visible()
+        ),
         "indent" => format!("{:?}{}", tab.indent, if tab.indent_picked { " (picked)" } else { "" }),
         "font" => format!("{} {}", a.settings.font, a.settings.font_size),
         "settings" => format!(

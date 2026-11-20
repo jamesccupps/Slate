@@ -87,6 +87,10 @@ pub enum Cmd {
     ToggleTitleBarTabs,
     /// View → Close Slate with the last tab (`Settings::close_with_last_tab`).
     ToggleCloseWithLastTab,
+    /// View → Find bar: Close when you click in the text (`Settings::find_close_on_leave`), One for each tab
+    /// (`Settings::find_per_tab`).
+    ToggleFindCloseOnLeave,
+    ToggleFindPerTab,
     /// The spell check menu's suggestion (`App::spell_word`).
     Suggestion(u8),
     AddWord,

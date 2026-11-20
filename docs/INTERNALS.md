@@ -602,6 +602,15 @@ when it's this user's alone, else a guest window that keeps nothing). Windows: `
 - View → Close Slate with the last tab (`Settings::close_with_last_tab`, off by default): Ctrl+W or a tab's × on the
   only tab marks it (`App::quit_with_tab`); once it's gone (after its question, or its save) `remove_tab` closes
   Slate (Windows `Deferred::Cmd(Cmd::Exit)`, Linux `Ask::Quit`). Close all/other tabs don't (an empty tab stays).
+- View → Find bar (issue #6; both off by default). *Close when you click in the text*
+  (`Settings::find_close_on_leave`): the keyboard going from the bar to the text closes it, after a click is placed
+  where it was made (Windows: where the app moves it there, a click in the text or gutter, Tab from the find box, a
+  structure jump: `in_find_bar` first; Linux: the window's `focus-widget` going from inside `find_box` to the text,
+  the close on an idle). *One for each tab* (`Settings::find_per_tab`): `App::find_owner` is the tab the bar's
+  state is about; when another tab shows (Windows `activate`, Linux `Ui::refresh`, so every way of switching
+  counts) `follow_find_bar` keeps the bar's state on the old tab (`Tab::find_bar`; Go to's isn't kept) and takes
+  the new one's (a new tab's: closed), without taking the keyboard from the text; the search is shared. Turning it
+  on or off forgets the kept states.
 - Input methods (Chinese, Japanese, Korean; `edit::Composing`, `View::composing`, both apps): what's being composed
   is never in the document (no undo step, nothing for the session, searches or screen readers); the caret's segment
   is laid out with it put in at the caret, its units mapped to the caret's byte so everything after maps as before
