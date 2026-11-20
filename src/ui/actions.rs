@@ -1523,9 +1523,15 @@ impl App {
         // Match counting.
         if let Some(job) = self.tabs[i].search.job.as_mut() {
             if let Some(found) = job.take() {
-                self.tabs[i].search.job = None;
+                let s = &mut self.tabs[i].search;
+                s.job = None;
+                s.started = None;
                 if found.complete {
-                    self.tabs[i].search.found = Some(found);
+                    s.found = Some(found);
+                    s.found_at = s.key.as_ref().map_or(0, |k| k.4);
+                } else {
+                    // (no count for this text: not the last one's either)
+                    s.found = None;
                 }
             } else {
                 running = true;
@@ -2291,9 +2297,11 @@ impl App {
         tab.sync_view();
         tab.view.upstream = false;
         tab.view.want_x = None;
-        tab.search.found = None;
-        tab.search.key = None;
         tab.search.job = None;
+        if !self.find.open {
+            tab.search.found = None;
+            tab.search.key = None;
+        }
         self.session_dirty = true;
         self.reveal_caret(false);
         self.restart_caret();
@@ -3049,7 +3057,7 @@ impl App {
         let q = &self.find.query;
         let key = (q.text.clone(), q.match_case, q.whole_word, q.regex, tab.doc.version);
         let f = tab.search.found.as_ref().filter(|f| f.complete && f.positions.len() as u64 == f.count)?;
-        if tab.search.key.as_ref() != Some(&key) {
+        if tab.search.key.as_ref() != Some(&key) || tab.search.found_at != tab.doc.version {
             return None;
         }
         // (the last that ends at or before `from`, else, wrapping around, the last one if it starts at or after it)
@@ -3275,9 +3283,14 @@ impl App {
         if tab.search.key.as_ref() == Some(&key) {
             return;
         }
+        // (only the text changed: the last count stays shown until this one is in)
+        let same_search = tab.search.key.as_ref().is_some_and(|k| k.0 == key.0 && (k.1, k.2, k.3) == (key.1, key.2, key.3));
         tab.search.key = Some(key);
-        tab.search.found = None;
-        tab.search.marks = None;
+        if !same_search {
+            tab.search.found = None;
+            tab.search.marks = None;
+        }
+        tab.search.started = Some(Instant::now());
         let snap = tab.doc.snapshot();
         tab.search.job = Some(Job::spawn(snap.len(), notify, move |ctx| search::count_in(&m, &snap, a, b, ctx)));
         self.timer(TIMER_JOBS, 100);
@@ -3294,6 +3307,8 @@ impl App {
         } else {
             match &tab.search.found {
                 Some(f) if f.count == 0 => ("No results".into(), true),
+                // (counted before the last edit: its places may have moved)
+                Some(f) if tab.search.found_at != tab.doc.version => (format!("{} found", group(f.count)), false),
                 Some(f) => match f.positions.binary_search_by_key(&sel.start(), |p| p.0) {
                     Ok(k) if f.positions[k].1 == sel.end() => (format!("{} of {}", group(k as u64 + 1), group(f.count)), false),
                     _ => (format!("{} found", group(f.count)), false),

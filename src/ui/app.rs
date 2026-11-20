@@ -143,10 +143,16 @@ pub struct Task {
 
 #[derive(Default)]
 pub struct Search {
-    /// The query and document version the results belong to.
+    /// The query and document version the results belong to (or will: the count under way).
     pub key: Option<(String, bool, bool, bool, u64)>,
     pub job: Option<Job<Found>>,
+    /// The last count. After an edit it stays shown until the next one is in (`found_at` older than the text), so the
+    /// find bar's message and the scrollbar's marks don't blink with every key typed while the bar is open.
     pub found: Option<Found>,
+    /// The document version `found` was counted in.
+    pub found_at: u64,
+    /// When the count under way started (the status bar shows its progress if it takes a while).
+    pub started: Option<Instant>,
     /// Where the scrollbar's match marks go, worked out once for a count and a bar (document version, matches, bar
     /// top and height): there can be a million matches, and the caret's blink repaints.
     pub marks: Option<((u64, usize, u32, u32), Vec<f32>)>,
@@ -1978,7 +1984,9 @@ impl App {
             return Some((format!("Downloading Slate {}… {:.0}%", release.version, job.fraction() * 100.0), false));
         }
         if let Some(j) = &tab.search.job {
-            if self.find.open {
+            // (a count again after an edit, with the last one still shown, only once it takes a while)
+            let slow = tab.search.started.is_some_and(|t| t.elapsed() >= std::time::Duration::from_millis(700));
+            if self.find.open && (tab.search.found.is_none() || slow) {
                 return Some((format!("Searching… {:.0}%", j.fraction() * 100.0), false));
             }
         }

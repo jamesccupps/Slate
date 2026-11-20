@@ -17,6 +17,8 @@ jobs
 expect:find=1 of 1
 key:ctrl+end
 type:\n
+# typing with the find bar open: the last count stays shown until the text is counted again (no blinking)
+expect:find=1 found
 expect:dirty=true
 cmd:Save
 jobs

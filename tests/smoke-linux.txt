@@ -16,9 +16,11 @@ expect:tabnames=smoke.json
 find:Slate
 jobs
 expect:find=Some(1)
-key:esc
+# typing with the find bar open: the last count stays shown until the text is counted again (no blinking)
 key:ctrl+end
 type:\n
+expect:findlabel=1 found
+key:esc
 expect:dirty=true
 cmd:save
 jobs

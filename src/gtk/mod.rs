@@ -3005,6 +3005,8 @@ impl Ui {
         let count = match (&a.find.error, &a.find.found) {
             (Some(e), _) => e.clone(),
             (None, Some((_, f))) if f.count == 0 => "No results".into(),
+            // (counted before the last edit: its places may have moved)
+            (None, Some((v, f))) if *v != a.tab().doc.version => format!("{} found", f.count),
             (None, Some((_, f))) => {
                 let sel = a.tab().view.sel;
                 let k = f.positions.iter().position(|p| *p == (sel.start(), sel.end()));

@@ -1802,7 +1802,11 @@ impl App {
         tab.view.block = None;
         tab.sync_view();
         tab.view.want_x = None;
-        self.find.found = None;
+        // (with the find bar open the last count stays shown until `keep_count`'s next one is in, so its message and
+        // the matches on screen don't blink with every key)
+        if !self.find.open {
+            self.find.found = None;
+        }
         self.session_dirty = true;
         self.dirty_title = true;
         self.dirty_view = true;
@@ -3263,9 +3267,18 @@ impl App {
         let v = tab.doc.version;
         let counted = matches!(&self.find.found, Some((fv, _)) if *fv == v);
         let counting = matches!(&self.find.count_job, Some((cv, _)) if *cv == v);
-        if !counted && !counting && (tab.doc.len() <= 16 << 20 || self.find.count_tab != tab.id) {
+        if counted || counting {
+            return;
+        }
+        if self.find.count_tab != tab.id {
             self.find.found = None;
             self.start_count();
+        } else if tab.doc.len() <= 16 << 20 {
+            // (the text changed: the last count stays until this one is in)
+            self.start_count();
+        } else {
+            // (a bigger one isn't counted again after an edit: no count rather than an old one)
+            self.find.found = None;
         }
     }
 
@@ -3570,6 +3583,17 @@ impl App {
             Some((v, f)) if self.find.open && *v == tab.doc.version => {
                 let k = f.positions.partition_point(|p| p.1 < a);
                 f.positions[k..].iter().take_while(|p| p.0 < b).copied().collect()
+            }
+            // (counted before the last edit, the next count under way: the screenful is searched directly meanwhile,
+            // as the count's places may have moved)
+            Some(_) if self.find.open => {
+                let Some(m) = &self.find.matcher else { return Vec::new() };
+                let (lo, hi) = self.search_range();
+                let (ra, rb) = (a.saturating_sub(256).max(lo), (b + 256).min(hi));
+                if rb <= ra || rb - ra >= 4 << 20 {
+                    return Vec::new();
+                }
+                m.matches_in(&tab.doc.read(ra, rb), ra, 5000).into_iter().filter(|p| p.1 >= a && p.0 < b).collect()
             }
             _ => Vec::new(),
         }

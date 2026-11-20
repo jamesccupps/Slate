@@ -632,6 +632,13 @@ when it's this user's alone, else a guest window that keeps nothing). Windows: `
   so the setting counts from the next start: the strip and `gtk4::WindowControls` (the desktop's own buttons, in its
   order) are `set_titlebar`'s widget; on the strip's empty room a drag starts `Toplevel::begin_move` (past the drag
   threshold), a double-click maximizes or restores, a right-click shows the window menu (`show_window_menu`).
+- The find bar's count ("3 of 120", the scrollbar's marks; Linux marks the matches on screen from it too) is counted
+  again after an edit while the bar is open, and the last count stays shown until the new one is in (Windows:
+  `Search::found_at` older than the text; Linux: `found`'s version), so the message doesn't blink with every key
+  typed (issue #6, up to 0.18.0 it emptied at each key). Meanwhile it says only how many ("120 found": the places
+  may have moved), Find previous doesn't use its places, Linux searches the screenful directly for the marks, and
+  Windows' status bar shows the count's progress only after 700 ms. A Linux text over 16 MiB isn't counted again
+  after an edit: its count goes, rather than staying wrong.
 - Find next and previous through all open tabs (the find box's All tabs toggle, Alt+A; `App::find_in_tabs`): on to
   this tab's end, then the other tabs in order, then the rest of this one; a tab of matching lines or one whose text
   isn't there yet is passed over, Find in selection keeps to the selection, and Find previous still takes a match

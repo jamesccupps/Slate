@@ -11,7 +11,7 @@
 //! switched; `print:contrast` says what's drawn; `refuse_access`: saves act as if the file's access list couldn't be
 //! kept), `gsettings:<key>=<value>` (GNOME's), `wait:<ms>`, `jobs` (wait for
 //! background work; `jobs:counts`: the status bar's word count too), `shot:<file.png>`, `print:<what>` (`text`, `sel`, `status`, `title`, `tabs`, `lang`, `asked`,
-//! `clipboard`, `find`, `dirty`, `top`, `session`: the session folder's files, `notice`, `composing`),
+//! `clipboard`, `find` (the count), `findlabel` (what the find bar says), `matches` (the matches marked), `dirty`, `top`, `session`: the session folder's files, `notice`, `composing`),
 //! `imemsg:start|pre|<text>|<cursor>|<clauses>|commit|<text>|end` (an input method), `expect:<what>=<value>`,
 //! `t:<label>` (a timing mark), `persist`, `session:save|soon|restore` (`soon`: on another thread, as the timer
 //! does), `printpdf:<file>[|selection]` (the tab printed into a PDF file, no dialog), `saveas:<file>`,
@@ -567,6 +567,8 @@ fn value(what: &str, test: &Test) -> String {
         "asked" => test.asked.borrow().join("; "),
         "clipboard" => test.clipboard.borrow().clone(),
         "find" => format!("{:?}", a.find.found.as_ref().map(|f| f.1.count)),
+        "findlabel" => ui.find_count.text().to_string(),
+        "matches" => format!("{:?}", a.visible_matches(0, tab.doc.len())),
         "dirty" => tab.doc.is_dirty().to_string(),
         "lines" => tab.doc.line_count().map(|n| n.to_string()).unwrap_or_else(|| "?".into()),
         "len" => tab.doc.len().to_string(),
