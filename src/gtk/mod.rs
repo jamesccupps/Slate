@@ -3747,6 +3747,8 @@ impl Ui {
                     let mut i = a.add_text_tab(text.as_bytes(), None, Some(Lang::Plain));
                     a.tabs[i].doc.mark_saved();
                     a.tabs[i].title_override = Some("Keyboard shortcuts".into());
+                    // (a list to read, as on Windows: a key typed there by mistake changes nothing, nor is it spell checked)
+                    a.tabs[i].read_only = true;
                     if blank {
                         a.tabs.remove(0);
                         a.active = 0;
