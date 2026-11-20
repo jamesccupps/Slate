@@ -602,8 +602,10 @@ when it's this user's alone, else a guest window that keeps nothing). Windows: `
 - View → Close Slate with the last tab (`Settings::close_with_last_tab`, off by default): Ctrl+W or a tab's × on the
   only tab marks it (`App::quit_with_tab`); once it's gone (after its question, or its save) `remove_tab` closes
   Slate (Windows `Deferred::Cmd(Cmd::Exit)`, Linux `Ask::Quit`). Close all/other tabs don't (an empty tab stays).
-- Multiple cursors (Edit → Multiple cursors, issue #5; `Settings::multi_cursor`, off by default: its commands only
-  say how to turn it on, Ctrl+click stays an ordinary click). `View::carets` (`edit::Carets`) holds the cursors
+- Multiple cursors (Edit → Multiple cursors, issue #5; `Settings::multi_cursor`, off by default: its menu items only
+  say how to turn it on, its keys aren't bound (Windows `key_cmd`, GTK `set_accels`: `shortcuts::CARET_COMMANDS`)
+  and do what they did, Ctrl+click stays an ordinary click). Above/below are Ctrl+Shift+Up/Down, not Ctrl+Alt:
+  GNOME switches workspaces with those (found on the VM's desktop), some Windows graphics drivers turn the screen. `View::carets` (`edit::Carets`) holds the cursors
   besides `sel`, the newest last; the main one (`sel`, which the view reveals and moves as always) is the newest of
   all, so Remove last cursor pops. `edit::multi_edit` does a key's edit at each, in the text's order with a running
   offset (a cursor's range is clipped to where the one before ended), as one undo step that typing continues; cursors

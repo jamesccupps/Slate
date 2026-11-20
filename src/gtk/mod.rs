@@ -1672,8 +1672,8 @@ fn commands() -> Vec<(&'static str, Cmd, &'static [&'static str])> {
         ("find-close-on-leave", Cmd::FindCloseOnLeave, &[]),
         ("find-per-tab", Cmd::FindPerTab, &[]),
         ("multi-cursor", Cmd::MultiCursor, &[]),
-        ("add-cursor-above", Cmd::AddCaretAbove, &["<Control><Alt>Up"]),
-        ("add-cursor-below", Cmd::AddCaretBelow, &["<Control><Alt>Down"]),
+        ("add-cursor-above", Cmd::AddCaretAbove, &["<Control><Shift>Up"]),
+        ("add-cursor-below", Cmd::AddCaretBelow, &["<Control><Shift>Down"]),
         ("add-next-match", Cmd::AddNextMatch, &["<Control><Shift>n"]),
         ("skip-match", Cmd::SkipMatch, &[]),
         ("all-matches", Cmd::AllMatches, &["<Control><Shift>a"]),
@@ -1752,6 +1752,8 @@ fn mono_families(ctx: &pango::Context, current: &str) -> Vec<String> {
 fn set_accels(ui: &Ui) {
     let Ok(a) = ui.app.try_borrow() else { return };
     let km = &a.keymap;
+    // (Edit → Multiple cursors' keys only while it's on: off, they do what they did before)
+    let carets_off = !a.settings.multi_cursor;
     let norm = |s: &str| gtk4::accelerator_parse(s).map(|(k, m)| (k.to_lower(), m));
     let taken: Vec<_> = crate::shortcuts::commands().filter_map(|c| km.keys_of(c.id)).flatten().filter_map(|c| norm(&c.gtk())).collect();
     let set = |name: &str, accels: Vec<String>| {
@@ -1761,6 +1763,7 @@ fn set_accels(ui: &Ui) {
     let own = |accels: Vec<String>| -> Vec<String> { accels.into_iter().filter(|s| norm(s).is_none_or(|n| !taken.contains(&n))).collect() };
     for (name, _, accels) in commands() {
         match km.keys_of(name) {
+            _ if carets_off && crate::shortcuts::CARET_COMMANDS.contains(&name) => set(name, Vec::new()),
             Some(mine) => set(name, mine.iter().map(|c| c.gtk()).collect()),
             None => set(name, own(accels.iter().map(|s| s.to_string()).collect())),
         }
@@ -2164,7 +2167,7 @@ const SHORTCUTS: &str = "Slate keyboard shortcuts (Help → Change keyboard shor
   Alt+H                    Highlight the search in every tab, in a color of its own (in the find box)
   Alt+drag, Shift+Alt+arrows  Column selection (type, paste, delete on every line)
   Ctrl+click               Add or take away a cursor (with Edit → Multiple cursors on)
-  Ctrl+Alt+Up / Down       A cursor above / below (multiple cursors)
+  Ctrl+Shift+Up / Down     A cursor above / below (multiple cursors)
   Ctrl+Shift+N / A         The next match / every match too (multiple cursors)
   Alt+[ / Alt+]            A cursor at the start / end of every selected line (multiple cursors)
   Up / Down                The searches (or replacements) before (in the find box)

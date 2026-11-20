@@ -278,8 +278,9 @@ const ALL: &[Command] = &[
     text(E, "date-time", "F5"),
     any(E, "overtype", ""),
     any(E, "multi-cursor", ""),
-    text(E, "add-cursor-above", "Ctrl+Alt+Up"),
-    text(E, "add-cursor-below", "Ctrl+Alt+Down"),
+    // (not Ctrl+Alt+Up/Down: GNOME switches workspaces with them, and some Windows graphics drivers turn the screen)
+    text(E, "add-cursor-above", "Ctrl+Shift+Up"),
+    text(E, "add-cursor-below", "Ctrl+Shift+Down"),
     text(E, "add-next-match", "Ctrl+Shift+N"),
     text(E, "skip-match", ""),
     text(E, "all-matches", "Ctrl+Shift+A"),
@@ -338,6 +339,19 @@ const ALL: &[Command] = &[
     only(any(H, "check-updates", ""), true),
     any(H, "report-problem", ""),
     any(H, "about", ""),
+];
+
+/// Edit → Multiple cursors' commands that add and take away cursors: their keys count only while the setting is on
+/// (off, the keys do what they did before; the menu items say how to turn it on).
+pub const CARET_COMMANDS: &[&str] = &[
+    "add-cursor-above",
+    "add-cursor-below",
+    "add-next-match",
+    "skip-match",
+    "all-matches",
+    "cursors-at-line-starts",
+    "cursors-at-line-ends",
+    "remove-last-cursor",
 ];
 
 /// The commands in this app.

@@ -2445,6 +2445,8 @@ impl App {
             }
             Cmd::MultiCursor => {
                 self.settings.multi_cursor = !self.settings.multi_cursor;
+                // (its keys are set only while it's on: `set_accels`)
+                self.shortcuts_changed = true;
                 if !self.settings.multi_cursor {
                     for t in &mut self.tabs {
                         t.view.carets.clear();

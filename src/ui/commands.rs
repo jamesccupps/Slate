@@ -280,9 +280,6 @@ pub fn editor_key(vk: u16, m: &Mods) -> Option<Cmd> {
             _ => None,
         };
     }
-    if m.ctrl && m.alt && !m.shift && matches!(k, VK_UP | VK_DOWN) {
-        return Some(if k == VK_UP { Cmd::AddCaretAbove } else { Cmd::AddCaretBelow });
-    }
     if m.ctrl && !m.alt {
         return Some(match (k, m.shift) {
             (VK_Z, false) => Cmd::Undo,
@@ -300,6 +297,8 @@ pub fn editor_key(vk: u16, m: &Mods) -> Option<Cmd> {
             (VK_U, true) => Cmd::Case(CaseOp::Upper),
             (VK_N, true) => Cmd::AddNextMatch,
             (VK_A, true) => Cmd::AllMatches,
+            (VK_UP, true) => Cmd::AddCaretAbove,
+            (VK_DOWN, true) => Cmd::AddCaretBelow,
             _ => return None,
         });
     }
@@ -597,7 +596,7 @@ Editing
   Alt+Up / Alt+Down             Move the line up / down
   Alt+drag, Shift+Alt+arrows    Column selection (type, paste, delete on every line)
   Ctrl+click                    Add or take away a cursor (with Edit → Multiple cursors on)
-  Ctrl+Alt+Up / Ctrl+Alt+Down   A cursor above / below (multiple cursors)
+  Ctrl+Shift+Up / Ctrl+Shift+Down  A cursor above / below (multiple cursors)
   Ctrl+Shift+N / Ctrl+Shift+A   The next match / every match too (multiple cursors)
   Alt+[ / Alt+]                 A cursor at the start / end of every selected line (multiple cursors)
   Esc                           Back to one cursor

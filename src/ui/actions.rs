@@ -2740,13 +2740,15 @@ impl App {
     /// `anywhere`, also in the find bar's boxes; `editor_key` in the text), unless the user gave that command or those
     /// keys to something else.
     fn key_cmd(&self, vk: u16, m: &Mods, anywhere: bool) -> Option<Cmd> {
+        // (Edit → Multiple cursors' keys only while it's on: off, they do what they did before)
+        let off = |id: &str| !self.settings.multi_cursor && crate::shortcuts::CARET_COMMANDS.contains(&id);
         let combo = super::commands::combo(vk, m);
         if let Some(c) = combo.and_then(|c| self.keymap.command_for(&c)) {
-            return if c.anywhere == anywhere { super::commands::cmd_of(c.id) } else { None };
+            return if c.anywhere == anywhere && !off(c.id) { super::commands::cmd_of(c.id) } else { None };
         }
         let own = if anywhere { global_key(vk, m) } else { editor_key(vk, m) }?;
         match super::commands::id_of(own) {
-            Some(id) if self.keymap.keys_of(id).is_some() => None,
+            Some(id) if self.keymap.keys_of(id).is_some() || off(id) => None,
             _ => Some(own),
         }
     }
@@ -5331,8 +5333,8 @@ impl App {
                     vec![
                         check(Cmd::ToggleMultiCursor, "&Use multiple cursors (Ctrl+click)", "", on),
                         Item::Sep,
-                        item(Cmd::AddCaretAbove, "Add cursor &above", "Ctrl+Alt+Up"),
-                        item(Cmd::AddCaretBelow, "Add cursor &below", "Ctrl+Alt+Down"),
+                        item(Cmd::AddCaretAbove, "Add cursor &above", "Ctrl+Shift+Up"),
+                        item(Cmd::AddCaretBelow, "Add cursor &below", "Ctrl+Shift+Down"),
                         item(Cmd::AddNextMatch, "Add &next match", "Ctrl+Shift+N"),
                         item(Cmd::SkipMatch, "S&kip to next match", ""),
                         item(Cmd::AllMatches, "Select all &matches", "Ctrl+Shift+A"),
