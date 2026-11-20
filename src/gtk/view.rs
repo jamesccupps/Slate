@@ -223,6 +223,8 @@ pub struct View {
     /// A column selection (Alt+drag, Shift+Alt+arrows): what's selected instead of `sel` (whose caret is at the
     /// block's caret).
     pub block: Option<edit::Block>,
+    /// Multiple cursors: the others besides `sel` (`edit::Carets`; none unless the user made some).
+    pub carets: edit::Carets,
     /// The starts of the lines bookmarked, in order (`edit::toggle_mark`); they follow edits (`sync`).
     pub bookmarks: Vec<u64>,
     /// Find in selection: the part of the text the find bar searches (drawn faintly); it follows edits (`sync`).
@@ -342,6 +344,7 @@ impl View {
             drag: None,
             drop_at: None,
             block: None,
+            carets: Default::default(),
             cache: HashMap::new(),
             cache_bytes: 0,
             tick: 0,
@@ -377,6 +380,9 @@ impl View {
         }
         if moved && !self.bookmarks.is_empty() {
             crate::edit::tidy_marks(&mut self.bookmarks, doc);
+        }
+        if moved {
+            self.carets.follow(doc);
         }
         self.hl.seen = 0;
         self.hl.len = doc.len();
@@ -1101,6 +1107,15 @@ impl View {
                 fill(cr, r, sa, sb, color, eol);
             }
         }
+        // multiple cursors: the others' selections, those on screen
+        let (top, bottom) = (rows.first().map_or(0, |r| r.seg.start), rows.last().map_or(0, |r| r.seg.end));
+        let more: Vec<Sel> = self.carets.more.iter().copied().filter(|s| s.end() >= top && s.start() <= bottom).collect();
+        for s in more.iter().filter(|s| !s.is_empty()) {
+            let color = if focused { t.selection } else { t.selection_inactive };
+            for r in rows.iter() {
+                fill(cr, r, s.start(), s.end(), color, false);
+            }
+        }
         // the bracket next to the caret and the one it pairs with
         if self.sel.is_empty() {
             if let Some((a, b)) = self.brackets_at(cx.doc, caret) {
@@ -1177,6 +1192,23 @@ impl View {
                         set_color(cr, t.caret);
                         cr.rectangle((x0 + x).round(), row.y, 1.0, row_h);
                         let _ = cr.fill();
+                    }
+                }
+            }
+        }
+        // multiple cursors: the others' carets
+        if focused && caret_on {
+            for s in &more {
+                let a = s.caret;
+                for row in rows.iter() {
+                    let (ra, rb) = row.lay.line_range(row.line);
+                    let (sa, sb) = (row.seg.start + row.lay.rel(ra), row.seg.start + row.lay.rel(rb));
+                    if a >= sa && (a < sb || (a == sb && row.line + 1 == row.lay.lines())) {
+                        let x = row.lay.x_of(row.lay.disp(a - row.seg.start));
+                        set_color(cr, t.caret);
+                        cr.rectangle((x0 + x).round(), row.y, 2.0, row_h);
+                        let _ = cr.fill();
+                        break;
                     }
                 }
             }

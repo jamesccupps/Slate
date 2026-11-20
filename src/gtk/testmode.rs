@@ -215,10 +215,10 @@ async fn script(lines: Vec<String>, test: Rc<Test>) -> i32 {
             // the mouse's left button in the text (`x,y` from the text area's corner, the gutter in it): pressed, moved
             // there with it held, let go (`up:ctrl` with Ctrl held)
             "down" | "move" => {
-                let (x, y) = arg.trim_end_matches(",alt").split_once(',').unwrap_or(("0", "0"));
+                let (x, y) = arg.trim_end_matches(",alt").trim_end_matches(",ctrl").split_once(',').unwrap_or(("0", "0"));
                 let (x, y) = (x.trim().parse().unwrap_or(0.0), y.trim().parse().unwrap_or(0.0));
                 if op == "down" {
-                    ui.press_for_test(1, x, y, arg.ends_with(",alt"));
+                    ui.press_for_test(1, x, y, arg.ends_with(",alt"), arg.ends_with(",ctrl"));
                 } else {
                     ui.drag_for_test(x, y);
                 }
@@ -570,6 +570,18 @@ fn value(what: &str, test: &Test) -> String {
         "asked" => test.asked.borrow().join("; "),
         "clipboard" => test.clipboard.borrow().clone(),
         "find" => format!("{:?}", a.find.found.as_ref().map(|f| f.1.count)),
+        // multiple cursors: every selection in the text's order, the main one starred (`a..b`, a caret `a`)
+        "carets" => tab
+            .view
+            .carets
+            .ordered(tab.view.sel)
+            .iter()
+            .map(|(s, from)| {
+                let at = if s.is_empty() { s.caret.to_string() } else { format!("{}..{}", s.anchor, s.caret) };
+                if from.is_none() { format!("*{at}") } else { at }
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
         // keys-<action>: the keys an action has now (`set_accels`)
         w if w.starts_with("keys-") => {
             ui.gtk_app.accels_for_action(&format!("win.{}", &w[5..])).iter().map(|s| s.to_string()).collect::<Vec<_>>().join(", ")

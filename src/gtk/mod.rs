@@ -1085,7 +1085,8 @@ fn connect(ui: &Rc<Ui>, prev: &gtk4::Button, next: &gtk4::Button, lines_btn: &gt
         if let Some(ui) = get_ui() {
             let state = g.current_event_state();
             let (shift, alt) = (state.contains(gdk::ModifierType::SHIFT_MASK), state.contains(gdk::ModifierType::ALT_MASK));
-            ui.text_pressed(g.current_button(), n, x, y, shift, alt);
+            let ctrl = state.contains(gdk::ModifierType::CONTROL_MASK);
+            ui.text_pressed(g.current_button(), n, x, y, shift, alt, ctrl);
         }
     });
     ui.text.add_controller(click);
@@ -1670,6 +1671,15 @@ fn commands() -> Vec<(&'static str, Cmd, &'static [&'static str])> {
         ("close-with-last-tab", Cmd::CloseWithLastTab, &[]),
         ("find-close-on-leave", Cmd::FindCloseOnLeave, &[]),
         ("find-per-tab", Cmd::FindPerTab, &[]),
+        ("multi-cursor", Cmd::MultiCursor, &[]),
+        ("add-cursor-above", Cmd::AddCaretAbove, &["<Control><Alt>Up"]),
+        ("add-cursor-below", Cmd::AddCaretBelow, &["<Control><Alt>Down"]),
+        ("add-next-match", Cmd::AddNextMatch, &["<Control><Shift>n"]),
+        ("skip-match", Cmd::SkipMatch, &[]),
+        ("all-matches", Cmd::AllMatches, &["<Control><Shift>a"]),
+        ("cursors-at-line-starts", Cmd::LineStartCarets, &["<Alt>bracketleft"]),
+        ("cursors-at-line-ends", Cmd::LineEndCarets, &["<Alt>bracketright"]),
+        ("remove-last-cursor", Cmd::RemoveLastCaret, &[]),
         ("suggest-0", Cmd::Suggestion(0), &[]),
         ("suggest-1", Cmd::Suggestion(1), &[]),
         ("suggest-2", Cmd::Suggestion(2), &[]),
@@ -1770,7 +1780,7 @@ pub fn action_for_accel(ui: &Ui, accel: &str) -> Option<String> {
 
 /// Menu items that show a check mark: their actions have a true/false state (`Ui::sync_menu`).
 const CHECKED: &[&str] =
-    &["wrap", "line-numbers", "show-whitespace", "spell-check", "title-bar-tabs", "close-with-last-tab", "find-close-on-leave", "find-per-tab", "theme-system", "theme-light", "theme-dark", "eol-lf", "eol-crlf", "read-only", "restore-session", "structure-panel", "path-bar"];
+    &["wrap", "line-numbers", "show-whitespace", "spell-check", "title-bar-tabs", "close-with-last-tab", "find-close-on-leave", "find-per-tab", "multi-cursor", "theme-system", "theme-light", "theme-dark", "eol-lf", "eol-crlf", "read-only", "restore-session", "structure-panel", "path-bar"];
 
 fn actions(ui: &Rc<Ui>) {
     // (in place of the window's own "win" group: menus and shortcuts find these the same way)
@@ -1934,6 +1944,22 @@ fn menu_model(recent: &gio::Menu, format_extra: &gio::Menu, view_extra: &gio::Me
             ("Move line down", "move-line-down"),
         ]),
     );
+    let carets = gio::Menu::new();
+    carets.append_section(None, &section(&[("Use multiple cursors (Ctrl+click)", "multi-cursor")]));
+    carets.append_section(
+        None,
+        &section(&[
+            ("Add cursor above", "add-cursor-above"),
+            ("Add cursor below", "add-cursor-below"),
+            ("Add next match", "add-next-match"),
+            ("Skip to next match", "skip-match"),
+            ("Select all matches", "all-matches"),
+            ("Cursors at line starts", "cursors-at-line-starts"),
+            ("Cursors at line ends", "cursors-at-line-ends"),
+            ("Remove last cursor", "remove-last-cursor"),
+        ]),
+    );
+    edit.append_submenu(Some("Multiple cursors"), &carets);
     let lines = section(&[("Sort A to Z", "sort-asc"), ("Sort Z to A", "sort-desc"), ("Remove duplicate lines", "dedupe"), ("Remove blank lines", "remove-blank"), ("Trim spaces at line ends", "trim")]);
     edit.append_submenu(Some("Lines"), &lines);
     let case = section(&[("UPPERCASE", "upper"), ("lowercase", "lower"), ("Title Case", "title-case")]);
@@ -2164,8 +2190,8 @@ const SHORTCUTS: &str = "Slate keyboard shortcuts (Help → Change keyboard shor
 impl Ui {
     /// Test mode: a key as if pressed in the text.
     /// Test mode: the left button pressed at `x`, `y` in the text (`n`: which click), the mouse moved there, let go.
-    pub fn press_for_test(&self, n: i32, x: f64, y: f64, alt: bool) {
-        self.text_pressed(1, n, x, y, false, alt);
+    pub fn press_for_test(&self, n: i32, x: f64, y: f64, alt: bool, ctrl: bool) {
+        self.text_pressed(1, n, x, y, false, alt, ctrl);
     }
 
     pub fn drag_for_test(&self, x: f64, y: f64) {
@@ -2439,7 +2465,8 @@ impl Ui {
         self.with(|a| a.ime_preedit(c));
     }
 
-    fn text_pressed(&self, button: u32, n: i32, x: f64, y: f64, shift: bool, alt: bool) {
+    #[allow(clippy::too_many_arguments)]
+    fn text_pressed(&self, button: u32, n: i32, x: f64, y: f64, shift: bool, alt: bool, ctrl: bool) {
         // A click ends a composition first, where the caret is (as in GTK's own text view: the input method commits
         // it or drops it); what still shows of it then goes.
         if self.app.try_borrow().is_ok_and(|a| a.tab().view.composing.is_some()) {
@@ -2488,6 +2515,24 @@ impl Ui {
                 a.tab_mut().view.sel = Sel::at(pos);
                 a.go_to_source();
             });
+            return;
+        }
+        // Ctrl+click with multiple cursors on: a cursor added there, or the one there taken away (in the selection,
+        // Ctrl+drag still copies it); any other click leaves one
+        let ctrl_click = n == 1 && ctrl && !alt && !shift;
+        let toggled = self.with(|a| {
+            let pos = a.with_view(&g, |v, cx| v.pos_at(cx, x, y));
+            let sel = a.tab().view.sel;
+            let in_sel = !sel.is_empty() && pos > sel.start() && pos < sel.end();
+            if ctrl_click && a.settings.multi_cursor && !in_sel {
+                a.toggle_caret(pos);
+                true
+            } else {
+                a.tabs[a.active].view.carets.clear();
+                false
+            }
+        });
+        if toggled == Some(true) {
             return;
         }
         self.with(|a| {
@@ -3137,6 +3182,7 @@ impl Ui {
             ("close-with-last-tab", a.settings.close_with_last_tab),
             ("find-close-on-leave", a.settings.find_close_on_leave),
             ("find-per-tab", a.settings.find_per_tab),
+            ("multi-cursor", a.settings.multi_cursor),
             ("theme-system", theme == ThemeMode::System),
             ("theme-light", theme == ThemeMode::Light),
             ("theme-dark", theme == ThemeMode::Dark),

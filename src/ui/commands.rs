@@ -94,6 +94,17 @@ pub enum Cmd {
     /// (`Settings::find_per_tab`).
     ToggleFindCloseOnLeave,
     ToggleFindPerTab,
+    /// Edit → Multiple cursors (`Settings::multi_cursor`; `crate::edit::Carets`): the setting, and adding and taking
+    /// away cursors.
+    ToggleMultiCursor,
+    AddCaretAbove,
+    AddCaretBelow,
+    AddNextMatch,
+    SkipMatch,
+    AllMatches,
+    LineStartCarets,
+    LineEndCarets,
+    RemoveLastCaret,
     /// The spell check menu's suggestion (`App::spell_word`).
     Suggestion(u8),
     AddWord,
@@ -264,8 +275,13 @@ pub fn editor_key(vk: u16, m: &Mods) -> Option<Cmd> {
         return match k {
             VK_UP if !m.shift => Some(Cmd::MoveLineUp),
             VK_DOWN if !m.shift => Some(Cmd::MoveLineDown),
+            VK_OEM_4 if !m.shift => Some(Cmd::LineStartCarets),
+            VK_OEM_6 if !m.shift => Some(Cmd::LineEndCarets),
             _ => None,
         };
+    }
+    if m.ctrl && m.alt && !m.shift && matches!(k, VK_UP | VK_DOWN) {
+        return Some(if k == VK_UP { Cmd::AddCaretAbove } else { Cmd::AddCaretBelow });
     }
     if m.ctrl && !m.alt {
         return Some(match (k, m.shift) {
@@ -282,6 +298,8 @@ pub fn editor_key(vk: u16, m: &Mods) -> Option<Cmd> {
             (VK_OEM_2, false) | (VK_DIVIDE, false) => Cmd::ToggleComment,
             (VK_U, false) => Cmd::Case(CaseOp::Lower),
             (VK_U, true) => Cmd::Case(CaseOp::Upper),
+            (VK_N, true) => Cmd::AddNextMatch,
+            (VK_A, true) => Cmd::AllMatches,
             _ => return None,
         });
     }
@@ -372,6 +390,15 @@ const IDS: &[(&str, Cmd)] = &[
     ("title-case", Cmd::Case(CaseOp::Title)),
     ("date-time", Cmd::InsertDateTime),
     ("overtype", Cmd::ToggleOvertype),
+    ("multi-cursor", Cmd::ToggleMultiCursor),
+    ("add-cursor-above", Cmd::AddCaretAbove),
+    ("add-cursor-below", Cmd::AddCaretBelow),
+    ("add-next-match", Cmd::AddNextMatch),
+    ("skip-match", Cmd::SkipMatch),
+    ("all-matches", Cmd::AllMatches),
+    ("cursors-at-line-starts", Cmd::LineStartCarets),
+    ("cursors-at-line-ends", Cmd::LineEndCarets),
+    ("remove-last-cursor", Cmd::RemoveLastCaret),
     ("wrap", Cmd::ToggleWrap),
     ("line-numbers", Cmd::ToggleLineNumbers),
     ("show-whitespace", Cmd::ToggleWhitespace),

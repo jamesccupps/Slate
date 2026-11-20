@@ -332,6 +332,9 @@ pub fn status_texts(app: &App) -> (String, Vec<(StatusItem, String)>, bool) {
         if let Some(f) = field {
             s.push_str(&format!("  ·  {f}"));
         }
+        if !tab.view.carets.is_empty() {
+            s.push_str(&format!("  ({} cursors)", crate::edit::group(tab.view.carets.count() as u64)));
+        }
         if !sel.is_empty() {
             let n = sel.end() - sel.start();
             if n <= 4 << 20 {

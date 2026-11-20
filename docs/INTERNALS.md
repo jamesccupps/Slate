@@ -602,6 +602,18 @@ when it's this user's alone, else a guest window that keeps nothing). Windows: `
 - View → Close Slate with the last tab (`Settings::close_with_last_tab`, off by default): Ctrl+W or a tab's × on the
   only tab marks it (`App::quit_with_tab`); once it's gone (after its question, or its save) `remove_tab` closes
   Slate (Windows `Deferred::Cmd(Cmd::Exit)`, Linux `Ask::Quit`). Close all/other tabs don't (an empty tab stays).
+- Multiple cursors (Edit → Multiple cursors, issue #5; `Settings::multi_cursor`, off by default: its commands only
+  say how to turn it on, Ctrl+click stays an ordinary click). `View::carets` (`edit::Carets`) holds the cursors
+  besides `sel`, the newest last; the main one (`sel`, which the view reveals and moves as always) is the newest of
+  all, so Remove last cursor pops. `edit::multi_edit` does a key's edit at each, in the text's order with a running
+  offset (a cursor's range is clipped to where the one before ended), as one undo step that typing continues; cursors
+  that meet become one (`Carets::tidy`, the newer kept). `move_carets` moves the others by characters and lines
+  (Up/Down by column in the line, not by screen row); keys and commands that don't work with several (Page Up,
+  Ctrl+Home, Undo, a format…) leave only the main one first (`exec`'s `keeps`). The cursors are for one document
+  version (`Carets::version`): `View::sync` drops them if the text changed otherwise. Copy joins the selections with
+  line breaks; Paste puts a line at each when the text has as many (`paste_parts`). Up to `CARETS_MAX` (10,000);
+  Add next match looks 64 MB each way, Select all matches works in texts up to 64 MB. Each app draws the others'
+  selections and carets for the rows on screen only; with none, nothing runs (`is_empty` checks).
 - Keyboard shortcuts the user changes (Help → Change keyboard shortcuts…, `crate::shortcuts`): one list of the
   commands for both apps (the GTK app's action names, the keys each has, whether it works in the find bar's boxes
   on Windows) and the user's `shortcuts.txt` in the data folder, made the first time it's opened with every command

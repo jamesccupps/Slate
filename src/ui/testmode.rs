@@ -228,6 +228,15 @@ fn cmd_of(name: &str) -> Option<Cmd> {
         "ToggleFindCloseOnLeave" => Cmd::ToggleFindCloseOnLeave,
         "ToggleFindPerTab" => Cmd::ToggleFindPerTab,
         "ChangeShortcuts" => Cmd::ChangeShortcuts,
+        "ToggleMultiCursor" => Cmd::ToggleMultiCursor,
+        "AddCaretAbove" => Cmd::AddCaretAbove,
+        "AddCaretBelow" => Cmd::AddCaretBelow,
+        "AddNextMatch" => Cmd::AddNextMatch,
+        "SkipMatch" => Cmd::SkipMatch,
+        "AllMatches" => Cmd::AllMatches,
+        "LineStartCarets" => Cmd::LineStartCarets,
+        "LineEndCarets" => Cmd::LineEndCarets,
+        "RemoveLastCaret" => Cmd::RemoveLastCaret,
         "AddWord" => Cmd::AddWord,
         "IgnoreWord" => Cmd::IgnoreWord,
         "ToggleLineNumbers" => Cmd::ToggleLineNumbers,
@@ -731,6 +740,19 @@ fn describe(cell: &Cell, what: &str) -> String {
             format!("private {} MB, working set {} MB, peak {} MB", c.private >> 20, c.ws >> 20, c.peak_ws >> 20)
         }
         "notice" => a.tab().notice.as_ref().map(|n| n.text.clone()).unwrap_or_default(),
+        // multiple cursors: every selection in the text's order, the main one starred (`a..b`, a caret `a`)
+        "carets" => {
+            let v = &a.tab().view;
+            v.carets
+                .ordered(v.sel)
+                .iter()
+                .map(|(s, from)| {
+                    let at = if s.is_empty() { s.caret.to_string() } else { format!("{}..{}", s.anchor, s.caret) };
+                    if from.is_none() { format!("*{at}") } else { at }
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
         // the find bar: closed, or its mode
         "findbar" => if a.find.open { format!("{:?}", a.find.mode) } else { "closed".into() },
         "focus" => {

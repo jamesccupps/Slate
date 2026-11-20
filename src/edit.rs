@@ -627,6 +627,392 @@ pub fn block_edit(doc: &mut Document, b: &Block, tab: u32, what: BlockEdit) -> B
     after
 }
 
+// ---- multiple cursors ----
+
+/// The most cursors (each a caret or a selection) there can be at once.
+pub const CARETS_MAX: usize = 10_000;
+pub const TOO_MANY_CARETS: &str = "That would be more than 10,000 cursors.";
+/// How far one Add next match looks for the next place, and the biggest text Select all matches searches.
+pub const CARET_SEARCH_MAX: u64 = 64 << 20;
+
+/// Multiple cursors (Edit → Multiple cursors, `Settings::multi_cursor`): the selections besides the main one
+/// (`View::sel`), the newest last; the main one is the newest of all. Typing, deleting, pasting and moving work at
+/// each (`multi_edit`, `move_carets`); anything else leaves only the main one. With none, nothing here runs.
+#[derive(Clone, Debug, Default)]
+pub struct Carets {
+    pub more: Vec<Sel>,
+    /// The document version they're for: once the text changed otherwise (undo, a command), only the main one is
+    /// left (`follow`).
+    pub version: u64,
+    /// The column Add cursor above / below keeps (as Up and Down keep theirs).
+    pub col: Option<u32>,
+}
+
+impl Carets {
+    pub fn is_empty(&self) -> bool {
+        self.more.is_empty()
+    }
+
+    pub fn clear(&mut self) {
+        self.more.clear();
+        self.col = None;
+    }
+
+    /// How many cursors there are, the main one included.
+    pub fn count(&self) -> usize {
+        self.more.len() + 1
+    }
+
+    /// After the text changed (`View::sync`): the cursors go if something else changed it.
+    pub fn follow(&mut self, doc: &Document) {
+        if self.more.is_empty() {
+            return;
+        }
+        if doc.version != self.version {
+            self.clear();
+            return;
+        }
+        let len = doc.len();
+        for s in &mut self.more {
+            s.anchor = s.anchor.min(len);
+            s.caret = s.caret.min(len);
+        }
+    }
+
+    /// Every selection in the text's order, each with where it's from (None: the main one).
+    pub fn ordered(&self, main: Sel) -> Vec<(Sel, Option<usize>)> {
+        let mut v: Vec<(Sel, Option<usize>)> = self.more.iter().enumerate().map(|(i, s)| (*s, Some(i))).collect();
+        v.push((main, None));
+        v.sort_by_key(|(s, _)| (s.start(), s.end()));
+        v
+    }
+
+    /// Cursors that meet or overlap become one: the newer.
+    pub fn tidy(&mut self, main: &mut Sel) {
+        if self.more.is_empty() {
+            return;
+        }
+        let age = |from: Option<usize>| from.unwrap_or(usize::MAX);
+        let mut kept: Vec<(Sel, Option<usize>)> = Vec::with_capacity(self.count());
+        for (s, from) in self.ordered(*main) {
+            match kept.last_mut() {
+                Some(last) if meet(last.0, s) => {
+                    if age(from) > age(last.1) {
+                        *last = (s, from);
+                    }
+                }
+                _ => kept.push((s, from)),
+            }
+        }
+        kept.sort_by_key(|(_, from)| age(*from));
+        if let Some((s, None)) = kept.pop() {
+            *main = s;
+        }
+        self.more = kept.into_iter().map(|(s, _)| s).collect();
+    }
+}
+
+/// Whether two selections (`a` starting no later than `b`) meet: carets at one place, or ranges that overlap or
+/// hold the other.
+fn meet(a: Sel, b: Sel) -> bool {
+    if a.is_empty() || b.is_empty() { b.start() <= a.end() } else { b.start() < a.end() }
+}
+
+/// What a key does at every cursor (`multi_edit`).
+pub enum MultiEdit<'a> {
+    /// Each selection replaced by a text: one each when there are as many as cursors (Paste of as many lines),
+    /// else the first everywhere.
+    Put(Vec<&'a [u8]>),
+    /// The selection deleted; where there's none, the character (or word) before (Backspace) or after.
+    Delete { back: bool, word: bool },
+    /// Enter: a line break with the line's indentation.
+    Newline,
+}
+
+/// Does `what` at every cursor (the main one and `c`'s), as one step to undo (typing on continues it, as with one
+/// cursor). Afterwards they're carets after what was put; cursors that meet become one.
+pub fn multi_edit(doc: &mut Document, main: &mut Sel, c: &mut Carets, what: MultiEdit, kind: EditKind) {
+    let order = c.ordered(*main);
+    let n = order.len();
+    let eol = eol(doc).to_vec();
+    doc.begin(kind, *main);
+    let (mut delta, mut floor) = (0i64, 0u64);
+    let mut after = Vec::with_capacity(n);
+    for (k, (s, from)) in order.into_iter().enumerate() {
+        let at = |p: u64| ((p as i64 + delta).max(0) as u64).max(floor);
+        let (a, b) = (at(s.start()), at(s.end()));
+        let mut put: Vec<u8> = Vec::new();
+        let (da, db) = match &what {
+            MultiEdit::Put(texts) => {
+                put = texts.get(if texts.len() == n { k } else { 0 }).copied().unwrap_or(b"").to_vec();
+                (a, b)
+            }
+            MultiEdit::Delete { .. } if b > a => (a, b),
+            MultiEdit::Delete { back: true, word } => (if *word { doc.word_left(a) } else { back_from(doc, a) }.max(floor), a),
+            MultiEdit::Delete { back: false, word } => (a, if *word { doc.word_right(a) } else { next_cluster(doc, a) }),
+            MultiEdit::Newline => {
+                let ls = doc.line_start_of(a);
+                put = eol.clone();
+                put.extend(doc.read(ls, a.min(ls + 4096)).iter().copied().take_while(|&b| b == b' ' || b == b'\t'));
+                (a, b)
+            }
+        };
+        if db > da {
+            doc.delete(da, db);
+        }
+        if !put.is_empty() {
+            doc.insert(da, &put);
+        }
+        let caret = da + put.len() as u64;
+        after.push((Sel::at(caret), from));
+        floor = caret;
+        delta += put.len() as i64 - (db - da) as i64;
+    }
+    for (s, from) in after {
+        match from {
+            None => *main = s,
+            Some(i) => c.more[i] = s,
+        }
+    }
+    c.col = None;
+    c.tidy(main);
+    doc.end(*main);
+    c.version = doc.version;
+}
+
+/// The texts selected at the cursors, in the text's order with line breaks between (Copy and Cut with several);
+/// None if nothing is selected, or if it's more than `COPY_MAX`.
+pub fn multi_text(doc: &Document, main: Sel, c: &Carets) -> Option<Vec<u8>> {
+    let parts: Vec<Sel> = c.ordered(main).into_iter().map(|(s, _)| s).filter(|s| !s.is_empty()).collect();
+    let total: u64 = parts.iter().map(|s| s.end() - s.start()).sum();
+    if parts.is_empty() || total > COPY_MAX {
+        return None;
+    }
+    let mut out = Vec::new();
+    for (k, s) in parts.iter().enumerate() {
+        if k > 0 {
+            out.extend_from_slice(eol(doc));
+        }
+        out.extend_from_slice(&doc.read(s.start(), s.end()));
+    }
+    Some(out)
+}
+
+/// Pasted text at several cursors: one line each when it has as many lines as there are cursors, else all of it at
+/// each (`MultiEdit::Put`).
+pub fn paste_parts(text: &[u8], cursors: usize) -> Vec<&[u8]> {
+    let text = text.strip_suffix(b"\n").map(|t| t.strip_suffix(b"\r").unwrap_or(t)).unwrap_or(text);
+    let lines: Vec<&[u8]> = text.split(|&b| b == b'\n').map(|l| l.strip_suffix(b"\r").unwrap_or(l)).collect();
+    if lines.len() == cursors && cursors > 1 { lines } else { vec![text] }
+}
+
+/// How a key moves the cursors (`move_carets`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CaretMove {
+    Left,
+    Right,
+    WordLeft,
+    WordRight,
+    Up,
+    Down,
+    Home,
+    End,
+}
+
+/// Moves the cursors besides the main one (the view moves that one) by lines and characters, or grows their
+/// selections (`extend`).
+pub fn move_carets(doc: &Document, c: &mut Carets, how: CaretMove, extend: bool, tab: u32) {
+    let last = doc.line_of(doc.len());
+    for s in &mut c.more {
+        let p = match how {
+            CaretMove::Left if !extend && !s.is_empty() => s.start(),
+            CaretMove::Right if !extend && !s.is_empty() => s.end(),
+            CaretMove::Left => prev_cluster(doc, s.caret),
+            CaretMove::Right => next_cluster(doc, s.caret),
+            CaretMove::WordLeft => doc.word_left(s.caret),
+            CaretMove::WordRight => doc.word_right(s.caret),
+            CaretMove::Up | CaretMove::Down => match (doc.line_of(s.caret), last) {
+                (Some(l), Some(last)) => {
+                    let to = if how == CaretMove::Up { l.checked_sub(1) } else { (l < last).then_some(l + 1) };
+                    match to {
+                        Some(to) => pos_at_col(doc, to, col_of(doc, s.caret, tab), tab),
+                        None if how == CaretMove::Up => 0,
+                        None => doc.len(),
+                    }
+                }
+                _ => s.caret,
+            },
+            CaretMove::Home => doc.line_start_of(s.caret),
+            CaretMove::End => doc.line_end_of(s.caret),
+        };
+        *s = if extend { Sel::new(s.anchor, p) } else { Sel::at(p) };
+    }
+    c.col = None;
+}
+
+/// Add cursor above / below: a caret on the line above (below) the main one, at the column the first one had; it's
+/// the main one then.
+pub fn add_caret_line(doc: &Document, main: &mut Sel, c: &mut Carets, down: bool, tab: u32) -> Result<(), &'static str> {
+    if c.count() >= CARETS_MAX {
+        return Err(TOO_MANY_CARETS);
+    }
+    let (Some(line), Some(last)) = (doc.line_of(main.caret), doc.line_of(doc.len())) else {
+        return Err("Still reading the file's lines — in a moment.");
+    };
+    let to = match (down, line) {
+        (true, l) if l < last => l + 1,
+        (false, l) if l > 0 => l - 1,
+        _ => return Ok(()),
+    };
+    let col = *c.col.get_or_insert_with(|| col_of(doc, main.caret, tab));
+    c.more.push(*main);
+    *main = Sel::at(pos_at_col(doc, to, col, tab));
+    let keep = c.col;
+    c.tidy(main);
+    c.col = keep;
+    c.version = doc.version;
+    Ok(())
+}
+
+/// The main selection's text as a search (what Add next match and Select all matches look for): with nothing
+/// selected, the word at the caret is selected first, and that's all (Some(None)).
+fn caret_search(doc: &Document, main: &mut Sel) -> Result<Option<crate::core::search::Matcher>, &'static str> {
+    if main.is_empty() {
+        let (a, b) = doc.word_at(main.caret);
+        let first = String::from_utf8_lossy(&doc.read(a, b.min(a + 4))).chars().next();
+        if a == b || first.is_none_or(|ch| text::char_class(ch) != text::CharClass::Word) {
+            return Err("Put the caret in a word, or select what to look for.");
+        }
+        *main = Sel::new(a, b);
+        return Ok(None);
+    }
+    if main.end() - main.start() > 1 << 20 {
+        return Err("That's too much to look for (more than 1 MB).");
+    }
+    let text = String::from_utf8(doc.read(main.start(), main.end())).map_err(|_| "Slate can only look for text.")?;
+    let q = crate::core::search::Query { text, match_case: true, whole_word: false, regex: false };
+    crate::core::search::Matcher::new(&q).map(Some).map_err(|_| "Slate can only look for text.")
+}
+
+/// Add next match (`skip`: Skip to next match): with nothing selected the word at the caret is selected; then each
+/// time the next place with the main selection's text, after it (then from the start), is selected as well (instead,
+/// skipping) and is the main one.
+pub fn add_next_match(doc: &Document, main: &mut Sel, c: &mut Carets, skip: bool) -> Result<(), &'static str> {
+    let Some(m) = caret_search(doc, main)? else {
+        c.version = doc.version;
+        return Ok(());
+    };
+    if !skip && c.count() >= CARETS_MAX {
+        return Err(TOO_MANY_CARETS);
+    }
+    let taken: std::collections::HashSet<(u64, u64)> = c.ordered(*main).iter().map(|(s, _)| (s.start(), s.end())).collect();
+    let len = doc.len();
+    let (a, b) = (main.start(), main.end());
+    let mut found = None;
+    for (from, to) in [(b, (b + CARET_SEARCH_MAX).min(len)), (0, a.min(CARET_SEARCH_MAX))] {
+        let mut at = from;
+        while let Some((s, e)) = m.find_fwd(doc, at, to, None) {
+            if !taken.contains(&(s, e)) {
+                found = Some((s, e));
+                break;
+            }
+            at = e.max(s + 1);
+        }
+        if found.is_some() {
+            break;
+        }
+    }
+    let Some((s, e)) = found else { return Err("No other match.") };
+    if !skip {
+        c.more.push(*main);
+    }
+    *main = Sel::new(s, e);
+    c.tidy(main);
+    c.version = doc.version;
+    Ok(())
+}
+
+/// Select all matches: every place with the main selection's text (with nothing selected, the word at the caret's)
+/// is selected; the main one stays the main one. Returns how many cursors there are.
+pub fn all_matches(doc: &Document, main: &mut Sel, c: &mut Carets) -> Result<usize, &'static str> {
+    if main.is_empty() {
+        caret_search(doc, main)?;
+    }
+    if doc.len() > CARET_SEARCH_MAX {
+        return Err("Select all matches works in texts up to 64 MB.");
+    }
+    let Some(m) = caret_search(doc, main)? else { return Ok(c.count()) };
+    let (a, b) = (main.start(), main.end());
+    let mut v = Vec::new();
+    let mut too_many = false;
+    m.each(doc, 0, doc.len(), None, 1 << 20, &mut |_, _, s, e| {
+        if (s, e) != (a, b) {
+            v.push(Sel::new(s, e));
+        }
+        too_many = v.len() >= CARETS_MAX;
+        !too_many
+    });
+    if too_many {
+        return Err(TOO_MANY_CARETS);
+    }
+    c.more = v;
+    c.col = None;
+    c.tidy(main);
+    c.version = doc.version;
+    Ok(c.count())
+}
+
+/// Cursors at line starts / ends: a caret at the start (end) of every line the main selection covers; the last
+/// line's is the main one.
+pub fn carets_on_lines(doc: &Document, main: &mut Sel, c: &mut Carets, ends: bool) -> Result<(), &'static str> {
+    if main.is_empty() {
+        return Err("Select the lines first.");
+    }
+    let starts = selected_lines(doc, *main).ok_or("Select fewer lines for that (up to 200,000).")?;
+    if starts.len() > CARETS_MAX {
+        return Err(TOO_MANY_CARETS);
+    }
+    let mut v: Vec<Sel> = starts.iter().map(|&p| Sel::at(if ends { doc.line_end_of(p) } else { p })).collect();
+    let Some(last) = v.pop() else { return Ok(()) };
+    c.more = v;
+    c.col = None;
+    *main = last;
+    c.tidy(main);
+    c.version = doc.version;
+    Ok(())
+}
+
+/// Ctrl+click with multiple cursors on: a caret added at `pos` (it's the main one then), or the cursor there taken
+/// away (the main one's: the newest of the others is the main one then).
+pub fn toggle_caret(doc: &Document, main: &mut Sel, c: &mut Carets, pos: u64) -> Result<(), &'static str> {
+    let at = |s: &Sel| s.start() <= pos && pos <= s.end();
+    if let Some(i) = c.more.iter().position(at) {
+        c.more.remove(i);
+    } else if at(main) {
+        if let Some(s) = c.more.pop() {
+            *main = s;
+        }
+    } else {
+        if c.count() >= CARETS_MAX {
+            return Err(TOO_MANY_CARETS);
+        }
+        c.more.push(*main);
+        *main = Sel::at(pos);
+    }
+    c.col = None;
+    c.tidy(main);
+    c.version = doc.version;
+    Ok(())
+}
+
+/// Remove last cursor: the main one goes, the newest of the others takes its place.
+pub fn remove_last_caret(main: &mut Sel, c: &mut Carets) {
+    if let Some(s) = c.more.pop() {
+        *main = s;
+    }
+    c.col = None;
+}
+
 /// One search a tab of matching lines was made with: its matcher, whether it kept the lines without a match, and what
 /// was searched for (for its name and note). A tab of lines filtered again has the searches in the order they ran.
 #[derive(Clone)]
@@ -854,6 +1240,12 @@ pub fn prev_cluster(doc: &Document, pos: u64) -> u64 {
     pos - text::cluster_len_before(&b).max(1) as u64
 }
 
+/// Where Backspace at `pos` deletes from: an emoji or a flag goes as a whole, an accented letter loses its last accent.
+fn back_from(doc: &Document, pos: u64) -> u64 {
+    let b = before(doc, pos);
+    if b.is_empty() || b.ends_with(b"\r") { doc.prev_char(pos) } else { pos - text::backspace_len(&b).max(1) as u64 }
+}
+
 pub fn backspace(doc: &mut Document, sel: Sel, word: bool) -> Sel {
     if !sel.is_empty() {
         return replace_selection(doc, sel, b"", EditKind::Other);
@@ -861,12 +1253,7 @@ pub fn backspace(doc: &mut Document, sel: Sel, word: bool) -> Sel {
     if sel.caret == 0 {
         return sel;
     }
-    // (an emoji or a flag goes as a whole; an accented letter loses its last accent)
-    let back = || {
-        let b = before(doc, sel.caret);
-        if b.is_empty() || b.ends_with(b"\r") { doc.prev_char(sel.caret) } else { sel.caret - text::backspace_len(&b).max(1) as u64 }
-    };
-    let a = if word { doc.word_left(sel.caret) } else { back() };
+    let a = if word { doc.word_left(sel.caret) } else { back_from(doc, sel.caret) };
     doc.begin(if word { EditKind::Other } else { EditKind::Backspace }, sel);
     doc.delete(a, sel.caret);
     let new = Sel::at(a);
@@ -2586,5 +2973,121 @@ mod tests {
         let s = duplicate(&mut d, Sel::at(end)).unwrap();
         assert!(d.read(0, d.len()).ends_with(b"\nb\r\nb"));
         assert_eq!(s, Sel::at(d.len()));
+    }
+}
+
+#[cfg(test)]
+mod caret_tests {
+    use super::*;
+
+    fn text(doc: &Document) -> String {
+        String::from_utf8(doc.read(0, doc.len())).unwrap()
+    }
+
+    fn lf(s: &str) -> Document {
+        let mut d = Document::from_text(s.as_bytes());
+        d.eol = Eol::Lf;
+        d
+    }
+
+    #[test]
+    fn typing_and_deleting_at_every_cursor() {
+        let mut doc = lf("ab\ncd\nef");
+        let (mut main, mut c) = (Sel::at(8), Carets::default());
+        c.more = vec![Sel::at(2), Sel::at(5)];
+        multi_edit(&mut doc, &mut main, &mut c, MultiEdit::Put(vec![b"X"]), EditKind::Typing);
+        assert_eq!(text(&doc), "abX\ncdX\nefX");
+        assert_eq!((main, c.more.clone()), (Sel::at(11), vec![Sel::at(3), Sel::at(7)]));
+        multi_edit(&mut doc, &mut main, &mut c, MultiEdit::Put(vec![b"Y"]), EditKind::Typing);
+        // one step to undo for the typing, as with one cursor
+        doc.undo();
+        assert_eq!(text(&doc), "ab\ncd\nef");
+        let mut doc = lf("ab\ncd\nef");
+        let (mut main, mut c) = (Sel::at(8), Carets { more: vec![Sel::at(2), Sel::new(3, 5)], ..Default::default() });
+        multi_edit(&mut doc, &mut main, &mut c, MultiEdit::Delete { back: true, word: false }, EditKind::Backspace);
+        assert_eq!(text(&doc), "a\n\ne");
+        multi_edit(&mut doc, &mut main, &mut c, MultiEdit::Newline, EditKind::Other);
+        assert_eq!(text(&doc), "a\n\n\n\ne\n");
+        assert_eq!(c.count(), 3);
+        assert_eq!(c.version, doc.version);
+    }
+
+    #[test]
+    fn cursors_that_meet_become_one() {
+        let mut doc = lf("abcdef");
+        let (mut main, mut c) = (Sel::at(3), Carets { more: vec![Sel::at(2), Sel::at(1)], ..Default::default() });
+        // Backspace three times: each deletes the character before it, and they meet at the start
+        for _ in 0..3 {
+            multi_edit(&mut doc, &mut main, &mut c, MultiEdit::Delete { back: true, word: false }, EditKind::Backspace);
+        }
+        assert_eq!(text(&doc), "def");
+        assert_eq!((main, c.count()), (Sel::at(0), 1));
+        // a caret inside another selection goes; the newer one stays
+        let (mut main, mut c) = (Sel::new(0, 4), Carets { more: vec![Sel::at(2)], ..Default::default() });
+        c.tidy(&mut main);
+        assert_eq!((main, c.count()), (Sel::new(0, 4), 1));
+    }
+
+    #[test]
+    fn copying_and_pasting_with_several() {
+        let doc = lf("one two three");
+        let (main, c) = (Sel::new(8, 13), Carets { more: vec![Sel::new(0, 3), Sel::at(5)], ..Default::default() });
+        assert_eq!(multi_text(&doc, main, &c).as_deref(), Some(&b"one\nthree"[..]));
+        assert_eq!(paste_parts(b"1\n2\n3\n", 3), vec![&b"1"[..], b"2", b"3"]);
+        assert_eq!(paste_parts(b"1\r\n2", 3), vec![&b"1\r\n2"[..]]);
+        let mut doc = lf("a\nb\nc");
+        let (mut main, mut c) = (Sel::at(5), Carets { more: vec![Sel::at(1), Sel::at(3)], ..Default::default() });
+        multi_edit(&mut doc, &mut main, &mut c, MultiEdit::Put(paste_parts(b"1\n2\n3", 3)), EditKind::Other);
+        assert_eq!(text(&doc), "a1\nb2\nc3");
+    }
+
+    #[test]
+    fn adding_and_taking_away_cursors() {
+        let doc = lf("foo bar foo baz foo\nxy\nlonger line");
+        let (mut main, mut c) = (Sel::at(1), Carets::default());
+        // the word first, then the next ones, round to the start
+        add_next_match(&doc, &mut main, &mut c, false).unwrap();
+        assert_eq!(main, Sel::new(0, 3));
+        add_next_match(&doc, &mut main, &mut c, false).unwrap();
+        add_next_match(&doc, &mut main, &mut c, false).unwrap();
+        assert_eq!((main, c.count()), (Sel::new(16, 19), 3));
+        assert_eq!(add_next_match(&doc, &mut main, &mut c, false), Err("No other match."));
+        remove_last_caret(&mut main, &mut c);
+        assert_eq!((main, c.count()), (Sel::new(8, 11), 2));
+        // skipping: the main one moves on instead
+        add_next_match(&doc, &mut main, &mut c, true).unwrap();
+        assert_eq!((main, c.count()), (Sel::new(16, 19), 2));
+        // all of them
+        let (mut main, mut c) = (Sel::new(8, 11), Carets::default());
+        assert_eq!(all_matches(&doc, &mut main, &mut c), Ok(3));
+        assert_eq!(main, Sel::new(8, 11));
+        // Ctrl+click: added, then taken away
+        let (mut main, mut c) = (Sel::at(0), Carets::default());
+        toggle_caret(&doc, &mut main, &mut c, 21).unwrap();
+        assert_eq!((main, c.more.clone()), (Sel::at(21), vec![Sel::at(0)]));
+        toggle_caret(&doc, &mut main, &mut c, 21).unwrap();
+        assert_eq!((main, c.count()), (Sel::at(0), 1));
+        // above and below keep the column, short lines between
+        let (mut main, mut c) = (Sel::at(5), Carets::default());
+        add_caret_line(&doc, &mut main, &mut c, true, 4).unwrap();
+        add_caret_line(&doc, &mut main, &mut c, true, 4).unwrap();
+        assert_eq!(main, Sel::at(23 + 5));
+        assert_eq!(c.more, vec![Sel::at(5), Sel::at(22)]);
+        // line starts and ends
+        let (mut main, mut c) = (Sel::new(2, 22), Carets::default());
+        carets_on_lines(&doc, &mut main, &mut c, true).unwrap();
+        assert_eq!((main, c.more.clone()), (Sel::at(22), vec![Sel::at(19)]));
+    }
+
+    #[test]
+    fn moving_the_others() {
+        let doc = lf("abc\nde\nfghij");
+        let mut c = Carets { more: vec![Sel::at(2), Sel::at(9)], ..Default::default() };
+        move_carets(&doc, &mut c, CaretMove::Down, false, 4);
+        assert_eq!(c.more, vec![Sel::at(6), Sel::at(12)]);
+        move_carets(&doc, &mut c, CaretMove::Home, true, 4);
+        assert_eq!(c.more, vec![Sel::new(6, 4), Sel::new(12, 7)]);
+        move_carets(&doc, &mut c, CaretMove::Left, false, 4);
+        assert_eq!(c.more, vec![Sel::at(4), Sel::at(7)]);
     }
 }

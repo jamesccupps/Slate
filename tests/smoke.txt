@@ -149,3 +149,20 @@ key:ctrl+d
 expect:lines=1
 key:ctrl+shift+d
 expect:lines=2
+# Edit → Multiple cursors: off unless turned on; then a cursor below, typed at both, Esc back to one
+cmd:NewTab
+type:ab\ncd
+key:ctrl+home
+cmd:AddCaretBelow
+type:>
+expect:text=>ab\ncd
+cmd:Undo
+cmd:ToggleMultiCursor
+key:ctrl+home
+cmd:AddCaretBelow
+expect:carets=0 *3
+type:>
+expect:text=>ab\n>cd
+key:escape
+expect:carets=*5
+cmd:ToggleMultiCursor

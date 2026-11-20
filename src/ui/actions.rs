@@ -2352,6 +2352,13 @@ impl App {
     /// After the caret moved without editing.
     pub fn after_move(&mut self) {
         self.tab_mut().view.block = None;
+        // (cursors that met as they moved become one)
+        let view = &mut self.tabs[self.active].view;
+        if !view.carets.is_empty() {
+            let mut main = view.sel;
+            view.carets.tidy(&mut main);
+            view.sel = main;
+        }
         self.tab_mut().doc.seal();
         self.reveal_caret(false);
         self.restart_caret();
@@ -2364,6 +2371,10 @@ impl App {
         }
         if let Some(b) = self.tab().view.block {
             self.block_edit(b, crate::edit::BlockEdit::Put(vec![s.as_bytes()]));
+            return;
+        }
+        if !self.tab().view.carets.is_empty() {
+            self.multi_edit(crate::edit::MultiEdit::Put(vec![s.as_bytes()]), EditKind::Typing);
             return;
         }
         let overtype = self.overtype;
@@ -2395,6 +2406,99 @@ impl App {
             editor::replace_selection(&mut tab.doc, sel, s.as_bytes(), EditKind::Typing)
         };
         self.after_edit();
+    }
+
+    /// An edit at every cursor (multiple cursors: `crate::edit::multi_edit`).
+    fn multi_edit(&mut self, what: crate::edit::MultiEdit, kind: EditKind) {
+        if !self.editable() {
+            return;
+        }
+        let tab = &mut self.tabs[self.active];
+        let mut main = tab.view.sel;
+        crate::edit::multi_edit(&mut tab.doc, &mut main, &mut tab.view.carets, what, kind);
+        tab.view.sel = main;
+        self.after_edit();
+    }
+
+    /// Keys with multiple cursors: Backspace, Delete, Enter and Tab edit at each; the arrows, Home and End move the
+    /// others (the main one then moves as always, `after_move` tidies); Esc leaves only the main one, as do the keys
+    /// that don't work with several (Page Up, Ctrl+Home…). None: the key goes on as usual.
+    fn carets_key(&mut self, k: VIRTUAL_KEY, m: &Mods) -> Option<bool> {
+        use crate::edit::{CaretMove, MultiEdit};
+        let how = match k {
+            VK_LEFT => Some(if m.ctrl { CaretMove::WordLeft } else { CaretMove::Left }),
+            VK_RIGHT => Some(if m.ctrl { CaretMove::WordRight } else { CaretMove::Right }),
+            VK_UP if !m.ctrl => Some(CaretMove::Up),
+            VK_DOWN if !m.ctrl => Some(CaretMove::Down),
+            VK_HOME if !m.ctrl => Some(CaretMove::Home),
+            VK_END if !m.ctrl => Some(CaretMove::End),
+            _ => None,
+        };
+        if let Some(how) = how {
+            let tab_size = self.settings.tab_size;
+            let tab = &mut self.tabs[self.active];
+            crate::edit::move_carets(&tab.doc, &mut tab.view.carets, how, m.shift, tab_size);
+            return None;
+        }
+        let unit = self.indent_now().unit();
+        let edit = match k {
+            VK_BACK => Some((MultiEdit::Delete { back: true, word: m.ctrl }, if m.ctrl { EditKind::Other } else { EditKind::Backspace })),
+            VK_DELETE => Some((MultiEdit::Delete { back: false, word: m.ctrl }, if m.ctrl { EditKind::Other } else { EditKind::DeleteForward })),
+            VK_RETURN if !m.ctrl && self.tab().filter.is_none() => Some((MultiEdit::Newline, EditKind::Other)),
+            VK_TAB if !m.ctrl && !m.shift => Some((MultiEdit::Put(vec![&unit[..]]), EditKind::Typing)),
+            _ => None,
+        };
+        if let Some((what, kind)) = edit {
+            self.multi_edit(what, kind);
+            return Some(true);
+        }
+        if k == VK_ESCAPE {
+            self.tab_mut().view.carets.clear();
+            self.invalidate();
+            return Some(true);
+        }
+        if matches!(k, VK_PRIOR | VK_NEXT | VK_HOME | VK_END | VK_UP | VK_DOWN | VK_TAB | VK_RETURN) {
+            self.tab_mut().view.carets.clear();
+        }
+        None
+    }
+
+    /// Edit → Multiple cursors' commands (`crate::edit`); with the setting off, only how to turn it on.
+    fn caret_cmd(&mut self, cmd: Cmd) {
+        if !self.settings.multi_cursor {
+            self.flash("Multiple cursors are off: Edit → Multiple cursors → Use multiple cursors turns them on.", false);
+            return;
+        }
+        let tab_size = self.settings.tab_size;
+        let tab = &mut self.tabs[self.active];
+        tab.view.block = None;
+        tab.doc.seal();
+        let (doc, view) = (&tab.doc, &mut tab.view);
+        let mut main = view.sel;
+        let c = &mut view.carets;
+        let r: Result<Option<String>, &str> = match cmd {
+            Cmd::AddCaretAbove => crate::edit::add_caret_line(doc, &mut main, c, false, tab_size).map(|_| None),
+            Cmd::AddCaretBelow => crate::edit::add_caret_line(doc, &mut main, c, true, tab_size).map(|_| None),
+            Cmd::AddNextMatch => crate::edit::add_next_match(doc, &mut main, c, false).map(|_| None),
+            Cmd::SkipMatch => crate::edit::add_next_match(doc, &mut main, c, true).map(|_| None),
+            Cmd::AllMatches => crate::edit::all_matches(doc, &mut main, c).map(|n| Some(format!("{} cursors", group(n as u64)))),
+            Cmd::LineStartCarets => crate::edit::carets_on_lines(doc, &mut main, c, false).map(|_| None),
+            Cmd::LineEndCarets => crate::edit::carets_on_lines(doc, &mut main, c, true).map(|_| None),
+            _ => {
+                crate::edit::remove_last_caret(&mut main, c);
+                Ok(None)
+            }
+        };
+        view.sel = main;
+        view.want_x = None;
+        match r {
+            Ok(Some(msg)) => self.flash(msg, false),
+            Ok(None) => {}
+            Err(e) => self.flash(e, true),
+        }
+        self.reveal_caret(false);
+        self.restart_caret();
+        self.invalidate();
     }
 
     // ---- tabs in the title bar ----
@@ -2704,6 +2808,7 @@ impl App {
             return true;
         }
         if self.block_key(k, &m) {
+            self.tab_mut().view.carets.clear();
             return true;
         }
         if let Some(cmd) = self.key_cmd(vk, &m, false) {
@@ -2712,6 +2817,11 @@ impl App {
         }
         if m.alt {
             return false;
+        }
+        if !self.tab().view.carets.is_empty() {
+            if let Some(used) = self.carets_key(k, &m) {
+                return used;
+            }
         }
         let ext = m.shift;
         match k {
@@ -2897,6 +3007,19 @@ impl App {
     }
 
     pub fn copy(&mut self) -> bool {
+        if !self.tab().view.carets.is_empty() {
+            let tab = self.tab();
+            let Some(text) = crate::edit::multi_text(&tab.doc, tab.view.sel, &tab.view.carets) else {
+                self.flash("Nothing is selected at the cursors (or it's more than 16 MB).", true);
+                return false;
+            };
+            if !win::set_clipboard(self.hwnd, &text) {
+                self.flash(CLIPBOARD_BUSY, true);
+                return false;
+            }
+            self.line_clip = None;
+            return true;
+        }
         if let Some(b) = self.tab().view.block {
             let tab = self.tab();
             let text = match crate::edit::block_text(&tab.doc, &b, self.settings.tab_size, tab.doc.eol.as_bytes()) {
@@ -2931,6 +3054,10 @@ impl App {
         if !self.editable() || !self.copy() {
             return;
         }
+        if !self.tab().view.carets.is_empty() {
+            self.multi_edit(crate::edit::MultiEdit::Put(vec![b""]), EditKind::Other);
+            return;
+        }
         if let Some(b) = self.tab().view.block {
             if b.cols().0 < b.cols().1 {
                 self.block_edit(b, crate::edit::BlockEdit::Delete { back: false });
@@ -2952,6 +3079,15 @@ impl App {
             return;
         }
         let Some(text) = win::get_clipboard(self.hwnd) else { return };
+        if !self.tab().view.carets.is_empty() {
+            // (a line each when it has as many as there are cursors, else all of it at each)
+            let text = editor::normalize_eols(&text, self.tab().doc.eol.as_bytes());
+            let n = self.tab().view.carets.count();
+            self.tab_mut().doc.seal();
+            self.multi_edit(crate::edit::MultiEdit::Put(crate::edit::paste_parts(&text, n)), EditKind::Other);
+            self.tab_mut().doc.seal();
+            return;
+        }
         if let Some(b) = self.tab().view.block {
             // into every line: a line of the text each when it has as many as the selection, else all of it
             let text = editor::normalize_eols(&text, b"\n");
@@ -3678,6 +3814,26 @@ impl App {
         let ext = mods().shift;
         let (pos, up) = self.with_view(|v, cx| v.pos_at(cx, x, y));
         self.tab_mut().view.block = None;
+        // Ctrl+click with multiple cursors on: a cursor added there, or the one there taken away (in the
+        // selection, Ctrl+drag still copies it)
+        let m = mods();
+        let sel = self.tab().view.sel;
+        let in_sel = !sel.is_empty() && pos > sel.start() && pos < sel.end();
+        if m.ctrl && !m.alt && !m.shift && !gutter && clicks == 1 && self.settings.multi_cursor && !in_sel {
+            let tab = &mut self.tabs[self.active];
+            let mut main = tab.view.sel;
+            let r = crate::edit::toggle_caret(&tab.doc, &mut main, &mut tab.view.carets, pos);
+            tab.view.sel = main;
+            tab.view.want_x = None;
+            tab.doc.seal();
+            if let Err(e) = r {
+                self.flash(e, true);
+            }
+            self.restart_caret();
+            self.invalidate();
+            return;
+        }
+        self.tab_mut().view.carets.clear();
         if mods().alt && !gutter && clicks == 1 {
             // Alt+drag: a column selection (and Alt let go after it doesn't give the menu bar the keyboard)
             self.alt_dragged = true;
@@ -4395,6 +4551,35 @@ impl App {
         if self.tabs.is_empty() {
             self.new_untitled();
         }
+        // (multiple cursors: what works with several keeps them; anything else leaves the main one)
+        let keeps = matches!(
+            cmd,
+            Cmd::Copy
+                | Cmd::Cut
+                | Cmd::Paste
+                | Cmd::ToggleMultiCursor
+                | Cmd::AddCaretAbove
+                | Cmd::AddCaretBelow
+                | Cmd::AddNextMatch
+                | Cmd::SkipMatch
+                | Cmd::AllMatches
+                | Cmd::LineStartCarets
+                | Cmd::LineEndCarets
+                | Cmd::RemoveLastCaret
+                | Cmd::Find
+                | Cmd::Replace
+                | Cmd::ZoomIn
+                | Cmd::ZoomOut
+                | Cmd::ZoomReset
+                | Cmd::ToggleWrap
+                | Cmd::ToggleLineNumbers
+                | Cmd::ToggleWhitespace
+                | Cmd::CharInfo
+        );
+        if !keeps && !self.tab().view.carets.is_empty() {
+            self.tab_mut().view.carets.clear();
+            self.invalidate();
+        }
         match cmd {
             Cmd::NewTab => self.new_untitled(),
             Cmd::Undo | Cmd::Redo => {
@@ -4516,6 +4701,32 @@ impl App {
                 self.settings.close_with_last_tab = !self.settings.close_with_last_tab;
                 self.settings_changed();
             }
+            Cmd::ToggleMultiCursor => {
+                self.settings.multi_cursor = !self.settings.multi_cursor;
+                if !self.settings.multi_cursor {
+                    for t in &mut self.tabs {
+                        t.view.carets.clear();
+                    }
+                }
+                self.flash(
+                    if self.settings.multi_cursor {
+                        "Multiple cursors on: Ctrl+click adds or takes away one (Edit → Multiple cursors has the rest)"
+                    } else {
+                        "Multiple cursors off"
+                    },
+                    false,
+                );
+                self.settings_changed();
+                self.invalidate();
+            }
+            Cmd::AddCaretAbove
+            | Cmd::AddCaretBelow
+            | Cmd::AddNextMatch
+            | Cmd::SkipMatch
+            | Cmd::AllMatches
+            | Cmd::LineStartCarets
+            | Cmd::LineEndCarets
+            | Cmd::RemoveLastCaret => self.caret_cmd(cmd),
             Cmd::ToggleFindCloseOnLeave => {
                 self.settings.find_close_on_leave = !self.settings.find_close_on_leave;
                 self.settings_changed();
@@ -5114,6 +5325,22 @@ impl App {
                 ),
                 Item::Sep,
                 item(Cmd::SelectAll, "Select &all", "Ctrl+A"),
+                // (no letter: every one in it is another item's)
+                sub("Multiple cursors", {
+                    let on = self.settings.multi_cursor;
+                    vec![
+                        check(Cmd::ToggleMultiCursor, "&Use multiple cursors (Ctrl+click)", "", on),
+                        Item::Sep,
+                        item(Cmd::AddCaretAbove, "Add cursor &above", "Ctrl+Alt+Up"),
+                        item(Cmd::AddCaretBelow, "Add cursor &below", "Ctrl+Alt+Down"),
+                        item(Cmd::AddNextMatch, "Add &next match", "Ctrl+Shift+N"),
+                        item(Cmd::SkipMatch, "S&kip to next match", ""),
+                        item(Cmd::AllMatches, "Select all &matches", "Ctrl+Shift+A"),
+                        item(Cmd::LineStartCarets, "Cursors at line &starts", "Alt+["),
+                        item(Cmd::LineEndCarets, "Cursors at line &ends", "Alt+]"),
+                        item(Cmd::RemoveLastCaret, "&Remove last cursor", ""),
+                    ]
+                }),
                 Item::Sep,
                 item(Cmd::DuplicateLine, "Dupl&icate line", "Ctrl+D"),
                 item(Cmd::DeleteLine, "Delete li&ne", "Ctrl+Shift+K"),

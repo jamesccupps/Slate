@@ -377,6 +377,8 @@ pub struct View {
     /// A column selection (Alt+drag, Shift+Alt+arrows): what's selected instead of `sel` (whose caret is at the
     /// block's caret).
     pub block: Option<crate::edit::Block>,
+    /// Multiple cursors: the others besides `sel` (`crate::edit::Carets`; none unless the user made some).
+    pub carets: crate::edit::Carets,
     /// Widest row seen recently (for horizontal scrolling without wrapping).
     pub content_w: f32,
     win: TextWindow,
@@ -415,6 +417,7 @@ impl View {
     pub fn new() -> View {
         View {
             sel: Sel::default(),
+            carets: Default::default(),
             upstream: false,
             want_x: None,
             top: 0,
@@ -490,6 +493,9 @@ impl View {
         }
         if moved && !self.bookmarks.is_empty() {
             crate::edit::tidy_marks(&mut self.bookmarks, doc);
+        }
+        if moved {
+            self.carets.follow(doc);
         }
         self.hl.seen = 0;
         self.hl.len = doc.len();
@@ -1234,6 +1240,23 @@ impl View {
         } else if !sel.is_empty() && !sel_is_match {
             let c = if focused { t.selection } else { t.selection_inactive };
             self.fill_range(cx, sel.start(), sel.end(), ox, c, true);
+        }
+        // Multiple cursors: the others' selections and carets, those on screen.
+        if let (false, Some(top), Some(bottom)) = (self.carets.is_empty(), self.rows.first().map(|r| r.start), self.rows.last().map(|r| r.end)) {
+            let c = if focused { t.selection } else { t.selection_inactive };
+            let shown: Vec<Sel> = self.carets.more.iter().copied().filter(|s| s.end() >= top && s.start() <= bottom).collect();
+            for s in shown {
+                if !s.is_empty() {
+                    self.fill_range(cx, s.start(), s.end(), ox, c, true);
+                }
+                if focused && caret_on {
+                    let (seg, lay, row, x) = self.caret_place(cx, s.caret, false);
+                    let rs = seg.start + lay.row_bytes(row).0;
+                    if let Some(vr) = self.rows.iter().find(|vr| vr.start == rs && vr.seg.start == seg.start) {
+                        g.fill(Rect::new((ox + x).round() - 0.5, vr.y, 2.0, row_h), t.caret);
+                    }
+                }
+            }
         }
 
         // The bracket next to the caret and the one it pairs with.

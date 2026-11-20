@@ -2099,6 +2099,7 @@ fn position_text(
         (Some(l), None) => format!("Ln {}, byte {}", group(l + 1), group(caret - ls + 1)),
         (None, _) => format!("Byte {}", group(caret + 1)),
     };
+    let s = if tab.view.carets.is_empty() { s } else { format!("{s}  ({} cursors)", group(tab.view.carets.count() as u64)) };
     if sel.is_empty() {
         return (s.clone(), s);
     }

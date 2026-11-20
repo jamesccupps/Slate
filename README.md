@@ -26,7 +26,8 @@ JSON file opens instantly, scrolls smoothly, and can be searched, edited, format
   `\t` in a regular expression's replacement for a line break or a tab. *View → Find bar* can close the bar
   when you click back in the text, or give each tab its own.
 - Column selection (Alt+drag, Shift+Alt+arrows: type, paste and delete on every line) and dragging selected text
-  to another place (with Ctrl, a copy).
+  to another place (with Ctrl, a copy). Multiple cursors when you turn them on (*Edit → Multiple cursors*):
+  Ctrl+click, a cursor above or below, the next match or all of them, one at every selected line's start or end.
 - Spell check, like Notepad's: words spelled wrong get a wavy red line, in plain text, Markdown's prose and comments
   in code (not names, links, numbers or data files); right-click one for suggestions, Add to dictionary or Ignore.
   It's Windows' own spell checker, in Windows' language (on Linux, Enchant, which Slate's package brings along when

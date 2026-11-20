@@ -50,6 +50,9 @@ pub struct Settings {
     /// View → Find bar → One for each tab: each tab keeps its find bar open or closed, a new one's closed; the
     /// search itself is shared. Off: one bar for the window, open whichever tab shows.
     pub find_per_tab: bool,
+    /// Edit → Multiple cursors → Use multiple cursors: Ctrl+click and the Multiple cursors commands make more than one
+    /// (issue #5). Off: Ctrl+click does what it always did and the commands only say how to turn it on.
+    pub multi_cursor: bool,
     pub theme: ThemeMode,
     pub tab_size: u32,
     pub use_spaces: bool,
@@ -94,6 +97,7 @@ impl Default for Settings {
             close_with_last_tab: false,
             find_close_on_leave: false,
             find_per_tab: false,
+            multi_cursor: false,
             theme: ThemeMode::System,
             tab_size: 4,
             use_spaces: true,
