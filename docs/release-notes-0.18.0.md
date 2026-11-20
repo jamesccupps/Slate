@@ -22,6 +22,7 @@ A security fix on Linux, three things a user asked for, and the rest of an outsi
 - Rare internal errors in the print preview, the prompts, the menu bar and printing on Linux are caught and logged, as elsewhere, instead of ending Slate.
 
 ### Linux
+- Quitting Slate no longer ends in a crash at the very last moment ("Aborted (core dumped)" when started from a terminal, and a line in Slate's crash.log every time). Nothing was lost: the session and settings had been written by then.
 - Sort by this column (CSV) reads ambiguous dates in the order your locale writes them (Japanese, Chinese, Hungarian, Canadian English and others were guessed wrong).
 - Text piped into Slate (`some-command | slate -`) that never reached a window (Slate closing at that moment, say) is deleted at the next start after a day, instead of staying in Slate's folder.
 - A middle-click paste that arrives after you switched tabs or edited the text no longer lands in the wrong place.

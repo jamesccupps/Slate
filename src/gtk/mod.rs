@@ -151,7 +151,19 @@ thread_local! {
 }
 
 pub fn get_ui() -> Option<Rc<Ui>> {
-    UI.with(|u| u.borrow().clone())
+    // (`try_with`: a GTK handler run while the thread's locals are destroyed finds no UI instead of panicking)
+    UI.try_with(|u| u.borrow().clone()).ok().flatten()
+}
+
+/// After GTK's main loop the UI is taken out of `UI` and left as it is: the process ends next, and the session and
+/// settings were written as the window closed. (Left in `UI`, `process::exit` dropped it with the thread's locals: the
+/// window's disposal sent the text's focus `leave` to a handler whose `get_ui` found `UI` half gone, a panic inside
+/// GTK's callback, so every quit before 0.18.0 ended in an abort, "Aborted (core dumped)" on a terminal. Dropped here
+/// instead, GTK warns about the menus still attached to their widgets; dropping it would only cancel jobs.)
+fn end_ui() {
+    if let Ok(Some(ui)) = UI.try_with(|u| u.borrow_mut().take()) {
+        std::mem::forget(ui);
+    }
 }
 
 /// A file opened or saved goes in the desktop's recently used files too (GNOME's Recent, the file dialogs' list: what
@@ -394,7 +406,9 @@ pub fn run(args: Vec<std::ffi::OsString>) -> i32 {
     }
     let cwd = shell_dir();
     let argv: Vec<String> = std::iter::once("slate".to_string()).chain(args.into_iter().map(|a| open_arg(a, cwd.as_deref()))).collect();
-    if application.run_with_args(&argv) == glib::ExitCode::SUCCESS { 0 } else { 1 }
+    let code = if application.run_with_args(&argv) == glib::ExitCode::SUCCESS { 0 } else { 1 };
+    end_ui();
+    code
 }
 
 /// Whether a D-Bus name has an owner on the session bus (Slate's application id: a Slate runs).
@@ -498,7 +512,9 @@ fn run_request(application: &gtk4::Application, args: Vec<std::ffi::OsString>, r
     let _ = std::fs::remove_file(&wait_file);
     let hint = hint.replace(&format!("wait={token};"), "");
     application.open(&files, &hint);
-    if application.run_with_args(&["slate"]) == glib::ExitCode::SUCCESS { 0 } else { 1 }
+    let code = if application.run_with_args(&["slate"]) == glib::ExitCode::SUCCESS { 0 } else { 1 };
+    end_ui();
+    code
 }
 
 /// GTK doesn't keep a native dialog alive while it's shown: dropped when the function showing it returns, its file

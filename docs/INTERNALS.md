@@ -252,7 +252,11 @@ when it's this user's alone, else a guest window that keeps nothing). Windows: `
     for those files and Help's Open files with Slate… or Stop opening files with Slate…, whichever applies (actions
     turned off, `hidden-when`), File → Open recent; Ctrl+1–9 and Alt+1–9 for tabs, Shift+Alt+F formats JSON or XML (taken in the window's capture phase: GTK also tried it as File's mnemonic and warned on the terminal);
     a panic in a callback would abort (GTK can't pass it on): `Ui::guarded` catches it around the app's work (logged in
-    crash.log by the panic hook, the session written, the window says so), drawing only logs; SIGTERM, SIGHUP and SIGINT
+    crash.log by the panic hook, the session written, the window says so), drawing only logs; after the main loop
+    `end_ui` takes the `Ui` out of its thread-local and leaves it undropped (dropped by `process::exit` with the
+    thread's locals, the window's disposal ran a focus handler whose `get_ui` found the thread-local half gone: every
+    quit aborted until 0.18.0; dropped earlier, GTK warns about popovers still parented), and `get_ui` uses
+    `try_with`; SIGTERM, SIGHUP and SIGINT
     (`stop_on_signals`: the handler writes the signal's number to a pipe, a thread asleep on it `invoke`s the rest on
     the main loop) and the session manager's `query-end` write the session first
     (`ending`), and logging out waits while unsaved work the session can't keep is open; SIGTERM then ends Slate,
