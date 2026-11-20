@@ -172,31 +172,6 @@ GTK's preedit on Linux); the tabs in the title bar, as in Windows 11's Notepad (
 buttons, with Snap layouts; Linux: the strip and the desktop's window buttons as GTK's title bar). Details in the
 [0.15.0 release notes](release-notes-0.15.0.md).
 
-## Next
-
-1. **Accessibility: screen readers, the rest (M).** The text is read since 0.12.0 (checked in test mode and by a real
-   UI Automation client, `tests/uia-client.ps1`). Next:
-   - Trying it with Narrator and NVDA (focus events can only be checked in a real, focused window).
-   - Notifications (`UiaRaiseNotificationEvent`, Windows 10 1709+) for what the status bar says ("Saved", "Not
-     found", a search's count) and for the line a Find next lands on while the find box has the keyboard.
-   - The tab strip (a Tab with its tab items, selectable), the status bar (a StatusBar: NVDA reads it with
-     NVDA+End) and the menu bar (its titles as menu items while Alt has it; the menus are Windows' own and read already).
-   - The JSON and XML path bar and structure panel (a tree), and Linux: Orca needs GTK 4.14's `GtkAccessibleText`
-     for a view Slate draws itself (Debian 12 and Raspberry Pi OS 12 have GTK 4.8).
-2. **Release basics (S–M).** Slate.exe is signed since 0.8.0 (Azure Artifact Signing, in CI); since 0.8.1 the
-   updater checks that an update is signed by the same publisher, and `Slate.exe --install` installs silently for
-   winget (`JamesCupps.Slate`, submitted with 0.8.1 and moved to 0.8.2 before it was merged). Next: a winget
-   manifest PR made by CI for each release (needs a GitHub token of the user's as a secret), Scoop and Chocolatey.
-   (Licensed MIT since October 2026.)
-3. **Big unsaved files, the rest (S–M).** Keep a big document's newline index in the session so putting it back
-   doesn't count the lines again, and keep big documents that Format or Replace All rewrote (today closing still asks
-   about those). (Its `.data` is already written anew, with only what the text uses, once most of it isn't.)
-
-## Soon
-
-Nothing waiting: the *Soon* list of 0.13.0 is done (0.13.0, 0.14.0, 0.15.0), and 0.16.0 took the Linux list and a
-few small items from *Later*. The next picks come from *Next* and *Later*.
-
 ## 0.16.0
 
 Linux caught up with Windows: the JSON/XML path bar and structure panel (the structure model now shared,
@@ -215,6 +190,50 @@ Linux checked on Ubuntu 24.04 with GNOME on Wayland (scaling 100% to 200%, loggi
 manager, the dialogs) and timed against Windows on the same PC: high contrast, GNOME's Dark back to Light followed,
 Alt+C / Alt+W / Alt+R in the find box, keyboard selections pasted with a middle click; the engine as fast as on
 Windows. Details in the [0.17.0 release notes](release-notes-0.17.0.md).
+
+## 0.16.1, 0.17.1, 0.17.2
+
+0.16.1: the updater checks the download's own version. 0.17.1: 0.16.1 and 0.17.0 could update themselves again (they
+read the version from the first place the bytes appeared, which was their own code; `scripts/check-version.ps1`
+keeps every build readable that way). 0.17.2: fixes from an outside review: Linux pipes and devices refused,
+`--version` and `--help`, piped-in text streamed to a file, column selections and drags on huge lines.
+
+## 0.18.0: a security report, a user's wishes, the review's small items
+
+A private report (GHSA-fwvq-4jjf-qg8c): on Linux a save that can't give the new file the old one's access list (ACL)
+stops and asks instead of saying "Saved", and the list goes on before the mode. From a user's list (GitHub
+Discussions): Go to matching bracket and Select inside brackets (Ctrl+M, Ctrl+Shift+M), the menu bar's letters
+underlined when Windows' Underline access keys is on, View → Close Slate with the last tab. The review's P3 items:
+tag characters ("ASCII smuggling") shown, `+` no hex digit, EditorConfig ranges in choices, XPath `*[n]`, the
+locale's date order on Linux, caps on huge JSON keys and XML names, panic guards in callbacks, leftover piped text
+cleaned up, a fuzzer that covers far more. CI: clippy, cargo-deny, Dependabot for the crates. Details in the
+[0.18.0 release notes](release-notes-0.18.0.md).
+
+## Next
+
+1. **Accessibility: screen readers, the rest (M).** The text is read since 0.12.0 (checked in test mode and by a real
+   UI Automation client, `tests/uia-client.ps1`). Next:
+   - Trying it with Narrator and NVDA (focus events can only be checked in a real, focused window).
+   - Notifications (`UiaRaiseNotificationEvent`, Windows 10 1709+) for what the status bar says ("Saved", "Not
+     found", a search's count) and for the line a Find next lands on while the find box has the keyboard.
+   - The tab strip (a Tab with its tab items, selectable), the status bar (a StatusBar: NVDA reads it with
+     NVDA+End) and the menu bar (its titles as menu items while Alt has it; the menus are Windows' own and read already).
+   - The JSON and XML path bar and structure panel (a tree), and Linux: Orca needs GTK 4.14's `GtkAccessibleText`
+     for a view Slate draws itself (Debian 12 and Raspberry Pi OS 12 have GTK 4.8).
+2. **Release basics (S–M).** Slate.exe is signed since 0.8.0 (Azure Artifact Signing, in CI); since 0.8.1 the
+   updater checks that an update is signed by the same publisher, and `Slate.exe --install` installs silently for
+   winget (`JamesCupps.Slate`, submitted with 0.8.1 and moved to 0.8.2 before it was merged). Next: a winget
+   manifest PR made by CI for each release (needs a GitHub token of the user's as a secret), Chocolatey. (Scoop:
+   since 2026-11-09, the user's bucket updates itself from each release.)
+   (Licensed MIT since October 2026.)
+3. **Big unsaved files, the rest (S–M).** Keep a big document's newline index in the session so putting it back
+   doesn't count the lines again, and keep big documents that Format or Replace All rewrote (today closing still asks
+   about those). (Its `.data` is already written anew, with only what the text uses, once most of it isn't.)
+
+## Soon
+
+Nothing waiting: the *Soon* list of 0.13.0 is done (0.13.0, 0.14.0, 0.15.0), and 0.16.0 took the Linux list and a
+few small items from *Later*. The next picks come from *Next* and *Later*.
 
 ## Later
 
@@ -260,6 +279,10 @@ Windows. Details in the [0.17.0 release notes](release-notes-0.17.0.md).
   alone changed (touched, synced unchanged) can't be saved (only Reload): a whole-file hash taken while its lines are
   counted, if that costs the count nothing, would tell (S–M); the JSON outline stops at a container nested over
   50,000 deep: reading past it cost every scan 3-6%, tried twice (S).
+- Work still on the UI thread that can take a while (from the 0.18.0 review): Linux's print layout of a long document
+  (up to 10,000 pages; Windows lays it out on a job's thread), Linux's session restore reading every unsaved tab's
+  copy before the window shows, and Go to line with a JSON key in an object of millions of keys (every key read;
+  XML's same-name lists are taken directly since 0.18.0) (S–M each).
 - Tests: a table of the key bindings checked against the shortcut lists and the README (S); the close and quit
   prompts and the updater's swap in the smoke tests (S–M).
 - Colors: a misdetected heredoc should end sooner than at its end word; exact states for lexers with look-ahead at
@@ -291,7 +314,10 @@ start and heavier, and turn it into another IDE. Slate is the editor that opens 
 
 ## Infrastructure
 
-- Reproducible builds: a pinned toolchain, a build cache, no home paths or timestamps in the exe (S).
+- Reproducible builds: a build cache, no home paths or timestamps in the exe (S). (The toolchain is pinned:
+  `RUST_VERSION` in `build.yml`.)
+- Symbols kept for each release (the exe ships stripped, so a minidump from Help → Report a problem can't be read):
+  a debug file per release kept somewhere that doesn't expire, without changing the signed exe (S–M).
 - CI: automated updater tests against a local stand-in for GitHub,
   and test-mode commands for the timers (S). (The smoke test writes a session and puts it back.)
 - Test on what the development PC doesn't have: a FAT/exFAT drive, a Chinese/Japanese/Korean system locale, the

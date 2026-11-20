@@ -41,6 +41,9 @@ pub struct Settings {
     pub spell_check: bool,
     /// Windows: the tabs in the title bar, as in Windows 11's Notepad (Windows' own title bar in high contrast).
     pub tabs_in_title_bar: bool,
+    /// View → Close Slate with the last tab: closing the only tab (Ctrl+W, its ×) closes Slate too; off, an empty tab
+    /// stays, as in Notepad.
+    pub close_with_last_tab: bool,
     pub theme: ThemeMode,
     pub tab_size: u32,
     pub use_spaces: bool,
@@ -82,6 +85,7 @@ impl Default for Settings {
             show_whitespace: false,
             spell_check: true,
             tabs_in_title_bar: true,
+            close_with_last_tab: false,
             theme: ThemeMode::System,
             tab_size: 4,
             use_spaces: true,
@@ -145,6 +149,8 @@ pub fn data_dir() -> PathBuf {
     d
 }
 
+// (each platform's part returns: Windows' `return` reads as the other's, though it's the last expression there)
+#[cfg_attr(windows, allow(clippy::needless_return))]
 fn find_data_dir() -> PathBuf {
     // For tests: a separate data folder.
     if let Some(d) = std::env::var_os("SLATE_DATA_DIR") {

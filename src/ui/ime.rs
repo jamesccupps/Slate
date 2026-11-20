@@ -43,12 +43,12 @@ pub fn read(hwnd: HWND, lp: LPARAM) -> (Option<String>, Composing) {
             buf.truncate(m.max(0) as usize);
             buf
         };
-        let units = |b: Vec<u8>| b.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect::<Vec<u16>>();
+        let units = |b: Vec<u8>| b.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c)).collect::<Vec<u16>>();
         let raw = Raw {
             comp: if has(GCS_COMPSTR) { units(get(GCS_COMPSTR)) } else { Vec::new() },
             attrs: if has(GCS_COMPATTR) { get(GCS_COMPATTR) } else { Vec::new() },
             clauses: if has(GCS_COMPCLAUSE) {
-                get(GCS_COMPCLAUSE).chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+                get(GCS_COMPCLAUSE).as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c)).collect()
             } else {
                 Vec::new()
             },

@@ -112,3 +112,39 @@ answer:save
 cmd:close-tab
 jobs
 expect:status=Saved smoke-c.txt
+# A save that can't give the new file the old one's access list (ACL) asks first: Cancel leaves it unsaved, Save anyway saves
+cmd:new-tab
+answer:smoke-d.txt
+cmd:save-as
+jobs
+set:refuse_access=true
+type:z
+answer:cancel
+cmd:save
+jobs
+expect:dirty=true
+answer:access
+cmd:save
+jobs
+expect:dirty=false
+expect:status=Saved smoke-d.txt
+set:refuse_access=false
+# Ctrl+M goes to the matching bracket and back; Ctrl+Shift+M selects inside the brackets, then the brackets too
+cmd:new-tab
+type:f(a, [b, c])
+key:ctrl+home
+key:right
+key:right
+key:ctrl+m
+expect:sel=12..12
+key:ctrl+m
+expect:sel=2..2
+key:right
+key:right
+key:right
+key:right
+key:right
+key:ctrl+shift+m
+expect:sel=6..10
+key:ctrl+shift+m
+expect:sel=5..11

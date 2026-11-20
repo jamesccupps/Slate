@@ -215,7 +215,7 @@ impl Scanner {
             self.names.truncate(w);
             lv.sparse = true;
         }
-        if !lv.sparse || lv.count % STRIDE == 0 {
+        if !lv.sparse || lv.count.is_multiple_of(STRIDE) {
             self.items.push(c);
             self.names.push(h);
         }

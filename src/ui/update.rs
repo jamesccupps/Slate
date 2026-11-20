@@ -100,6 +100,9 @@ pub fn parse_sha(text: &[u8]) -> Option<[u8; 32]> {
     let hex = text.trim_ascii_start().get(..64)?;
     let mut out = [0u8; 32];
     for (i, pair) in hex.chunks(2).enumerate() {
+        if !pair.iter().all(u8::is_ascii_hexdigit) {
+            return None;
+        }
         out[i] = u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()?;
     }
     Some(out)

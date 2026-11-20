@@ -8,7 +8,8 @@
 //! box: `up`, `alt+s`), `cmd:<action>` (a menu action's name: `save`, `json-format`...),
 //! `find:<text>`, `replace:<text>`, `goto:<line>`, `answer:save,dont,cancel` (or a path for Open and Save as),
 //! `lang:<name>`, `set:wrap=true` (also `line_numbers`, `font_size`, `high_contrast`: the desktop's, as if
-//! switched; `print:contrast` says what's drawn), `gsettings:<key>=<value>` (GNOME's), `wait:<ms>`, `jobs` (wait for
+//! switched; `print:contrast` says what's drawn; `refuse_access`: saves act as if the file's access list couldn't be
+//! kept), `gsettings:<key>=<value>` (GNOME's), `wait:<ms>`, `jobs` (wait for
 //! background work; `jobs:counts`: the status bar's word count too), `shot:<file.png>`, `print:<what>` (`text`, `sel`, `status`, `title`, `tabs`, `lang`, `asked`,
 //! `clipboard`, `find`, `dirty`, `top`, `session`: the session folder's files, `notice`, `composing`),
 //! `imemsg:start|pre|<text>|<cursor>|<clauses>|commit|<text>|end` (an input method), `expect:<what>=<value>`,
@@ -407,6 +408,9 @@ async fn script(lines: Vec<String>, test: Rc<Test>) -> i32 {
                             a.system_hc = v == "true";
                             a.apply_theme();
                         }
+                        // (saves act as if the file's access list couldn't be kept: `SaveError::Access`)
+                        "refuse_access" => crate::core::io::TEST_REFUSE_ACCESS
+                            .store(v == "true", std::sync::atomic::Ordering::Relaxed),
                         "print_colors" => a.settings.print_colors = v == "true",
                         "print_line_numbers" => a.settings.print_line_numbers = v == "true",
                         "print_header" => a.settings.print_header = v == "true",

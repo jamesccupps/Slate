@@ -342,7 +342,7 @@ impl Gfx {
             // flip-model frame is dropped (the window came on white), and stays when the swap chain is let go of, so
             // the window shows the last one until a flip-model one's first frame takes its place (a flip-model one's
             // frames go with it: the window flashed white at the switch from WARP).
-            let blt = (!self.shown || self.on_warp_for_now).then(|| DXGI_SWAP_CHAIN_DESC1 {
+            let blt = (!self.shown || self.on_warp_for_now).then_some(DXGI_SWAP_CHAIN_DESC1 {
                 BufferCount: 1,
                 Scaling: DXGI_SCALING_STRETCH,
                 SwapEffect: DXGI_SWAP_EFFECT_DISCARD,

@@ -861,7 +861,7 @@ mod tests {
         }
         for off in (0..=model.len() as u64).step_by(13) {
             let next = nls.iter().copied().find(|&p| p >= off);
-            let prev = nls.iter().copied().filter(|&p| p < off).last();
+            let prev = nls.iter().copied().rfind(|&p| p < off);
             assert_eq!(b.next_newline(off), next, "next_newline({off})");
             assert_eq!(b.prev_newline(off), prev, "prev_newline({off})");
         }
@@ -891,12 +891,10 @@ mod tests {
                 }
                 8 => {
                     // typing run
-                    let mut at = r.below(len + 1);
-                    for _ in 0..10 {
+                    for at in (r.below(len + 1)..).take(10) {
                         let t = text(&mut r, 1);
                         b.insert(at, &t);
                         model.splice(at as usize..at as usize, t);
-                        at += 1;
                     }
                 }
                 _ => {

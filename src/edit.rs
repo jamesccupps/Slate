@@ -1064,6 +1064,60 @@ fn bracket_partner(doc: &Document, at: u64, open: u8, close: u8, forward: bool) 
     None
 }
 
+/// The brackets around `a..b` (a selection, or a caret where they're equal): the nearest pair whose opening bracket is
+/// before `a` and whose closing one is at or after `b`, looking up to `BRACKET_REACH` back. As for
+/// `matching_bracket`, a pair is `(`, `[` or `{` with its own closing one, and brackets in strings and comments count.
+pub fn enclosing_brackets(doc: &Document, a: u64, b: u64) -> Option<(u64, u64)> {
+    const CHUNK: u64 = 64 << 10;
+    const PAIRS: [(u8, u8); 3] = [(b'(', b')'), (b'[', b']'), (b'{', b'}')];
+    let start = a.saturating_sub(BRACKET_REACH);
+    // (closing brackets met on the way back, each kind on its own: the opening ones they pair with are skipped)
+    let mut depth = [0u64; 3];
+    let mut end = a;
+    while end > start {
+        let s = end.saturating_sub(CHUNK).max(start);
+        for (i, &c) in doc.read(s, end).iter().enumerate().rev() {
+            let Some(k) = PAIRS.iter().position(|&(o, cl)| c == o || c == cl) else { continue };
+            if c == PAIRS[k].1 {
+                depth[k] += 1;
+            } else if depth[k] > 0 {
+                depth[k] -= 1;
+            } else {
+                let o = s + i as u64;
+                // (a pair that ends inside the selection, or one never closed: the next one out)
+                if let Some(q) = bracket_partner(doc, o, PAIRS[k].0, PAIRS[k].1, true).filter(|&q| q >= b) {
+                    return Some((o, q));
+                }
+            }
+        }
+        end = s;
+    }
+    None
+}
+
+/// Edit → Go to matching bracket (Ctrl+M): where the caret goes. From a bracket next to it (the one before it
+/// first, as `matching_bracket`), to the same side of the one it pairs with: after it when the caret was after this
+/// one, else before it, so pressing it again comes back. With no bracket next to it, to the closing bracket of the
+/// pair around it.
+pub fn bracket_jump(doc: &Document, caret: u64) -> Option<u64> {
+    if let Some((p, q)) = matching_bracket(doc, caret) {
+        return Some(if p < caret { q + 1 } else { q });
+    }
+    enclosing_brackets(doc, caret, caret).map(|(_, q)| q)
+}
+
+/// Edit → Select inside brackets (Ctrl+Shift+M): what to select. Inside the pair at the caret (the one
+/// `matching_bracket` highlights) or around the selection; when that's selected already, the brackets too; then
+/// inside the next pair out, and so on.
+pub fn bracket_select(doc: &Document, a: u64, b: u64) -> Option<(u64, u64)> {
+    let at = if a == b { matching_bracket(doc, a).map(|(p, q)| (p.min(q), p.max(q))) } else { None };
+    let (o, c) = match at {
+        Some(pair) => pair,
+        None => enclosing_brackets(doc, a, b)?,
+    };
+    Some(if (a, b) == (o + 1, c) { (o, c + 1) } else { (o + 1, c) })
+}
+
 /// `pos`, moved back to the start of the character it falls in (and to the `\r` of a `\r\n`): a place from another
 /// version of the text (a reopened tab, the session) never splits a character or a line break.
 pub fn char_start(doc: &Document, pos: u64) -> u64 {
@@ -1564,9 +1618,7 @@ fn indent_each(doc: &mut Document, sel: Sel, lines: &[u64], unit: &[u8], width: 
                 continue;
             }
             doc.insert(ls, unit);
-            if anchor > ls || (anchor == ls && !sel.is_empty() && anchor != sel.start()) {
-                anchor += unit.len() as u64;
-            } else if anchor == ls && sel.is_empty() {
+            if anchor > ls || (anchor == ls && (sel.is_empty() || anchor != sel.start())) {
                 anchor += unit.len() as u64;
             }
             if caret > ls || (caret == ls && (sel.is_empty() || caret != sel.start())) {
@@ -1777,7 +1829,7 @@ pub fn group(n: u64) -> String {
     let s = n.to_string();
     let mut out = String::new();
     for (i, c) in s.chars().enumerate() {
-        if i > 0 && (s.len() - i) % 3 == 0 {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(c);
@@ -1904,7 +1956,7 @@ pub fn char_info(doc: &Document, pos: u64, enc: text::Encoding) -> Option<String
     let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02X}")).collect::<Vec<_>>().join(" ");
     let utf8 = &bytes[..n];
     let shown = match char_name(c) {
-        Some(name) if c.is_control() || c.is_whitespace() || text::is_invisible(c) || text::is_bidi_control(c) || c >= '\u{200B}' && c <= '\u{200F}' => name.to_string(),
+        Some(name) if c.is_control() || c.is_whitespace() || text::is_invisible(c) || text::is_bidi_control(c) || ('\u{200B}'..='\u{200F}').contains(&c) => name.to_string(),
         Some(name) => format!("{c}  {name}"),
         None => c.to_string(),
     };
@@ -2089,7 +2141,7 @@ mod tests {
         assert_eq!(block_at(&d, d.len(), 4), Ok(Block::at(1, 5)));
         // more than COPY_MAX of a block isn't copied
         let lines = (COPY_MAX / 1000) as usize + 2;
-        let d = Document::from_text(&vec![b'y'; 1000].iter().copied().chain([b'\n']).cycle().take(lines * 1001).collect::<Vec<u8>>());
+        let d = Document::from_text(&vec![b'y'; 1000].iter().copied().chain(*b"\n").cycle().take(lines * 1001).collect::<Vec<u8>>());
         assert_eq!(block_text(&d, &Block { anchor: (0, 0), caret: (lines as u64 - 1, 1000) }, 4, b"\n"), Err(TOO_MUCH_TEXT));
         assert_eq!(block_text(&d, &Block { anchor: (0, 0), caret: (2, 2) }, 4, b"\n"), Ok(b"yy\nyy\nyy".to_vec()));
     }
@@ -2469,6 +2521,37 @@ mod tests {
         assert_eq!(matching_bracket(&d, 0), None);
         assert_eq!(matching_bracket(&d, 1), Some((1, 3)));
         assert_eq!(matching_bracket(&d, 2), Some((1, 3)));
+    }
+
+    #[test]
+    fn brackets_are_gone_to_and_selected() {
+        //                           0123456789012345678901
+        let d = Document::from_text(b"f(a, [b, c], {d: (e)})");
+        // next to a bracket: to the same side of its partner, and back
+        assert_eq!(bracket_jump(&d, 2), Some(22));
+        assert_eq!(bracket_jump(&d, 22), Some(2));
+        assert_eq!(bracket_jump(&d, 1), Some(21));
+        // inside a pair: its closing bracket
+        assert_eq!(bracket_jump(&d, 7), Some(10));
+        assert_eq!(bracket_jump(&d, 15), Some(20));
+        // inside, then the brackets too, then the next pair out
+        assert_eq!(bracket_select(&d, 7, 7), Some((6, 10)));
+        assert_eq!(bracket_select(&d, 6, 10), Some((5, 11)));
+        assert_eq!(bracket_select(&d, 5, 11), Some((2, 21)));
+        assert_eq!(bracket_select(&d, 2, 21), Some((1, 22)));
+        assert_eq!(bracket_select(&d, 1, 22), None);
+        // a selection running out of a pair: the pair around all of it
+        assert_eq!(bracket_select(&d, 7, 16), Some((2, 21)));
+        // the caret at a bracket: that pair
+        assert_eq!(bracket_select(&d, 18, 18), Some((18, 19)));
+        assert_eq!(bracket_select(&d, 13, 13), Some((14, 20)));
+        // none
+        let d = Document::from_text(b"no brackets) here");
+        assert_eq!(bracket_jump(&d, 3), None);
+        assert_eq!(bracket_select(&d, 3, 3), None);
+        // a pair left open is passed over
+        let d = Document::from_text(b"[ ( x ]");
+        assert_eq!(enclosing_brackets(&d, 4, 4), Some((0, 6)));
     }
 
     #[test]

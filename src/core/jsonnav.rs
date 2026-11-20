@@ -301,7 +301,7 @@ fn add_child(items: &mut Vec<Child>, lv: &mut Level, s: u64, e: u64) {
         items.truncate(w);
         lv.sparse = true;
     }
-    if !lv.sparse || lv.count % STRIDE == 0 {
+    if !lv.sparse || lv.count.is_multiple_of(STRIDE) {
         items.push(Child { start: s, end: e, key_back, key_len });
     }
     lv.count += 1;
@@ -814,7 +814,7 @@ pub fn key_text(raw: &[u8]) -> String {
     if !inner.contains(&b'\\') {
         return String::from_utf8_lossy(inner).into_owned();
     }
-    let hex = |s: Option<&[u8]>| s.and_then(|s| std::str::from_utf8(s).ok()).and_then(|h| u32::from_str_radix(h, 16).ok());
+    let hex = |s: Option<&[u8]>| s.filter(|h| h.iter().all(u8::is_ascii_hexdigit)).and_then(|s| std::str::from_utf8(s).ok()).and_then(|h| u32::from_str_radix(h, 16).ok());
     let mut out = Vec::with_capacity(inner.len());
     let mut i = 0;
     while i < inner.len() {
@@ -855,6 +855,20 @@ pub fn key_text(raw: &[u8]) -> String {
 
 /// A key as the path bar and the panel show it: line breaks and other control characters as symbols, very long
 /// keys shortened.
+/// How much of a key the path bar, the panel and Go to line read: a key of hundreds of MB (in a file made for it) was
+/// read whole, twice, each time the caret's path was worked out. A longer one is cut, with "…".
+pub const KEY_READ_MAX: u64 = 16 << 10;
+
+/// The text of the key at `a..b` (with its quotes), read up to `KEY_READ_MAX`.
+pub fn key_at(src: &dyn Chunked, a: u64, b: u64) -> String {
+    if b - a <= KEY_READ_MAX {
+        return key_text(&src.bytes(a, b));
+    }
+    let mut s = key_text(&src.bytes(a, a + KEY_READ_MAX));
+    s.push('…');
+    s
+}
+
 pub fn key_label(key: &str) -> String {
     let mut s = String::new();
     for (n, c) in key.chars().enumerate() {
@@ -902,7 +916,7 @@ pub fn path_at(
         if !single_root {
             let key = match again {
                 Some(s) => s.key.clone(),
-                None => c.key_range().map(|(a, b)| key_text(&src.bytes(a, b))),
+                None => c.key_range().map(|(a, b)| key_at(src, a, b)),
             };
             path.push(Step { index: i, key, start: c.start, end: c.end, parent: open, ord: 0 });
         }
@@ -965,6 +979,17 @@ mod tests {
     use super::*;
     use crate::core::document::Document;
     use std::collections::HashMap;
+
+    #[test]
+    fn a_huge_key_is_read_only_so_far() {
+        let key = "k".repeat(100_000);
+        let d = doc(&format!("{{\"{key}\": 1}}"));
+        let k = key_at(&d, 1, 3 + key.len() as u64);
+        assert!(k.ends_with('…'));
+        assert_eq!(k.chars().count(), KEY_READ_MAX as usize);
+        let d = doc("{\"name\": 1}");
+        assert_eq!(key_at(&d, 1, 7), "name");
+    }
 
     fn doc(s: &str) -> Document {
         Document::from_text(s.as_bytes())
@@ -1094,7 +1119,7 @@ mod tests {
             self.0.len() as u64
         }
         fn chunked(&self, a: u64, b: u64, f: &mut dyn FnMut(&[u8]) -> bool) -> bool {
-            self.0[a as usize..b as usize].chunks(self.1).all(|c| f(c))
+            self.0[a as usize..b as usize].chunks(self.1).all(f)
         }
     }
 
@@ -1175,7 +1200,7 @@ mod tests {
     fn random_json(r: &mut u64, depth: u32, out: &mut String) {
         let ws = |n: u64, out: &mut String| {
             for _ in 0..(n % 3) {
-                out.push(if n % 2 == 0 { ' ' } else { '\n' });
+                out.push(if n.is_multiple_of(2) { ' ' } else { '\n' });
             }
         };
         let k = rnd(r) % if depth > 4 { 4 } else { 7 };

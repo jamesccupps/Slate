@@ -852,6 +852,9 @@ pub fn window(application: &gtk4::Application, test: Option<Rc<testmode::Test>>)
     }
     app.disk_notify = Some(disk_notifier());
     session::restore(&mut app, test.is_none());
+    if test.is_none() {
+        app::prune_handed(&app);
+    }
     if app.tabs.is_empty() {
         app.new_untitled();
     }
@@ -1580,6 +1583,8 @@ fn commands() -> Vec<(&'static str, Cmd, &'static [&'static str])> {
         ("replace-one", Cmd::ReplaceOne, &[]),
         ("replace-all", Cmd::ReplaceAll, &["<Control><Alt>Return"]),
         ("goto-line", Cmd::GotoLine, &["<Control>g"]),
+        ("goto-bracket", Cmd::GoToBracket, &["<Control>m"]),
+        ("select-brackets", Cmd::SelectBrackets, &["<Control><Shift>m"]),
         ("toggle-comment", Cmd::ToggleComment, &["<Control>slash"]),
         ("duplicate-line", Cmd::DuplicateLine, &["<Control>d"]),
         ("delete-line", Cmd::DeleteLine, &["<Control><Shift>k"]),
@@ -1625,6 +1630,7 @@ fn commands() -> Vec<(&'static str, Cmd, &'static [&'static str])> {
         ("clear-highlights", Cmd::ClearHighlights, &[]),
         ("spell-check", Cmd::SpellCheck, &[]),
         ("title-bar-tabs", Cmd::TitleBarTabs, &[]),
+        ("close-with-last-tab", Cmd::CloseWithLastTab, &[]),
         ("suggest-0", Cmd::Suggestion(0), &[]),
         ("suggest-1", Cmd::Suggestion(1), &[]),
         ("suggest-2", Cmd::Suggestion(2), &[]),
@@ -1693,7 +1699,7 @@ fn mono_families(ctx: &pango::Context, current: &str) -> Vec<String> {
 
 /// Menu items that show a check mark: their actions have a true/false state (`Ui::sync_menu`).
 const CHECKED: &[&str] =
-    &["wrap", "line-numbers", "show-whitespace", "spell-check", "title-bar-tabs", "theme-system", "theme-light", "theme-dark", "eol-lf", "eol-crlf", "read-only", "restore-session", "structure-panel", "path-bar"];
+    &["wrap", "line-numbers", "show-whitespace", "spell-check", "title-bar-tabs", "close-with-last-tab", "theme-system", "theme-light", "theme-dark", "eol-lf", "eol-crlf", "read-only", "restore-session", "structure-panel", "path-bar"];
 
 fn actions(ui: &Rc<Ui>) {
     // (in place of the window's own "win" group: menus and shortcuts find these the same way)
@@ -1847,6 +1853,7 @@ fn menu_model(recent: &gio::Menu, format_extra: &gio::Menu, view_extra: &gio::Me
     edit.append_section(None, &section(&[("Undo", "undo"), ("Redo", "redo")]));
     edit.append_section(None, &section(&[("Cut", "cut"), ("Copy", "copy"), ("Paste", "paste"), ("Select all", "select-all")]));
     edit.append_section(None, &section(&[("Find…", "find"), ("Replace…", "replace"), ("Find next", "find-next"), ("Find previous", "find-prev"), ("Go to line…", "goto-line")]));
+    edit.append_section(None, &section(&[("Go to matching bracket", "goto-bracket"), ("Select inside brackets", "select-brackets")]));
     let marks = section(&[("Toggle bookmark", "toggle-bookmark"), ("Next bookmark", "next-bookmark"), ("Previous bookmark", "prev-bookmark")]);
     marks.append_section(None, &section(&[("Clear bookmarks", "clear-bookmarks")]));
     edit.append_submenu(Some("Bookmarks"), &marks);
@@ -1866,6 +1873,7 @@ fn menu_model(recent: &gio::Menu, format_extra: &gio::Menu, view_extra: &gio::Me
             ("Show whitespace", "show-whitespace"),
             ("Spell check", "spell-check"),
             ("Tabs in the title bar", "title-bar-tabs"),
+            ("Close Slate with the last tab", "close-with-last-tab"),
             ("Character at the caret", "char-info"),
         ]),
     );
@@ -2051,6 +2059,9 @@ const SHORTCUTS: &str = "Slate keyboard shortcuts
   Alt+L                    Show only the lines with a match, in a tab of their own
                            (Enter or a double-click there goes to the line in the file)
   Ctrl+G                   Go to line
+  Ctrl+M                   Go to the matching bracket (again: back)
+  Ctrl+Shift+M             Select inside brackets (again: the brackets too, then the pair
+                           around them)
   Ctrl+F2                  Bookmark the line (or take the bookmark off)
   F2 / Shift+F2            Next / previous bookmark
   Ctrl+/                   Toggle comment
@@ -2359,6 +2370,9 @@ impl Ui {
         if button == 2 {
             // Linux: the middle button pastes what was selected last (anywhere), where it's clicked
             let pos = self.with(|a| a.with_view(&g, |v, cx| v.pos_at(cx, x, y))).unwrap_or(0);
+            // (the text comes later: dropped if by then another tab is shown or the text changed, where `pos` may be
+            // past the end or somewhere else)
+            let Some((tab, version)) = self.with(|a| (a.tab().id, a.tab().doc.version)) else { return };
             let primary = gdk::Display::default().map(|d| d.primary_clipboard());
             if let (Some(cb), None) = (primary, &self.test) {
                 glib::spawn_future_local(async move {
@@ -2366,8 +2380,10 @@ impl Ui {
                         if let Some(ui) = get_ui() {
                             let t = t.to_string();
                             ui.with(|a| {
-                                a.tab_mut().view.sel = Sel::at(pos);
-                                a.paste_text(&t);
+                                if a.tab().id == tab && a.tab().doc.version == version {
+                                    a.tab_mut().view.sel = Sel::at(pos);
+                                    a.paste_text(&t);
+                                }
                             });
                         }
                     }
@@ -2611,7 +2627,7 @@ impl Ui {
                 return;
             }
             (Some(chrome::TabPart::Tab(i)) | Some(chrome::TabPart::Close(i)), 2) | (Some(chrome::TabPart::Close(i)), 1) => {
-                self.with(|a| a.close_tab(i));
+                self.with(|a| a.close_tab_by_user(i));
             }
             (Some(chrome::TabPart::Plus), 1) => {
                 self.with(|a| a.exec(Cmd::NewTab));
@@ -3027,6 +3043,7 @@ impl Ui {
             ("path-bar", a.settings.path_bar),
             ("spell-check", a.settings.spell_check),
             ("title-bar-tabs", a.settings.tabs_in_title_bar),
+            ("close-with-last-tab", a.settings.close_with_last_tab),
             ("theme-system", theme == ThemeMode::System),
             ("theme-light", theme == ThemeMode::Light),
             ("theme-dark", theme == ThemeMode::Dark),
@@ -3451,6 +3468,23 @@ impl Ui {
                     },
                 );
             }
+            Ask::Access { tab, path, encoding, close_after } => {
+                let Some(title) = self.app.borrow().index_of(tab).map(|i| self.app.borrow().tabs[i].title()) else { return };
+                let ask = Ask::Access { tab, path, encoding, close_after };
+                self.dialog(
+                    &format!("Saving would change who can read {title}"),
+                    "This file has an access list (ACL) or a group that limits who may read it, and Slate couldn't give \
+                     it to the new copy (the file system or a security policy refused). Saved anyway, the file keeps \
+                     only its plain permissions, so people it keeps out now might be able to read it. Nothing has been \
+                     changed yet.",
+                    &[("Cancel", "cancel"), ("Save anyway", "access")],
+                    move |answer: &str| {
+                        if let Some(ui) = get_ui() {
+                            ui.answer(ask.clone(), answer);
+                        }
+                    },
+                );
+            }
             Ask::GotoLine => self.goto_dialog(),
             Ask::Quit => self.try_quit(),
             Ask::About => {
@@ -3691,6 +3725,17 @@ impl Ui {
                     let Some(i) = a.index_of(tab) else { return };
                     if answer == "owner" {
                         a.tabs[i].owner_ok = Some(path.clone());
+                        a.start_save(i, path, encoding, close_after, false);
+                    } else {
+                        a.quitting = false;
+                    }
+                });
+            }
+            Ask::Access { tab, path, encoding, close_after } => {
+                self.with(|a| {
+                    let Some(i) = a.index_of(tab) else { return };
+                    if answer == "access" {
+                        a.tabs[i].access_ok = Some(path.clone());
                         a.start_save(i, path, encoding, close_after, false);
                     } else {
                         a.quitting = false;

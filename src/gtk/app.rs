@@ -46,6 +46,8 @@ pub enum Ask {
     Lossy { tab: u64, path: PathBuf, encoding: Encoding, close_after: bool },
     /// Saving would change who owns the file (`fileio::owner_kept`): save anyway?
     Owner { tab: u64, path: PathBuf, encoding: Encoding, close_after: bool },
+    /// The new file couldn't get the old one's access list or group (`SaveError::Access`): save anyway?
+    Access { tab: u64, path: PathBuf, encoding: Encoding, close_after: bool },
     GotoLine,
     /// Quit once the unsaved tabs that can't be kept are dealt with.
     Quit,
@@ -97,6 +99,9 @@ pub enum Cmd {
     ReplaceAll,
     CloseFind,
     GotoLine,
+    /// Edit → Go to matching bracket (Ctrl+M) and Select inside brackets (Ctrl+Shift+M).
+    GoToBracket,
+    SelectBrackets,
     ToggleComment,
     DuplicateLine,
     DeleteLine,
@@ -142,6 +147,8 @@ pub enum Cmd {
     ClearHighlights,
     SpellCheck,
     TitleBarTabs,
+    /// View → Close Slate with the last tab (`Settings::close_with_last_tab`).
+    CloseWithLastTab,
     /// The spell check menu's suggestion (`App::spell_word`).
     Suggestion(u8),
     AddWord,
@@ -279,6 +286,8 @@ pub struct Tab {
     pub notice_save_as: bool,
     /// The file the user said to save even though it changes who owns it (`Ask::Owner`).
     pub owner_ok: Option<PathBuf>,
+    /// The file the user said to save even though its access list or group couldn't be kept (`Ask::Access`).
+    pub access_ok: Option<PathBuf>,
     /// Line (and column) to go to once the document is there (`slate file.txt:120`).
     pub goto: Option<(u64, u64)>,
     /// What was last seen on disk (a change already told about isn't told again).
@@ -427,6 +436,9 @@ pub struct App {
     pub focused: bool,
     /// Files of tabs closed lately, for Reopen closed tab.
     pub closed: Vec<PathBuf>,
+    /// The only tab, which the user is closing with View → Close Slate with the last tab on: once it's gone (after
+    /// its question, or its save), Slate quits (`remove_tab`).
+    pub quit_with_tab: Option<u64>,
     /// The system wants dark (when the theme follows it).
     pub system_dark: bool,
     /// The desktop's high contrast is on (then Slate is drawn in `Theme::high_contrast_fixed`).
@@ -481,13 +493,15 @@ pub struct App {
 }
 
 fn now_text() -> String {
-    // (local time without a time zone library: what `date` gives)
-    std::process::Command::new("date")
-        .arg("+%H:%M %Y-%m-%d")
-        .output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default()
+    // (local time, as `date +"%H:%M %Y-%m-%d"` gives it, without starting a program and waiting for it)
+    unsafe {
+        let t = libc::time(std::ptr::null_mut());
+        let mut tm: libc::tm = std::mem::zeroed();
+        if libc::localtime_r(&t, &mut tm).is_null() {
+            return String::new();
+        }
+        format!("{:02}:{:02} {:04}-{:02}-{:02}", tm.tm_hour, tm.tm_min, tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday)
+    }
 }
 
 impl App {
@@ -508,6 +522,7 @@ impl App {
             caret_on: true,
             focused: true,
             closed: Vec::new(),
+            quit_with_tab: None,
             system_dark,
             system_hc: false,
             dirty_view: true,
@@ -631,6 +646,7 @@ impl App {
             notice: None,
             notice_save_as: false,
             owner_ok: None,
+            access_ok: None,
             goto: None,
             seen_disk: None,
             backup: None,
@@ -1523,6 +1539,7 @@ impl App {
         let p = path.clone();
         let damaged = (tab.doc.bad_units > 0 || tab.doc.suspect) && !lossy_ok;
         let owner_ok = tab.owner_ok.as_deref() == Some(path.as_path());
+        let access_ok = tab.access_ok.as_deref() == Some(path.as_path());
         let job = Job::spawn(snap.len(), notify, move |ctx| {
             if damaged {
                 return Err(SaveError::Lossy);
@@ -1530,7 +1547,7 @@ impl App {
             if !owner_ok && !fileio::owner_kept(&p) {
                 return Err(SaveError::Owner);
             }
-            fileio::save(&snap, &p, encoding, bom, lossy_ok, ctx)
+            fileio::save(&snap, &p, encoding, bom, lossy_ok, access_ok, ctx)
         });
         let doc = tab.doc.id();
         tab.save = Some(SaveTask { job, state, version, doc, path, encoding, close_after });
@@ -1606,6 +1623,10 @@ impl App {
                 let tab = self.tabs[i].id;
                 self.asks.push(Ask::Owner { tab, path: st.path, encoding: st.encoding, close_after: st.close_after });
             }
+            Err(SaveError::Access) => {
+                let tab = self.tabs[i].id;
+                self.asks.push(Ask::Access { tab, path: st.path, encoding: st.encoding, close_after: st.close_after });
+            }
             Err(SaveError::Cancelled) => {
                 self.flash("Saving was cancelled.", false);
                 self.quitting = false;
@@ -1627,6 +1648,14 @@ impl App {
 
     /// Closes tab `i`: right away when it has nothing unsaved (or the session keeps its text: no, a closed tab's
     /// text isn't kept anywhere, so unsaved changes are asked about).
+    /// Ctrl+W, a tab's ×: `close_tab`; with View → Close Slate with the last tab on, Slate quits once the only tab is
+    /// gone (after its question, or its save).
+    pub fn close_tab_by_user(&mut self, i: usize) {
+        let last = self.settings.close_with_last_tab && self.tabs.len() == 1;
+        self.quit_with_tab = self.tabs.get(i).filter(|_| last).map(|t| t.id);
+        self.close_tab(i);
+    }
+
     pub fn close_tab(&mut self, i: usize) {
         if i >= self.tabs.len() {
             return; // (an index from the tab strip as it was last drawn)
@@ -1689,6 +1718,7 @@ impl App {
 
     pub fn remove_tab(&mut self, i: usize) {
         let tab = self.tabs.remove(i);
+        let id = tab.id;
         if !self.waits.is_empty() {
             self.tab_gone(tab.id);
         }
@@ -1709,6 +1739,10 @@ impl App {
         }
         if self.tabs.is_empty() {
             self.new_untitled();
+            // (the user closed the last tab, and Slate goes with it: View → Close Slate with the last tab)
+            if self.quit_with_tab.take() == Some(id) && self.settings.close_with_last_tab {
+                self.asks.push(Ask::Quit);
+            }
         }
         self.keep_shown(i);
         self.session_dirty = true;
@@ -2188,7 +2222,7 @@ impl App {
                     }
                 }
             }
-            Cmd::CloseTab => self.close_tab(self.active),
+            Cmd::CloseTab => self.close_tab_by_user(self.active),
             Cmd::ReopenClosed => {
                 if let Some(p) = self.closed.pop() {
                     self.open_paths(&[p]);
@@ -2414,12 +2448,16 @@ impl App {
                 self.settings.spell_check = !self.settings.spell_check;
                 self.settings.save();
             }
+            Cmd::CloseWithLastTab => {
+                self.settings.close_with_last_tab = !self.settings.close_with_last_tab;
+                self.settings.save();
+            }
             Cmd::TitleBarTabs => {
                 // (GTK makes a window's title bar as it's shown: the next start has it)
                 self.settings.tabs_in_title_bar = !self.settings.tabs_in_title_bar;
                 self.settings.save();
                 let where_ = if self.settings.tabs_in_title_bar { "in the title bar" } else { "under the menu bar" };
-                self.flash(&format!("The tabs go {where_} from the next start."), false);
+                self.flash(format!("The tabs go {where_} from the next start."), false);
             }
             Cmd::Suggestion(i) => self.spell_replace(i as usize),
             Cmd::AddWord | Cmd::IgnoreWord => {
@@ -2492,6 +2530,25 @@ impl App {
                 let caret = tab.view.sel.caret;
                 edit::toggle_mark(&mut tab.view.bookmarks, &tab.doc, caret);
                 self.session_dirty = true;
+            }
+            Cmd::GoToBracket | Cmd::SelectBrackets => {
+                let tab = &mut self.tabs[self.active];
+                let sel = tab.view.sel;
+                let to = if cmd == Cmd::GoToBracket {
+                    edit::bracket_jump(&tab.doc, sel.caret).map(Sel::at)
+                } else {
+                    edit::bracket_select(&tab.doc, sel.start(), sel.end()).map(|(a, b)| Sel::new(a, b))
+                };
+                match to {
+                    Some(s) => {
+                        tab.view.block = None;
+                        tab.view.sel = s;
+                        tab.view.want_x = None;
+                        tab.doc.seal();
+                        self.reveal_pending = true;
+                    }
+                    None => self.flash("No brackets around the caret.", false),
+                }
             }
             Cmd::NextBookmark | Cmd::PrevBookmark => {
                 let tab = &mut self.tabs[self.active];
@@ -3587,6 +3644,24 @@ impl App {
 /// sends it, or doesn't, themselves).
 /// A file standard input's text was put in (`mod::run_request`: `handed/stdin-<token>.txt`), opened as a file
 /// because it was too big to read into memory.
+/// What's left in the data folder's `handed` folder for over a day: text piped in (`slate -`) and `--wait` marks that
+/// the Slate meant to take them never did (it was closing, the hand-over was lost, the sender was killed between the
+/// write and the hand-over). Piped text can be a secret (`pass show x | slate -`), so it doesn't stay; a file an open
+/// tab reads (big piped text, opened as the file it's in) is kept. Run at the start, after the session is back.
+pub fn prune_handed(app: &App) {
+    const DAY: u64 = 24 * 3600;
+    let Ok(rd) = std::fs::read_dir(crate::settings::data_dir().join("handed")) else { return };
+    for e in rd.flatten() {
+        let p = e.path();
+        let ours = e.file_name().to_str().is_some_and(|n| n.starts_with("stdin-") || n.starts_with("wait-"));
+        let old = e.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|a| a.as_secs() > DAY);
+        let open = app.tabs.iter().any(|t| t.doc.path.as_deref() == Some(p.as_path()));
+        if ours && old && !open && e.file_type().is_ok_and(|t| t.is_file()) {
+            let _ = std::fs::remove_file(&p);
+        }
+    }
+}
+
 fn handed_text(p: &Path) -> bool {
     p.parent() == Some(crate::settings::data_dir().join("handed").as_path())
         && p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("stdin-"))

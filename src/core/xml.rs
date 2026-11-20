@@ -156,6 +156,10 @@ pub const NOT_UTF8: &str =
 /// Check: an XML declaration that isn't at the very start.
 const LATE_DECLARATION: &str = "The XML declaration (<?xml ...?>) can only be at the very start of the file";
 const MAX_WS: usize = 1 << 20;
+/// A tag's or attribute's name longer than this stops Check and Format: they keep the names of the open elements and
+/// the tag's attributes, and a "name" of hundreds of MB (in a file made for it) would be copied into memory.
+const NAME_MAX: usize = 64 << 10;
+const NAME_TOO_LONG: &str = "A tag or attribute name longer than 64 KB (Slate stops here)";
 /// A tag's attribute names compared with each other directly up to this many; past it, by their hashes first.
 const ATTRS_COMPARED: usize = 16;
 /// Deeper elements aren't indented any further, so absurdly deep input can't turn into gigabytes of spaces.
@@ -595,6 +599,14 @@ impl<'w> Formatter<'w> {
                         St::AttrName => self.attrs.extend_from_slice(name),
                         _ => self.end.extend_from_slice(name),
                     }
+                    let long = match self.st {
+                        St::StartName => self.names.len() - self.stack.last().map_or(0, |&(s, _)| s),
+                        St::AttrName => self.attrs.len() - self.attr,
+                        _ => self.end.len(),
+                    };
+                    if long > NAME_MAX {
+                        return Err(err(self.mark, NAME_TOO_LONG));
+                    }
                     if self.st != St::EndName {
                         self.emit(name);
                     }
@@ -903,6 +915,28 @@ fn feed_all(snap: &Snapshot, mut f: Formatter, ctx: &Ctx) -> Result<XmlStats, Xm
 mod tests {
     use super::*;
 
+    /// `SLATE_XML_FILE=<file> cargo test --release --lib xml_format_speed -- --ignored --nocapture`: how long Check,
+    /// Format and Minify take on a big XML file in memory (the output thrown away), the best of five.
+    #[test]
+    #[ignore]
+    fn xml_format_speed() {
+        let Some(p) = std::env::var_os("SLATE_XML_FILE") else { return };
+        let mut d = crate::core::document::Document::from_text(&std::fs::read(p).unwrap());
+        let snap = d.snapshot();
+        let ctx = crate::core::job::Ctx { cancel: Default::default(), progress: Default::default() };
+        for mode in [Mode::Validate, Mode::Pretty, Mode::Minify] {
+            let best = (0..5)
+                .map(|_| {
+                    let t = std::time::Instant::now();
+                    let mut sink = std::io::sink();
+                    run(&snap, mode, b"  ", b"\n", Some(&mut sink), None, &ctx).unwrap();
+                    t.elapsed().as_secs_f64() * 1000.0
+                })
+                .fold(f64::MAX, f64::min);
+            println!("xml {mode:?}: {best:.1} ms");
+        }
+    }
+
     /// Runs `mode` over `input` fed in pieces of `step` bytes.
     fn feed(mode: Mode, input: &str, step: usize) -> Result<(String, XmlStats), XmlError> {
         let mut out = Vec::new();
@@ -914,6 +948,18 @@ mod tests {
             f.finish()?
         };
         Ok((String::from_utf8(out).unwrap(), stats))
+    }
+
+    #[test]
+    fn a_huge_name_stops_check_and_format() {
+        let name = "a".repeat(70_000);
+        for input in [format!("<{name}/>"), format!("<r {name}=\"1\"/>"), format!("<r></{name}>")] {
+            for mode in [Mode::Validate, Mode::Pretty] {
+                let e = feed(mode, &input, 4096).unwrap_err();
+                assert_eq!(e.msg, NAME_TOO_LONG);
+            }
+        }
+        assert!(feed(Mode::Validate, &format!("<{}/>", "a".repeat(60_000)), 4096).is_ok());
     }
 
     /// Runs `mode` over `input` in one piece and byte by byte, which must give the same result.

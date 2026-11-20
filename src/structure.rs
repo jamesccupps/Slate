@@ -266,8 +266,8 @@ impl Structure {
         if self.rows_lost {
             return None;
         }
-        let s = self.since_rows.iter().try_fold(start, |p, c| start_after(p, c))?;
-        let e = self.since_rows.iter().try_fold(end, |p, c| end_after(p, c))?;
+        let s = self.since_rows.iter().try_fold(start, start_after)?;
+        let e = self.since_rows.iter().try_fold(end, end_after)?;
         (s < e && e <= doc.len()).then_some((s, e))
     }
 
@@ -279,7 +279,7 @@ impl Structure {
             return;
         }
         let since = &self.since_rows;
-        let now = |p: u64| since.iter().try_fold(p, |p, c| start_after(p, c));
+        let now = |p: u64| since.iter().try_fold(p, start_after);
         let mut r = Reopen::default();
         // the container start of each depth on the way (a range's rows are inside it)
         let mut containers: Vec<Option<u64>> = Vec::new();
@@ -462,8 +462,12 @@ impl Structure {
             let part = &parts[k];
             let found = match part {
                 PathPart::Index(i) => ch.get(&*doc, *i).filter(|_| !ch.is_object || self.xml),
-                PathPart::Key(key) if ch.is_object => find_child(&ch, doc, |c| c.key_range().is_some_and(|(a, b)| jsonnav::key_text(&doc.read(a, b)) == *key)),
+                PathPart::Key(key) if ch.is_object => find_child(&ch, doc, |c| c.key_range().is_some_and(|(a, b)| jsonnav::key_at(&*doc, a, b) == *key)),
                 PathPart::Key(_) => None,
+                // (all the children have one name: the nth is the nth child, without reading every name before it)
+                PathPart::Elem(name, ord) if ch.same_names => {
+                    ch.get(&*doc, ord - 1).filter(|c| xmlnav::name_at(&*doc, c.start) == *name)
+                }
                 PathPart::Elem(name, ord) => {
                     let mut n = 0;
                     find_child(&ch, doc, |c| {
@@ -656,7 +660,7 @@ impl Structure {
             let ((kind, preview), name) = if self.xml {
                 (xmlnav::preview(&*doc, &c, 80), Some(xmlnav::name_at(&*doc, c.start)))
             } else {
-                (jsonnav::preview(&*doc, &c, 80), c.key_range().map(|(ka, kb)| jsonnav::key_text(&doc.read(ka, kb))))
+                (jsonnav::preview(&*doc, &c, 80), c.key_range().map(|(ka, kb)| jsonnav::key_at(&*doc, ka, kb)))
             };
             let (label, is_key) = match &name {
                 Some(k) => (jsonnav::key_label(k), true),
@@ -842,6 +846,11 @@ fn parse_xpath(text: &str) -> Option<Vec<PathPart>> {
         if name.is_empty() || name.contains(char::is_whitespace) {
             return None;
         }
+        // (`*[n]`: the nth child, whatever its name, as Copy XML path writes it in a huge list of mixed names)
+        if name == "*" {
+            out.push(PathPart::Index(ord - 1));
+            continue;
+        }
         out.push(PathPart::Elem(name.to_string(), ord));
     }
     Some(out)
@@ -865,6 +874,14 @@ fn size_text(n: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn copied_xpaths_are_read_back() {
+        // (`*[n]`: what Copy XML path writes for a step in a huge list of mixed names)
+        assert_eq!(parse_xpath("/rows/*[130002]"), Some(vec![PathPart::Elem("rows".into(), 1), PathPart::Index(130001)]));
+        assert_eq!(parse_xpath("/catalog/book[3]"), Some(vec![PathPart::Elem("catalog".into(), 1), PathPart::Elem("book".into(), 3)]));
+        assert_eq!(parse_xpath("/rows/*[0]"), None);
+    }
     use crate::core::document::{EditKind, Sel};
 
     fn notify() -> Notify {

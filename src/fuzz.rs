@@ -1,6 +1,10 @@
 //! Hostile files (`cargo test --release --lib fuzz -- --ignored --nocapture`): random and mutated text through every
-//! language's lexer (whole, and in two pieces as coloring does), JSON and XML Check and Format, and the structure
-//! panel's scans and paths. A panic is reported with its input. An input that keeps one step busy for 10 s (a loop
+//! language's lexer (whole, and in pieces as coloring does: in three at line breaks it must end in the state lexing
+//! it whole does), JSON and XML Check and Format, the structure panel's scans and paths, CSV Check and Sort by column,
+//! the line tools, search (the input's own bytes as a plain and a regex query), encoding detection and the UTF-16 and
+//! ANSI codecs (UTF-16 there and back must give the text back), how the text is drawn and stepped through, Convert's
+//! decoders (Base64 and URL encoding there and back), EditorConfig's globs and settings.json. A panic, or a property
+//! that doesn't hold, is reported with its input. An input that keeps one step busy for 10 s (a loop
 //! that doesn't end: a file that would freeze the window) stops the run, its bytes written to `slate-fuzz-hang.bin`
 //! in the temp folder. `SLATE_FUZZ_ROUNDS` sets how many inputs (default 2000), `SLATE_FUZZ_SEED` where they start.
 
@@ -9,10 +13,14 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::core::csv::{self, Dialect};
 use crate::core::document::Document;
 use crate::core::job::Ctx;
 use crate::core::json::{self, Mode};
 use crate::core::jsonnav::{self, Children};
+use crate::core::lines::{self, LineOp};
+use crate::core::search::{self, Matcher, Query};
+use crate::core::text::{self, AnsiDecoder, AnsiEncoder, Utf16Decoder, Utf16Encoder};
 use crate::core::{xml, xmlnav};
 use crate::highlight::{self, Lang, State};
 
@@ -85,8 +93,10 @@ fn path(doc: &Document, offset: u64, is_xml: bool) {
     }
 }
 
-/// Everything a file goes through, one step at a time (`step` says which, for a report).
-fn work(data: &[u8], step: &Mutex<String>, ticks: &AtomicU64) {
+/// Everything a file goes through, one step at a time (`step` says which, for a report). Returns the properties that
+/// didn't hold.
+fn work(data: &[u8], step: &Mutex<String>, ticks: &AtomicU64) -> Vec<String> {
+    let mut wrong = Vec::new();
     let mut spans = Vec::new();
     let at = |what: String| {
         *step.lock().unwrap() = what;
@@ -102,6 +112,22 @@ fn work(data: &[u8], step: &Mutex<String>, ticks: &AtomicU64) {
             let _ = highlight::lex(lang, &data[cut + 1..], st, None);
         }
         let _ = highlight::guess(lang, data, true);
+    }
+    // (in three pieces, each after a line break: the state at the end is the one lexing it whole ends in)
+    let breaks: Vec<usize> = memchr::memchr_iter(b'\n', data).collect();
+    if breaks.len() >= 2 {
+        let (c1, c2) = (breaks[breaks.len() / 3] + 1, breaks[breaks.len() * 2 / 3] + 1);
+        if c1 < c2 {
+            for &lang in Lang::ALL.iter() {
+                at(format!("lexing as {} in three pieces", lang.label()));
+                let whole = highlight::lex(lang, data, State::START, None);
+                let s = highlight::lex(lang, &data[..c1], State::START, None);
+                let s = highlight::lex(lang, &data[c1..c2], s, None);
+                if highlight::lex(lang, &data[c2..], s, None) != whole {
+                    wrong.push(format!("lexing as {} in three pieces (cut at {c1} and {c2}) ends elsewhere", lang.label()));
+                }
+            }
+        }
     }
     let mut doc = Document::from_text(data);
     let snap = doc.snapshot();
@@ -121,6 +147,87 @@ fn work(data: &[u8], step: &Mutex<String>, ticks: &AtomicU64) {
             path(&doc, offset, is_xml);
         }
     }
+    for d in [Dialect { sep: b',', strict: true }, Dialect { sep: b';', strict: true }, Dialect { sep: b'\t', strict: false }] {
+        at(format!("CSV Check with {:?}", d.sep as char));
+        let _ = csv::check_bytes(data, d);
+        at(format!("CSV Sort by column with {:?}", d.sep as char));
+        for (col, desc, day_first) in [(0, false, true), (1, true, false)] {
+            let _ = csv::sort_by_column(data, d, col, desc, day_first, true, &mut |_| Ok(()));
+        }
+    }
+    let _ = csv::sniff(data);
+    for op in [LineOp::SortAsc, LineOp::SortDesc, LineOp::Dedupe, LineOp::RemoveBlank, LineOp::TrimTrailing] {
+        at(format!("lines {op:?}"));
+        let _ = lines::apply(op, data);
+    }
+    // (queries from the input itself, so they match somewhere: its start, and a piece from its middle)
+    let mid = data.len() / 2;
+    for q in [&data[..data.len().min(1 + data.len() % 12)], &data[mid..data.len().min(mid + 1 + mid % 7)]] {
+        let q = String::from_utf8_lossy(q).into_owned();
+        for (regex, match_case, whole_word) in [(false, false, false), (false, true, true), (true, false, false), (true, true, true)] {
+            at(format!("search {q:?}, regex {regex}, case {match_case}, word {whole_word}"));
+            if let Ok(m) = Matcher::new(&Query { text: q.clone(), match_case, whole_word, regex }) {
+                let _ = search::count_all(&m, &snap, &ctx);
+            }
+        }
+    }
+    at("encodings".into());
+    let _ = text::detect_encoding(data, false);
+    let _ = text::detect_eol(data);
+    let _ = text::ansi_fits(data, false);
+    for be in [false, true] {
+        let decode = |bytes: &[u8]| {
+            let (mut d, mut out) = (Utf16Decoder::new(be), Vec::new());
+            d.push(bytes, &mut out);
+            d.finish(&mut out);
+            out
+        };
+        let utf8 = decode(data);
+        let (mut e, mut back) = (Utf16Encoder::new(be), Vec::new());
+        e.push(&utf8, &mut back);
+        e.finish(&mut back);
+        if decode(&back) != utf8 {
+            wrong.push(format!("UTF-16 ({}) there and back changes the text", if be { "big-endian" } else { "little-endian" }));
+        }
+    }
+    let (mut d, mut ansi) = (AnsiDecoder::new(), Vec::new());
+    d.push(data, &mut ansi);
+    d.finish(&mut ansi);
+    let (mut e, mut back) = (AnsiEncoder::new(), Vec::new());
+    e.push(&ansi, &mut back);
+    e.finish(&mut back);
+    let _ = text::ansi_round_trips(&ansi, data);
+    let _ = text::utf8_to_ansi(data);
+    at("display".into());
+    let (mut out, mut map) = (Vec::new(), Vec::new());
+    text::decode_display(data, &mut out, &mut map);
+    if map.len() != out.len() + 1 {
+        wrong.push("decode_display's map isn't one longer than its text".into());
+    }
+    let mut i = 0;
+    while i < data.len() {
+        i += text::cluster_len_at(&data[i..]).max(1);
+    }
+    let _ = text::cluster_len_before(data);
+    let _ = text::backspace_len(data);
+    at("Convert".into());
+    let _ = crate::convert::json_unescape(data);
+    let _ = crate::convert::base64_decode(data);
+    let _ = crate::convert::url_decode(data);
+    if crate::convert::base64_decode(&crate::convert::base64_encode(data)).ok().as_deref() != Some(data) {
+        wrong.push("Base64 there and back changes the bytes".into());
+    }
+    if crate::convert::url_decode(crate::convert::url_encode(data).as_bytes()).ok().as_deref() != Some(data) {
+        wrong.push("URL encoding there and back changes the bytes".into());
+    }
+    at("EditorConfig globs".into());
+    let glob = String::from_utf8_lossy(&data[..data.len().min(300)]).into_owned();
+    for name in ["a", "b2.txt", "src/main.rs", "x/y/z.json", ".editorconfig"] {
+        let _ = crate::editorconfig::glob_match(&glob, name);
+    }
+    at("settings.json".into());
+    let _ = crate::settings::Settings::from_json(data);
+    wrong
 }
 
 #[test]
@@ -151,17 +258,24 @@ fn fuzz_hostile_files() {
     }
     let mut r = Rng(seed | 1);
     let mut panics = Vec::new();
+    let mut wrong = Vec::new();
     let mut bytes = 0usize;
     for i in 0..rounds {
         let data = input(&mut r);
         bytes += data.len();
         *current.lock().unwrap() = data.clone();
-        if catch_unwind(AssertUnwindSafe(|| work(&data, &step, &ticks))).is_err() {
-            let file = std::env::temp_dir().join(format!("slate-fuzz-panic-{i}.bin"));
-            let _ = std::fs::write(&file, &data);
-            panics.push(format!("{} ({})", step.lock().unwrap(), file.display()));
+        match catch_unwind(AssertUnwindSafe(|| work(&data, &step, &ticks))) {
+            Ok(w) if w.is_empty() => {}
+            r => {
+                let file = std::env::temp_dir().join(format!("slate-fuzz-{i}.bin"));
+                let _ = std::fs::write(&file, &data);
+                match r {
+                    Ok(w) => wrong.extend(w.into_iter().map(|w| format!("{w} ({})", file.display()))),
+                    Err(_) => panics.push(format!("{} ({})", step.lock().unwrap(), file.display())),
+                }
+            }
         }
     }
-    eprintln!("{rounds} inputs, {} MB, {} panics", bytes >> 20, panics.len());
-    assert!(panics.is_empty(), "{panics:#?}");
+    eprintln!("{rounds} inputs, {} MB, {} panics, {} properties that didn't hold", bytes >> 20, panics.len(), wrong.len());
+    assert!(panics.is_empty() && wrong.is_empty(), "{panics:#?}\n{wrong:#?}");
 }

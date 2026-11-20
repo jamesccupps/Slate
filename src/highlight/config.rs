@@ -1279,9 +1279,9 @@ pub(super) fn gcode_line(l: &[u8], _col0: bool, bol: bool, o: &mut Out) {
                 i = e;
             }
             b'#' => {
-                // #100, #<_name>
+                // #100, #<_name> (its `>` looked for only so far: a line of `#<#<#<…` searched to its end at each one)
                 let e = if at(l, i + 1) == b'<' {
-                    l[i..].iter().position(|&b| b == b'>').map_or(i + 1, |p| i + p + 1)
+                    l[i..].iter().take(256).position(|&b| b == b'>').map_or(i + 1, |p| i + p + 1)
                 } else {
                     i + 1 + l[i + 1..].iter().take_while(|b| b.is_ascii_digit()).count()
                 };

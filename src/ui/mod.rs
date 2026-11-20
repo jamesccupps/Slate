@@ -467,6 +467,14 @@ fn handle(cell: &Cell, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<L
                     a.apply_theme();
                 }
             }
+            // (Underline access keys: read again whatever changed, as not every way of switching it says which)
+            if let Ok(mut a) = cell.try_borrow_mut() {
+                let cues = actions::keyboard_cues();
+                if cues != a.keyboard_cues {
+                    a.keyboard_cues = cues;
+                    a.invalidate();
+                }
+            }
             None
         }
         WM_SYSCOLORCHANGE | WM_THEMECHANGED => {
@@ -1096,6 +1104,8 @@ fn slate_window(class: PCWSTR) -> Option<HWND> {
 pub fn register_class() -> HINSTANCE {
     unsafe {
         let hinst: HINSTANCE = GetModuleHandleW(None).map(|h| h.into()).unwrap_or_default();
+        // (MAKEINTRESOURCE(1): the icon's id in a pointer, never read, so not `ptr::dangling`)
+        #[allow(clippy::manual_dangling_ptr)]
         let icon = LoadImageW(hinst, PCWSTR(1 as *const u16), IMAGE_ICON, 0, 0, LR_DEFAULTSIZE | LR_SHARED)
             .map(|h| HICON(h.0))
             .unwrap_or_default();

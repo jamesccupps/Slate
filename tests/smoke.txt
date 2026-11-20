@@ -99,3 +99,22 @@ expect:uia-range=second line
 print:uia-events
 key:right
 expect:uia-events=selection
+# Ctrl+M goes to the matching bracket and back; Ctrl+Shift+M selects inside the brackets, then the brackets too
+cmd:NewTab
+type:f(a, [b, c])
+key:ctrl+home
+key:right
+key:right
+key:ctrl+m
+expect:sel=12..12
+key:ctrl+m
+expect:sel=2..2
+key:right
+key:right
+key:right
+key:right
+key:right
+key:ctrl+shift+m
+expect:sel=6..10
+key:ctrl+shift+m
+expect:sel=5..11

@@ -65,7 +65,7 @@ pub mod json_path {
         Some(std::ffi::OsString::from_vec(b?).into())
     }
 
-    pub fn serialize<S: Serializer>(p: &PathBuf, s: S) -> Result<S::Ok, S::Error> {
+    pub fn serialize<S: Serializer>(p: &Path, s: S) -> Result<S::Ok, S::Error> {
         repr(p).serialize(s)
     }
 
@@ -361,7 +361,10 @@ mod imp {
             return None;
         }
         let st = unsafe { st.assume_init() };
-        Some((st.f_bavail as u64).saturating_mul(st.f_frsize as u64))
+        // (the fields' types differ by system: 32 bits on some)
+        #[allow(clippy::unnecessary_cast)]
+        let free = (st.f_bavail as u64).saturating_mul(st.f_frsize as u64);
+        Some(free)
     }
 
     /// Whether the process `pid` is still running.
@@ -413,11 +416,37 @@ mod imp {
         }
     }
 
-    /// Whether dates are written day first (31/12/2026), from the locale's name (LC_ALL, LC_TIME, LANG): month first
-    /// only in the United States' English (and where the locale says nothing).
+    /// Whether dates are written day first (31/12/2026): the locale's own date format (LC_TIME's `D_FMT`: `%d.%m.%Y`
+    /// yes; `%m/%d/%y` and year first, `%Y-%m-%d`, no). Where that locale isn't installed, from its name (LC_ALL,
+    /// LC_TIME, LANG): month first only in the United States' English, and where the locale says nothing.
     pub fn day_first() -> bool {
+        let fmt = unsafe {
+            let loc = libc::newlocale(libc::LC_TIME_MASK, c"".as_ptr(), std::ptr::null_mut());
+            if loc.is_null() {
+                None
+            } else {
+                let f = libc::nl_langinfo_l(libc::D_FMT, loc);
+                let fmt = (!f.is_null()).then(|| std::ffi::CStr::from_ptr(f).to_bytes().to_vec());
+                libc::freelocale(loc);
+                fmt
+            }
+        };
+        if let Some(day) = fmt.as_deref().and_then(day_before_month) {
+            return day;
+        }
         let locale = ["LC_ALL", "LC_TIME", "LANG"].iter().find_map(|v| std::env::var(v).ok().filter(|s| !s.is_empty()));
         locale.is_some_and(|l| !(l.starts_with("en_US") || l == "C" || l.starts_with("C.") || l == "POSIX"))
+    }
+
+    /// A `strftime` date format: whether the day (`%d`, `%e`) comes before the month (`%m`, `%b`); None if it has
+    /// neither.
+    pub fn day_before_month(fmt: &[u8]) -> Option<bool> {
+        let at = |keys: &[u8]| fmt.windows(2).position(|w| w[0] == b'%' && keys.contains(&w[1]));
+        // (`%x` or `%D`: the format of the C locale, month first)
+        if at(b"D").is_some() {
+            return Some(false);
+        }
+        Some(at(b"de")? < at(b"mbB")?)
     }
 
     /// Why a read failed, in a few words, where it's about the file rather than the system's own message.
@@ -428,5 +457,21 @@ mod imp {
             }
             _ => None,
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    #[test]
+    fn the_date_order_is_read_from_the_format() {
+        use super::imp::day_before_month as d;
+        assert_eq!(d(b"%d.%m.%Y"), Some(true));
+        assert_eq!(d(b"%d/%m/%y"), Some(true));
+        assert_eq!(d(b"%e %b %Y"), Some(true));
+        assert_eq!(d(b"%m/%d/%Y"), Some(false));
+        assert_eq!(d(b"%Y-%m-%d"), Some(false));
+        assert_eq!(d(b"%Y\xe5\xb9\xb4%m\xe6\x9c\x88%d\xe6\x97\xa5"), Some(false));
+        assert_eq!(d(b"%D"), Some(false));
+        assert_eq!(d(b"%x"), None);
     }
 }

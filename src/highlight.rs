@@ -1492,7 +1492,7 @@ fn csv(t: &[u8], st: State, sep: u8, o: &mut Out) -> State {
     let mut q = st.a;
     let mut field = 0;
     let put = |o: &mut Out, s: usize, e: usize, col: u16| {
-        if col % 8 != 0 {
+        if !col.is_multiple_of(8) {
             o.put(s, e, Tok::Col((col % 8) as u8));
         }
     };

@@ -3,7 +3,7 @@
 //! show the system's print dialog and draw the pages (`ui::print` with GDI, `gtk::print` with cairo and Pango).
 
 use crate::core::buffer::Snapshot;
-use crate::core::text::{decode_char, display_char, is_continuation};
+use crate::core::text::{decode_char, display_char_in, is_continuation};
 use crate::highlight::{self, Lang, State, Tok};
 
 /// Documents up to this size are colored as in the editor, each line in the state the line before it ended in; in
@@ -222,16 +222,18 @@ impl Builder {
             self.fresh = false;
         }
         let mut k = 0;
+        let mut flag = false;
         while k < text.len() {
             let (c, n) = decode_char(&text[k..]);
             let tok = toks[k];
             if c == '\t' {
+                flag = false;
                 let tab = self.shape.tab;
                 for _ in 0..tab - self.line_col % tab {
                     self.add(' ', 1, tok)?;
                 }
             } else {
-                let d = display_char(c);
+                let d = display_char_in(c, &mut flag);
                 self.add(d, width(d), tok)?;
             }
             k += n;

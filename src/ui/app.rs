@@ -597,8 +597,14 @@ pub struct App {
     pub disk_job: Option<Job<Vec<DiskCheck>>>,
     /// Typing replaces the character after the caret (Insert toggles it).
     pub overtype: bool,
+    /// Windows' *Underline access keys* (Settings → Accessibility → Keyboard; `actions::keyboard_cues`): the menu
+    /// bar's letters are underlined all the time, not only while Alt has given it the keyboard.
+    pub keyboard_cues: bool,
     /// Tabs closed recently (with a file), the last one closed last; Ctrl+Shift+T opens them again.
     pub closed_tabs: Vec<ClosedTab>,
+    /// The only tab, which the user is closing with View → Close Slate with the last tab on: once it's gone (after
+    /// its question, or its save), Slate closes (`remove_tab`).
+    pub quit_with_tab: Option<u64>,
     /// `slate --wait`: an event to set once all of its tabs are closed (`Opts::wait`).
     pub waits: Vec<(String, Vec<u64>)>,
     /// The printer and its settings chosen last (File → Print).
@@ -730,7 +736,9 @@ impl App {
             flash_search: false,
             disk_job: None,
             overtype: false,
+            keyboard_cues: super::actions::keyboard_cues(),
             closed_tabs: Vec::new(),
+            quit_with_tab: None,
             waits: Vec::new(),
             print_last: Default::default(),
             highlights: Vec::new(),
@@ -1429,8 +1437,9 @@ impl App {
             } else if self.hover == Hit::Menu(i) || self.menu_armed == Some(i) {
                 g.fill_round(*r, 5.0, t.hover);
             }
-            if self.menu_armed.is_some() {
-                // The keyboard is on the menu bar: underline the letter that opens each menu.
+            if self.menu_armed.is_some() || self.keyboard_cues {
+                // The keyboard is on the menu bar (or Windows says to show it always): underline the letter that opens
+                // each menu.
                 let l = g.layout(&super::gfx::wide(MENU_TITLES[i]), &self.fonts.ui, r.w, r.h);
                 unsafe {
                     let _ = l.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);

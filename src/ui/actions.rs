@@ -396,6 +396,7 @@ impl App {
             return;
         }
         let t = self.tabs.remove(i);
+        let id = t.id;
         if !self.waits.is_empty() {
             self.tab_gone(t.id);
         }
@@ -412,6 +413,10 @@ impl App {
         }
         if self.tabs.is_empty() {
             self.new_untitled();
+            // (the user closed the last tab, and Slate goes with it: View → Close Slate with the last tab)
+            if self.quit_with_tab.take() == Some(id) && self.settings.close_with_last_tab {
+                self.pending.push(Deferred::Cmd(Cmd::Exit));
+            }
         }
         if self.active > i || self.active >= self.tabs.len() {
             self.active = self.active.saturating_sub(1).min(self.tabs.len() - 1);
@@ -1158,7 +1163,7 @@ impl App {
             if damaged {
                 return Err(SaveError::Lossy);
             }
-            fileio::save(&saving, &p, encoding, bom, lossy_ok, ctx)
+            fileio::save(&saving, &p, encoding, bom, lossy_ok, false, ctx)
         });
         let doc = tab.doc.id();
         tab.save = Some(SaveTask { job, state, version, snap, doc, path, encoding, close_after, again: false });
@@ -1687,7 +1692,7 @@ impl App {
                     }
                     SaveError::ReadOnly => "This file is read-only, so it couldn't be saved.".to_string(),
                     // (Linux only)
-                    SaveError::Owner => format!("Couldn't save: {e}"),
+                    SaveError::Owner | SaveError::Access => format!("Couldn't save: {e}"),
                     SaveError::Io(m) => format!("Couldn't save: {m}"),
                 };
                 self.tabs[i].notice = Some(Notice {
@@ -4331,6 +4336,25 @@ impl App {
             Cmd::Find => self.open_find(BarMode::Find),
             Cmd::Replace => self.open_find(BarMode::Replace),
             Cmd::GoToLine => self.open_find(BarMode::GoTo),
+            Cmd::GoToBracket | Cmd::SelectBrackets => {
+                let tab = self.tab();
+                let sel = tab.view.sel;
+                let to = if cmd == Cmd::GoToBracket {
+                    crate::edit::bracket_jump(&tab.doc, sel.caret).map(Sel::at)
+                } else {
+                    crate::edit::bracket_select(&tab.doc, sel.start(), sel.end()).map(|(a, b)| Sel::new(a, b))
+                };
+                match to {
+                    Some(sel) => {
+                        let tab = self.tab_mut();
+                        tab.view.sel = sel;
+                        tab.view.upstream = false;
+                        tab.view.want_x = None;
+                        self.after_move();
+                    }
+                    None => self.flash("No brackets around the caret.", false),
+                }
+            }
             Cmd::FindNext => self.find_next(true),
             Cmd::FindPrev => self.find_next(false),
             Cmd::DuplicateLine | Cmd::DeleteLine | Cmd::MoveLineUp | Cmd::MoveLineDown | Cmd::Indent | Cmd::Outdent => {
@@ -4390,6 +4414,10 @@ impl App {
                 self.settings.tabs_in_title_bar = !self.settings.tabs_in_title_bar;
                 self.settings_changed();
                 self.sync_frame();
+            }
+            Cmd::ToggleCloseWithLastTab => {
+                self.settings.close_with_last_tab = !self.settings.close_with_last_tab;
+                self.settings_changed();
             }
             Cmd::Suggestion(i) => self.spell_replace(i as usize),
             Cmd::AddWord | Cmd::IgnoreWord => {
@@ -4957,6 +4985,9 @@ impl App {
                 item(Cmd::FindPrev, "Find pre&vious", "Shift+F3"),
                 item(Cmd::Replace, "R&eplace…", "Ctrl+H"),
                 item(Cmd::GoToLine, "&Go to line…", "Ctrl+G"),
+                item(Cmd::GoToBracket, "Go to matching &bracket", "Ctrl+M"),
+                // (no letter: every one in it is another item's)
+                item(Cmd::SelectBrackets, "Select inside brackets", "Ctrl+Shift+M"),
                 sub(
                     "Boo&kmarks",
                     vec![
@@ -5020,6 +5051,7 @@ impl App {
                     check(Cmd::ToggleLineNumbers, "&Line numbers", "", s.line_numbers),
                     check(Cmd::ToggleWhitespace, "Show w&hitespace", "", s.show_whitespace),
                     check(Cmd::ToggleTitleBarTabs, "&Tabs in the title bar", "", s.tabs_in_title_bar && !self.theme.hc),
+                    check(Cmd::ToggleCloseWithLastTab, "Close Slate with the last ta&b", "", s.close_with_last_tab),
                     check(Cmd::ToggleSpellCheck, if matches!(self.speller, Spelling::Unavailable) { "Spell chec&k (Windows has no dictionary for it)" } else { "Spell chec&k" }, "", s.spell_check),
                     item(Cmd::CharInfo, "&Character at the caret", ""),
                     Item::Sep,
@@ -5223,6 +5255,20 @@ pub fn caret_moved() {
     CARET_SINCE.with(|c| c.set(Some(Instant::now())));
 }
 
+/// Windows' *Underline access keys* setting (SPI_GETKEYBOARDCUES): menu letters underlined all the time.
+pub fn keyboard_cues() -> bool {
+    let mut on = windows::Win32::Foundation::BOOL(0);
+    let got = unsafe {
+        SystemParametersInfoW(
+            windows::Win32::UI::WindowsAndMessaging::SPI_GETKEYBOARDCUES,
+            0,
+            Some(&mut on as *mut _ as *mut _),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+    };
+    got.is_ok() && on.as_bool()
+}
+
 /// How long the caret blinks after it last moved: Windows' setting (SPI_GETCARETTIMEOUT), 5 s unless changed.
 fn caret_timeout() -> Duration {
     let mut ms = 0u32;
@@ -5326,7 +5372,14 @@ thread_local! {
 }
 
 /// Message filter during menu tracking: Left/Right and hovering move between the menu bar's menus.
+// (a panic can't unwind out of a call from Windows: caught, logged by the panic hook, and the message passed on)
 unsafe extern "system" fn menu_hook(code: i32, wp: windows::Win32::Foundation::WPARAM, lp: windows::Win32::Foundation::LPARAM) -> windows::Win32::Foundation::LRESULT {
+    use windows::Win32::UI::WindowsAndMessaging::{CallNextHookEx, HHOOK};
+    std::panic::catch_unwind(|| unsafe { menu_message(code, wp, lp) })
+        .unwrap_or_else(|_| unsafe { CallNextHookEx(HHOOK::default(), code, wp, lp) })
+}
+
+unsafe fn menu_message(code: i32, wp: windows::Win32::Foundation::WPARAM, lp: windows::Win32::Foundation::LPARAM) -> windows::Win32::Foundation::LRESULT {
     use windows::Win32::UI::WindowsAndMessaging::{CallNextHookEx, EndMenu, HHOOK, MSG, MSGF_MENU, WM_KEYDOWN, WM_MOUSEMOVE};
     if code == MSGF_MENU as i32 {
         let msg = unsafe { &*(lp.0 as *const MSG) };
@@ -5828,11 +5881,14 @@ pub fn run_cmd(cell: &Cell, cmd: Cmd) {
                 }
             }
         }
-        Cmd::CloseTab => {
-            let i = cell.borrow().active;
-            close_tab(cell, i);
-        }
-        Cmd::CloseTabAt(i) => {
+        Cmd::CloseTab | Cmd::CloseTabAt(_) => {
+            let i = if let Cmd::CloseTabAt(i) = cmd { i } else { cell.borrow().active };
+            {
+                // (the only tab, with View → Close Slate with the last tab on: Slate closes once it's gone)
+                let mut a = cell.borrow_mut();
+                let last = a.settings.close_with_last_tab && a.tabs.len() == 1;
+                a.quit_with_tab = a.tabs.get(i).filter(|_| last).map(|t| t.id);
+            }
             close_tab(cell, i);
         }
         Cmd::CloseOthers | Cmd::CloseRight => {
@@ -5976,7 +6032,7 @@ fn ask_lossy(cell: &Cell, id: u64) {
         let hwnd = a.hwnd;
         let Some(t) = a.tabs.iter_mut().find(|t| t.id == id) else { return };
         let Some(ask) = t.ask_lossy.take() else { return };
-        let damaged = (t.doc.bad_units > 0).then(|| (t.doc.bad_units, t.doc.encoding));
+        let damaged = (t.doc.bad_units > 0).then_some((t.doc.bad_units, t.doc.encoding));
         let suspect = t.doc.suspect;
         (hwnd, t.title(), ask, damaged, suspect)
     };

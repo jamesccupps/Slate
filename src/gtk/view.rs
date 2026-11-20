@@ -287,9 +287,11 @@ pub fn display_text(bytes: &[u8]) -> (String, Vec<u32>) {
     let mut out = String::with_capacity(bytes.len());
     let mut map = Vec::with_capacity(bytes.len() + 1);
     let mut i = 0;
+    let mut flag = false;
     while i < bytes.len() {
         let b = bytes[i];
         let (c, n) = if b < 0x80 {
+            flag = false;
             let c = match b {
                 b'\t' => '\t',
                 0x00..=0x1F => char::from_u32(0x2400 + b as u32).unwrap(),
@@ -301,7 +303,7 @@ pub fn display_text(bytes: &[u8]) -> (String, Vec<u32>) {
             let n = text::char_len_at(&bytes[i..]).max(1);
             match std::str::from_utf8(&bytes[i..i + n]).ok().and_then(|s| s.chars().next()) {
                 // (line separators and invisible characters as their symbols, as on Windows)
-                Some(c) => (text::display_char(c), n),
+                Some(c) => (text::display_char_in(c, &mut flag), n),
                 None => ('\u{FFFD}', 1),
             }
         };

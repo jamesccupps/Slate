@@ -150,8 +150,8 @@ pub fn detect_encoding(sample: &[u8], truncated: bool) -> (Encoding, usize) {
 /// for opening it and for `io::looks_binary` alike.
 fn utf16_mostly(sample: &[u8], n: usize, be: bool) -> bool {
     let (mut bad, mut high) = (0, false);
-    for p in sample[..n].chunks_exact(2) {
-        let u = if be { u16::from_be_bytes([p[0], p[1]]) } else { u16::from_le_bytes([p[0], p[1]]) };
+    for p in sample[..n].as_chunks::<2>().0 {
+        let u = if be { u16::from_be_bytes(*p) } else { u16::from_le_bytes(*p) };
         let low = (0xDC00..0xE000).contains(&u);
         bad += (high != low) as usize;
         high = (0xD800..0xDC00).contains(&u);
@@ -333,8 +333,8 @@ impl Utf16Decoder {
             self.emit(self.unit(b, input[0]), out);
             input = &input[1..];
         }
-        let pairs = input.chunks_exact(2);
-        if let [b] = pairs.remainder() {
+        let (pairs, rest) = input.as_chunks::<2>();
+        if let [b] = rest {
             self.odd = Some(*b);
         }
         for p in pairs {
@@ -656,7 +656,7 @@ fn cp1252_char(b: u8) -> char {
 #[cfg(windows)]
 fn single_byte_windows(cp: u32) -> Option<Arc<SingleByte>> {
     let mut info = CPINFO::default();
-    let t = (unsafe { GetCPInfo(cp, &mut info) }.is_ok() && info.MaxCharSize == 1).then(|| {
+    (unsafe { GetCPInfo(cp, &mut info) }.is_ok() && info.MaxCharSize == 1).then(|| {
         let mut t = SingleByte { utf8: [[0; 4]; 256], back: Vec::new(), same: [false; 256], default: info.DefaultChar[0] };
         for b in 0..=255u8 {
             let s = ansi_to_utf8_cp(&[b], cp);
@@ -672,8 +672,7 @@ fn single_byte_windows(cp: u32) -> Option<Arc<SingleByte>> {
         t.back.sort_unstable();
         t.back.dedup_by_key(|e| e.0);
         Arc::new(t)
-    });
-    t
+    })
 }
 
 impl SingleByte {
@@ -976,16 +975,37 @@ pub fn display_char(c: char) -> char {
     }
 }
 
+/// `display_char`, knowing what came before: a tag character (U+E0000–U+E007F: invisible copies of ASCII, which can
+/// hide text that a program reading the file sees and a person reading the screen doesn't, "ASCII smuggling") shows
+/// as ▯ too, except in an emoji flag's sequence after U+1F3F4 (England, Scotland, Wales). `in_flag` carries that
+/// from one character to the next (false at a line's start).
+pub fn display_char_in(c: char, in_flag: &mut bool) -> char {
+    let tag = is_tag(c);
+    let d = if tag && !*in_flag { '\u{25AF}' } else { display_char(c) };
+    *in_flag = c == '\u{1F3F4}' || (*in_flag && tag && c != '\u{E007F}');
+    d
+}
+
+/// A tag character (U+E0000–U+E007F; see `display_char_in`).
+pub fn is_tag(c: char) -> bool {
+    ('\u{E0000}'..='\u{E007F}').contains(&c)
+}
+
 // (the ranges `display_char` looks in first: most characters are past them, or before)
 const INVISIBLE_A: char = '\u{AD}';
-const INVISIBLE_Z: char = '\u{FEFF}';
+const INVISIBLE_Z: char = '\u{FFA0}';
 const BIDI_A: char = '\u{61C}';
 const BIDI_Z: char = '\u{2069}';
 
 /// A character with no width that changes what a text means: a zero-width space, a word joiner, a byte order mark
-/// (inside the text: one at its start is the file's), a soft hyphen, the Mongolian vowel separator.
+/// (inside the text: one at its start is the file's), a soft hyphen, the Mongolian vowel separator, the invisible
+/// operators of mathematics (U+2061–U+2064), and the Hangul fillers, which show as blank and pass for letters in
+/// names.
 pub fn is_invisible(c: char) -> bool {
-    matches!(c, '\u{AD}' | '\u{180E}' | '\u{200B}' | '\u{2060}' | '\u{FEFF}')
+    matches!(
+        c,
+        '\u{AD}' | '\u{115F}' | '\u{1160}' | '\u{180E}' | '\u{200B}' | '\u{2060}'..='\u{2064}' | '\u{3164}' | '\u{FEFF}' | '\u{FFA0}'
+    )
 }
 
 /// A space that looks like an ordinary one but isn't: non-breaking (also narrow), the fixed-width spaces of
@@ -1003,8 +1023,9 @@ pub fn is_bidi_control(c: char) -> bool {
 /// `map[i]` is the byte offset of UTF-16 unit `i`; `map` gets one extra entry for the end.
 pub fn decode_display(bytes: &[u8], out: &mut Vec<u16>, map: &mut Vec<u32>) {
     fn push_str(s: &str, base: usize, out: &mut Vec<u16>, map: &mut Vec<u32>) {
+        let mut flag = false;
         for (k, c) in s.char_indices() {
-            let c = display_char(c);
+            let c = display_char_in(c, &mut flag);
             let mut buf = [0u16; 2];
             for u in c.encode_utf16(&mut buf) {
                 out.push(*u);
@@ -1070,9 +1091,14 @@ fn is_extend(u: u32) -> bool {
         0x0610..=0x061A | 0x064B..=0x065F | 0x0670 | 0x06D6..=0x06DC | 0x06DF..=0x06E4 | 0x06E7..=0x06E8 => true,
         0x06EA..=0x06ED | 0x0E31 | 0x0E34..=0x0E3A | 0x0E47..=0x0E4E | 0x0EB1 | 0x0EB4..=0x0EBC | 0x0EC8..=0x0ECD => true,
         0x1AB0..=0x1AFF | 0x1DC0..=0x1DFF | 0x200C | 0x20D0..=0x20FF | 0x3099..=0x309A | 0xFE00..=0xFE0F => true,
-        0xFE20..=0xFE2F | 0x1F3FB..=0x1F3FF | 0xE0020..=0xE007F | 0xE0100..=0xE01EF => true,
+        // (not the tag characters: only in a flag's sequence, `cluster_len_at`)
+        0xFE20..=0xFE2F | 0x1F3FB..=0x1F3FF | 0xE0100..=0xE01EF => true,
         _ => false,
     }
+}
+
+fn is_tag_u(u: u32) -> bool {
+    (0xE0000..=0xE007F).contains(&u)
 }
 
 fn is_regional(u: u32) -> bool {
@@ -1105,7 +1131,9 @@ pub fn cluster_len_at(bytes: &[u8]) -> usize {
             // a conjunct: the consonant after a virama, in the same script
             || (is_linker(prev) && u >> 7 == prev >> 7)
             // flags: regional letters go in pairs
-            || (is_regional(u) && regional % 2 == 1);
+            || (is_regional(u) && regional % 2 == 1)
+            // a flag of England, Scotland or Wales: tag characters after U+1F3F4, up to the cancel tag
+            || (is_tag(c) && first == '\u{1F3F4}' && (prev == 0x1F3F4 || (is_tag_u(prev) && prev != 0xE007F)));
         if !joins || std::str::from_utf8(&bytes[n..n + len]).is_err() {
             break;
         }
@@ -1147,6 +1175,31 @@ pub fn backspace_len(bytes: &[u8]) -> usize {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn hidden_tag_characters_show_but_flags_stay() {
+        let (mut out, mut map) = (Vec::new(), Vec::new());
+        // text hidden in tag characters after a letter: each shows, and the caret stops at each
+        let s = "a\u{E0068}\u{E0069}b";
+        super::decode_display(s.as_bytes(), &mut out, &mut map);
+        assert_eq!(String::from_utf16(&out).unwrap(), "a\u{25AF}\u{25AF}b");
+        assert_eq!(super::cluster_len_at(s.as_bytes()), 1);
+        assert_eq!(super::cluster_len_at(&s.as_bytes()[1..]), 4);
+        // England's flag: one character, drawn as it is
+        let flag = "\u{1F3F4}\u{E0067}\u{E0062}\u{E0065}\u{E006E}\u{E0067}\u{E007F}";
+        let t = format!("{flag}x\u{E0041}");
+        super::decode_display(t.as_bytes(), &mut out, &mut map);
+        assert_eq!(String::from_utf16(&out).unwrap(), format!("{flag}x\u{25AF}"));
+        assert_eq!(super::cluster_len_at(t.as_bytes()), flag.len());
+        // after the cancel tag, a tag is hidden text again
+        let u = format!("{flag}\u{E0041}");
+        super::decode_display(u.as_bytes(), &mut out, &mut map);
+        assert_eq!(String::from_utf16(&out).unwrap(), format!("{flag}\u{25AF}"));
+        // invisible operators and Hangul fillers
+        for c in ['\u{2061}', '\u{2064}', '\u{115F}', '\u{3164}', '\u{FFA0}'] {
+            assert_eq!(super::display_char(c), '\u{25AF}', "{:X}", c as u32);
+        }
+    }
+
     use super::*;
 
     #[test]

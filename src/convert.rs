@@ -168,7 +168,8 @@ pub fn url_decode(b: &[u8]) -> Result<Vec<u8>, String> {
     let mut i = 0;
     while i < b.len() {
         if b[i] == b'%' {
-            let hex = b.get(i + 1..i + 3).and_then(|h| std::str::from_utf8(h).ok()).and_then(|h| u8::from_str_radix(h, 16).ok());
+            // (only hex digits: `from_str_radix` would take `%+A` as a line feed)
+            let hex = b.get(i + 1..i + 3).filter(|h| h.iter().all(u8::is_ascii_hexdigit)).and_then(|h| std::str::from_utf8(h).ok()).and_then(|h| u8::from_str_radix(h, 16).ok());
             match hex {
                 Some(v) => {
                     out.push(v);
@@ -213,7 +214,7 @@ pub fn json_unescape(b: &[u8]) -> Result<Vec<u8>, String> {
     };
     let mut out = Vec::with_capacity(b.len());
     let bad = |i: usize| format!("That isn't a JSON string: \"{}\" at character {}", show(&b[i..]), group(i as u64 + 1));
-    let hex4 = |i: usize| b.get(i..i + 4).and_then(|h| std::str::from_utf8(h).ok()).and_then(|h| u32::from_str_radix(h, 16).ok());
+    let hex4 = |i: usize| b.get(i..i + 4).filter(|h| h.iter().all(u8::is_ascii_hexdigit)).and_then(|h| std::str::from_utf8(h).ok()).and_then(|h| u32::from_str_radix(h, 16).ok());
     let mut i = 0;
     while i < b.len() {
         if b[i] != b'\\' {
@@ -318,11 +319,10 @@ impl Sha256 {
             self.block(&block);
             self.used = 0;
         }
-        let mut blocks = b.chunks_exact(64);
-        for block in &mut blocks {
-            self.block(block.try_into().unwrap());
+        let (blocks, rest) = b.as_chunks::<64>();
+        for block in blocks {
+            self.block(block);
         }
-        let rest = blocks.remainder();
         self.buf[..rest.len()].copy_from_slice(rest);
         self.used = rest.len();
     }
@@ -336,16 +336,16 @@ impl Sha256 {
         self.update(&tail);
         self.len = len;
         let mut out = [0u8; 32];
-        for (o, h) in out.chunks_exact_mut(4).zip(self.h) {
-            o.copy_from_slice(&h.to_be_bytes());
+        for (o, h) in out.as_chunks_mut::<4>().0.iter_mut().zip(self.h) {
+            *o = h.to_be_bytes();
         }
         out
     }
 
     fn block(&mut self, block: &[u8; 64]) {
         let mut w = [0u32; 64];
-        for (i, c) in block.chunks_exact(4).enumerate() {
-            w[i] = u32::from_be_bytes(c.try_into().unwrap());
+        for (i, c) in block.as_chunks::<4>().0.iter().enumerate() {
+            w[i] = u32::from_be_bytes(*c);
         }
         for i in 16..64 {
             let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
@@ -375,6 +375,16 @@ pub fn hex(d: &[u8; 32]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_plus_is_no_hex_digit() {
+        // (`from_str_radix` takes a sign: `%+A` was a line feed, `\u+123` U+0123)
+        assert!(super::url_decode(b"%+A").is_err());
+        assert_eq!(super::url_decode(b"%0A").unwrap(), b"\n");
+        assert!(super::json_unescape(b"\\u+123").is_err());
+        assert_eq!(super::json_unescape(b"\\u0041").unwrap(), b"A");
+        assert_eq!(crate::core::jsonnav::key_text(b"\"\\u+123\""), "\\u+123");
+    }
+
     use super::*;
 
     #[test]

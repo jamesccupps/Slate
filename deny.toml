@@ -1,0 +1,17 @@
+# cargo-deny (CI's Dependencies job: `cargo deny check advisories licenses`): known security advisories in the crates
+# Cargo.lock pins, and that every crate's license is one THIRD-PARTY-NOTICES.md can honor.
+
+[graph]
+# Only what Slate is built for: the Windows exe and the Linux packages.
+targets = ["x86_64-pc-windows-gnu", "x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
+
+[advisories]
+# (RustSec's database; a vulnerability fails the check. To let one pass for a while, its id goes here with why.)
+ignore = []
+
+[licenses]
+# MIT for what's in Slate (most crates offer MIT or Apache-2.0: Slate takes MIT, as THIRD-PARTY-NOTICES.md says);
+# Unicode-3.0 for unicode-ident's tables; Apache-2.0 with the LLVM exception only for target-lexicon, which runs
+# while the Linux build is configured (system-deps) and isn't in the program.
+allow = ["MIT", "Unicode-3.0", "Apache-2.0 WITH LLVM-exception"]
+confidence-threshold = 0.9

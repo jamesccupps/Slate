@@ -1143,7 +1143,7 @@ mod tests {
                 x ^= x << 13;
                 x ^= x >> 7;
                 x ^= x << 17;
-                if x % 37 == 0 { b'\n' } else { b'a' + (x % 26) as u8 }
+                if x.is_multiple_of(37) { b'\n' } else { b'a' + (x % 26) as u8 }
             })
             .collect()
     }

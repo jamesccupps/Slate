@@ -95,6 +95,8 @@ pub struct Matcher {
 }
 
 /// A plain-text query searched more directly than through its regex, finding exactly what the regex would.
+// (one in each `Matcher`, which tabs share, and cloned seldom: boxing the regex would buy nothing)
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone)]
 enum Literal {
     /// Match case: the bytes as they are.
@@ -1665,7 +1667,7 @@ a", false),
         assert_eq!(count_all(&m, &snap, &ctx()).positions, want);
         assert_eq!(m.find_fwd(&snap, 0, snap.len(), None), want.first().copied());
         for caret in (0..=small.len() as u64).step_by(97).chain([small.len() as u64]) {
-            let before = want.iter().copied().filter(|&(_, e)| e <= caret).last();
+            let before = want.iter().copied().rfind(|&(_, e)| e <= caret);
             assert_eq!(m.find_back(&snap, 0, caret, None), before, "previous before {caret}");
         }
     }
@@ -1677,7 +1679,7 @@ a", false),
         let m = Matcher::new(&Query { regex: true, ..q("ab+a|b") }).unwrap();
         for at in 990..1020 {
             let mut text = vec![b'.'; at];
-            text.extend_from_slice(&[b'a', b'b', b'b', b'b', b'b', b'b', b'a']);
+            text.extend_from_slice(b"abbbbba");
             text.extend(std::iter::repeat_n(b'.', 600));
             let snap = fragmented(&text);
             let mut got = Vec::new();

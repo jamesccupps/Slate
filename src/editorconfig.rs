@@ -175,7 +175,7 @@ const BRACES_MAX: usize = 32;
 /// `{a,b}`, `{1..9}` (a whole number in that range), `\` to take the next character as it is. Made into one regex, as
 /// EditorConfig's own C library does: matched in time linear in the name however many braces there are (trying each
 /// choice of each `{a,b}` in turn took twice as long for each: a header of 40 never finished, on the UI thread).
-fn glob_match(glob: &str, s: &str) -> bool {
+pub(crate) fn glob_match(glob: &str, s: &str) -> bool {
     let mut re = String::from("^");
     let mut ranges = Vec::new();
     let g: Vec<char> = glob.chars().collect();
@@ -185,9 +185,9 @@ fn glob_match(glob: &str, s: &str) -> bool {
     re.push('$');
     let Ok(r) = regex::RegexBuilder::new(&re).size_limit(1 << 20).build() else { return false };
     let Some(c) = r.captures(s) else { return false };
-    // (each `{n..m}` a group: its number in range)
+    // (each `{n..m}` a group: its number in range, where it took part: one in a `{a,b}` choice not taken didn't)
     ranges.iter().enumerate().all(|(k, &(lo, hi))| {
-        c.get(k + 1).and_then(|m| m.as_str().parse::<i64>().ok()).is_some_and(|v| v >= lo && v <= hi)
+        c.get(k + 1).is_none_or(|m| m.as_str().parse::<i64>().ok().is_some_and(|v| v >= lo && v <= hi))
     })
 }
 
@@ -371,6 +371,14 @@ impl crate::core::job::Failure for Props {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_range_in_a_choice_not_taken_is_no_obstacle() {
+        assert!(super::glob_match("{a,b{1..3}}", "a"));
+        assert!(super::glob_match("{a,b{1..3}}", "b2"));
+        assert!(!super::glob_match("{a,b{1..3}}", "b5"));
+        assert!(!super::glob_match("{a,b{1..3}}", "c"));
+    }
+
     use super::*;
 
     #[test]

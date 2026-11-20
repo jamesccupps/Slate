@@ -61,20 +61,21 @@ JSON file opens instantly, scrolls smoothly, and can be searched, edited, format
   page numbers (each can be left out); long lines go on in the next row, breaking between words. Print preview
   shows the pages as they'll print, and Page setup the paper and margins. *Microsoft Print to PDF* (Windows) and
   *Print to File* (Linux) make a PDF.
-- Characters you can't see are shown: control characters as symbols (␀, ␛…), zero-width ones and a byte order mark
-  inside the text as ▯, the bidirectional controls of the "Trojan Source" trick as ⇄ (they don't reorder the text on
+- Characters you can't see are shown: control characters as symbols (␀, ␛…), zero-width ones, a byte order mark
+  inside the text and the invisible "tag" characters that can hide text in a file as ▯, the bidirectional controls of the "Trojan Source" trick as ⇄ (they don't reorder the text on
   screen); Show whitespace marks non-breaking and other look-alike spaces. *View → Character at the caret* says
   what one is (`é  U+00E9  ·  UTF-8: C3 A9`).
 - From a command line: `slate notes.txt:120` opens a file at a line, `slate --read-only file` opens it read only,
   `slate --wait file` returns once its tab is closed (`git config --global core.editor "slate --wait"`), and
   `some-command | slate -` opens what it prints in a new tab.
-- Go to line, word wrap, line numbers, show whitespace, the matching
-  bracket highlighted, overtype, zoom, dark and light themes (follows Windows, or switch with the sun/moon button).
+- Go to line, word wrap, line numbers, show whitespace, the matching bracket highlighted (Ctrl+M goes to it,
+  Ctrl+Shift+M selects inside the brackets), overtype, zoom, dark and light themes (follows Windows, or switch with the sun/moon button).
   With Windows' high contrast on, Slate uses its colors, and Magnifier follows the text cursor.
 - Tabs in the title bar, as in Windows 11's Notepad (*View → Tabs in the title bar* puts them back under it).
   Reopen closed tabs (Ctrl+Shift+T), close the other, the saved or all tabs, and a list of all tabs when they don't
-  fit. The files opened last are on the taskbar button's menu (on Linux, in the desktop's recent files). The status bar counts words and characters, and shows the language, line endings, encoding and indentation:
-  click one to change it.
+  fit; *View → Close Slate with the last tab* makes closing the only tab close Slate. The files opened last are on the taskbar button's menu (on Linux, in the desktop's recent files). The status
+  bar counts words and characters, and shows the language, line endings, encoding and indentation: click one to
+  change it.
 - Detects and keeps the encoding (UTF-8, UTF-8 with BOM, UTF-16, ANSI) and line endings (CRLF / LF). Saving as ANSI
   asks first if some characters would turn into "?".
 - Notices when another program changes an open file; reloads it automatically when you have no unsaved changes
@@ -106,6 +107,7 @@ The usual ones work as in Notepad (Ctrl+N, O, S, F, H, G, Z, Y, A, X, C, V), plu
 | Ctrl+P | Print |
 | Ctrl+D / Ctrl+Shift+K | Duplicate / delete the line |
 | Alt+Up / Alt+Down | Move the line up / down |
+| Ctrl+M / Ctrl+Shift+M | Go to the matching bracket / select inside brackets (again: the brackets too) |
 | Alt+drag, Shift+Alt+arrows | Column selection |
 | Ctrl+/ | Toggle comment |
 | Ctrl+U / Ctrl+Shift+U | lowercase / UPPERCASE |
@@ -219,7 +221,8 @@ MIT: see [LICENSE](LICENSE). The libraries built into `Slate.exe` are listed, wi
 
 ## Building
 
-Windows: needs Rust (the GNU toolchain is enough; no Visual Studio). Run `build.cmd`, which produces
+Windows: needs Rust (the GNU toolchain is enough; no Visual Studio; CI builds with the version in
+`.github/workflows/build.yml`, `RUST_VERSION`). Run `build.cmd`, which produces
 `dist\Slate.exe`. Linux: Rust and GTK 4's development files (`sudo apt install build-essential libgtk-4-dev`), then
 `cargo build --release` (`target/release/Slate`); `packaging/linux/package.sh` makes the `.deb`.
 `cargo test --lib` runs the unit tests, and `Slate.exe --test tests\smoke.txt` drives the real app in a hidden
@@ -227,4 +230,6 @@ window (set `SLATE_DATA_DIR` to an empty folder first: the smoke test writes a s
 GitHub Actions builds and tests every push to `main`, every pull request and every version tag, for Windows and for
 Linux on x86-64 and ARM64 (on Debian 12, under Xvfb:
 `tests/smoke-linux.txt`); a version tag (`v1.2.3`) drafts a release with `Slate.exe`, `Slate.exe.sha256` and the
-Linux packages attached. What's planned is in [docs/ROADMAP.md](docs/ROADMAP.md).
+Linux packages attached; CI also runs clippy (`-D warnings`) and `cargo deny` (security advisories and licenses of the
+crates). The code is formatted by hand to about 120 columns, not by rustfmt: please don't run `cargo fmt`, which
+would rewrite every file. What's planned is in [docs/ROADMAP.md](docs/ROADMAP.md).

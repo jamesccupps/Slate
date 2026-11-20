@@ -9,3 +9,17 @@ updates:
     groups:
       actions:
         patterns: ["*"]
+
+  # The Rust crates in Cargo.lock, in one pull request a month (security fixes come with Dependabot's alerts, and
+  # CI's Dependencies job turns red on a known advisory). The windows crates stay at 0.58 on purpose: newer ones link
+  # through raw-dylib, which the GNU toolchain can't (CLAUDE.md, Build).
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      crates:
+        patterns: ["*"]
+    ignore:
+      - dependency-name: windows
+      - dependency-name: windows-core

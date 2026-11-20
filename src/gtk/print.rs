@@ -151,142 +151,155 @@ pub fn run(ui: &Ui, export: Option<(PathBuf, bool)>, preview: bool) {
         b.append(&row);
         Some(b.upcast())
     });
+    // (in these three, a panic can't pass through GTK's call: it would abort, with no session written. Caught and
+    // logged by the panic hook: begin-print's cancels the printing, draw-page's leaves that page blank.)
     let j = job.clone();
     op.connect_custom_widget_apply(move |_, w| {
-        let mut j = j.borrow_mut();
-        let mut child = w.first_child();
-        let mut checks = Vec::new();
-        while let Some(c) = child {
-            if let Some(cb) = c.downcast_ref::<gtk4::CheckButton>() {
-                checks.push(cb.is_active());
-            } else if let Some(spin) = c.last_child().and_downcast::<gtk4::SpinButton>() {
-                j.margins = [(spin.value() * 100.0).round() as u32; 4];
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut j = j.borrow_mut();
+            let mut child = w.first_child();
+            let mut checks = Vec::new();
+            while let Some(c) = child {
+                if let Some(cb) = c.downcast_ref::<gtk4::CheckButton>() {
+                    checks.push(cb.is_active());
+                } else if let Some(spin) = c.last_child().and_downcast::<gtk4::SpinButton>() {
+                    j.margins = [(spin.value() * 100.0).round() as u32; 4];
+                }
+                child = c.next_sibling();
             }
-            child = c.next_sibling();
-        }
-        if let [colors, numbers, header] = checks[..] {
-            (j.colors, j.numbers, j.header) = (colors, numbers, header);
-        }
-        // (the settings from now on)
-        if let Some(ui) = get_ui() {
-            let (c, n, h, m) = (j.colors, j.numbers, j.header, j.margins);
-            ui.with(|a| {
-                let s = &mut a.settings;
-                (s.print_colors, s.print_line_numbers, s.print_header, s.print_margins) = (c, n, h, m);
-            });
-        }
+            if let [colors, numbers, header] = checks[..] {
+                (j.colors, j.numbers, j.header) = (colors, numbers, header);
+            }
+            // (the settings from now on)
+            if let Some(ui) = get_ui() {
+                let (c, n, h, m) = (j.colors, j.numbers, j.header, j.margins);
+                ui.with(|a| {
+                    let s = &mut a.settings;
+                    (s.print_colors, s.print_line_numbers, s.print_header, s.print_margins) = (c, n, h, m);
+                });
+            }
+        }));
+        let _ = r;
     });
     let j = job.clone();
     op.connect_begin_print(move |op, ctx| {
-        let mut j = j.borrow_mut();
-        let selection = op.print_settings().is_some_and(|s| s.print_pages() == gtk4::PrintPages::Selection);
-        let (from, to, line, last, line_start) = match j.sel {
-            Some((a, b, l, last, ls)) if selection => (a, b, l, last, ls),
-            _ => (0, j.len, 1, j.last_line, 0),
-        };
-        // the margins from the paper's edges (three quarters of an inch unless changed), or the printer's own if
-        // it's wider
-        let setup = ctx.page_setup();
-        let pt = |mm100: u32| mm100 as f64 * 72.0 / 2540.0;
-        let [ml, mt, mr, mb] = j.margins.map(pt);
-        let m = |want: f64, margin: f64| (want - margin).max(0.0);
-        let (w, h) = (ctx.width(), ctx.height());
-        let (left, right) = (m(ml, setup.left_margin(gtk4::Unit::Points)), w - m(mr, setup.right_margin(gtk4::Unit::Points)));
-        let (top, bottom) = (m(mt, setup.top_margin(gtk4::Unit::Points)), h - m(mb, setup.bottom_margin(gtk4::Unit::Points)));
-        let (right, bottom) = (right.max(left + 1.0), bottom.max(top + 1.0));
-        let layout = ctx.create_pango_layout();
-        let measure = |f: &pango::FontDescription| {
-            layout.set_font_description(Some(f));
-            layout.set_text("MMMMMMMMMM");
-            let (w, h) = layout.size();
-            (w as f64 / pango::SCALE as f64 / 10.0, h as f64 / pango::SCALE as f64)
-        };
-        let (normal, small) = (font(&j.font, j.size), font(&j.font, j.size * 0.85));
-        let (char_w, line_h) = measure(&normal);
-        let (_, small_h) = measure(&small);
-        let (char_w, line_h) = (char_w.max(0.5), line_h.max(1.0));
-        // the file's name, a blank line, the text, a blank line, the page's number
-        let (body_top, body_bottom) = if j.header { (top + 2.0 * small_h, bottom - 2.0 * small_h) } else { (top, bottom) };
-        let per_page = (((body_bottom - body_top) / line_h).floor() as usize).max(1);
-        let digits = if j.numbers { last.max(1).to_string().len() } else { 0 };
-        let gutter = if j.numbers { digits + 2 } else { 0 };
-        let cols = (((right - left) / char_w).floor() as usize).saturating_sub(gutter).max(1);
-        let state = print::state_at(&j.snap, j.lang, line_start, from);
-        let text = Text { snap: &j.snap, from, to, line, lang: j.lang, state };
-        match print::layout(&text, Shape { cols, rows: per_page, tab: j.tab }, &mut |_| true) {
-            Ok(Some(rows)) => {
-                let count = rows.len().div_ceil(per_page);
-                op.set_n_pages(count as i32);
-                j.pages = Some(Pages { rows, per_page, count, font: normal, small, left, right, top, bottom, body_top, line_h, small_h, char_w, digits, gutter });
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut j = j.borrow_mut();
+            let selection = op.print_settings().is_some_and(|s| s.print_pages() == gtk4::PrintPages::Selection);
+            let (from, to, line, last, line_start) = match j.sel {
+                Some((a, b, l, last, ls)) if selection => (a, b, l, last, ls),
+                _ => (0, j.len, 1, j.last_line, 0),
+            };
+            // the margins from the paper's edges (three quarters of an inch unless changed), or the printer's own if
+            // it's wider
+            let setup = ctx.page_setup();
+            let pt = |mm100: u32| mm100 as f64 * 72.0 / 2540.0;
+            let [ml, mt, mr, mb] = j.margins.map(pt);
+            let m = |want: f64, margin: f64| (want - margin).max(0.0);
+            let (w, h) = (ctx.width(), ctx.height());
+            let (left, right) = (m(ml, setup.left_margin(gtk4::Unit::Points)), w - m(mr, setup.right_margin(gtk4::Unit::Points)));
+            let (top, bottom) = (m(mt, setup.top_margin(gtk4::Unit::Points)), h - m(mb, setup.bottom_margin(gtk4::Unit::Points)));
+            let (right, bottom) = (right.max(left + 1.0), bottom.max(top + 1.0));
+            let layout = ctx.create_pango_layout();
+            let measure = |f: &pango::FontDescription| {
+                layout.set_font_description(Some(f));
+                layout.set_text("MMMMMMMMMM");
+                let (w, h) = layout.size();
+                (w as f64 / pango::SCALE as f64 / 10.0, h as f64 / pango::SCALE as f64)
+            };
+            let (normal, small) = (font(&j.font, j.size), font(&j.font, j.size * 0.85));
+            let (char_w, line_h) = measure(&normal);
+            let (_, small_h) = measure(&small);
+            let (char_w, line_h) = (char_w.max(0.5), line_h.max(1.0));
+            // the file's name, a blank line, the text, a blank line, the page's number
+            let (body_top, body_bottom) = if j.header { (top + 2.0 * small_h, bottom - 2.0 * small_h) } else { (top, bottom) };
+            let per_page = (((body_bottom - body_top) / line_h).floor() as usize).max(1);
+            let digits = if j.numbers { last.max(1).to_string().len() } else { 0 };
+            let gutter = if j.numbers { digits + 2 } else { 0 };
+            let cols = (((right - left) / char_w).floor() as usize).saturating_sub(gutter).max(1);
+            let state = print::state_at(&j.snap, j.lang, line_start, from);
+            let text = Text { snap: &j.snap, from, to, line, lang: j.lang, state };
+            match print::layout(&text, Shape { cols, rows: per_page, tab: j.tab }, &mut |_| true) {
+                Ok(Some(rows)) => {
+                    let count = rows.len().div_ceil(per_page);
+                    op.set_n_pages(count as i32);
+                    j.pages = Some(Pages { rows, per_page, count, font: normal, small, left, right, top, bottom, body_top, line_h, small_h, char_w, digits, gutter });
+                }
+                Ok(None) => op.cancel(),
+                Err(TooMany) => {
+                    j.too_many = true;
+                    op.cancel();
+                }
             }
-            Ok(None) => op.cancel(),
-            Err(TooMany) => {
-                j.too_many = true;
-                op.cancel();
-            }
+        }));
+        if r.is_err() {
+            op.cancel();
         }
     });
     let j = job.clone();
     op.connect_draw_page(move |_, ctx, n| {
-        let mut j = j.borrow_mut();
-        j.printed += 1;
-        let j = &*j;
-        let Some(p) = &j.pages else { return };
-        let cr = ctx.cairo_context();
-        let layout = ctx.create_pango_layout();
-        let show = |cr: &cairo::Context, x: f64, y: f64, layout: &pango::Layout| {
-            cr.move_to(x, y);
-            pangocairo::functions::show_layout(cr, layout);
-        };
-        // (without colors, black: bold and italic stay)
-        let black = 0xFF00_0000;
-        let dim = if j.colors { j.theme.text_dim } else { black };
-        // the file's name at the top, the page's number at the bottom
-        if j.header {
-            layout.set_font_description(Some(&p.small));
-            set_color(&cr, dim);
-            layout.set_text(&j.title);
-            show(&cr, p.left, p.top, &layout);
-            layout.set_text(&format!("Page {} of {}", group(n as u64 + 1), group(p.count as u64)));
-            let w = layout.size().0 as f64 / pango::SCALE as f64;
-            show(&cr, p.left + (p.right - p.left - w) / 2.0, p.bottom - p.small_h, &layout);
-        }
-        layout.set_font_description(Some(&p.font));
-        let first = n as usize * p.per_page;
-        for (r, row) in p.rows.iter().skip(first).take(p.per_page).enumerate() {
-            let y = p.body_top + r as f64 * p.line_h;
-            if let (Some(l), true) = (row.line, p.digits > 0) {
-                let s = l.to_string();
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut j = j.borrow_mut();
+            j.printed += 1;
+            let j = &*j;
+            let Some(p) = &j.pages else { return };
+            let cr = ctx.cairo_context();
+            let layout = ctx.create_pango_layout();
+            let show = |cr: &cairo::Context, x: f64, y: f64, layout: &pango::Layout| {
+                cr.move_to(x, y);
+                pangocairo::functions::show_layout(cr, layout);
+            };
+            // (without colors, black: bold and italic stay)
+            let black = 0xFF00_0000;
+            let dim = if j.colors { j.theme.text_dim } else { black };
+            // the file's name at the top, the page's number at the bottom
+            if j.header {
+                layout.set_font_description(Some(&p.small));
                 set_color(&cr, dim);
+                layout.set_text(&j.title);
+                show(&cr, p.left, p.top, &layout);
+                layout.set_text(&format!("Page {} of {}", group(n as u64 + 1), group(p.count as u64)));
+                let w = layout.size().0 as f64 / pango::SCALE as f64;
+                show(&cr, p.left + (p.right - p.left - w) / 2.0, p.bottom - p.small_h, &layout);
+            }
+            layout.set_font_description(Some(&p.font));
+            let first = n as usize * p.per_page;
+            for (r, row) in p.rows.iter().skip(first).take(p.per_page).enumerate() {
+                let y = p.body_top + r as f64 * p.line_h;
+                if let (Some(l), true) = (row.line, p.digits > 0) {
+                    let s = l.to_string();
+                    set_color(&cr, dim);
+                    layout.set_attributes(None);
+                    layout.set_text(&s);
+                    show(&cr, p.left + p.digits.saturating_sub(s.len()) as f64 * p.char_w, y, &layout);
+                }
+                // colors, bold and italic as attributes of the row's text, which goes in one piece
+                let attrs = pango::AttrList::new();
+                for run in &row.runs {
+                    let Some(tok) = run.tok else { continue };
+                    if j.colors {
+                        let c = tok_color(&j.theme, tok);
+                        let ch = |s: u32| (((c >> s) & 0xFF) * 257) as u16;
+                        let mut color = pango::AttrColor::new_foreground(ch(16), ch(8), ch(0));
+                        color.set_start_index(run.start as u32);
+                        color.set_end_index(run.end as u32);
+                        attrs.insert(color);
+                    }
+                    if print::bold(tok) || print::italic(tok) {
+                        let mut a = if print::bold(tok) { pango::AttrInt::new_weight(pango::Weight::Bold) } else { pango::AttrInt::new_style(pango::Style::Italic) };
+                        a.set_start_index(run.start as u32);
+                        a.set_end_index(run.end as u32);
+                        attrs.insert(a);
+                    }
+                }
+                set_color(&cr, if j.colors { j.theme.text } else { black });
+                layout.set_text(&row.text);
+                layout.set_attributes(Some(&attrs));
+                show(&cr, p.left + p.gutter as f64 * p.char_w, y, &layout);
                 layout.set_attributes(None);
-                layout.set_text(&s);
-                show(&cr, p.left + p.digits.saturating_sub(s.len()) as f64 * p.char_w, y, &layout);
             }
-            // colors, bold and italic as attributes of the row's text, which goes in one piece
-            let attrs = pango::AttrList::new();
-            for run in &row.runs {
-                let Some(tok) = run.tok else { continue };
-                if j.colors {
-                    let c = tok_color(&j.theme, tok);
-                    let ch = |s: u32| (((c >> s) & 0xFF) * 257) as u16;
-                    let mut color = pango::AttrColor::new_foreground(ch(16), ch(8), ch(0));
-                    color.set_start_index(run.start as u32);
-                    color.set_end_index(run.end as u32);
-                    attrs.insert(color);
-                }
-                if print::bold(tok) || print::italic(tok) {
-                    let mut a = if print::bold(tok) { pango::AttrInt::new_weight(pango::Weight::Bold) } else { pango::AttrInt::new_style(pango::Style::Italic) };
-                    a.set_start_index(run.start as u32);
-                    a.set_end_index(run.end as u32);
-                    attrs.insert(a);
-                }
-            }
-            set_color(&cr, if j.colors { j.theme.text } else { black });
-            layout.set_text(&row.text);
-            layout.set_attributes(Some(&attrs));
-            show(&cr, p.left + p.gutter as f64 * p.char_w, y, &layout);
-            layout.set_attributes(None);
-        }
+        }));
+        let _ = r;
     });
     let j = job.clone();
     let exporting = export.is_some();

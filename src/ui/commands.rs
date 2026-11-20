@@ -59,6 +59,10 @@ pub enum Cmd {
     FindPrev,
     Replace,
     GoToLine,
+    /// Edit → Go to matching bracket (Ctrl+M) and Select inside brackets (Ctrl+Shift+M): `edit::bracket_jump`,
+    /// `edit::bracket_select`.
+    GoToBracket,
+    SelectBrackets,
     /// View → Show only matching lines (false) / lines not matching (true): the find bar's search, the lines in a tab
     /// of their own.
     FilterLines(bool),
@@ -81,6 +85,8 @@ pub enum Cmd {
     ToggleWhitespace,
     ToggleSpellCheck,
     ToggleTitleBarTabs,
+    /// View → Close Slate with the last tab (`Settings::close_with_last_tab`).
+    ToggleCloseWithLastTab,
     /// The spell check menu's suggestion (`App::spell_word`).
     Suggestion(u8),
     AddWord,
@@ -262,6 +268,8 @@ pub fn editor_key(vk: u16, m: &Mods) -> Option<Cmd> {
             (VK_A, false) => Cmd::SelectAll,
             (VK_D, false) => Cmd::DuplicateLine,
             (VK_K, true) => Cmd::DeleteLine,
+            (VK_M, false) => Cmd::GoToBracket,
+            (VK_M, true) => Cmd::SelectBrackets,
             (VK_OEM_2, false) | (VK_DIVIDE, false) => Cmd::ToggleComment,
             (VK_U, false) => Cmd::Case(CaseOp::Lower),
             (VK_U, true) => Cmd::Case(CaseOp::Upper),
@@ -395,6 +403,9 @@ Moving around
   PgUp / PgDn                   Page up / down
   Ctrl+Up / Ctrl+Down           Scroll without moving the caret
   Ctrl+G                        Go to line (line:column works too)
+  Ctrl+M                        Go to the matching bracket (again: back)
+  Ctrl+Shift+M                  Select inside brackets (again: the brackets too, then the
+                                pair around them)
   Ctrl+F2                       Bookmark the line (or take the bookmark off)
   F2 / Shift+F2                 Next / previous bookmark
 

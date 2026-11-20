@@ -439,7 +439,13 @@ pub fn render(owner: HWND, title: &str, main: &str, detail: &str, buttons: &[&st
     }
 }
 
+// (a panic can't unwind out of a call from Windows: the process would end with no session written. Caught, logged by
+// the panic hook, and Windows' own answer given.)
 extern "system" fn dialog_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
+    std::panic::catch_unwind(|| dialog_message(hwnd, msg, wp, lp)).unwrap_or(0)
+}
+
+fn dialog_message(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
     unsafe {
         if msg == WM_INITDIALOG {
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, lp.0);
@@ -510,6 +516,11 @@ extern "system" fn dialog_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
 
 /// Ctrl+C on a button copies the prompt's text.
 extern "system" fn copy_keys(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM, _id: usize, _data: usize) -> LRESULT {
+    // (see `dialog_proc`)
+    std::panic::catch_unwind(|| button_key(hwnd, msg, wp, lp)).unwrap_or_else(|_| unsafe { DefSubclassProc(hwnd, msg, wp, lp) })
+}
+
+fn button_key(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     unsafe {
         if msg == WM_KEYDOWN && wp.0 == b'C' as usize && GetKeyState(VK_CONTROL.0 as i32) < 0 {
             if let Ok(dlg) = GetParent(hwnd) {

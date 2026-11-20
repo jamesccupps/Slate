@@ -21,7 +21,7 @@ use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use super::buffer::{Buffer, Snapshot};
 use super::document::{DiskInfo, Document};
@@ -57,7 +57,7 @@ pub fn looks_binary(path: &Path) -> bool {
     let n = File::open(path).and_then(|mut f| f.read(&mut head)).unwrap_or(0);
     let head = &head[..n];
     match detect_encoding(head, n == 8192) {
-        (Encoding::Utf16Le | Encoding::Utf16Be, bom) => head[bom..].chunks_exact(2).any(|u| u == [0, 0]),
+        (Encoding::Utf16Le | Encoding::Utf16Be, bom) => head[bom..].as_chunks::<2>().0.contains(&[0, 0]),
         _ => memchr::memchr(0, head).is_some(),
     }
 }
@@ -407,6 +407,9 @@ pub enum SaveError {
     Changed,
     /// Linux: saving would change who owns the file (`owner_kept`); nothing was written.
     Owner,
+    /// Linux: the new file couldn't get the old one's access list (ACL), or its group, so people they keep out could
+    /// read it (`place::copy_identity`); nothing was replaced.
+    Access,
     Io(String),
 }
 
@@ -422,6 +425,11 @@ impl std::fmt::Display for SaveError {
                  you didn't edit aren't your version any more, and saving would mix the two. Nothing was saved."
             ),
             SaveError::Owner => write!(f, "Saving would change who owns this file."),
+            SaveError::Access => write!(
+                f,
+                "Slate couldn't give the new copy this file's access list (ACL) or its group, so saving would let \
+                 people they keep out read it. Nothing was saved."
+            ),
             SaveError::Io(s) => write!(f, "{s}"),
         }
     }
@@ -458,6 +466,10 @@ pub struct Saved {
 }
 
 static SAVE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Test mode (`set:refuse_access=true`): saves on Linux act as if the file's access list couldn't be kept
+/// (`SaveError::Access`), to try the question it asks.
+pub static TEST_REFUSE_ACCESS: AtomicBool = AtomicBool::new(false);
 
 /// Saving's steps that differ between Windows and Linux.
 #[cfg(windows)]
@@ -580,8 +592,9 @@ mod place {
         Ok(ok)
     }
 
-    /// Gives the new file the old one's creation time and attributes (and clears our temp "hidden" flag).
-    pub fn copy_identity(file: &File, old: Option<&fs::Metadata>, _old_path: &Path) {
+    /// Gives the new file the old one's creation time and attributes (and clears our temp "hidden" flag). Who may
+    /// open it is `keep_permissions`' (true).
+    pub fn copy_identity(file: &File, old: Option<&fs::Metadata>, _old_path: &Path) -> bool {
         let mut info = FILE_BASIC_INFO::default();
         let attrs = old.map_or(0, |m| m.file_attributes() & KEEP_ATTRIBUTES);
         info.FileAttributes = if attrs == 0 { FILE_ATTRIBUTE_NORMAL } else { attrs };
@@ -596,6 +609,7 @@ mod place {
                 std::mem::size_of::<FILE_BASIC_INFO>() as u32,
             );
         }
+        true
     }
 
     /// Creates the hidden temp file a save writes (`p` mustn't exist), encrypted if the file it replaces (`old`) is.
@@ -806,12 +820,20 @@ mod place {
         true
     }
 
-    /// Gives the new file the old one's owner and group where that's allowed, then its permissions (in that order: a
-    /// change of owner clears setuid and setgid), then its extended attributes (ACLs, an SELinux label…) where
-    /// allowed.
-    pub fn copy_identity(file: &File, old: Option<&fs::Metadata>, old_path: &Path) {
+    /// Gives the new file the old one's owner and group where that's allowed, its extended attributes (ACLs, an SELinux
+    /// label…) where allowed, and last its permissions (a change of owner clears setuid and setgid, so they go on
+    /// after it). The attributes go on while the file is still this user's alone (`create_temp`'s 0600): with the
+    /// mode first, for a moment it had the old mode without the access list that narrows it (an access list sets the
+    /// mode's bits to its own as it goes on, and the mode's group bits are then its mask, so setting the mode after
+    /// gives the same list).
+    ///
+    /// Returns whether who may read it is kept. Not when the old file's access list couldn't be put on the new one (a
+    /// file system or security policy that refuses it), or its group couldn't though it should have (this user is in
+    /// it: else `owner_kept` asked first) and the mode gives that group anything: the new file would let people in
+    /// whom the old one kept out. The save then stops unless the user said to go on (`SaveError::Access`).
+    pub fn copy_identity(file: &File, old: Option<&fs::Metadata>, old_path: &Path) -> bool {
         use std::os::unix::fs::PermissionsExt;
-        let Some(m) = old else { return };
+        let Some(m) = old else { return true };
         let _ = std::os::unix::fs::fchown(file, Some(m.uid()), Some(m.gid()));
         // (not allowed to give it away: keep the group at least, which may be)
         let _ = std::os::unix::fs::fchown(file, None, Some(m.gid()));
@@ -822,40 +844,76 @@ mod place {
         if now.as_ref().is_none_or(|n| n.uid() != m.uid()) {
             mode &= !0o4000;
         }
-        if now.as_ref().is_none_or(|n| n.gid() != m.gid()) {
+        let group_kept = now.as_ref().is_some_and(|n| n.gid() == m.gid());
+        if !group_kept {
             mode &= !0o2000;
         }
+        let acl_kept = copy_xattrs(file, old_path);
         let _ = file.set_permissions(fs::Permissions::from_mode(mode));
-        copy_xattrs(file, old_path);
+        let group_ok = group_kept || mode & 0o070 == 0 || !os::owner_kept(old_path);
+        acl_kept && group_ok && !TEST_REFUSE_ACCESS.load(Ordering::Relaxed)
     }
 
-    /// The old file's extended attributes onto the new one (best effort: some can't be set by this user).
-    fn copy_xattrs(file: &File, from: &Path) {
+    #[cfg(test)]
+    thread_local! {
+        /// Tests: the access list isn't put on the new file (on this thread), as when a file system refuses it.
+        pub static REFUSE_ACL_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// The old file's extended attributes onto the new one (best effort: some can't be set by this user). Returns
+    /// false if its access list (`system.posix_acl_access`, the one that says who may read it) couldn't be read or
+    /// put on the new one.
+    fn copy_xattrs(file: &File, from: &Path) -> bool {
         use std::os::fd::AsRawFd;
         use std::os::unix::ffi::OsStrExt;
-        let Ok(c) = std::ffi::CString::new(from.as_os_str().as_bytes()) else { return };
+        let Ok(c) = std::ffi::CString::new(from.as_os_str().as_bytes()) else { return true };
         // (how long the list is first: it has no limit)
         let len = unsafe { libc::listxattr(c.as_ptr(), std::ptr::null_mut(), 0) };
         if len <= 0 {
-            return;
+            return true;
         }
         let mut names = vec![0u8; len as usize + 256];
         let n = unsafe { libc::listxattr(c.as_ptr(), names.as_mut_ptr().cast(), names.len()) };
         if n <= 0 {
-            return;
+            return true;
         }
-        let mut value = vec![0u8; 64 << 10];
+        let mut kept = true;
+        let mut value = Vec::new();
         // (IMA's and EVM's are the kernel's, about the old content: never copied)
         let kernels = |s: &[u8]| s == b"security.ima" || s == b"security.evm";
         for name in names[..n as usize].split(|&b| b == 0).filter(|s| !s.is_empty() && !kernels(s)) {
             let Ok(key) = std::ffi::CString::new(name) else { continue };
-            let len = unsafe { libc::getxattr(c.as_ptr(), key.as_ptr(), value.as_mut_ptr().cast(), value.len()) };
-            if len >= 0 {
-                unsafe {
-                    libc::fsetxattr(file.as_raw_fd(), key.as_ptr(), value.as_ptr().cast(), len as usize, 0);
+            let access_list = name == b"system.posix_acl_access";
+            #[cfg(test)]
+            let refused = access_list && REFUSE_ACL_HERE.with(|r| r.get());
+            #[cfg(not(test))]
+            let refused = false;
+            let ok = !refused && (|| {
+                // (each value's size first: one can be over 64 KiB, and it may grow between the two calls)
+                for _ in 0..4 {
+                    let size = unsafe { libc::getxattr(c.as_ptr(), key.as_ptr(), std::ptr::null_mut(), 0) };
+                    if size < 0 {
+                        return false;
+                    }
+                    value.resize(size as usize, 0);
+                    let len = unsafe { libc::getxattr(c.as_ptr(), key.as_ptr(), value.as_mut_ptr().cast(), value.len()) };
+                    if len >= 0 {
+                        let set = unsafe {
+                            libc::fsetxattr(file.as_raw_fd(), key.as_ptr(), value.as_ptr().cast(), len as usize, 0)
+                        };
+                        return set == 0;
+                    }
+                    if io::Error::last_os_error().raw_os_error() != Some(libc::ERANGE) {
+                        return false;
+                    }
                 }
+                false
+            })();
+            if access_list && !ok {
+                kept = false;
             }
         }
+        kept
     }
 
     /// Puts the written temp file (`file`, at `temp_path`) in place of `target`: a rename, atomic, and open files
@@ -1008,13 +1066,15 @@ fn clean_stale_temps(dir: &Path) {
 }
 
 /// Saves `snap` to `path` in `encoding` (with a byte order mark if `bom`). Run on a background thread. Text that
-/// ANSI can't hold fails with `Lossy` (writing nothing) unless `lossy_ok`.
+/// ANSI can't hold fails with `Lossy` (writing nothing) unless `lossy_ok`; on Linux a file whose access list or
+/// group the new one couldn't get fails with `Access` (nothing replaced) unless `access_ok`.
 pub fn save(
     snap: &Snapshot,
     path: &Path,
     encoding: Encoding,
     bom: bool,
     lossy_ok: bool,
+    access_ok: bool,
     ctx: &Ctx,
 ) -> Result<Saved, SaveError> {
     if snap.changed_in_place() {
@@ -1087,7 +1147,9 @@ pub fn save(
             return Err(SaveError::Changed);
         }
         // (the old file's owner, permissions and the like first: on the disk with the text, before the swap)
-        place::copy_identity(&file, old.as_ref(), &target);
+        if !place::copy_identity(&file, old.as_ref(), &target) && !access_ok {
+            return Err(SaveError::Access);
+        }
         file.sync_all()?;
         Ok(r)
     })();
@@ -1269,7 +1331,7 @@ mod tests {
         doc.insert(0, b"edited\n");
         doc.end(Default::default());
         let snap = doc.snapshot();
-        let saved = save(&snap, &path, Encoding::Utf8, false, false, &ctx()).unwrap();
+        let saved = save(&snap, &path, Encoding::Utf8, false, false, false, &ctx()).unwrap();
         let on_disk = fs::read(&path).unwrap();
         assert_eq!(&on_disk[..7], b"edited\n");
         assert_eq!(&on_disk[7..], &original[..]);
@@ -1295,7 +1357,7 @@ mod tests {
             let mut doc = Document::from_text("Grüße, café\r\nline two\r\n".as_bytes());
             doc.encoding = enc;
             let snap = doc.snapshot();
-            save(&snap, &path, enc, true, false, &ctx()).unwrap();
+            save(&snap, &path, enc, true, false, false, &ctx()).unwrap();
             let bytes = fs::read(&path).unwrap();
             let back = document_from_bytes(bytes);
             assert_eq!(back.encoding, enc, "{enc:?}");
@@ -1314,7 +1376,7 @@ mod tests {
         fs::set_permissions(&path, p.clone()).unwrap();
         let mut doc = Document::from_text(b"y");
         let snap = doc.snapshot();
-        assert!(matches!(save(&snap, &path, Encoding::Utf8, false, false, &ctx()), Err(SaveError::ReadOnly)));
+        assert!(matches!(save(&snap, &path, Encoding::Utf8, false, false, false, &ctx()), Err(SaveError::ReadOnly)));
         #[allow(clippy::permissions_set_readonly_false)]
         p.set_readonly(false);
         fs::set_permissions(&path, p).unwrap();
@@ -1342,7 +1404,7 @@ mod tests {
         assert!(tail.iter().all(|&b| b == 0));
         let snap = doc.snapshot();
         let other = dir.join("copy.txt");
-        let r = save(&snap, &other, Encoding::Utf8, false, false, &ctx());
+        let r = save(&snap, &other, Encoding::Utf8, false, false, false, &ctx());
         // (the file it reads from got shorter: changed in place, which is found before reading it)
         assert!(matches!(r, Err(SaveError::Changed)), "{:?}", r.as_ref().map(|_| ()));
         assert!(!other.exists());
@@ -1361,7 +1423,7 @@ mod tests {
         assert_eq!(doc.encoding, Encoding::Utf16Le);
         assert!(!doc.bom);
         let snap = doc.snapshot();
-        save(&snap, &path, doc.encoding, doc.bom, false, &ctx()).unwrap();
+        save(&snap, &path, doc.encoding, doc.bom, false, false, &ctx()).unwrap();
         assert_eq!(fs::read(&path).unwrap(), bytes);
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1376,14 +1438,14 @@ mod tests {
         }
         let mut doc = Document::from_text(b"changed");
         let snap = doc.snapshot();
-        save(&snap, &path, Encoding::Utf8, false, false, &ctx()).unwrap();
+        save(&snap, &path, Encoding::Utf8, false, false, false, &ctx()).unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"changed");
         // a cancelled save leaves the file alone
         let c = ctx();
         c.cancel.store(true, Ordering::Relaxed);
         let mut doc = Document::from_text(&vec![b'x'; 10 << 20]);
         let snap = doc.snapshot();
-        assert!(save(&snap, &path, Encoding::Utf8, false, false, &c).is_err());
+        assert!(save(&snap, &path, Encoding::Utf8, false, false, false, &c).is_err());
         assert_eq!(fs::read(&path).unwrap(), b"changed");
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1415,7 +1477,7 @@ mod tests {
             }
         }
         let mut doc = Document::from_text(b"another file");
-        save(&doc.snapshot(), &dir.join("other.txt"), Encoding::Utf8, false, false, &ctx()).unwrap();
+        save(&doc.snapshot(), &dir.join("other.txt"), Encoding::Utf8, false, false, false, &ctx()).unwrap();
         assert_eq!(names(&dir), [".slate-bak-4294967280-0.tmp", ".slate-bak-4294967280-2.tmp", "other.txt"]);
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1446,14 +1508,14 @@ mod tests {
         f.write_all(b"one more line\n").unwrap();
         drop(f);
         let copy = dir.join("copy.log");
-        save(&doc.snapshot(), &copy, Encoding::Utf8, false, false, &ctx()).unwrap();
+        save(&doc.snapshot(), &copy, Encoding::Utf8, false, false, false, &ctx()).unwrap();
         assert_eq!(fs::read(&copy).unwrap(), [b"EDIT\n".as_slice(), &original].concat());
         // Rewritten by another program (same length): the text would mix both versions, so nothing is written.
         let rewritten = lines("new");
         fs::write(&path, &rewritten).unwrap();
         let snap = doc.snapshot();
-        assert!(matches!(save(&snap, &path, Encoding::Utf8, false, false, &ctx()), Err(SaveError::Changed)));
-        assert!(matches!(save(&snap, &copy, Encoding::Utf8, false, false, &ctx()), Err(SaveError::Changed)));
+        assert!(matches!(save(&snap, &path, Encoding::Utf8, false, false, false, &ctx()), Err(SaveError::Changed)));
+        assert!(matches!(save(&snap, &copy, Encoding::Utf8, false, false, false, &ctx()), Err(SaveError::Changed)));
         assert_eq!(fs::read(&path).unwrap(), rewritten);
         assert_eq!(names(&dir), ["big.log", "copy.log"]);
         drop((doc, snap, src));
@@ -1474,11 +1536,11 @@ mod tests {
         doc.insert(0, "→ ✓ ".as_bytes());
         doc.end(Default::default());
         let snap = doc.snapshot();
-        assert!(matches!(save(&snap, &path, Encoding::Ansi, false, false, &ctx()), Err(SaveError::Lossy)));
+        assert!(matches!(save(&snap, &path, Encoding::Ansi, false, false, false, &ctx()), Err(SaveError::Lossy)));
         assert_eq!(fs::read(&path).unwrap(), b"caf\xE9\r\n");
         assert_eq!(names(&dir), ["ansi.txt"]);
         // When the user says so.
-        let saved = save(&snap, &path, Encoding::Ansi, false, true, &ctx()).unwrap();
+        let saved = save(&snap, &path, Encoding::Ansi, false, true, false, &ctx()).unwrap();
         assert!(saved.lossy);
         assert_eq!(fs::read(&path).unwrap(), b"? ? caf\xE9\r\n");
         let _ = fs::remove_dir_all(&dir);
@@ -1563,7 +1625,7 @@ mod tests {
         fs::write(&path, &bytes).unwrap();
         let mut doc = document_from_bytes(fs::read(&path).unwrap());
         assert_eq!(doc.encoding, Encoding::Utf8);
-        save(&doc.snapshot(), &path, doc.encoding, doc.bom, false, &ctx()).unwrap();
+        save(&doc.snapshot(), &path, doc.encoding, doc.bom, false, false, &ctx()).unwrap();
         assert_eq!(fs::read(&path).unwrap(), bytes);
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1577,9 +1639,9 @@ mod tests {
         bytes.extend_from_slice(b"one stray byte: \xFF\r\n");
         let mut doc = document_from_bytes(bytes);
         assert_eq!(doc.encoding, Encoding::Utf8);
-        assert!(matches!(save(&doc.snapshot(), &path, Encoding::Utf16Le, true, false, &ctx()), Err(SaveError::Lossy)));
+        assert!(matches!(save(&doc.snapshot(), &path, Encoding::Utf16Le, true, false, false, &ctx()), Err(SaveError::Lossy)));
         assert!(!path.exists());
-        let saved = save(&doc.snapshot(), &path, Encoding::Utf16Le, true, true, &ctx()).unwrap();
+        let saved = save(&doc.snapshot(), &path, Encoding::Utf16Le, true, true, false, &ctx()).unwrap();
         assert!(saved.lossy && path.exists());
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1616,8 +1678,64 @@ mod tests {
             }
         }
         let mut doc = Document::from_text(b"text");
-        assert!(matches!(save(&doc.snapshot(), &fifo, Encoding::Utf8, false, false, &ctx()), Err(SaveError::Io(m)) if m == NOT_REGULAR));
+        assert!(matches!(save(&doc.snapshot(), &fifo, Encoding::Utf8, false, false, false, &ctx()), Err(SaveError::Io(m)) if m == NOT_REGULAR));
         assert!(fs::symlink_metadata(&fifo).unwrap().file_type().is_fifo());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A file's access list (ACL) goes onto the new file as it was, with its mode; where it can't (a file system or
+    /// security policy that refuses it), the save stops and replaces nothing unless the user said to go on.
+    #[cfg(unix)]
+    #[test]
+    fn a_save_keeps_the_access_list_or_stops() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = test_dir("acl");
+        let path = dir.join("private.txt");
+        fs::write(&path, b"old\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        // user::rw-, user:65534:---, group::r--, mask::r--, other::r-- (version 2, then each entry's tag,
+        // permissions and id)
+        let mut acl = 2u32.to_le_bytes().to_vec();
+        for (tag, perm, id) in [(1u16, 6u16, u32::MAX), (2, 0, 65534), (4, 4, u32::MAX), (0x10, 4, u32::MAX), (0x20, 4, u32::MAX)] {
+            acl.extend(tag.to_le_bytes());
+            acl.extend(perm.to_le_bytes());
+            acl.extend(id.to_le_bytes());
+        }
+        let c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        let key = c"system.posix_acl_access";
+        if unsafe { libc::setxattr(c.as_ptr(), key.as_ptr(), acl.as_ptr().cast(), acl.len(), 0) } != 0 {
+            eprintln!("(no access lists on this file system: {})", io::Error::last_os_error());
+            let _ = fs::remove_dir_all(&dir);
+            return;
+        }
+        let read_acl = || {
+            let mut v = vec![0u8; 256];
+            let n = unsafe { libc::getxattr(c.as_ptr(), key.as_ptr(), v.as_mut_ptr().cast(), v.len()) };
+            (n >= 0).then(|| v[..n as usize].to_vec())
+        };
+        let mode = || fs::metadata(&path).unwrap().permissions().mode() & 0o7777;
+        let before = read_acl().unwrap();
+        let text = |t: &[u8]| Document::from_text(t).snapshot();
+        // kept, as it was
+        save(&text(b"one\n"), &path, Encoding::Utf8, false, false, false, &ctx()).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"one\n");
+        assert_eq!(read_acl(), Some(before.clone()));
+        assert_eq!(mode(), 0o644);
+        // refused: nothing replaced, and no temp file left
+        place::REFUSE_ACL_HERE.with(|r| r.set(true));
+        let r = save(&text(b"two\n"), &path, Encoding::Utf8, false, false, false, &ctx());
+        assert!(matches!(r, Err(SaveError::Access)), "{:?}", r.as_ref().err());
+        assert_eq!(fs::read(&path).unwrap(), b"one\n");
+        assert_eq!(read_acl(), Some(before));
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+        // the user said to go on: saved, with the plain permissions only
+        let r = save(&text(b"three\n"), &path, Encoding::Utf8, false, false, true, &ctx());
+        place::REFUSE_ACL_HERE.with(|r| r.set(false));
+        r.unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"three\n");
+        assert_eq!(read_acl(), None);
+        assert_eq!(mode(), 0o644);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1630,7 +1748,7 @@ mod tests {
         fs::write(&path, b"old").unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
         let mut doc = Document::from_text(b"new secret");
-        save(&doc.snapshot(), &path, Encoding::Utf8, false, false, &ctx()).unwrap();
+        save(&doc.snapshot(), &path, Encoding::Utf8, false, false, false, &ctx()).unwrap();
         assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o7777, 0o600);
         // the temp file a save writes: only its owner can read it
         let old = fs::metadata(&path).ok();
@@ -1639,7 +1757,7 @@ mod tests {
         assert_eq!(fs::metadata(&temp).unwrap().permissions().mode() & 0o077, 0);
         // a new file gets the usual permissions
         let new = dir.join("new.txt");
-        save(&doc.snapshot(), &new, Encoding::Utf8, false, false, &ctx()).unwrap();
+        save(&doc.snapshot(), &new, Encoding::Utf8, false, false, false, &ctx()).unwrap();
         assert_ne!(fs::metadata(&new).unwrap().permissions().mode() & 0o044, 0);
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1656,7 +1774,7 @@ mod tests {
         let m = fs::metadata(&path).unwrap();
         assert!(place::special(&path, &m));
         let mut doc = Document::from_text(b"edited");
-        save(&doc.snapshot(), &path, Encoding::Utf8, false, false, &ctx()).unwrap();
+        save(&doc.snapshot(), &path, Encoding::Utf8, false, false, false, &ctx()).unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"edited");
         assert_eq!(fs::read(&mark).unwrap(), b"[ZoneTransfer]\r\nZoneId=3\r\n");
         assert_eq!(names(&dir), ["downloaded.txt"]);
@@ -1698,7 +1816,7 @@ mod tests {
         let before = acl_lines(&path);
         assert!(!before.iter().any(|l| l.contains("S-1-5-32-545") || l.contains("BUILTIN\\Users")), "{before:?}");
         let mut doc = Document::from_text(b"still secret");
-        save(&doc.snapshot(), &path, Encoding::Utf8, false, false, &ctx()).unwrap();
+        save(&doc.snapshot(), &path, Encoding::Utf8, false, false, false, &ctx()).unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"still secret");
         assert_eq!(acl_lines(&path), before);
         assert_eq!(names(&shared), ["notes.txt"]);
@@ -1732,7 +1850,7 @@ mod tests {
         assert_eq!(replace_file(&temp, &target, &dir), Ok(false));
         fs::remove_file(&temp).unwrap();
         let mut doc = Document::from_text(b"newer");
-        assert!(save(&doc.snapshot(), &target, Encoding::Utf8, false, false, &ctx()).is_err());
+        assert!(save(&doc.snapshot(), &target, Encoding::Utf8, false, false, false, &ctx()).is_err());
         drop(other);
         assert_eq!(fs::read(&target).unwrap(), b"NEW content");
         assert_eq!(names(&dir), ["t.txt"]);
@@ -1753,7 +1871,7 @@ mod tests {
         let original: Vec<u8> = (0..200_000u32).flat_map(|i| format!("line {i}\n").into_bytes()).collect();
         fs::write(&path, &original).unwrap();
         let (mut doc, src) = edited(&path);
-        save(&doc.snapshot(), &path, Encoding::Utf8, false, false, &ctx()).unwrap();
+        save(&doc.snapshot(), &path, Encoding::Utf8, false, false, false, &ctx()).unwrap();
         assert_eq!(fs::read(&path).unwrap(), [b"EDIT\n".as_slice(), &original].concat());
         let mut old = Vec::new();
         src.read_into(0, 12, &mut old);

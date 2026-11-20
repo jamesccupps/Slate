@@ -16,6 +16,12 @@ on:
 permissions:
   contents: read
 
+# A push that comes while the last one to the same branch (or pull request) is still building stops that run: only
+# the newest is worth finishing. A tag's run is never stopped.
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
 # The Rust every build uses: a newer one is taken on purpose (raised here, and on the development PC with it), never
 # whatever "stable" happens to be on the day a tag is built.
 env:
@@ -50,8 +56,12 @@ jobs:
         shell: pwsh
         run: |
           # rust-mingw brings the toolchain's own linker libraries (crt2.o, libkernel32.a...)
-          rustup toolchain install "$($env:RUST_VERSION)-x86_64-pc-windows-gnu" --profile minimal --component rust-mingw
+          rustup toolchain install "$($env:RUST_VERSION)-x86_64-pc-windows-gnu" --profile minimal --component rust-mingw --component clippy
           rustup default "$($env:RUST_VERSION)-x86_64-pc-windows-gnu"
+
+      - name: Clippy
+        # (Cargo.toml's [lints.clippy] says which style lints the code doesn't follow)
+        run: cargo clippy --all-targets --locked -- -D warnings
 
       - name: Test
         run: cargo test --lib --locked
@@ -156,8 +166,9 @@ jobs:
           $old = Join-Path $env:RUNNER_TEMP 'slate-0.15.0'
           New-Item -ItemType Directory -Force $old | Out-Null
           $url = 'https://github.com/jamesccupps/Slate/releases/download/v0.15.0'
-          Invoke-WebRequest "$url/Slate.exe" -OutFile "$old\Slate.exe"
-          Invoke-WebRequest "$url/Slate.exe.sha256" -OutFile "$old\Slate.exe.sha256"
+          # (tried again: a download that fails now and then isn't the build's fault)
+          Invoke-WebRequest "$url/Slate.exe" -OutFile "$old\Slate.exe" -MaximumRetryCount 4 -RetryIntervalSec 15
+          Invoke-WebRequest "$url/Slate.exe.sha256" -OutFile "$old\Slate.exe.sha256" -MaximumRetryCount 4 -RetryIntervalSec 15
           $want = ((Get-Content "$old\Slate.exe.sha256" -Raw).Trim() -split '\s+')[0]
           if ((Get-FileHash "$old\Slate.exe" -Algorithm SHA256).Hash -ne $want) { throw "0.15.0's Slate.exe doesn't match its .sha256" }
           # Twice: a plain update, and one over what a test build of 0.16.0 left when its move failed (empty keys under
@@ -288,8 +299,10 @@ jobs:
           - runner: ubuntu-24.04-arm
             arch: arm64
     runs-on: ${{ matrix.runner }}
-    # Built on Debian 12 (GTK 4.8, glibc 2.36): it then runs there, on Raspberry Pi OS 12 and on newer systems.
-    container: debian:12
+    # Built on Debian 12 (GTK 4.8, glibc 2.36): it then runs there, on Raspberry Pi OS 12 and on newer systems. Pinned
+    # like the actions (the image of debian:12 on 2026-11-20; its packages come fresh from apt-get anyway): to move
+    # on, `docker buildx imagetools inspect debian:12` gives the digest.
+    container: debian:12@sha256:268fb24c39bca92d326dd83ea3abebe4a3f7751c804ffef23bb6d857dd343ff8
     steps:
       - name: Tools
         run: |
@@ -303,9 +316,13 @@ jobs:
 
       - name: Rust
         run: |
-          curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain "$RUST_VERSION"
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain "$RUST_VERSION" --component clippy
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
 
       - name: Test
         run: cargo test --lib --locked
@@ -346,6 +363,21 @@ jobs:
         with:
           name: slate-linux-${{ matrix.arch }}
           path: out/
+
+  deny:
+    name: Dependencies
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Known security advisories (RustSec) in the crates Cargo.lock pins, and their licenses (deny.toml). A new
+      # advisory turns this red on the next run: Dependabot's alerts say so too, and its monthly pull request brings
+      # the fixed version.
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check advisories licenses
 
   release:
     name: Draft the release

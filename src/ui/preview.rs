@@ -544,7 +544,13 @@ fn hit(st: &State, x: i32, y: i32) -> Option<Item> {
     st.items.iter().find(|(_, r)| x >= r.left && x < r.right && y >= r.top && y < r.bottom).map(|(i, _)| *i)
 }
 
+// (a panic can't unwind out of a call from Windows: the process would end with no session written. Caught, logged by
+// the panic hook, and Windows' own answer given.)
 extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    std::panic::catch_unwind(|| handle(hwnd, msg, wp, lp)).unwrap_or_else(|_| unsafe { DefWindowProcW(hwnd, msg, wp, lp) })
+}
+
+fn handle(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     let xy = || ((lp.0 & 0xFFFF) as i16 as i32, ((lp.0 >> 16) & 0xFFFF) as i16 as i32);
     match msg {
         WM_PAINT => {

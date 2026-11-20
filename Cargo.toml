@@ -1,6 +1,6 @@
 [package]
 name = "slate"
-version = "0.17.2"
+version = "0.18.0"
 edition = "2024"
 description = "A fast, simple text editor for Windows and Linux that handles huge files"
 license = "MIT"
@@ -89,6 +89,15 @@ features = [
 # The code `implement` writes names `windows_core` (the version the windows crate uses).
 [target.'cfg(windows)'.dependencies.windows-core]
 version = "=0.58.0"
+
+# Clippy (CI runs it with -D warnings on Windows and Linux). These three are style the code chose: nested ifs kept as
+# written (the conditions read one after another; let-chains would rewrite dozens of them for nothing), a few long
+# types spelled out where they're used, and functions with more than seven arguments where a struct would only move
+# them.
+[lints.clippy]
+collapsible_if = "allow"
+type_complexity = "allow"
+too_many_arguments = "allow"
 
 [profile.dev]
 opt-level = 1

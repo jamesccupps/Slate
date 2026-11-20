@@ -290,7 +290,7 @@ pub fn status_texts(app: &App) -> (String, Vec<(StatusItem, String)>, bool) {
     } else if tab.loading() {
         "Opening…".into()
     } else if let Some((done, total)) = doc.index_progress() {
-        format!("Reading lines… {}%", if total > 0 { done * 100 / total } else { 0 })
+        format!("Reading lines… {}%", (done * 100).checked_div(total).unwrap_or(0))
     } else if tab.saving() {
         "Saving…".into()
     } else {

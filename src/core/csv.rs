@@ -40,7 +40,7 @@ impl Dialect {
 /// none does.
 pub fn sniff(head: &[u8]) -> u8 {
     let mut best = (b',', 0usize, 0usize);
-    for sep in [b',', b';', b'\t', b'|'] {
+    for sep in *b",;\t|" {
         let counts = row_widths(head, Dialect::csv(sep), 20);
         let Some(&first) = counts.first() else { continue };
         if first < 2 {
