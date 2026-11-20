@@ -188,7 +188,8 @@ the part about the area you're changing first, and keep it current in the same c
   text through every lexer (and in three pieces at line breaks: the same end state as whole), JSON and XML
   Check/Format, the structure scans, CSV Check and Sort, the line tools, search (queries from the input), the
   encodings (UTF-16 there and back), drawing and caret steps, Convert (Base64 and URL there and back), EditorConfig's
-  globs and settings.json; a panic or a property that doesn't hold is reported with its input, a
+  globs, settings.json and shortcuts.txt, and multiple cursors; a panic or a property that doesn't hold is reported
+  with its input, a
   step stuck for 10 s (a file that would freeze the window) stops the run and saves the input to
   `%TEMP%\slate-fuzz-hang.bin`. `SLATE_FUZZ_ROUNDS` (2000) and `SLATE_FUZZ_SEED` choose the inputs.
 - `Slate.exe --test script.txt` drives the real app in a hidden window and renders frames offscreen into PNGs (the
@@ -202,6 +203,8 @@ the part about the area you're changing first, and keep it current in the same c
   point such as the tab strip —, `altkey`, `altgr:on`, `activate`…), `request:<lines, | between>` hands files over
   as a second start with `--read-only` / `--wait` / `-` does (`waitevent:<name>` makes the event, `print:waits`
   shows the waits and whether it's set), `print:findtext` the find bar's boxes and Find in selection's range,
+  `print:findbar` (closed, or its mode), `print:carets` (multiple cursors, the main one starred; both test modes),
+  `print:menukeys0`…`4` (a menu's items with the keys they show, the user's included: `crate::shortcuts`),
   `print:rows` the structure panel's rows (`row:<n>` / `rowopen:<n>` click one, or its arrow),
   `previewshot:<png>|<page>[|width|noprinter]` the print preview drawn into a picture (laid out for Microsoft Print
   to PDF, or as it shows without a printer), `previewrun:<steps, | between>` File → Print preview run for real
@@ -243,7 +246,9 @@ the part about the area you're changing first, and keep it current in the same c
   encoding|readonly|ovr` (menus are listed in `print:asked`, not shown), `pathclick:<i>` / `rowclick:<k>[,chevron|
   double]` (the path bar and the panel), `gsettings:<key>=<value>` (GNOME's interface settings, under
   `GSETTINGS_BACKEND=memory`; the image needs gsettings-desktop-schemas), `print:encoding`, `indent`, `font`,
-  `settings`, `strip`, `path`, `rows`, `shown`,
+  `settings`, `strip`, `path`, `rows`, `shown` (the path bar, the panel and the find bar), `findlabel` (what the
+  find bar says), `matches` (the matches marked), `keys-<action>` (an action's accelerators now; `key:` goes through
+  the accelerators first, as GTK does), `down:<x>,<y>,ctrl` (a Ctrl+click),
   `set:print_colors=false` and the other print options.
 - Measuring: `t:<label>` marks; `print:startup` (each startup step in ms since the process was created: `warp`,
   `device`, `first frame` or `first frame (WARP)` and the switch; a hidden test window gets no WM_PAINT, so the

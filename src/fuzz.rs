@@ -3,7 +3,9 @@
 //! it whole does), JSON and XML Check and Format, the structure panel's scans and paths, CSV Check and Sort by column,
 //! the line tools, search (the input's own bytes as a plain and a regex query), encoding detection and the UTF-16 and
 //! ANSI codecs (UTF-16 there and back must give the text back), how the text is drawn and stepped through, Convert's
-//! decoders (Base64 and URL encoding there and back), EditorConfig's globs and settings.json. A panic, or a property
+//! decoders (Base64 and URL encoding there and back), EditorConfig's globs, settings.json and shortcuts.txt (every key
+//! it takes written back reads the same), and multiple cursors (typing, deleting, Enter and moving at cursors put
+//! anywhere: they stay in the text, in order and apart, for its version). A panic, or a property
 //! that doesn't hold, is reported with its input. An input that keeps one step busy for 10 s (a loop
 //! that doesn't end: a file that would freeze the window) stops the run, its bytes written to `slate-fuzz-hang.bin`
 //! in the temp folder. `SLATE_FUZZ_ROUNDS` sets how many inputs (default 2000), `SLATE_FUZZ_SEED` where they start.
@@ -227,7 +229,51 @@ fn work(data: &[u8], step: &Mutex<String>, ticks: &AtomicU64) -> Vec<String> {
     }
     at("settings.json".into());
     let _ = crate::settings::Settings::from_json(data);
+    at("shortcuts.txt".into());
+    for (_, combos) in crate::shortcuts::parse(&String::from_utf8_lossy(&data[..data.len().min(4096)])).keys {
+        for c in combos {
+            if crate::shortcuts::Combo::parse(&c.text()) != Some(c) {
+                wrong.push(format!("the key {} doesn't read back the same", c.text()));
+            }
+        }
+    }
+    at("multiple cursors".into());
+    carets(data, &mut wrong);
     wrong
+}
+
+/// Cursors put where the input's bytes say, then typing, deleting, Enter and moving at all of them.
+fn carets(data: &[u8], wrong: &mut Vec<String>) {
+    use crate::core::document::{EditKind, Sel};
+    use crate::edit::{CaretMove, Carets, MultiEdit};
+    let text = &data[..data.len().min(64 << 10)];
+    let mut doc = Document::from_text(text);
+    let len = doc.len();
+    let at = |k: usize| crate::edit::char_start(&doc, (data.get(k).copied().unwrap_or(0) as u64 * 7919 + k as u64 * 31) % (len + 1));
+    let mut main = Sel::at(at(0));
+    let mut c = Carets { more: (1..9).map(|k| Sel::at(at(k))).collect(), version: doc.version, col: None };
+    c.tidy(&mut main);
+    let steps: [(&str, MultiEdit, EditKind); 4] = [
+        ("type", MultiEdit::Put(vec![b"x\xC3\xA9"]), EditKind::Typing),
+        ("Backspace", MultiEdit::Delete { back: true, word: false }, EditKind::Backspace),
+        ("Delete a word", MultiEdit::Delete { back: false, word: true }, EditKind::Other),
+        ("Enter", MultiEdit::Newline, EditKind::Other),
+    ];
+    for (name, what, kind) in steps {
+        crate::edit::multi_edit(&mut doc, &mut main, &mut c, what, kind);
+        crate::edit::move_carets(&doc, &mut c, if name == "Enter" { CaretMove::Up } else { CaretMove::Right }, name == "type", 4);
+        c.tidy(&mut main);
+        let all = c.ordered(main);
+        if all.iter().any(|(s, _)| s.anchor > doc.len() || s.caret > doc.len()) {
+            wrong.push(format!("a cursor past the end after {name}"));
+        }
+        if all.windows(2).any(|w| w[1].0.start() < w[0].0.end() || w[0].0 == w[1].0) {
+            wrong.push(format!("cursors overlap after {name}"));
+        }
+        if c.version != doc.version {
+            wrong.push(format!("the cursors' version isn't the text's after {name}"));
+        }
+    }
 }
 
 #[test]
