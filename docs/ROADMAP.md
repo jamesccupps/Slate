@@ -209,6 +209,14 @@ locale's date order on Linux, caps on huge JSON keys and XML names, panic guards
 cleaned up, a fuzzer that covers far more. CI: clippy, cargo-deny, Dependabot for the crates. Details in the
 [0.18.0 release notes](release-notes-0.18.0.md).
 
+## 0.19.0: a user's issues
+
+From the same user's GitHub issues (#5, #6), everything new off until turned on: multiple cursors (Edit → Multiple
+cursors: Ctrl+click, above/below, next and all matches, line starts and ends), Help → Change keyboard shortcuts (a
+file over each app's own keys, `crate::shortcuts`), View → Find bar (close on going back to the text, one for each
+tab), and the find bar's count no longer blinking while typing in the text. Benchmarks against 0.18.0 on both
+platforms: the same. Details in the [0.19.0 release notes](release-notes-0.19.0.md).
+
 ## Next
 
 1. **Accessibility: screen readers, the rest (M).** The text is read since 0.12.0 (checked in test mode and by a real
@@ -283,7 +291,8 @@ few small items from *Later*. The next picks come from *Next* and *Later*.
   (up to 10,000 pages; Windows lays it out on a job's thread), Linux's session restore reading every unsaved tab's
   copy before the window shows, and Go to line with a JSON key in an object of millions of keys (every key read;
   XML's same-name lists are taken directly since 0.18.0) (S–M each).
-- Tests: a table of the key bindings checked against the shortcut lists and the README (S); the close and quit
+- Tests: the key bindings checked against the help lists and the README (S; since 0.19.0 unit tests check each app's
+  keys against `crate::shortcuts`' list); the close and quit
   prompts and the updater's swap in the smoke tests (S–M).
 - Colors: a misdetected heredoc should end sooner than at its end word; exact states for lexers with look-ahead at
   the 8 KiB cuts of very long lines; VB ` _` continued comments, AutoHotkey continuation sections, R raw strings, C#

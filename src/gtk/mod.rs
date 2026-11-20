@@ -2163,6 +2163,10 @@ const SHORTCUTS: &str = "Slate keyboard shortcuts (Help → Change keyboard shor
   Alt+A                   Next / previous match through all open tabs (in the find box: on or off)
   Alt+H                    Highlight the search in every tab, in a color of its own (in the find box)
   Alt+drag, Shift+Alt+arrows  Column selection (type, paste, delete on every line)
+  Ctrl+click               Add or take away a cursor (with Edit → Multiple cursors on)
+  Ctrl+Alt+Up / Down       A cursor above / below (multiple cursors)
+  Ctrl+Shift+N / A         The next match / every match too (multiple cursors)
+  Alt+[ / Alt+]            A cursor at the start / end of every selected line (multiple cursors)
   Up / Down                The searches (or replacements) before (in the find box)
   \\n  \\t                 A line break, a tab, in a regular expression's replacement
   Esc                      Close the find bar

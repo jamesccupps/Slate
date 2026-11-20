@@ -596,6 +596,11 @@ Editing
   Ctrl+Shift+K                  Delete the line
   Alt+Up / Alt+Down             Move the line up / down
   Alt+drag, Shift+Alt+arrows    Column selection (type, paste, delete on every line)
+  Ctrl+click                    Add or take away a cursor (with Edit → Multiple cursors on)
+  Ctrl+Alt+Up / Ctrl+Alt+Down   A cursor above / below (multiple cursors)
+  Ctrl+Shift+N / Ctrl+Shift+A   The next match / every match too (multiple cursors)
+  Alt+[ / Alt+]                 A cursor at the start / end of every selected line (multiple cursors)
+  Esc                           Back to one cursor
   Tab / Shift+Tab               Indent / outdent the selected lines
   Ctrl+/                        Toggle comment
   Ctrl+U / Ctrl+Shift+U         lowercase / UPPERCASE
