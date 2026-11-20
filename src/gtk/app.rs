@@ -1872,7 +1872,12 @@ impl App {
     /// typed); none in tabs that can't be edited. The first time, the checker is asked for (`speller_wanted`).
     pub fn misspelled(&mut self, g: &Geom, focused: bool) -> Vec<(u64, u64)> {
         let tab = self.tab();
-        if !self.settings.spell_check || tab.read_only || tab.filter.is_some() || !crate::spell::checks(tab.lang) {
+        if !self.settings.spell_check
+            || tab.read_only
+            || tab.filter.is_some()
+            || !crate::spell::checks(tab.lang)
+            || crate::shortcuts::is_file(tab.doc.path.as_deref())
+        {
             return Vec::new();
         }
         let caret = tab.view.sel.caret;

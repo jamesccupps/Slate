@@ -1623,7 +1623,13 @@ impl App {
         // Words spelled wrong on screen, but not one the caret is at the end of while the text has the keyboard (being
         // typed); none in tabs that can't be edited.
         let mut wrong = Vec::new();
-        if self.settings.spell_check && !tab.read_only && tab.filter.is_none() && coming.is_none() && crate::spell::checks(tab.lang) {
+        if self.settings.spell_check
+            && !tab.read_only
+            && tab.filter.is_none()
+            && coming.is_none()
+            && crate::spell::checks(tab.lang)
+            && !crate::shortcuts::is_file(tab.doc.path.as_deref())
+        {
             if matches!(self.speller, Spelling::NotYet) {
                 // (made a moment after the window shows, as it takes ~25 ms; test mode too, so startups measure the
                 // same: its scripts run the timer, `timer:13`)

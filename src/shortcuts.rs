@@ -372,6 +372,11 @@ pub fn path() -> PathBuf {
     crate::settings::data_dir().join("shortcuts.txt")
 }
 
+/// Whether a tab's file is this one (no spell check there: command names and keys aren't words).
+pub fn is_file(p: Option<&std::path::Path>) -> bool {
+    p.is_some_and(|p| if cfg!(windows) { p.as_os_str().eq_ignore_ascii_case(path().as_os_str()) } else { p == path() })
+}
+
 /// What the file is written as the first time it's opened.
 pub fn template() -> String {
     let mut s = String::from(
