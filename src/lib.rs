@@ -9,6 +9,7 @@ pub mod editorconfig;
 pub mod highlight;
 pub mod print;
 pub mod settings;
+pub mod shortcuts;
 pub mod spell;
 pub mod structure;
 pub mod theme;

@@ -7,6 +7,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::HSTRING;
 
+use crate::convert::Conv;
+use crate::shortcuts::{Combo, Key, Keymap};
+
 use crate::core::lines::{CaseOp, LineOp};
 use crate::core::text::{Encoding, Eol};
 
@@ -132,6 +135,8 @@ pub enum Cmd {
     ActivateTab(usize),
     About,
     Shortcuts,
+    /// Help → Change keyboard shortcuts…: the user's file (`crate::shortcuts`), made the first time.
+    ChangeShortcuts,
     MakeDefault,
     StopDefault,
     OpenDataFolder,
@@ -289,7 +294,7 @@ pub fn editor_key(vk: u16, m: &Mods) -> Option<Cmd> {
 }
 
 pub enum Item {
-    Cmd { cmd: Cmd, label: String, keys: &'static str, checked: bool, enabled: bool },
+    Cmd { cmd: Cmd, label: String, keys: String, checked: bool, enabled: bool },
     Sep,
     Sub { label: String, items: Vec<Item> },
     /// The next items go in a new column.
@@ -297,19 +302,191 @@ pub enum Item {
 }
 
 pub fn item(cmd: Cmd, label: &str, keys: &'static str) -> Item {
-    Item::Cmd { cmd, label: label.into(), keys, checked: false, enabled: true }
+    Item::Cmd { cmd, label: label.into(), keys: keys.into(), checked: false, enabled: true }
 }
 
 pub fn check(cmd: Cmd, label: &str, keys: &'static str, checked: bool) -> Item {
-    Item::Cmd { cmd, label: label.into(), keys, checked, enabled: true }
+    Item::Cmd { cmd, label: label.into(), keys: keys.into(), checked, enabled: true }
 }
 
 pub fn enabled(cmd: Cmd, label: &str, keys: &'static str, on: bool) -> Item {
-    Item::Cmd { cmd, label: label.into(), keys, checked: false, enabled: on }
+    Item::Cmd { cmd, label: label.into(), keys: keys.into(), checked: false, enabled: on }
 }
 
 pub fn sub(label: &str, items: Vec<Item>) -> Item {
     Item::Sub { label: label.into(), items }
+}
+
+/// The changeable commands (`crate::shortcuts`) by their names there.
+const IDS: &[(&str, Cmd)] = &[
+    ("new-tab", Cmd::NewTab),
+    ("open", Cmd::Open),
+    ("reopen-closed", Cmd::ReopenClosed),
+    ("save", Cmd::Save),
+    ("save-as", Cmd::SaveAs),
+    ("save-all", Cmd::SaveAll),
+    ("reload", Cmd::Reload),
+    ("print", Cmd::Print),
+    ("print-preview", Cmd::PrintPreview),
+    ("page-setup", Cmd::PageSetup),
+    ("close-tab", Cmd::CloseTab),
+    ("close-others", Cmd::CloseOthers),
+    ("close-right", Cmd::CloseRight),
+    ("close-saved", Cmd::CloseSaved),
+    ("close-all", Cmd::CloseAll),
+    ("copy-path", Cmd::CopyPath),
+    ("reveal-file", Cmd::RevealFile),
+    ("read-only", Cmd::ToggleReadOnly),
+    ("restore-session", Cmd::ToggleRestoreSession),
+    ("clear-recent", Cmd::ClearRecent),
+    ("quit", Cmd::Exit),
+    ("undo", Cmd::Undo),
+    ("redo", Cmd::Redo),
+    ("cut", Cmd::Cut),
+    ("copy", Cmd::Copy),
+    ("paste", Cmd::Paste),
+    ("select-all", Cmd::SelectAll),
+    ("find", Cmd::Find),
+    ("replace", Cmd::Replace),
+    ("find-next", Cmd::FindNext),
+    ("find-prev", Cmd::FindPrev),
+    ("goto-line", Cmd::GoToLine),
+    ("goto-bracket", Cmd::GoToBracket),
+    ("select-brackets", Cmd::SelectBrackets),
+    ("toggle-bookmark", Cmd::ToggleBookmark),
+    ("next-bookmark", Cmd::NextBookmark),
+    ("prev-bookmark", Cmd::PrevBookmark),
+    ("clear-bookmarks", Cmd::ClearBookmarks),
+    ("toggle-comment", Cmd::ToggleComment),
+    ("duplicate-line", Cmd::DuplicateLine),
+    ("delete-line", Cmd::DeleteLine),
+    ("move-line-up", Cmd::MoveLineUp),
+    ("move-line-down", Cmd::MoveLineDown),
+    ("sort-asc", Cmd::Lines(LineOp::SortAsc)),
+    ("sort-desc", Cmd::Lines(LineOp::SortDesc)),
+    ("dedupe", Cmd::Lines(LineOp::Dedupe)),
+    ("remove-blank", Cmd::Lines(LineOp::RemoveBlank)),
+    ("trim", Cmd::Lines(LineOp::TrimTrailing)),
+    ("upper", Cmd::Case(CaseOp::Upper)),
+    ("lower", Cmd::Case(CaseOp::Lower)),
+    ("title-case", Cmd::Case(CaseOp::Title)),
+    ("date-time", Cmd::InsertDateTime),
+    ("overtype", Cmd::ToggleOvertype),
+    ("wrap", Cmd::ToggleWrap),
+    ("line-numbers", Cmd::ToggleLineNumbers),
+    ("show-whitespace", Cmd::ToggleWhitespace),
+    ("spell-check", Cmd::ToggleSpellCheck),
+    ("title-bar-tabs", Cmd::ToggleTitleBarTabs),
+    ("close-with-last-tab", Cmd::ToggleCloseWithLastTab),
+    ("find-close-on-leave", Cmd::ToggleFindCloseOnLeave),
+    ("find-per-tab", Cmd::ToggleFindPerTab),
+    ("char-info", Cmd::CharInfo),
+    ("filter-lines", Cmd::FilterLines(false)),
+    ("filter-lines-not", Cmd::FilterLines(true)),
+    ("clear-highlights", Cmd::ClearHighlights),
+    ("structure-panel", Cmd::ToggleStructure),
+    ("path-bar", Cmd::TogglePathBar),
+    ("zoom-in", Cmd::ZoomIn),
+    ("zoom-out", Cmd::ZoomOut),
+    ("zoom-reset", Cmd::ZoomReset),
+    ("theme-system", Cmd::Theme(ThemeMode::System)),
+    ("theme-light", Cmd::Theme(ThemeMode::Light)),
+    ("theme-dark", Cmd::Theme(ThemeMode::Dark)),
+    ("next-tab", Cmd::NextTab),
+    ("prev-tab", Cmd::PrevTab),
+    ("format", Cmd::Format),
+    ("minify", Cmd::Minify),
+    ("check", Cmd::Validate),
+    ("csv-sort", Cmd::SortByColumn(false)),
+    ("csv-sort-desc", Cmd::SortByColumn(true)),
+    ("copy-json-path", Cmd::CopyJsonPath),
+    ("eol-lf", Cmd::SetEol(Eol::Lf)),
+    ("eol-crlf", Cmd::SetEol(Eol::Crlf)),
+    ("convert-base64-encode", Cmd::Convert(Conv::Base64Encode)),
+    ("convert-base64-decode", Cmd::Convert(Conv::Base64Decode)),
+    ("convert-url-encode", Cmd::Convert(Conv::UrlEncode)),
+    ("convert-url-decode", Cmd::Convert(Conv::UrlDecode)),
+    ("convert-json-escape", Cmd::Convert(Conv::JsonEscape)),
+    ("convert-json-unescape", Cmd::Convert(Conv::JsonUnescape)),
+    ("convert-sha256", Cmd::Convert(Conv::Sha256)),
+    ("shortcuts", Cmd::Shortcuts),
+    ("change-shortcuts", Cmd::ChangeShortcuts),
+    ("open-data-folder", Cmd::OpenDataFolder),
+    ("make-default", Cmd::MakeDefault),
+    ("stop-default", Cmd::StopDefault),
+    ("check-updates", Cmd::CheckUpdates),
+    ("report-problem", Cmd::ReportProblem),
+    ("about", Cmd::About),
+];
+
+pub fn cmd_of(id: &str) -> Option<Cmd> {
+    IDS.iter().find(|(i, _)| *i == id).map(|(_, c)| *c)
+}
+
+pub fn id_of(cmd: Cmd) -> Option<&'static str> {
+    IDS.iter().find(|(_, c)| *c == cmd).map(|(i, _)| *i)
+}
+
+/// A key pressed as `crate::shortcuts` writes it (None: one it doesn't name, or AltGr typing a character).
+pub fn combo(vk: u16, m: &Mods) -> Option<Combo> {
+    if m.ctrl && m.alt && makes_char(vk, m) {
+        return None;
+    }
+    let k = VIRTUAL_KEY(vk);
+    let key = match k {
+        _ if (VK_A.0..=VK_Z.0).contains(&vk) || (VK_0.0..=VK_9.0).contains(&vk) => Key::Char(vk as u8),
+        _ if (VK_F1.0..=VK_F24.0).contains(&vk) => Key::F((vk - VK_F1.0 + 1) as u8),
+        _ if (VK_NUMPAD0.0..=VK_NUMPAD9.0).contains(&vk) => Key::Num((vk - VK_NUMPAD0.0) as u8),
+        VK_UP => Key::Up,
+        VK_DOWN => Key::Down,
+        VK_LEFT => Key::Left,
+        VK_RIGHT => Key::Right,
+        VK_HOME => Key::Home,
+        VK_END => Key::End,
+        VK_PRIOR => Key::PageUp,
+        VK_NEXT => Key::PageDown,
+        VK_INSERT => Key::Insert,
+        VK_DELETE => Key::Delete,
+        VK_BACK => Key::Backspace,
+        VK_RETURN => Key::Enter,
+        VK_TAB => Key::Tab,
+        VK_ESCAPE => Key::Esc,
+        VK_SPACE => Key::Space,
+        VK_ADD => Key::NumPlus,
+        VK_SUBTRACT => Key::NumMinus,
+        VK_DIVIDE => Key::NumSlash,
+        VK_OEM_2 => Key::Char(b'/'),
+        VK_OEM_5 => Key::Char(b'\\'),
+        VK_OEM_4 => Key::Char(b'['),
+        VK_OEM_6 => Key::Char(b']'),
+        VK_OEM_1 => Key::Char(b';'),
+        VK_OEM_7 => Key::Char(b'\''),
+        VK_OEM_COMMA => Key::Char(b','),
+        VK_OEM_PERIOD => Key::Char(b'.'),
+        VK_OEM_MINUS => Key::Char(b'-'),
+        VK_OEM_PLUS => Key::Char(b'='),
+        VK_OEM_3 => Key::Char(b'`'),
+        _ => return None,
+    };
+    Some(Combo { ctrl: m.ctrl, alt: m.alt, shift: m.shift, key })
+}
+
+/// A menu with the user's keys shown for the commands that have them (`crate::shortcuts`).
+pub fn keyed(items: Vec<Item>, km: &Keymap) -> Vec<Item> {
+    if km.is_empty() {
+        return items;
+    }
+    items
+        .into_iter()
+        .map(|it| match it {
+            Item::Cmd { cmd, label, keys, checked, enabled } => {
+                let keys = id_of(cmd).and_then(|id| km.menu_text(id)).unwrap_or(keys);
+                Item::Cmd { cmd, label, keys, checked, enabled }
+            }
+            Item::Sub { label, items } => Item::Sub { label, items: keyed(items, km) },
+            other => other,
+        })
+        .collect()
 }
 
 /// Builds a native popup menu; menu ids index into `ids`.
@@ -365,7 +542,7 @@ pub fn menu_for_letter(vk: u16) -> Option<usize> {
 }
 
 pub const SHORTCUTS: &str = "\
-Keyboard shortcuts
+Keyboard shortcuts (Help → Change keyboard shortcuts… gives commands other keys)
 
 Files
   Ctrl+N / Ctrl+T               New tab
@@ -445,3 +622,63 @@ Mouse
   Double-click / triple-click   Select a word / a line
   Click a line number           Select the line (drag for more)
   Shift+wheel                   Scroll sideways (when word wrap is off)";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The key a `Combo` is pressed with here (the inverse of `combo`).
+    fn vk_of(k: Key) -> u16 {
+        match k {
+            Key::Char(c) if c.is_ascii_alphanumeric() => c as u16,
+            Key::Char(c) => match c {
+                b'/' => VK_OEM_2.0,
+                b'\\' => VK_OEM_5.0,
+                b'[' => VK_OEM_4.0,
+                b']' => VK_OEM_6.0,
+                b';' => VK_OEM_1.0,
+                b'\'' => VK_OEM_7.0,
+                b',' => VK_OEM_COMMA.0,
+                b'.' => VK_OEM_PERIOD.0,
+                b'-' => VK_OEM_MINUS.0,
+                b'=' => VK_OEM_PLUS.0,
+                _ => VK_OEM_3.0,
+            },
+            Key::F(n) => VK_F1.0 + n as u16 - 1,
+            Key::Num(n) => VK_NUMPAD0.0 + n as u16,
+            Key::Up => VK_UP.0,
+            Key::Down => VK_DOWN.0,
+            Key::Left => VK_LEFT.0,
+            Key::Right => VK_RIGHT.0,
+            Key::Home => VK_HOME.0,
+            Key::End => VK_END.0,
+            Key::PageUp => VK_PRIOR.0,
+            Key::PageDown => VK_NEXT.0,
+            Key::Insert => VK_INSERT.0,
+            Key::Delete => VK_DELETE.0,
+            Key::Backspace => VK_BACK.0,
+            Key::Enter => VK_RETURN.0,
+            Key::Tab => VK_TAB.0,
+            Key::Esc => VK_ESCAPE.0,
+            Key::Space => VK_SPACE.0,
+            Key::NumPlus => VK_ADD.0,
+            Key::NumMinus => VK_SUBTRACT.0,
+            Key::NumSlash => VK_DIVIDE.0,
+        }
+    }
+
+    #[test]
+    fn the_listed_keys_are_the_keys_slate_has() {
+        for c in crate::shortcuts::commands() {
+            let cmd = cmd_of(c.id).unwrap_or_else(|| panic!("no Cmd for {}", c.id));
+            assert_eq!(id_of(cmd), Some(c.id));
+            for k in crate::shortcuts::default_keys(c) {
+                let vk = vk_of(k.key);
+                let m = Mods { ctrl: k.ctrl, shift: k.shift, alt: k.alt };
+                assert_eq!(combo(vk, &m), Some(k), "{}", k.text());
+                let got = if c.anywhere { global_key(vk, &m) } else { editor_key(vk, &m) };
+                assert_eq!(got, Some(cmd), "{} for {}", k.text(), c.id);
+            }
+        }
+    }
+}

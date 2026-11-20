@@ -53,6 +53,8 @@ pub enum Ask {
     Quit,
     About,
     Shortcuts,
+    /// Help → Change keyboard shortcuts…: the user's file opened (made the first time).
+    ChangeShortcuts,
     /// Make Slate the default app for the file types it opens?
     MakeDefault,
     /// Stop Slate being the default app for them?
@@ -136,6 +138,8 @@ pub enum Cmd {
     InsertDateTime,
     About,
     Shortcuts,
+    /// Help → Change keyboard shortcuts… (`crate::shortcuts`).
+    ChangeShortcuts,
     MakeDefault,
     StopDefault,
     /// File → Read only: the tab's text can't be changed.
@@ -447,6 +451,10 @@ pub struct App {
     pub quit_with_tab: Option<u64>,
     /// The tab the find bar's state (`find.open`, `find.replace`) is about (`follow_find_bar`).
     pub find_owner: u64,
+    /// The user's keyboard shortcuts (Help → Change keyboard shortcuts…), over Slate's own; changed: the window
+    /// sets its accelerators again (`set_accels`).
+    pub keymap: crate::shortcuts::Keymap,
+    pub shortcuts_changed: bool,
     /// The system wants dark (when the theme follows it).
     pub system_dark: bool,
     /// The desktop's high contrast is on (then Slate is drawn in `Theme::high_contrast_fixed`).
@@ -532,6 +540,8 @@ impl App {
             closed: Vec::new(),
             quit_with_tab: None,
             find_owner: 0,
+            keymap: crate::shortcuts::Keymap::new(&crate::shortcuts::read()),
+            shortcuts_changed: false,
             system_dark,
             system_hc: false,
             dirty_view: true,
@@ -1565,6 +1575,25 @@ impl App {
         self.dirty_view = true;
     }
 
+    /// The shortcuts file was saved: its keys count from now (the window sets them: `shortcuts_changed`), and what
+    /// couldn't be used is said on its tab. Returns whether it was that file.
+    fn shortcuts_saved(&mut self, i: usize, path: &Path) -> bool {
+        if path != crate::shortcuts::path() {
+            return false;
+        }
+        let user = crate::shortcuts::read();
+        self.keymap = crate::shortcuts::Keymap::new(&user);
+        self.shortcuts_changed = true;
+        if user.problems.is_empty() {
+            self.flash("Saved — Slate uses these shortcuts now", false);
+        } else {
+            self.tabs[i].notice = Some(format!("Saved, but not all of it can be used: {}", user.problems.join("; ")));
+            self.tabs[i].notice_save_as = false;
+            self.flash("Saved, but not all of it can be used (see above the text)", true);
+        }
+        true
+    }
+
     /// Tab `i`'s save ended. Returns false if the tab is gone: it was closed once saved (`close_after`).
     fn finish_save(&mut self, i: usize, st: SaveTask, r: Result<Saved, SaveError>) -> bool {
         match r {
@@ -1608,7 +1637,7 @@ impl App {
                     self.flash("Some characters can't be stored in ANSI and were saved as \"?\".", true);
                 } else if saved.lossy {
                     self.flash(format!("Bytes that weren't text were saved in {} as \"\u{FFFD}\".", st.encoding.label()), true);
-                } else {
+                } else if !self.shortcuts_saved(i, &st.path) {
                     self.flash(format!("Saved {name}"), false);
                 }
                 let closed = st.close_after && !self.tabs[i].doc.is_dirty();
@@ -2120,8 +2149,6 @@ impl App {
                     v.want_x = None;
                 });
             }
-            Key::Up | Key::KP_Up if alt && !shift => self.exec(Cmd::MoveLineUp),
-            Key::Down | Key::KP_Down if alt && !shift => self.exec(Cmd::MoveLineDown),
             Key::Up | Key::KP_Up if ctrl => moving(self, &mut |v, c| v.scroll_rows(c, -1)),
             Key::Down | Key::KP_Down if ctrl => moving(self, &mut |v, c| v.scroll_rows(c, 1)),
             Key::Up | Key::KP_Up => moving(self, &mut |v, c| v.move_rows(c, -1, shift)),
@@ -2534,6 +2561,7 @@ impl App {
             Cmd::InsertDateTime => self.insert_text(&now_text()),
             Cmd::About => self.asks.push(Ask::About),
             Cmd::Shortcuts => self.asks.push(Ask::Shortcuts),
+            Cmd::ChangeShortcuts => self.asks.push(Ask::ChangeShortcuts),
             Cmd::MakeDefault => self.asks.push(Ask::MakeDefault),
             Cmd::StopDefault => self.asks.push(Ask::StopDefault),
             Cmd::ToggleReadOnly => {

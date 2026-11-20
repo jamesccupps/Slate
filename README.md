@@ -23,7 +23,8 @@ JSON file opens instantly, scrolls smoothly, and can be searched, edited, format
 - Find and replace with match case, whole word and regular expressions; fast on huge files (on several cores).
   Find in selection (Alt+S), Find next and previous through all open tabs (Alt+A), searches kept highlighted in
   every tab, each in a color of its own (Alt+H), the last searches and replacements with Up and Down, and `\n` /
-  `\t` in a regular expression's replacement for a line break or a tab.
+  `\t` in a regular expression's replacement for a line break or a tab. *View → Find bar* can close the bar
+  when you click back in the text, or give each tab its own.
 - Column selection (Alt+drag, Shift+Alt+arrows: type, paste and delete on every line) and dragging selected text
   to another place (with Ctrl, a copy).
 - Spell check, like Notepad's: words spelled wrong get a wavy red line, in plain text, Markdown's prose and comments
@@ -124,7 +125,9 @@ The usual ones work as in Notepad (Ctrl+N, O, S, F, H, G, Z, Y, A, X, C, V), plu
 | Insert | Overtype on / off |
 | F5 | Insert the time and date |
 
-*Help → Keyboard shortcuts* lists them all. On Linux, Alt+1 … Alt+9 go to a tab too.
+*Help → Keyboard shortcuts* lists them all. On Linux, Alt+1 … Alt+9 go to a tab too. *Help → Change keyboard
+shortcuts…* opens a short file listing every command with its keys: take the `#` off a line, write other keys
+(`duplicate-line = Ctrl+Shift+D`, or nothing for none) and save, and Slate uses them at once, in its menus too.
 
 ## Download
 

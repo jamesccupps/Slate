@@ -6,5 +6,8 @@
 - **View → Find bar → Close when you click in the text**: the find bar closes as soon as you go back to the text (issue #6). Off unless you turn it on.
 - **View → Find bar → One for each tab**: each tab keeps its own find bar open or closed, and a new tab starts without one; the search itself is shared, so F3 still finds it in any tab. Off unless you turn it on.
 
+- **Help → Change keyboard shortcuts…**: give any command the keys you want. It opens a short file listing every command with its keys; take the `#` off a line, write other keys (`duplicate-line = Ctrl+Shift+D`, or nothing for none) and save, and Slate uses them at once, its menus included. A line Slate can't use is pointed out when you save.
+- Linux: **Edit → Move line up / Move line down** in the menu (Alt+Up / Alt+Down, as before).
+
 ### Fixes, on Windows and Linux
 - With the find bar open, typing in the text no longer makes its count ("3 of 12", or a red "No results") blink at every key: it changes only when the number does (issue #6). On Linux the matches marked in the text no longer blink either.

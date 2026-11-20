@@ -135,3 +135,17 @@ expect:focus=find
 click:300,250
 expect:findbar=closed
 cmd:ToggleFindCloseOnLeave
+# Help → Change keyboard shortcuts…: a command given other keys loses its own
+cmd:ChangeShortcuts
+jobs
+expect:title=shortcuts.txt
+key:ctrl+a
+type:duplicate-line = Ctrl+Shift+D\n
+cmd:Save
+jobs
+cmd:NewTab
+type:ab
+key:ctrl+d
+expect:lines=1
+key:ctrl+shift+d
+expect:lines=2

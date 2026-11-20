@@ -616,6 +616,8 @@ pub struct App {
     pub quit_with_tab: Option<u64>,
     /// The tab the find bar's state (`find.open`, `find.mode`) is about (`App::follow_find_bar`).
     pub find_owner: u64,
+    /// The user's keyboard shortcuts (Help → Change keyboard shortcuts…), over Slate's own.
+    pub keymap: crate::shortcuts::Keymap,
     /// `slate --wait`: an event to set once all of its tabs are closed (`Opts::wait`).
     pub waits: Vec<(String, Vec<u64>)>,
     /// The printer and its settings chosen last (File → Print).
@@ -751,6 +753,7 @@ impl App {
             closed_tabs: Vec::new(),
             quit_with_tab: None,
             find_owner: 0,
+            keymap: crate::shortcuts::Keymap::new(&crate::shortcuts::read()),
             waits: Vec::new(),
             print_last: Default::default(),
             highlights: Vec::new(),

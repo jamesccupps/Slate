@@ -167,3 +167,17 @@ up:
 wait:200
 expect:shown=path bar false, panel false, find bar false
 cmd:find-close-on-leave
+# Help → Change keyboard shortcuts…: a command given other keys loses its own
+cmd:change-shortcuts
+jobs
+key:ctrl+a
+type:duplicate-line = Ctrl+Shift+D\n
+cmd:save
+jobs
+expect:keys-duplicate-line=<Shift><Control>d
+cmd:new-tab
+type:ab
+key:ctrl+d
+expect:lines=1
+key:ctrl+shift+d
+expect:lines=2

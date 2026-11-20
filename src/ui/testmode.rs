@@ -227,6 +227,7 @@ fn cmd_of(name: &str) -> Option<Cmd> {
         "ToggleCloseWithLastTab" => Cmd::ToggleCloseWithLastTab,
         "ToggleFindCloseOnLeave" => Cmd::ToggleFindCloseOnLeave,
         "ToggleFindPerTab" => Cmd::ToggleFindPerTab,
+        "ChangeShortcuts" => Cmd::ChangeShortcuts,
         "AddWord" => Cmd::AddWord,
         "IgnoreWord" => Cmd::IgnoreWord,
         "ToggleLineNumbers" => Cmd::ToggleLineNumbers,
@@ -595,6 +596,11 @@ fn describe(cell: &Cell, what: &str) -> String {
         "top" => a.tab().view.top.to_string(),
         "dirty" => a.tab().doc.is_dirty().to_string(),
         "tabs" => a.tabs.len().to_string(),
+        // menukeys0 … menukeys4: a menu bar's menu with the keys it shows (the user's, `crate::shortcuts`)
+        m if m.starts_with("menukeys") => {
+            let items = super::commands::keyed(a.menu_items(m[8..].parse().unwrap_or(0)), &a.keymap);
+            keys(&items)
+        }
         m if m.starts_with("menu") => {
             // menu0 … menu4: the menu bar's menus, as their labels (submenus in brackets)
             let items = a.menu_items(m[4..].parse().unwrap_or(0));
@@ -839,6 +845,24 @@ fn describe(cell: &Cell, what: &str) -> String {
         },
         _ => format!("(unknown: {what})"),
     }
+}
+
+/// A menu's items that show keys, as "label keys".
+fn keys(items: &[super::commands::Item]) -> String {
+    let mut v = Vec::new();
+    for it in items {
+        match it {
+            super::commands::Item::Cmd { label, keys, .. } if !keys.is_empty() => v.push(format!("{} {keys}", label.replace('&', ""))),
+            super::commands::Item::Sub { items, .. } => {
+                let inner = self::keys(items);
+                if !inner.is_empty() {
+                    v.push(inner);
+                }
+            }
+            _ => {}
+        }
+    }
+    v.join(" | ")
 }
 
 /// A menu as its labels (submenus in brackets).

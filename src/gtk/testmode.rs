@@ -196,10 +196,13 @@ async fn script(lines: Vec<String>, test: Rc<Test>) -> i32 {
             }
             "key" => match combo(arg) {
                 Some((k, m, accel)) => {
-                    if !ui.key_for_test(k, m) {
-                        match commands().into_iter().find(|(_, _, accels)| accels.iter().any(|a| a.eq_ignore_ascii_case(&accel))) {
-                            Some((_, cmd, _)) => ui.command(cmd),
-                            None => log(&mut out, format!("key {arg}: nothing does that")),
+                    // (as GTK does: the window's accelerators, as set now, before the text has the key)
+                    match super::action_for_accel(&ui, &accel) {
+                        Some(name) => gio::prelude::ActionGroupExt::activate_action(&ui.win_actions, &name, None),
+                        None => {
+                            if !ui.key_for_test(k, m) {
+                                log(&mut out, format!("key {arg}: nothing does that"));
+                            }
                         }
                     }
                 }
@@ -567,6 +570,10 @@ fn value(what: &str, test: &Test) -> String {
         "asked" => test.asked.borrow().join("; "),
         "clipboard" => test.clipboard.borrow().clone(),
         "find" => format!("{:?}", a.find.found.as_ref().map(|f| f.1.count)),
+        // keys-<action>: the keys an action has now (`set_accels`)
+        w if w.starts_with("keys-") => {
+            ui.gtk_app.accels_for_action(&format!("win.{}", &w[5..])).iter().map(|s| s.to_string()).collect::<Vec<_>>().join(", ")
+        }
         "findlabel" => ui.find_count.text().to_string(),
         "matches" => format!("{:?}", a.visible_matches(0, tab.doc.len())),
         "dirty" => tab.doc.is_dirty().to_string(),

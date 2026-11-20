@@ -1622,6 +1622,8 @@ fn commands() -> Vec<(&'static str, Cmd, &'static [&'static str])> {
         ("toggle-comment", Cmd::ToggleComment, &["<Control>slash"]),
         ("duplicate-line", Cmd::DuplicateLine, &["<Control>d"]),
         ("delete-line", Cmd::DeleteLine, &["<Control><Shift>k"]),
+        ("move-line-up", Cmd::MoveLineUp, &["<Alt>Up"]),
+        ("move-line-down", Cmd::MoveLineDown, &["<Alt>Down"]),
         ("sort-asc", Cmd::Lines(LineOp::SortAsc), &[]),
         ("sort-desc", Cmd::Lines(LineOp::SortDesc), &[]),
         ("dedupe", Cmd::Lines(LineOp::Dedupe), &[]),
@@ -1655,6 +1657,7 @@ fn commands() -> Vec<(&'static str, Cmd, &'static [&'static str])> {
         ("eol-crlf", Cmd::SetEol(Eol::Crlf), &[]),
         ("date-time", Cmd::InsertDateTime, &["F5"]),
         ("shortcuts", Cmd::Shortcuts, &["<Control>question"]),
+        ("change-shortcuts", Cmd::ChangeShortcuts, &[]),
         ("about", Cmd::About, &[]),
         ("make-default", Cmd::MakeDefault, &[]),
         ("stop-default", Cmd::StopDefault, &[]),
@@ -1733,6 +1736,38 @@ fn mono_families(ctx: &pango::Context, current: &str) -> Vec<String> {
     v
 }
 
+/// The keys of the actions: `commands()`'s and Ctrl/Alt+1–9 for the tabs (Ctrl as on Windows; Alt as in other Linux
+/// apps), with the user's laid over them (`crate::shortcuts`): a command given keys of its own has only those, and
+/// keys given to one no longer do anything else. Again when the user's file is saved (`App::shortcuts_changed`).
+fn set_accels(ui: &Ui) {
+    let Ok(a) = ui.app.try_borrow() else { return };
+    let km = &a.keymap;
+    let norm = |s: &str| gtk4::accelerator_parse(s).map(|(k, m)| (k.to_lower(), m));
+    let taken: Vec<_> = crate::shortcuts::commands().filter_map(|c| km.keys_of(c.id)).flatten().filter_map(|c| norm(&c.gtk())).collect();
+    let set = |name: &str, accels: Vec<String>| {
+        let accels: Vec<&str> = accels.iter().map(String::as_str).collect();
+        ui.gtk_app.set_accels_for_action(&format!("win.{name}"), &accels);
+    };
+    let own = |accels: Vec<String>| -> Vec<String> { accels.into_iter().filter(|s| norm(s).is_none_or(|n| !taken.contains(&n))).collect() };
+    for (name, _, accels) in commands() {
+        match km.keys_of(name) {
+            Some(mine) => set(name, mine.iter().map(|c| c.gtk()).collect()),
+            None => set(name, own(accels.iter().map(|s| s.to_string()).collect())),
+        }
+    }
+    for k in 1..=9usize {
+        set(&format!("tab-{k}"), own(vec![format!("<Control>{k}"), format!("<Alt>{k}")]));
+    }
+}
+
+/// The action a key's accelerator activates now (test mode's `key:`, as GTK does before the text has the key).
+pub fn action_for_accel(ui: &Ui, accel: &str) -> Option<String> {
+    let norm = |s: &str| gtk4::accelerator_parse(s).map(|(k, m)| (k.to_lower(), m));
+    let want = norm(accel)?;
+    let names = commands().into_iter().map(|c| c.0.to_string()).chain((1..=9).map(|k| format!("tab-{k}")));
+    names.into_iter().find(|n| ui.gtk_app.accels_for_action(&format!("win.{n}")).iter().any(|a| norm(a) == Some(want)))
+}
+
 /// Menu items that show a check mark: their actions have a true/false state (`Ui::sync_menu`).
 const CHECKED: &[&str] =
     &["wrap", "line-numbers", "show-whitespace", "spell-check", "title-bar-tabs", "close-with-last-tab", "find-close-on-leave", "find-per-tab", "theme-system", "theme-light", "theme-dark", "eol-lf", "eol-crlf", "read-only", "restore-session", "structure-panel", "path-bar"];
@@ -1740,7 +1775,7 @@ const CHECKED: &[&str] =
 fn actions(ui: &Rc<Ui>) {
     // (in place of the window's own "win" group: menus and shortcuts find these the same way)
     ui.window.insert_action_group("win", Some(&ui.win_actions));
-    for (name, cmd, accels) in commands() {
+    for (name, cmd, _) in commands() {
         let a = if CHECKED.contains(&name) {
             gio::SimpleAction::new_stateful(name, None, &false.to_variant())
         } else {
@@ -1752,9 +1787,6 @@ fn actions(ui: &Rc<Ui>) {
             }
         });
         ui.win_actions.add_action(&a);
-        if !accels.is_empty() {
-            ui.gtk_app.set_accels_for_action(&format!("win.{name}"), accels);
-        }
     }
     for k in 1..=9usize {
         let name = format!("tab-{k}");
@@ -1765,9 +1797,8 @@ fn actions(ui: &Rc<Ui>) {
             }
         });
         ui.win_actions.add_action(&a);
-        // (Ctrl as on Windows; Alt as in other Linux apps)
-        ui.gtk_app.set_accels_for_action(&format!("win.{name}"), &[&format!("<Control>{k}"), &format!("<Alt>{k}")]);
     }
+    set_accels(ui);
     // (its state is the tab's language: the menu shows a dot at that one)
     let lang = gio::SimpleAction::new_stateful("set-lang", Some(glib::VariantTy::STRING), &"".to_variant());
     lang.connect_activate(|_, v| {
@@ -1893,7 +1924,16 @@ fn menu_model(recent: &gio::Menu, format_extra: &gio::Menu, view_extra: &gio::Me
     let marks = section(&[("Toggle bookmark", "toggle-bookmark"), ("Next bookmark", "next-bookmark"), ("Previous bookmark", "prev-bookmark")]);
     marks.append_section(None, &section(&[("Clear bookmarks", "clear-bookmarks")]));
     edit.append_submenu(Some("Bookmarks"), &marks);
-    edit.append_section(None, &section(&[("Toggle comment", "toggle-comment"), ("Duplicate line", "duplicate-line"), ("Delete line", "delete-line")]));
+    edit.append_section(
+        None,
+        &section(&[
+            ("Toggle comment", "toggle-comment"),
+            ("Duplicate line", "duplicate-line"),
+            ("Delete line", "delete-line"),
+            ("Move line up", "move-line-up"),
+            ("Move line down", "move-line-down"),
+        ]),
+    );
     let lines = section(&[("Sort A to Z", "sort-asc"), ("Sort Z to A", "sort-desc"), ("Remove duplicate lines", "dedupe"), ("Remove blank lines", "remove-blank"), ("Trim spaces at line ends", "trim")]);
     edit.append_submenu(Some("Lines"), &lines);
     let case = section(&[("UPPERCASE", "upper"), ("lowercase", "lower"), ("Title Case", "title-case")]);
@@ -1948,7 +1988,15 @@ fn menu_model(recent: &gio::Menu, format_extra: &gio::Menu, view_extra: &gio::Me
     format.append_section(None, &rest);
     bar.append_submenu(Some("F_ormat"), &format);
     let help = gio::Menu::new();
-    help.append_section(None, &section(&[("Keyboard shortcuts", "shortcuts"), ("Open files with Slate…", "make-default"), ("Stop opening files with Slate…", "stop-default")]));
+    help.append_section(
+        None,
+        &section(&[
+            ("Keyboard shortcuts", "shortcuts"),
+            ("Change keyboard shortcuts…", "change-shortcuts"),
+            ("Open files with Slate…", "make-default"),
+            ("Stop opening files with Slate…", "stop-default"),
+        ]),
+    );
     help.append_section(None, &section(&[("Open settings folder", "open-data-folder"), ("Report a problem…", "report-problem")]));
     help.append_section(None, &section(&[("About Slate", "about")]));
     bar.append_submenu(Some("_Help"), &help);
@@ -2067,7 +2115,7 @@ fn lang_menu() -> gio::Menu {
     m
 }
 
-const SHORTCUTS: &str = "Slate keyboard shortcuts
+const SHORTCUTS: &str = "Slate keyboard shortcuts (Help → Change keyboard shortcuts… gives commands other keys)
 
   Ctrl+N / Ctrl+T          New tab
   Ctrl+O                   Open
@@ -3059,7 +3107,11 @@ impl Ui {
         let find_open = a.find.open;
         self.syncing.set(false);
         let dark = a.theme.dark;
+        let shortcuts = std::mem::take(&mut a.shortcuts_changed);
         drop(a);
+        if shortcuts {
+            set_accels(self);
+        }
         if self.css_dark.get() != Some(dark) {
             self.apply_theme();
         }
@@ -3370,6 +3422,9 @@ impl Ui {
         if matches!(ask, Ask::Shortcuts) {
             return self.show_shortcuts();
         }
+        if matches!(ask, Ask::ChangeShortcuts) {
+            return self.change_shortcuts();
+        }
         if let Some(test) = &self.test {
             test.asked.borrow_mut().push(format!("{ask:?}"));
             let answer = test.answers.borrow_mut().pop_front().unwrap_or_default();
@@ -3579,6 +3634,7 @@ impl Ui {
             Ask::Print { preview, .. } => print::run(self, None, preview),
             Ask::PageSetup => print::page_setup(self),
             Ask::Shortcuts => self.show_shortcuts(),
+            Ask::ChangeShortcuts => self.change_shortcuts(),
             Ask::Reload { tab, encoding } => {
                 let Some(name) = self.app.borrow().index_of(tab).map(|i| self.app.borrow().tabs[i].title()) else { return };
                 self.dialog(&format!("Reload {name} and lose your changes?"), "", &[("Cancel", "cancel"), ("Reload", "reload")], move |answer| {
@@ -3603,6 +3659,23 @@ impl Ui {
         }
     }
 
+    /// Help → Change keyboard shortcuts…: the user's file (`crate::shortcuts`), made the first time listing every
+    /// command with its keys (test mode: only in its own data folder).
+    fn change_shortcuts(&self) {
+        if self.test.is_some() && std::env::var_os("SLATE_DATA_DIR").is_none() {
+            return;
+        }
+        let p = crate::shortcuts::path();
+        if !p.exists() {
+            crate::settings::make_data_dir();
+            if let Err(e) = std::fs::write(&p, crate::shortcuts::template()) {
+                self.with(|a| a.flash(format!("Couldn't make {}: {e}", p.display()), true));
+                return;
+            }
+        }
+        self.with(|a| a.open_paths(&[p]));
+    }
+
     /// Help → Keyboard shortcuts: in a tab of their own (nothing is asked, also in test mode).
     fn show_shortcuts(&self) {
         self.with(|a| {
@@ -3612,7 +3685,13 @@ impl Ui {
                 None => {
                     // (an untouched empty tab gives way to them, as to a file opened)
                     let blank = a.tabs.len() == 1 && a.tabs[0].is_blank();
-                    let mut i = a.add_text_tab(SHORTCUTS.as_bytes(), None, Some(Lang::Plain));
+                    let mine = a.keymap.summary();
+                    let text = if mine.is_empty() {
+                        SHORTCUTS.to_string()
+                    } else {
+                        format!("{SHORTCUTS}\n\nYour own keys (Help → Change keyboard shortcuts…), in place of those above\n{mine}")
+                    };
+                    let mut i = a.add_text_tab(text.as_bytes(), None, Some(Lang::Plain));
                     a.tabs[i].doc.mark_saved();
                     a.tabs[i].title_override = Some("Keyboard shortcuts".into());
                     if blank {
@@ -3874,5 +3953,26 @@ impl Ui {
             }
         });
         d.present();
+    }
+}
+
+#[cfg(test)]
+mod shortcut_tests {
+    use super::*;
+
+    /// The commands' default keys as `crate::shortcuts` lists them are the accelerators the actions get.
+    #[test]
+    fn the_listed_keys_are_the_keys_slate_has() {
+        let all = commands();
+        for c in crate::shortcuts::commands() {
+            let (_, _, accels) = all.iter().find(|a| a.0 == c.id).unwrap_or_else(|| panic!("no action {}", c.id));
+            let listed: Vec<String> = crate::shortcuts::default_keys(c).iter().map(|k| k.gtk()).collect();
+            for l in &listed {
+                assert!(accels.contains(&l.as_str()), "{} has no {l}", c.id);
+            }
+            for a in accels.iter() {
+                assert!(listed.iter().any(|l| l == a) || *a == "<Control>plus", "{}'s {a} isn't listed", c.id);
+            }
+        }
     }
 }

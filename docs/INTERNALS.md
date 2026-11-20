@@ -602,6 +602,18 @@ when it's this user's alone, else a guest window that keeps nothing). Windows: `
 - View → Close Slate with the last tab (`Settings::close_with_last_tab`, off by default): Ctrl+W or a tab's × on the
   only tab marks it (`App::quit_with_tab`); once it's gone (after its question, or its save) `remove_tab` closes
   Slate (Windows `Deferred::Cmd(Cmd::Exit)`, Linux `Ask::Quit`). Close all/other tabs don't (an empty tab stays).
+- Keyboard shortcuts the user changes (Help → Change keyboard shortcuts…, `crate::shortcuts`): one list of the
+  commands for both apps (the GTK app's action names, the keys each has, whether it works in the find bar's boxes
+  on Windows) and the user's `shortcuts.txt` in the data folder, made the first time it's opened with every command
+  on a `#` line. A line without the `#` gives that command its own keys (or none), and those keys stop doing
+  anything else (`Keymap`); a line that can't be used is told on its tab when it's saved (`shortcuts_saved`). Each
+  app keeps its own keys as the defaults and lays the user's over them: Windows `App::key_cmd` (the user's first,
+  then `global_key` / `editor_key` unless the command or the keys were given away; `commands::IDS` names the
+  commands, `commands::keyed` puts the user's keys in the menus), GTK `set_accels` (`commands()`'s accelerators
+  with the user's over them, again after the file is saved). Unit tests on each platform check the list's keys are
+  the ones the app has. Moving and typing keys (arrows, Home, Backspace, Ctrl+1–9) aren't in it. Linux's Alt+Up and
+  Alt+Down became the move-line actions' accelerators for it (GTK runs the window's accelerators before the text
+  has the key; test mode's `key:` does the same: `action_for_accel`).
 - View → Find bar (issue #6; both off by default). *Close when you click in the text*
   (`Settings::find_close_on_leave`): the keyboard going from the bar to the text closes it, after a click is placed
   where it was made (Windows: where the app moves it there, a click in the text or gutter, Tab from the find box, a

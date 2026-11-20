@@ -1700,7 +1700,7 @@ impl App {
                 } else if st.close_after {
                     // Typed more while it was saving: closing now would lose that.
                     self.flash("Saved — but you typed more while it was saving, so the tab stayed open.", true);
-                } else {
+                } else if !self.shortcuts_saved(i, &st.path) {
                     self.flash("Saved", false);
                 }
                 self.update_title();
@@ -2632,6 +2632,42 @@ impl App {
         }
     }
 
+    /// The command a key gives: the user's keys first (`crate::shortcuts`), then Slate's own (`global_key` for
+    /// `anywhere`, also in the find bar's boxes; `editor_key` in the text), unless the user gave that command or those
+    /// keys to something else.
+    fn key_cmd(&self, vk: u16, m: &Mods, anywhere: bool) -> Option<Cmd> {
+        let combo = super::commands::combo(vk, m);
+        if let Some(c) = combo.and_then(|c| self.keymap.command_for(&c)) {
+            return if c.anywhere == anywhere { super::commands::cmd_of(c.id) } else { None };
+        }
+        let own = if anywhere { global_key(vk, m) } else { editor_key(vk, m) }?;
+        match super::commands::id_of(own) {
+            Some(id) if self.keymap.keys_of(id).is_some() => None,
+            _ => Some(own),
+        }
+    }
+
+    /// The shortcuts file was saved: its keys count from now, and what couldn't be used is said on its tab. Returns
+    /// whether it was that file.
+    fn shortcuts_saved(&mut self, i: usize, path: &Path) -> bool {
+        if !path.as_os_str().eq_ignore_ascii_case(crate::shortcuts::path().as_os_str()) {
+            return false;
+        }
+        let user = crate::shortcuts::read();
+        self.keymap = crate::shortcuts::Keymap::new(&user);
+        if user.problems.is_empty() {
+            self.flash("Saved — Slate uses these shortcuts now", false);
+        } else {
+            self.tabs[i].notice = Some(Notice {
+                kind: NoticeKind::Warn,
+                text: format!("Saved, but not all of it can be used: {}", user.problems.join("; ")),
+                actions: vec![("Dismiss".into(), NoticeAction::Dismiss)],
+            });
+            self.layout();
+        }
+        true
+    }
+
     /// Key presses in the text area. Returns whether the key was used.
     pub fn on_key(&mut self, vk: u16) -> bool {
         self.hide_tip();
@@ -2643,7 +2679,7 @@ impl App {
         if let Some(used) = self.menu_bar_key(vk, &m) {
             return used;
         }
-        if let Some(cmd) = global_key(vk, &m) {
+        if let Some(cmd) = self.key_cmd(vk, &m, true) {
             self.pending.push(Deferred::Cmd(cmd));
             return true;
         }
@@ -2670,7 +2706,7 @@ impl App {
         if self.block_key(k, &m) {
             return true;
         }
-        if let Some(cmd) = editor_key(vk, &m) {
+        if let Some(cmd) = self.key_cmd(vk, &m, false) {
             self.pending.push(Deferred::Cmd(cmd));
             return true;
         }
@@ -3517,7 +3553,7 @@ impl App {
                 false
             }
             _ => {
-                if let Some(cmd) = global_key(vk, &m) {
+                if let Some(cmd) = self.key_cmd(vk, &m, true) {
                     self.pending.push(Deferred::Cmd(cmd));
                     return true;
                 }
@@ -5223,6 +5259,7 @@ impl App {
                 };
                 vec![
                     item(Cmd::Shortcuts, "&Keyboard shortcuts", ""),
+                    item(Cmd::ChangeShortcuts, "&Change keyboard shortcuts…", ""),
                     if super::install::associated() {
                         item(Cmd::StopDefault, "Stop opening files &with Slate…", "")
                     } else {
@@ -5532,6 +5569,7 @@ fn client_to_screen(hwnd: HWND, x: i32, y: i32) -> POINT {
 /// Shows a popup menu at client DIPs (x, y), below that point or (`up`) above it; returns the chosen command.
 /// `name` says which menu it is (test mode notes it instead of showing it).
 fn popup(cell: &Cell, name: &str, items: Vec<Item>, x: f32, y: f32, up: bool) -> Option<Cmd> {
+    let items = super::commands::keyed(items, &cell.borrow().keymap);
     if let Some(chosen) = win::scripted_menu(name, &items) {
         return chosen;
     }
@@ -6079,7 +6117,13 @@ pub fn run_cmd(cell: &Cell, cmd: Cmd) {
                 return;
             }
             let blank = a.tabs.len() == 1 && a.tabs[0].is_blank();
-            let mut doc = Document::from_text(SHORTCUTS.as_bytes());
+            let mine = a.keymap.summary();
+            let text = if mine.is_empty() {
+                SHORTCUTS.to_string()
+            } else {
+                format!("{SHORTCUTS}\n\nYour own keys (Help → Change keyboard shortcuts…), in place of those above\n{mine}")
+            };
+            let mut doc = Document::from_text(text.as_bytes());
             doc.eol = Eol::Lf;
             let mut i = a.add_tab(doc);
             // (an untouched empty tab gives way to them, as to a file opened)
@@ -6094,6 +6138,21 @@ pub fn run_cmd(cell: &Cell, cmd: Cmd) {
             // (a list to read: a key typed there by mistake doesn't make it a tab with unsaved changes)
             t.read_only = true;
             a.activate(i);
+        }
+        Cmd::ChangeShortcuts => {
+            // (made the first time, listing every command with its keys; test mode only in its own data folder)
+            let p = crate::shortcuts::path();
+            if win::testing() && std::env::var_os("SLATE_DATA_DIR").is_none() {
+                return;
+            }
+            if !p.exists() {
+                crate::settings::make_data_dir();
+                if let Err(e) = std::fs::write(&p, crate::shortcuts::template()) {
+                    cell.borrow_mut().flash(format!("Couldn't make {}: {e}", p.display()), true);
+                    return;
+                }
+            }
+            cell.borrow_mut().open_paths(&[p]);
         }
         Cmd::MakeDefault => super::install::make_default(cell),
         Cmd::StopDefault => super::install::stop_default(cell),
