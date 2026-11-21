@@ -187,6 +187,15 @@ up:
 wait:200
 expect:shown=path bar false, panel false, find bar false
 expect:top=21+0
+# … and a press at the same place in the window right after it is that click's second (the text moved up with the
+# bar, here 47 pixels, and GTK alone would count a click of its own): the word under the mouse selected
+down:200,147
+up:
+expect:sel=76..78
+# (and a third, the line)
+down:200,147
+up:
+expect:sel=71..79
 cmd:find-close-on-leave
 # Help → Change keyboard shortcuts…: a command given other keys loses its own
 cmd:change-shortcuts

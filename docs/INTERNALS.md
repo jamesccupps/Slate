@@ -636,7 +636,11 @@ when it's this user's alone, else a guest window that keeps nothing). Windows: `
   bar is above the text, so closing it at the press moved the text up under a held button and the drag (Windows'
   own mouse move as the bar's boxes hid was enough) selected from the click to what was under the mouse then
   (0.19.0; reported on issue #6). Closing, the view scrolls back as many rows as the bar was tall, so the text
-  stays where it is on screen and the caret under the mouse (not at the very top: no rows above). *One for each tab* (`Settings::find_per_tab`): `App::find_owner` is the tab the bar's
+  stays where it is on screen and the caret under the mouse (not at the very top: no rows above). Linux: GTK counts
+  a press as the next click only near the first in the text widget's own coordinates, which moved up with the bar
+  (at the next frame: before or after the second press), so from a click that closed it to the end of that run of
+  clicks `Ui::click_count` counts them itself at places in the window (`last_press`, GTK's double-click time and
+  distance; `click_extra` what GTK's count is off by after). *One for each tab* (`Settings::find_per_tab`): `App::find_owner` is the tab the bar's
   state is about; when another tab shows (Windows `activate`, Linux `Ui::refresh`, so every way of switching
   counts) `follow_find_bar` keeps the bar's state on the old tab (`Tab::find_bar`; Go to's isn't kept) and takes
   the new one's (a new tab's: closed), without taking the keyboard from the text; the search is shared. Turning it

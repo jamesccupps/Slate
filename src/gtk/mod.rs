@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gtk4::prelude::*;
-use gtk4::{cairo, gdk, gio, glib, pango};
+use gtk4::{cairo, gdk, gio, glib, graphene, pango};
 
 use crate::core::document::Sel;
 use crate::core::job::Notify;
@@ -120,6 +120,11 @@ pub struct Ui {
     /// A press in the text closes the find bar when it's let go (View → Find bar → Close when you click in the
     /// text): the tab's id.
     close_find_on_release: Cell<Option<u64>>,
+    /// The last left press in the text (`click_count`): its time, where it was in the window, its count, and whether
+    /// the text moved under its run of clicks (one of them closed the find bar: `click_count` counts the next).
+    last_press: Cell<(u32, f64, f64, i32, bool)>,
+    /// What GTK's count is off by after a run of clicks `click_count` counted itself, while GTK goes on counting.
+    click_extra: Cell<i32>,
     last_input: Cell<Instant>,
     /// The caret's timer, only while it blinks: stopped once the caret has been still for `BLINK_STOP` or the window
     /// is in the background, so an idle Slate doesn't wake up twice a second (`wake_blink` starts it again).
@@ -927,6 +932,8 @@ pub fn window(application: &gtk4::Application, test: Option<Rc<testmode::Test>>)
         scroll_acc: Cell::new(0.0),
         drag_origin: Cell::new((0.0, 0.0)),
         close_find_on_release: Cell::new(None),
+        last_press: Cell::new((0, 0.0, 0.0, 0, false)),
+        click_extra: Cell::new(0),
         last_input: Cell::new(Instant::now()),
         blink_timer: Cell::new(None),
         polling: Cell::new(false),
@@ -1090,6 +1097,7 @@ fn connect(ui: &Rc<Ui>, prev: &gtk4::Button, next: &gtk4::Button, lines_btn: &gt
             let state = g.current_event_state();
             let (shift, alt) = (state.contains(gdk::ModifierType::SHIFT_MASK), state.contains(gdk::ModifierType::ALT_MASK));
             let ctrl = state.contains(gdk::ModifierType::CONTROL_MASK);
+            let n = ui.click_count(g.current_button(), n, g.current_event_time(), x, y);
             ui.text_pressed(g.current_button(), n, x, y, shift, alt, ctrl);
         }
     });
@@ -2202,6 +2210,7 @@ impl Ui {
     /// Test mode: a key as if pressed in the text.
     /// Test mode: the left button pressed at `x`, `y` in the text (`n`: which click), the mouse moved there, let go.
     pub fn press_for_test(&self, n: i32, x: f64, y: f64, alt: bool, ctrl: bool) {
+        let n = self.click_count(1, n, (glib::monotonic_time() / 1000) as u32, x, y);
         self.text_pressed(1, n, x, y, false, alt, ctrl);
     }
 
@@ -2632,11 +2641,13 @@ impl Ui {
     /// stays where it is on screen, scrolled back as many rows as the bar was tall (as far as there are rows above).
     fn close_find_after_click(&self) {
         let Some(id) = self.close_find_on_release.take() else { return };
-        let bar_h = self.find_box.height() as f64;
+        // (its padding and border included: the text moves up by all of it; `height` is only what's inside)
+        let bar = &self.find_box;
+        let bar_h = bar.compute_bounds(bar).map_or(bar.height() as f64, |r| r.height() as f64);
         let g = self.geom();
-        self.with(|a| {
+        let closed = self.with(|a| {
             if !a.find.open || a.tab().id != id {
-                return;
+                return false;
             }
             a.exec(Cmd::CloseFind);
             let rows = (bar_h / a.style.row_h.max(1.0)).round() as i64;
@@ -2644,7 +2655,46 @@ impl Ui {
                 a.with_view(&g, |v, cx| v.scroll_rows(cx, -rows));
             }
             a.dirty_view = true;
+            true
         });
+        if closed == Some(true) {
+            let (t, x, y, n, _) = self.last_press.get();
+            self.last_press.set((t, x, y, n, true));
+        }
+    }
+
+    /// How many clicks a press of `button` in the text at `x`, `y` (the text's own coordinates) at `time` (ms) makes:
+    /// GTK's count `n`, except from a click that closed the find bar (`close_find_after_click`) on. GTK counts a
+    /// press as the next click only near the first in the text's own coordinates, which moved up with the bar (at
+    /// the next frame: maybe before the second press, maybe after it): from that click to the end of its run, the
+    /// presses are counted here, at places in the window (a double-click there selects a word, a triple the line).
+    fn click_count(&self, button: u32, n: i32, time: u32, x: f64, y: f64) -> i32 {
+        if button != 1 {
+            self.last_press.set((0, 0.0, 0.0, 0, false));
+            self.click_extra.set(0);
+            return n;
+        }
+        let p = graphene::Point::new(x as f32, y as f32);
+        let (wx, wy) = self.text.compute_point(&self.window, &p).map_or((x, y), |p| (p.x() as f64, p.y() as f64));
+        let (t0, x0, y0, n0, moved) = self.last_press.get();
+        let ours = if moved {
+            let (wait, near) = gtk4::Settings::default()
+                .map_or((400, 5), |s| (s.gtk_double_click_time(), s.gtk_double_click_distance()));
+            let next = time.wrapping_sub(t0) <= wait.max(0) as u32
+                && (wx - x0).abs() <= near as f64
+                && (wy - y0).abs() <= near as f64;
+            let ours = if next { n0 + 1 } else { 1 };
+            // (what GTK's count is off by, should it go on counting after this run)
+            self.click_extra.set(ours - n);
+            ours
+        } else if n > 1 {
+            n + self.click_extra.get()
+        } else {
+            self.click_extra.set(0);
+            1
+        };
+        self.last_press.set((time, wx, wy, ours, moved && ours > 1));
+        ours
     }
 
     fn text_dragged(&self, x: f64, y: f64) {
