@@ -433,6 +433,13 @@ async fn script(lines: Vec<String>, test: Rc<Test>) -> i32 {
                 settle(20).await;
             }
             "wait" => settle(arg.parse().unwrap_or(100)).await,
+            // another program writes a file (`outside:<path>|<text>`, `\n` a line break), unseen until the next look
+            "outside" => {
+                let (p, t) = arg.split_once('|').unwrap_or((arg, ""));
+                if let Err(e) = std::fs::write(p, t.replace("\\n", "\n")) {
+                    log(&mut out, format!("outside {p}: {e}"));
+                }
+            }
             "jobs" => jobs(arg == "counts").await,
             "shot" => {
                 // (a window that's being resized or mapped draws nothing for a moment: tried again then)

@@ -802,11 +802,14 @@ pub fn window(application: &gtk4::Application, test: Option<Rc<testmode::Test>>)
     let menubar = gtk4::PopoverMenuBar::from_model(Some(&menu_model(&recent_menu, &format_extra, &view_extra, &mono_families(&text.pango_context(), &settings.font))));
     // A menu bar item clicked kept the keyboard once its menu closed (typing went nowhere, as Ctrl+N's new tab
     // showed): as on Windows, the keyboard stays in the text, and the menus open in popovers of their own.
+    let mut items = Vec::new();
     let mut item = menubar.first_child();
     while let Some(w) = item {
         w.set_focusable(false);
         item = w.next_sibling();
+        items.push(w);
     }
+    menus_beside(&window, &items);
     let path_bar = gtk4::DrawingArea::new();
     path_bar.set_content_height(structure::PATH_H as i32);
     path_bar.set_hexpand(true);
@@ -1918,6 +1921,105 @@ fn section(items: &[(&str, &str)]) -> gio::Menu {
     m
 }
 
+thread_local! {
+    /// While `open_menu_soon` waits: which menu bar item's menu it opens (Left and Right meanwhile move it on, rather
+    /// than the caret in the text).
+    static MENU_NEXT: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+/// Left and Right in an open menu go to the menu beside it, as GTK's own would: but GTK closes the one and opens the
+/// other in the same step, and on Wayland the second can't show while the compositor still has the first (a grabbing
+/// popup's parent must be the top one: "Tried to map a grabbing popup with a non-top most parent"). No menu showed,
+/// and from then on the menus didn't open, by key or click, nor did clicks in the text move the caret, until Slate was
+/// started again (the 2026-11-21 audit, on GNOME). Here the open one is closed, and the next opened a moment later, as
+/// Alt and its letter open it (`open_menu_soon`). A key that opens or closes a submenu stays GTK's (`child_focus` takes
+/// it first).
+fn menus_beside(window: &gtk4::ApplicationWindow, items: &[gtk4::Widget]) {
+    let n = items.len();
+    let weak: Rc<Vec<glib::WeakRef<gtk4::Widget>>> = Rc::new(items.iter().map(|w| w.downgrade()).collect());
+    let step = move |i: usize, right: bool| if right { (i + 1) % n } else { (i + n - 1) % n };
+    let mods = gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::ALT_MASK | gdk::ModifierType::SHIFT_MASK;
+    let arrow = |key: gdk::Key| match key {
+        gdk::Key::Right | gdk::Key::KP_Right => Some(true),
+        gdk::Key::Left | gdk::Key::KP_Left => Some(false),
+        _ => None,
+    };
+    for (k, item) in items.iter().enumerate() {
+        let Some(pop) = popover_of(item) else { continue };
+        let keys = gtk4::EventControllerKey::new();
+        keys.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        let (me, weak) = (pop.downgrade(), weak.clone());
+        keys.connect_key_pressed(move |_, key, _, state| {
+            let Some(right) = arrow(key) else { return glib::Propagation::Proceed };
+            let Some(pop) = me.upgrade().filter(|_| !state.intersects(mods) && n > 1) else {
+                return glib::Propagation::Proceed;
+            };
+            // (Right on an item with a submenu opens it, and Left in a submenu goes back: GTK's. Left at the top asked
+            // of GTK closed the menu, with a Gtk-CRITICAL, on an item with a submenu.)
+            if right && pop.child_focus(gtk4::DirectionType::Right) {
+                return glib::Propagation::Stop;
+            }
+            let page = pop.property::<Option<glib::GString>>("visible-submenu");
+            if !right && page.is_some_and(|p| p != "main") {
+                return glib::Propagation::Proceed;
+            }
+            pop.popdown();
+            MENU_NEXT.set(Some(step(k, right)));
+            open_menu_soon(weak.clone(), 5);
+            glib::Propagation::Stop
+        });
+        pop.add_controller(keys);
+    }
+    // (while the next menu is on its way: Left and Right go on from it, Esc forgets it)
+    let keys = gtk4::EventControllerKey::new();
+    keys.set_propagation_phase(gtk4::PropagationPhase::Capture);
+    keys.connect_key_pressed(move |_, key, _, state| {
+        let Some(i) = MENU_NEXT.get() else { return glib::Propagation::Proceed };
+        match arrow(key) {
+            Some(right) if !state.intersects(mods) => MENU_NEXT.set(Some(step(i, right))),
+            _ if key == gdk::Key::Escape => MENU_NEXT.set(None),
+            _ => return glib::Propagation::Proceed,
+        }
+        glib::Propagation::Stop
+    });
+    window.add_controller(keys);
+}
+
+/// A menu bar item's menu.
+fn popover_of(item: &gtk4::Widget) -> Option<gtk4::PopoverMenu> {
+    let mut child = item.first_child();
+    while let Some(w) = child {
+        child = w.next_sibling();
+        if let Ok(pop) = w.downcast::<gtk4::PopoverMenu>() {
+            return Some(pop);
+        }
+    }
+    None
+}
+
+/// Opens the menu of the menu bar item `MENU_NEXT` says once the compositor has let the one before go: 120 ms after it
+/// closed was enough on GNOME in a VM, 30 ms never and 60 ms not always. A menu that still didn't show (GTK has it
+/// shown, the screen doesn't) is closed again and tried a little later (`tries` times in all), so a slower machine gets
+/// it too (a run with a 40 ms wait took two tries each time, and showed every one).
+fn open_menu_soon(items: Rc<Vec<glib::WeakRef<gtk4::Widget>>>, tries: u32) {
+    glib::timeout_add_local_once(Duration::from_millis(120), move || {
+        // (taken by an earlier timer, or Esc: nothing to do)
+        let Some(i) = MENU_NEXT.take() else { return };
+        let Some(w) = items.get(i).and_then(|w| w.upgrade()) else { return };
+        w.activate();
+        glib::timeout_add_local_once(Duration::from_millis(80), move || {
+            let Some(pop) = popover_of(&w) else { return };
+            if pop.is_visible() && !pop.is_mapped() && tries > 1 {
+                pop.popdown();
+                if MENU_NEXT.get().is_none() {
+                    MENU_NEXT.set(Some(i));
+                }
+                open_menu_soon(items, tries - 1);
+            }
+        });
+    });
+}
+
 fn menu_model(recent: &gio::Menu, format_extra: &gio::Menu, view_extra: &gio::Menu, fonts: &[String]) -> gio::Menu {
     let bar = gio::Menu::new();
     let file = gio::Menu::new();
@@ -2554,6 +2656,10 @@ impl Ui {
             let in_sel = !sel.is_empty() && pos > sel.start() && pos < sel.end();
             if ctrl_click && a.settings.multi_cursor && !in_sel {
                 a.toggle_caret(pos);
+                true
+            } else if n >= 2 && ctrl && !alt && !shift && a.settings.multi_cursor {
+                // (Ctrl+double-click, triple: the word there, the line, as one more selection)
+                a.add_caret_word(pos, n >= 3);
                 true
             } else {
                 a.tabs[a.active].view.carets.clear();

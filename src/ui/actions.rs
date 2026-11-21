@@ -13,13 +13,12 @@ use windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
 use windows::Win32::Globalization::{GetDateFormatEx, GetTimeFormatEx, TIME_NOSECONDS};
 use windows::Win32::System::SystemInformation::GetLocalTime;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
-use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
     DestroyMenu, DestroyWindow, GetCaretBlinkTime, GetSystemMetrics, KillTimer, SM_CXDOUBLECLK, SM_CXDRAG, SM_CYDRAG, SPI_GETCARETTIMEOUT,
-    SPI_GETWHEELSCROLLLINES, SW_SHOWNORMAL, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SetTimer, SystemParametersInfoW,
+    SPI_GETWHEELSCROLLLINES, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SetTimer, SystemParametersInfoW,
     TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_TOPALIGN, TrackPopupMenuEx,
 };
-use windows::core::{HSTRING, PCWSTR, w};
+use windows::core::{HSTRING, PCWSTR};
 
 use crate::core::document::{Document, EditKind, Sel};
 use crate::core::io::{self as fileio, Loading, SaveError};
@@ -352,8 +351,15 @@ impl App {
         }
         match self.tab().find_bar {
             Some(mode) => {
+                // (the keyboard in a box this tab's bar doesn't show, Go to's or Replace's, goes to the find box)
+                let f = win::focus();
+                let hidden = self.find.open
+                    && (f == self.find.goto_edit || (f == self.find.replace_edit && mode != BarMode::Replace));
                 self.find.open = true;
                 self.find.mode = mode;
+                if hidden {
+                    FindBar::focus(self.find.find_edit);
+                }
             }
             None if self.find.open => {
                 let in_bar = self.in_find_bar();
@@ -739,6 +745,7 @@ impl App {
                 self.tabs[i].read_only = true;
             }
             // Binary files open too (as text), but saving one from here could damage it.
+            self.tabs[i].binary = opened.binary;
             if opened.binary {
                 self.tabs[i].notice = Some(Notice {
                     kind: NoticeKind::Warn,
@@ -814,8 +821,10 @@ impl App {
             self.layout();
         } else if creatable {
             // A file that isn't there yet in a folder that is (`Slate todo.txt`): an empty tab that becomes that
-            // file when it's saved (Notepad offers to create it).
+            // file when it's saved (Notepad offers to create it), with EditorConfig's line endings, encoding and
+            // indentation for it (the open looked them up: `finish_read`).
             self.flash(format!("{name} is a new file: saving creates it."), false);
+            self.detect_indent(i);
         } else if (place.is_some() || self.tabs[i].restore.is_some())
             && self.tabs[i].doc.path.as_deref().is_some_and(|p| fileio::transient(p, &e))
         {
@@ -1198,9 +1207,15 @@ impl App {
         let bom = tab.doc.bom;
         let saving = snap.clone();
         let damaged = (tab.doc.bad_units > 0 || tab.doc.suspect) && !lossy_ok;
+        // (to its own file: unless another program changed it just now, unseen by the look every 2 s)
+        let own = tab.doc.path.as_deref().is_some_and(|q| q.as_os_str().eq_ignore_ascii_case(path.as_os_str()));
+        let looked = own.then_some((tab.doc.disk, tab.seen_disk));
         let job = Job::spawn(snap.len(), notify, move |ctx| {
             if damaged {
                 return Err(SaveError::Lossy);
+            }
+            if let Some(now) = looked.and_then(|(old, seen)| fileio::changed_outside(&p, old, seen)) {
+                return Err(SaveError::Outside(now));
             }
             fileio::save(&saving, &p, encoding, bom, lossy_ok, false, ctx)
         });
@@ -1640,6 +1655,7 @@ impl App {
                 let ext = |p: &Path| p.extension().map(|e| e.to_ascii_lowercase());
                 // A new name, or a new kind of name (notes.txt saved as notes.md): pick the language again.
                 let renamed = tab.doc.path.as_deref().map(ext) != Some(ext(&st.path));
+                let moved = tab.doc.path.as_deref() != Some(st.path.as_path());
                 tab.doc.path = Some(st.path.clone());
                 tab.canon = Some((st.path.clone(), saved.canon));
                 tab.doc.encoding = st.encoding;
@@ -1683,6 +1699,11 @@ impl App {
                 self.settings.add_recent(&st.path);
                 super::jumplist::update(self.settings.recent.clone());
                 self.session_dirty = true;
+                // (a file somewhere new, a new tab's first save: EditorConfig's rule there, which may have come back
+                // before the save gave the tab that path)
+                if moved {
+                    self.detect_indent(i);
+                }
                 if saved.lossy {
                     // (only when the user said so) The tab keeps the real characters: never close it now, nor the
                     // window it was being saved for.
@@ -1730,6 +1751,21 @@ impl App {
                             actions: vec![
                                 ("Reload (lose my changes)".into(), NoticeAction::Reload),
                                 ("Dismiss".into(), NoticeAction::Dismiss),
+                            ],
+                        });
+                        self.layout();
+                        return false;
+                    }
+                    SaveError::Outside(now) => {
+                        // (told now: saving again keeps the user's version, as after the look's own notice)
+                        let tab = &mut self.tabs[i];
+                        tab.seen_disk = Some(Some(*now));
+                        tab.notice = Some(Notice {
+                            kind: NoticeKind::Warn,
+                            text: e.to_string(),
+                            actions: vec![
+                                ("Reload (lose my changes)".into(), NoticeAction::Reload),
+                                ("Keep mine".into(), NoticeAction::KeepMine),
                             ],
                         });
                         self.layout();
@@ -1859,6 +1895,8 @@ impl App {
                     text: format!("{verb}: {msg}{at}"),
                     actions: vec![("Show me".into(), NoticeAction::GoTo(off)), ("Dismiss".into(), NoticeAction::Dismiss)],
                 });
+                // (the status bar's message is older: "Valid JSON" from the check before can't stay beside this)
+                self.flash = None;
                 if i == self.active {
                     self.go_to(off, true);
                 }
@@ -1870,6 +1908,7 @@ impl App {
                     text: m,
                     actions: vec![("Dismiss".into(), NoticeAction::Dismiss)],
                 });
+                self.flash = None;
                 self.layout();
             }
             TaskResult::Done(m) => self.flash(m, false),
@@ -2422,9 +2461,10 @@ impl App {
         self.after_edit();
     }
 
-    /// Keys with multiple cursors: Backspace, Delete, Enter and Tab edit at each; the arrows, Home and End move the
-    /// others (the main one then moves as always, `after_move` tidies); Esc leaves only the main one, as do the keys
-    /// that don't work with several (Page Up, Ctrl+Home…). None: the key goes on as usual.
+    /// Keys with multiple cursors: Backspace, Delete, Enter and Tab edit at each; the arrows, Home and End move them
+    /// all (`move_carets`: Left and Right the others, the main one then moving as always; `after_move` tidies); Esc
+    /// leaves only the main one, as do the keys that don't work with several (Page Up, Ctrl+Home…). None: the key goes
+    /// on as usual.
     fn carets_key(&mut self, k: VIRTUAL_KEY, m: &Mods) -> Option<bool> {
         use crate::edit::{CaretMove, MultiEdit};
         let how = match k {
@@ -2439,7 +2479,14 @@ impl App {
         if let Some(how) = how {
             let tab_size = self.settings.tab_size;
             let tab = &mut self.tabs[self.active];
-            crate::edit::move_carets(&tab.doc, &mut tab.view.carets, how, m.shift, tab_size);
+            let mut main = tab.view.sel;
+            if crate::edit::move_carets(&tab.doc, &mut main, &mut tab.view.carets, how, m.shift, tab_size) {
+                // (Up, Down, Home and End: the main one by the others' rule, so they all go the same way)
+                tab.view.set_caret(main.caret, m.shift);
+                tab.view.want_x = None;
+                self.after_move();
+                return Some(true);
+            }
             return None;
         }
         let unit = self.indent_now().unit();
@@ -2459,7 +2506,8 @@ impl App {
             self.invalidate();
             return Some(true);
         }
-        if matches!(k, VK_PRIOR | VK_NEXT | VK_HOME | VK_END | VK_UP | VK_DOWN | VK_TAB | VK_RETURN) {
+        // (Ctrl+Up / Down only scroll: the cursors stay, as with the wheel)
+        if matches!(k, VK_PRIOR | VK_NEXT | VK_HOME | VK_END | VK_TAB | VK_RETURN) {
             self.tab_mut().view.carets.clear();
         }
         None
@@ -2792,7 +2840,10 @@ impl App {
             return true;
         }
         let k = VIRTUAL_KEY(vk);
-        if m.alt && !m.ctrl && !m.shift {
+        // (Alt and a menu's letter opens it, unless the user gave those keys to a command: theirs wins, and the menu
+        // is still Alt, then the letter, or F10)
+        let mine = super::commands::combo(vk, &m).is_some_and(|c| self.keymap.taken(&c));
+        if m.alt && !m.ctrl && !m.shift && !mine {
             if let Some(i) = menu_for_letter(vk) {
                 self.drop_typed_char();
                 self.pending.push(Deferred::Menu(i));
@@ -3857,6 +3908,21 @@ impl App {
             let tab = &mut self.tabs[self.active];
             let mut main = tab.view.sel;
             let r = crate::edit::toggle_caret(&tab.doc, &mut main, &mut tab.view.carets, pos);
+            tab.view.sel = main;
+            tab.view.want_x = None;
+            tab.doc.seal();
+            if let Err(e) = r {
+                self.flash(e, true);
+            }
+            self.restart_caret();
+            self.invalidate();
+            return;
+        }
+        // Ctrl+double-click (triple) with multiple cursors on: the word there (the line) is one more selection
+        if m.ctrl && !m.alt && !m.shift && !gutter && clicks >= 2 && self.settings.multi_cursor {
+            let tab = &mut self.tabs[self.active];
+            let mut main = tab.view.sel;
+            let r = crate::edit::add_caret_word(&tab.doc, &mut main, &mut tab.view.carets, pos, clicks >= 3);
             tab.view.sel = main;
             tab.view.want_x = None;
             tab.doc.seal();
@@ -5181,16 +5247,12 @@ impl App {
             }
             Cmd::ReportProblem => {
                 // GitHub's issue form, filled in: the user sees it all, and sends it (or doesn't) themselves.
-                unsafe {
-                    ShellExecuteW(self.hwnd, w!("open"), &HSTRING::from(super::crash::report_url()), None, None, SW_SHOWNORMAL);
-                }
+                win::shell_open(self.hwnd, std::ffi::OsStr::new(&super::crash::report_url()), "report a problem");
             }
             Cmd::OpenDataFolder => {
                 let d = data_dir();
                 let _ = std::fs::create_dir_all(&d);
-                unsafe {
-                    ShellExecuteW(self.hwnd, w!("open"), &HSTRING::from(d.as_os_str()), None, None, SW_SHOWNORMAL);
-                }
+                win::shell_open(self.hwnd, d.as_os_str(), "open the data folder");
             }
             _ => {}
         }
@@ -5317,7 +5379,7 @@ impl App {
                     item(Cmd::SaveAll, "Save a&ll", "Ctrl+Alt+S"),
                     Item::Sep,
                     item(Cmd::Print, "&Print…", "Ctrl+P"),
-                    item(Cmd::PrintPreview, "Print pre&view…", ""),
+                    item(Cmd::PrintPreview, "Print previe&w…", ""),
                     item(Cmd::PageSetup, "Page set&up…", ""),
                     Item::Sep,
                     enabled(Cmd::Reload, "Reloa&d from disk", "", has_path),
@@ -5443,7 +5505,7 @@ impl App {
                     Item::Sep,
                     item(Cmd::FilterLines(false), "Show only &matching lines", "Alt+L"),
                     item(Cmd::FilterLines(true), "Show lines &not matching", ""),
-                    enabled(Cmd::ClearHighlights, "Clear &highlights", "", !self.highlights.is_empty()),
+                    enabled(Cmd::ClearHighlights, "Clear hi&ghlights", "", !self.highlights.is_empty()),
                 ];
                 if lang.has_structure() {
                     let what = if lang == Lang::Xml { "XML" } else { "JSON" };
@@ -5463,7 +5525,7 @@ impl App {
                     ),
                     sub("&Font", font_items),
                     sub(
-                        "&Theme",
+                        "Th&eme",
                         vec![
                             check(Cmd::Theme(ThemeMode::System), "Use &system setting", "", s.theme == ThemeMode::System),
                             check(Cmd::Theme(ThemeMode::Light), "&Light", "", s.theme == ThemeMode::Light),

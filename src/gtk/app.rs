@@ -313,6 +313,8 @@ pub struct Tab {
     pub goto: Option<(u64, u64)>,
     /// What was last seen on disk (a change already told about isn't told again).
     pub seen_disk: Option<Option<crate::core::document::DiskInfo>>,
+    /// The file looked like a binary one when it was read (its notice says so): no spell check there.
+    pub binary: bool,
     /// Where the session keeps its text (its backup file's name), when it does.
     pub backup: Option<String>,
     /// The selection (anchor, caret) and top to go back to once its file is read (a tab from the session).
@@ -323,6 +325,9 @@ pub struct Tab {
     pub canon: Option<PathBuf>,
     /// What the tab is called when it isn't a file's (Keyboard shortcuts).
     pub title_override: Option<String>,
+    /// An unsaved tab's number, as on Windows: "Untitled 2" (1 is plain "Untitled"), the lowest no other unsaved tab
+    /// has when it's made.
+    pub untitled: u32,
     /// Being read again after another program changed the file: whether the caret was at the end (it stays there,
     /// following a log as it grows).
     reload: Option<bool>,
@@ -351,6 +356,7 @@ impl Tab {
         }
         match &self.doc.path {
             Some(p) => p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| p.display().to_string()),
+            None if self.untitled > 1 => format!("Untitled {}", self.untitled),
             None => "Untitled".into(),
         }
     }
@@ -657,8 +663,11 @@ impl App {
         let id = self.next_id;
         self.next_id += 1;
         let indent = default_indent(&self.settings);
+        let used: Vec<u32> = self.tabs.iter().filter(|t| t.doc.path.is_none()).map(|t| t.untitled).collect();
+        let untitled = if doc.path.is_none() { (1..).find(|n| !used.contains(n)).unwrap_or(1) } else { 0 };
         Tab {
             id,
+            untitled,
             doc,
             view: View::new(),
             find_bar: None,
@@ -680,6 +689,7 @@ impl App {
             access_ok: None,
             goto: None,
             seen_disk: None,
+            binary: false,
             backup: None,
             restore_at: None,
             session_version: 0,
@@ -1471,6 +1481,7 @@ impl App {
                 tab.goto = None;
             }
         }
+        self.tabs[i].binary = opened.binary;
         if opened.binary {
             self.tabs[i].notice = Some("This looks like a binary file (a program, an image...): shown as text.".into());
         }
@@ -1571,9 +1582,14 @@ impl App {
         let damaged = (tab.doc.bad_units > 0 || tab.doc.suspect) && !lossy_ok;
         let owner_ok = tab.owner_ok.as_deref() == Some(path.as_path());
         let access_ok = tab.access_ok.as_deref() == Some(path.as_path());
+        // (to its own file: unless another program changed it just now, unseen by the look every 2 s)
+        let looked = (tab.doc.path.as_deref() == Some(path.as_path())).then_some((tab.doc.disk, tab.seen_disk));
         let job = Job::spawn(snap.len(), notify, move |ctx| {
             if damaged {
                 return Err(SaveError::Lossy);
+            }
+            if let Some(now) = looked.and_then(|(old, seen)| fileio::changed_outside(&p, old, seen)) {
+                return Err(SaveError::Outside(now));
             }
             if !owner_ok && !fileio::owner_kept(&p) {
                 return Err(SaveError::Owner);
@@ -1619,6 +1635,7 @@ impl App {
                 }
                 let ext = |p: &Path| p.extension().map(|e| e.to_ascii_lowercase());
                 let renamed = tab.doc.path.as_deref().map(ext) != Some(ext(&st.path));
+                let moved = tab.doc.path.as_deref() != Some(st.path.as_path());
                 tab.doc.path = Some(st.path.clone());
                 // (another open of the file it is now finds this tab; the shortcuts tab saved as a file is that file)
                 tab.canon = saved.canon;
@@ -1644,6 +1661,11 @@ impl App {
                 self.settings.add_recent(&st.path);
                 super::note_recent(&st.path);
                 self.session_dirty = true;
+                // (a file somewhere new, a new tab's first save: EditorConfig's rule there, which may have come back
+                // before the save gave the tab that path)
+                if moved {
+                    self.apply_editorconfig(i);
+                }
                 if saved.lossy && st.encoding == Encoding::Ansi {
                     self.flash("Some characters can't be stored in ANSI and were saved as \"?\".", true);
                 } else if saved.lossy {
@@ -1679,6 +1701,15 @@ impl App {
             }
             Err(SaveError::Cancelled) => {
                 self.flash("Saving was cancelled.", false);
+                self.quitting = false;
+            }
+            Err(e @ SaveError::Outside(now)) => {
+                // (told now: saving again keeps the user's version, as after the look's own notice)
+                let tab = &mut self.tabs[i];
+                tab.seen_disk = Some(Some(now));
+                tab.notice = Some(e.to_string());
+                tab.notice_save_as = false;
+                self.flash("Not saved: another program changed the file (see above the text).", true);
                 self.quitting = false;
             }
             Err(e) => {
@@ -1874,6 +1905,7 @@ impl App {
         let tab = self.tab();
         if !self.settings.spell_check
             || tab.read_only
+            || tab.binary
             || tab.filter.is_some()
             || !crate::spell::checks(tab.lang)
             || crate::shortcuts::is_file(tab.doc.path.as_deref())
@@ -2013,9 +2045,10 @@ impl App {
         self.after_edit(true);
     }
 
-    /// Keys with multiple cursors: Backspace, Delete, Enter and Tab edit at each; the arrows, Home and End move the
-    /// others (the main one then moves as always; they're tidied at the end of `on_key`); Esc leaves only the main
-    /// one, as do the keys that don't work with several (Page Up, Ctrl+Home…). None: the key goes on as usual.
+    /// Keys with multiple cursors: Backspace, Delete, Enter and Tab edit at each; the arrows, Home and End move them
+    /// all (`move_carets`: Left and Right the others, the main one then moving as always; they're tidied at the end of
+    /// `on_key`); Esc leaves only the main one, as do the keys that don't work with several (Page Up, Ctrl+Home…).
+    /// None: the key goes on as usual.
     fn carets_key(&mut self, key: gdk::Key, ctrl: bool, shift: bool) -> Option<bool> {
         use edit::{CaretMove, MultiEdit};
         use gdk::Key;
@@ -2031,7 +2064,21 @@ impl App {
         if let Some(how) = how {
             let ts = self.settings.tab_size;
             let tab = &mut self.tabs[self.active];
-            edit::move_carets(&tab.doc, &mut tab.view.carets, how, shift, ts);
+            let mut main = tab.view.sel;
+            if edit::move_carets(&tab.doc, &mut main, &mut tab.view.carets, how, shift, ts) {
+                // (Up, Down, Home and End: the main one by the others' rule, so they all go the same way; tidied as
+                // at the end of `on_key`)
+                let v = &mut tab.view;
+                v.block = None;
+                v.set_caret(main.caret, shift);
+                v.want_x = None;
+                let mut main = v.sel;
+                v.carets.tidy(&mut main);
+                v.sel = main;
+                self.reveal_pending = true;
+                self.dirty_view = true;
+                return Some(true);
+            }
             return None;
         }
         let unit = self.tab().indent.unit();
@@ -2053,7 +2100,8 @@ impl App {
             self.dirty_view = true;
             return Some(true);
         }
-        if matches!(key, Key::Page_Up | Key::KP_Page_Up | Key::Page_Down | Key::KP_Page_Down | Key::Home | Key::KP_Home | Key::End | Key::KP_End | Key::Up | Key::KP_Up | Key::Down | Key::KP_Down | Key::Tab | Key::ISO_Left_Tab | Key::Return | Key::KP_Enter) {
+        // (Ctrl+Up / Down only scroll: the cursors stay, as with the wheel)
+        if matches!(key, Key::Page_Up | Key::KP_Page_Up | Key::Page_Down | Key::KP_Page_Down | Key::Home | Key::KP_Home | Key::End | Key::KP_End | Key::Tab | Key::ISO_Left_Tab | Key::Return | Key::KP_Enter) {
             self.tabs[self.active].view.carets.clear();
         }
         None
@@ -2101,6 +2149,20 @@ impl App {
         let tab = &mut self.tabs[self.active];
         let mut main = tab.view.sel;
         let r = edit::toggle_caret(&tab.doc, &mut main, &mut tab.view.carets, pos);
+        tab.view.sel = main;
+        tab.view.want_x = None;
+        tab.doc.seal();
+        if let Err(e) = r {
+            self.flash(e, true);
+        }
+        self.dirty_view = true;
+    }
+
+    /// Ctrl+double-click (`line`: triple) with multiple cursors on: `edit::add_caret_word`.
+    pub fn add_caret_word(&mut self, pos: u64, line: bool) {
+        let tab = &mut self.tabs[self.active];
+        let mut main = tab.view.sel;
+        let r = edit::add_caret_word(&tab.doc, &mut main, &mut tab.view.carets, pos, line);
         tab.view.sel = main;
         tab.view.want_x = None;
         tab.doc.seal();
@@ -3369,6 +3431,17 @@ impl App {
                 tab.doc.seal();
                 tab.view.sel = new_sel;
                 tab.sync_view();
+                // (formatted: indented by the formatter's own rule now, as Windows has it too; EditorConfig's, or what
+                // the user picked, comes first)
+                if matches!(kind, TaskKind::Json(json::Mode::Pretty) | TaskKind::Xml(json::Mode::Pretty)) && !tab.indent_picked {
+                    let ts = self.settings.tab_size;
+                    let ec = tab.editorconfig.as_ref().filter(|(p, _)| Some(p) == tab.doc.path.as_ref());
+                    let ec = ec.and_then(|(_, props)| edit::editorconfig_of(props, ts).0);
+                    let head = tab.doc.read(0, (64 << 10).min(tab.doc.len()));
+                    if let Some(ind) = ec.or_else(|| edit::detect_indent(&head)) {
+                        tab.indent = ind;
+                    }
+                }
                 // (Find in selection: Replace all's range ends where its replacements end; anything else ends it)
                 tab.view.scope = match kind {
                     TaskKind::ReplaceAll => scope.map(|(a, b)| (a, (b + new_len).saturating_sub(old_len).max(a))),

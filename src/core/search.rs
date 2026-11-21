@@ -391,7 +391,7 @@ impl Matcher {
                     break;
                 }
                 let me = hs + m.1 as u64;
-                if me <= to {
+                if me <= to && !inside_crlf(hay, m) {
                     best = Some((ms, me));
                 }
                 at = next_at(hay, m);
@@ -481,8 +481,8 @@ impl Matcher {
                     }
                     break;
                 }
-                // Skip an empty match right where the previous match ended.
-                if !(m.0 == m.1 && last_end == Some(ms)) && !f(hay, hs, Hit::Match(ms, me)) {
+                // Skip an empty match right where the previous match ended, or inside a line break.
+                if !(m.0 == m.1 && last_end == Some(ms)) && !inside_crlf(hay, m) && !f(hay, hs, Hit::Match(ms, me)) {
                     return;
                 }
                 last_end = Some(me);
@@ -1006,6 +1006,12 @@ enum Hit {
     Done(u64),
 }
 
+/// Whether match `m` of `hay` is an empty one between the CR and the LF of a line break: that isn't a place in the text
+/// (`x*` finds one there, and Replace all would put its text inside the line break). `^` and `$` never match there.
+fn inside_crlf(hay: &[u8], m: (usize, usize)) -> bool {
+    m.0 == m.1 && m.0 > 0 && hay[m.0 - 1] == b'\r' && hay.get(m.0) == Some(&b'\n')
+}
+
 /// Where to continue after match `m` (start, end; one character further after an empty match).
 fn next_at(hay: &[u8], m: (usize, usize)) -> usize {
     if m.1 > m.0 { m.1 } else { m.1 + super::text::char_len_at(&hay[m.1..]).max(1) }
@@ -1499,13 +1505,26 @@ mod tests {
         let (mut v, mut at, mut last_end) = (Vec::new(), 0, None);
         while at <= text.len() {
             let Some(x) = m.re.find_at(text, at) else { break };
-            if !(x.start() == x.end() && last_end == Some(x.start())) {
+            if !(x.start() == x.end() && last_end == Some(x.start())) && !inside_crlf(text, (x.start(), x.end())) {
                 v.push((x.start() as u64, x.end() as u64));
             }
             last_end = Some(x.end());
             at = next_at(text, (x.start(), x.end()));
         }
         v
+    }
+
+    #[test]
+    fn no_empty_match_inside_a_line_break() {
+        let m = Matcher::new(&Query { regex: true, ..q("x*") }).unwrap();
+        let snap = Document::from_text(b"a\r\nb").snapshot();
+        let mut found = Vec::new();
+        m.each(&snap, 0, snap.len(), None, 1000, &mut |_, _, s, e| {
+            found.push((s, e));
+            true
+        });
+        assert_eq!(found, vec![(0, 0), (1, 1), (3, 3), (4, 4)]);
+        assert_eq!(m.find_back(&snap, 0, 3, None), Some((1, 1)));
     }
 
     #[test]

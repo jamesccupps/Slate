@@ -129,6 +129,11 @@ impl Combo {
                 _ => return None,
             }
         }
+        // (Windows tells keys by where they are, not by what they type: ? is Shift and the / key)
+        if cfg!(windows) && c.key == Key::Char(b'?') {
+            c.key = Key::Char(b'/');
+            c.shift = true;
+        }
         Some(c)
     }
 
@@ -410,9 +415,27 @@ pub struct User {
     pub problems: Vec<String>,
 }
 
+/// The keys after a line's `=`, split at the commas between them: a comma right after a `+` is the comma key
+/// (`Ctrl+,`).
+fn split_keys(s: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    for (i, c) in s.char_indices() {
+        if c == ',' && !s[start..i].trim_end().ends_with('+') {
+            out.push(s[start..i].trim());
+            start = i + 1;
+        }
+    }
+    out.push(s[start..].trim());
+    out.retain(|k| !k.is_empty());
+    out
+}
+
 pub fn parse(text: &str) -> User {
     let mut u = User::default();
     let mut owner: HashMap<Combo, (&'static str, usize)> = HashMap::new();
+    // (a file saved with a byte order mark: it isn't part of the first command's name)
+    let text = text.strip_prefix('\u{FEFF}').unwrap_or(text);
     for (n, line) in text.lines().enumerate() {
         let n = n + 1;
         let line = line.split('#').next().unwrap_or("").trim();
@@ -429,24 +452,30 @@ pub fn parse(text: &str) -> User {
             continue;
         };
         let mut combos = Vec::new();
-        for k in keys.split(',').map(str::trim).filter(|k| !k.is_empty()) {
+        let mut wrong = Vec::new();
+        for k in split_keys(keys) {
             match Combo::parse(k) {
-                None => u.problems.push(format!("Line {n}: “{k}” isn't a key Slate knows")),
+                None => wrong.push(format!("Line {n}: “{k}” isn't a key Slate knows")),
                 Some(combo) if !combo.usable() => {
-                    u.problems.push(format!("Line {n}: {k} needs Ctrl or Alt (or an F key), or it would stop typing"))
+                    wrong.push(format!("Line {n}: {k} needs Ctrl or Alt (or an F key), or it would stop typing"))
                 }
                 Some(combo) => match owner.get(&combo) {
                     Some(&(other, line)) if other != c.id => {
-                        u.problems.push(format!("Line {n}: {} is already {other}'s (line {line})", combo.text()))
+                        wrong.push(format!("Line {n}: {} is already {other}'s (line {line})", combo.text()))
                     }
-                    _ => {
-                        owner.insert(combo, (c.id, n));
-                        if !combos.contains(&combo) {
-                            combos.push(combo);
-                        }
-                    }
+                    _ if !combos.contains(&combo) => combos.push(combo),
+                    _ => {}
                 },
             }
+        }
+        // (a line with a mistake changes nothing: its command keeps the keys it had, and the message says so)
+        if let Some(last) = wrong.last_mut() {
+            last.push_str(&format!(", so {} keeps the keys it had", c.id));
+            u.problems.append(&mut wrong);
+            continue;
+        }
+        for combo in &combos {
+            owner.insert(*combo, (c.id, n));
         }
         // (a command named twice: the last line counts)
         u.keys.retain(|(i, _)| *i != c.id);
@@ -591,11 +620,29 @@ mod tests {
         assert!(!k.keeps("goto-line", &Combo::parse("Ctrl+G").unwrap()));
         assert!(k.keeps("find-next", &Combo::parse("F3").unwrap()));
         assert!(!k.keeps("structure-panel", &Combo::parse("Ctrl+Shift+D").unwrap()));
-        assert_eq!(k.keys_of("find"), Some(&[][..]));
+        // (a line with a mistake changes nothing: its command keeps the keys it had, and the message says so)
+        assert_eq!(k.keys_of("find"), None);
+        assert_eq!(k.keys_of("replace"), None);
         let problems = u.problems.join("\n");
-        for p in ["Line 5: Slate has no command “nothing”", "“Ctrl+Foo” isn't a key", "Line 6: Q needs Ctrl or Alt", "Line 7: Ctrl+L is already goto-line's (line 2)", "Line 8: no “=”"] {
+        for p in [
+            "Line 5: Slate has no command “nothing”",
+            "“Ctrl+Foo” isn't a key",
+            "Line 6: Q needs Ctrl or Alt (or an F key), or it would stop typing, so find keeps the keys it had",
+            "Line 7: Ctrl+L is already goto-line's (line 2), so replace keeps the keys it had",
+            "Line 8: no “=”",
+        ] {
             assert!(problems.contains(p), "{p} in {problems}");
         }
         assert!(k.summary().contains("Ctrl+Shift+D") && k.summary().contains("(none)"));
+        // the comma key, after a `+`; a byte order mark before the first line
+        let u = parse("\u{FEFF}duplicate-line = Ctrl+,, Alt+X\nupper = Ctrl+Shift+,\n");
+        assert!(u.problems.is_empty(), "{:?}", u.problems);
+        let k = Keymap::new(&u);
+        assert_eq!(k.menu_text("duplicate-line").as_deref(), Some("Ctrl+,"));
+        assert_eq!(k.keys_of("duplicate-line").map(<[Combo]>::len), Some(2));
+        assert_eq!(k.menu_text("upper").as_deref(), Some("Ctrl+Shift+,"));
+        // (Windows: ? is Shift and the / key, which is what a key press there gives)
+        #[cfg(windows)]
+        assert_eq!(Combo::parse("Ctrl+?"), Combo::parse("Ctrl+Shift+/"));
     }
 }

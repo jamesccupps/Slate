@@ -193,3 +193,86 @@ expect:text=>ab\n>cd
 key:escape
 expect:carets=*5
 cmd:ToggleMultiCursor
+# Save looks at the file first: another program's change that the look every 2 s hasn't seen isn't saved over
+cmd:NewTab
+type:mine
+saveas:smoke-outside.txt
+jobs
+type: too
+outside:smoke-outside.txt|another program's
+cmd:Save
+jobs
+expect:dirty=true
+expect:notice=Another program changed this file just before you saved, so Slate didn't save over its version. Your changes are still here: save again to keep yours.
+# (told now: saving again keeps the user's version)
+cmd:Save
+jobs
+expect:dirty=false
+expect:notice=
+# Multiple cursors: Home at every cursor stops where the indentation ends (the main one too), and Ctrl+Down keeps them
+cmd:ToggleMultiCursor
+cmd:NewTab
+type:  ab\n  cd
+expect:text=  ab\n  cd
+key:ctrl+home
+key:end
+cmd:AddCaretBelow
+key:home
+expect:carets=2 *7
+type:>
+expect:text=  >ab\n  >cd
+key:ctrl+down
+expect:carets=3 *9
+key:escape
+cmd:ToggleMultiCursor
+# Test mode never shows Windows' own windows: Open, Show in folder, Report a problem and the data folder are noted
+cmd:PrevTab
+expect:title=smoke-outside.txt
+cmd:open
+cmd:reveal-file
+cmd:report-problem
+cmd:open-data-folder
+print:asked
+# One find bar for each tab: the keyboard in Go to's box, hidden on a tab whose bar is Replace, goes to the find box
+cmd:ToggleFindPerTab
+cmd:NewTab
+cmd:Replace
+cmd:NewTab
+cmd:GoToLine
+expect:focus=goto
+cmd:PrevTab
+expect:findbar=Replace
+expect:focus=find
+cmd:ToggleFindPerTab
+key:escape
+# EditorConfig for a new file named when starting (no reading brings it), and for a new tab saved into a folder (its
+# answer can come before the save gives the tab that path): 2 spaces, LF
+outside:.editorconfig|root = true\n[*]\nindent_style = space\nindent_size = 2\nend_of_line = lf\n
+args:smoke-ec-new.py
+jobs
+wait:100
+jobs
+expect:indent=spaces 2
+cmd:NewTab
+saveas:smoke-ec.txt
+jobs
+wait:100
+jobs
+expect:indent=spaces 2
+key:enter
+expect:text=\n
+# Multiple cursors: Ctrl+double-click adds the word there as one more selection, the others kept
+cmd:ToggleMultiCursor
+cmd:NewTab
+set:wrap=false
+type:alpha beta gamma\ndelta epsilon zeta\neta theta iota\nkappa lambda mu
+key:ctrl+home
+down:200,90,ctrl
+up:200,90
+down:200,128,ctrl
+up:200,128
+down:200,128,ctrl
+up:200,128
+expect:carets=0 34 *64..66
+key:escape
+cmd:ToggleMultiCursor

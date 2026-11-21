@@ -196,7 +196,9 @@ when it's this user's alone, else a guest window that keeps nothing). Windows: `
     document and lets the printer go; `Geometry` works out a page for a printer DC and `draw_page` draws one, shared
     by printing and the preview) and `gtk/print.rs` (GtkPrintOperation: the layout in begin-print, when the
     paper is known; Pango and cairo in draw-page; the settings kept while Slate runs; a "Text" tab of Slate's own in
-    the dialog, `create-custom-widget`). The options are settings (`print_colors`: else black, bold and italic
+    the dialog, `create-custom-widget`: the gtk4 0.11 binding hands GTK the box's pointer and lets its own reference
+    go, so the box gets an extra reference for GTK to take, or GTK got a freed object, logged a GLib-CRITICAL and
+    showed no tab, 0.17 to 0.19.0). The options are settings (`print_colors`: else black, bold and italic
     kept; `print_line_numbers`; `print_header`: the file's name and the page's number; `print_margins` in hundredths
     of a millimetre, 3/4 inch unless changed, or the printer's own margin where it's wider). Print preview on
     Windows is `ui/preview.rs`: a modal window of its own (GDI, the theme's colors; the main window waits, its
@@ -297,7 +299,11 @@ when it's this user's alone, else a guest window that keeps nothing). Windows: `
     desktop file's MimeType list through GIO (`~/.config/mimeapps.list`; Linux lets an app do that itself); Stop
     opening files with Slate… takes only Slate's entries out of that file (GIO's reset would forget other apps' too).
     File dialogs (`FileChooserNative`) must be kept alive until answered (`keep_until_answered`): GTK drops them
-    otherwise. The menu bar's items don't take the keyboard, and commands leave it in the text.
+    otherwise. The menu bar's items don't take the keyboard, and commands leave it in the text. Left and Right in an
+    open menu go to the next menu by Slate's own code (`menus_beside`): GTK closes one popover and opens the other in
+    the same step, which on Wayland fails ("Tried to map a grabbing popup with a non-top most parent") and left the
+    menus and clicks in the text dead; `open_menu_soon` opens the next 120 ms after (30 ms never worked in the VM, 60
+    not always), checks it showed, and tries again if not; arrows meanwhile move the target (`MENU_NEXT`).
     `SLATE_TIMING=1` prints how long painting and keys take.
 - `src/ui/` — the Win32 app (see the module docs at the top of each file).
   - `src/highlight.rs` (+ `highlight/code.rs`, `highlight/markup.rs`, `highlight/config.rs`; shared, `ui` reaches it
@@ -480,6 +486,10 @@ when it's this user's alone, else a guest window that keeps nothing). Windows: `
   (`check_disk`, then `poll_disk`; a network drive that went away mustn't freeze the window). A clean document
   reloads (one whose lines are still being read, once they are); with unsaved changes the user is told, and for a
   big file another program wrote into, "Keep mine" isn't offered: saving would mix the two versions, so it's refused.
+  A save to the document's own file looks once more first, in its job (`io::changed_outside`: the stamp against
+  `Document::disk`): a change since then that nobody was told of (`seen_disk`) stops it with `SaveError::Outside`
+  and the notice; told, a second save keeps the user's version. (Before 0.19.2 a change in the 2 s before a save was
+  written over without a word.)
 - Opening and reloading never touch the file system on the UI thread: the tab is there at once and its file is read
   on another thread (`Tab::load_job`); opening waits up to 150 ms for that (`OPEN_WAIT`), so only a slower file
   shows "Opening…". "Open already?" goes by name, then by the canonical path found when a file was read or saved.
@@ -610,7 +620,11 @@ when it's this user's alone, else a guest window that keeps nothing). Windows: `
   all, so Remove last cursor pops. `edit::multi_edit` does a key's edit at each, in the text's order with a running
   offset (a cursor's range is clipped to where the one before ended), as one undo step that typing continues; cursors
   that meet become one (`Carets::tidy`, the newer kept). `move_carets` moves the others by characters and lines
-  (Up/Down by column in the line, not by screen row); keys and commands that don't work with several (Page Up,
+  (Up/Down by column in the line, not by screen row), and for Up, Down, Home and End the main one too, by the same
+  rule (the view's would go by screen rows with wrap on, and Home stop at the indentation while the others went to
+  column 0: typed text landed at two columns); Home goes where the indentation ends, then the line's start, at each.
+  Ctrl+double-click (triple) adds the word (line) as one more selection (`add_caret_word`); Ctrl+Up/Down scroll and
+  keep them. Keys and commands that don't work with several (Page Up,
   Ctrl+Home, Undo, a format…) leave only the main one first (`exec`'s `keeps`). The cursors are for one document
   version (`Carets::version`): `View::sync` drops them if the text changed otherwise. Copy joins the selections with
   line breaks; Paste puts a line at each when the text has as many (`paste_parts`). Up to `CARETS_MAX` (10,000);
@@ -620,7 +634,11 @@ when it's this user's alone, else a guest window that keeps nothing). Windows: `
   commands for both apps (the GTK app's action names, the keys each has, whether it works in the find bar's boxes
   on Windows) and the user's `shortcuts.txt` in the data folder, made the first time it's opened with every command
   on a `#` line. A line without the `#` gives that command its own keys (or none), and those keys stop doing
-  anything else (`Keymap`); a line that can't be used is told on its tab when it's saved (`shortcuts_saved`). Each
+  anything else (`Keymap`); a line that can't be used is told on its tab when it's saved (`shortcuts_saved`), and
+  changes nothing: its command keeps the keys it had (a line with a typo used to leave it with none). Keys are split at
+  commas, but one right after a `+` is the comma key (`split_keys`); a byte order mark is skipped; on Windows `?` is
+  read as Shift+`/` (keys are told by place there), and Alt with a menu's letter given to a command wins over the
+  menu (Alt, then the letter, still opens it). Each
   app keeps its own keys as the defaults and lays the user's over them: Windows `App::key_cmd` (the user's first,
   then `global_key` / `editor_key` unless the command or the keys were given away; `commands::IDS` names the
   commands, `commands::keyed` puts the user's keys in the menus), GTK `set_accels` (`commands()`'s accelerators

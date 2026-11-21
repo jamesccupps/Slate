@@ -291,7 +291,8 @@ fn cmd_of(name: &str) -> Option<Cmd> {
         // Format → Convert's items by their key (`Convert:base64-encode`)
         n if n.starts_with("Convert:") => Cmd::Convert(crate::convert::Conv::ALL.into_iter().find(|c| c.key() == &n["Convert:".len()..])?),
         "ReplaceAll" => return None,
-        _ => return None,
+        // (and every command by its name in the shortcuts file: `open`, `reveal-file`)
+        _ => return super::commands::cmd_of(name),
     })
 }
 
@@ -1148,6 +1149,13 @@ pub fn run(args: &[String]) -> i32 {
             "wait" => pump(&cell, arg.parse().unwrap_or(100)),
             // What the timer does every 2 s in the real window (follow with `jobs`).
             "checkdisk" => cell.borrow_mut().check_disk(),
+            // Another program writes a file (`outside:<path>|<text>`, `\n` a line break), unseen until the next look.
+            "outside" => {
+                let (p, t) = arg.split_once('|').unwrap_or((arg, ""));
+                if let Err(e) = std::fs::write(p, t.replace("\\n", "\n")) {
+                    out.push_str(&format!("outside {p}: {e}\n"));
+                }
+            }
             "endsession" => {
                 // What a shutdown asks: may the session end? Then "it isn't ending after all".
                 use windows::Win32::Foundation::{LPARAM, WPARAM};

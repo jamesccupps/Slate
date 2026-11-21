@@ -522,6 +522,9 @@ fn filters() -> Vec<(HSTRING, HSTRING)> {
 
 /// The Open dialog (several files allowed).
 pub fn open_dialog(hwnd: HWND, folder: Option<&Path>) -> Vec<PathBuf> {
+    if scripted(|s| s.asked.push("open".into())).is_some() {
+        return Vec::new();
+    }
     unsafe {
         let Ok(dlg) = CoCreateInstance::<_, IFileOpenDialog>(&FileOpenDialog, None, CLSCTX_INPROC_SERVER) else {
             return Vec::new();
@@ -539,6 +542,24 @@ pub fn open_dialog(hwnd: HWND, folder: Option<&Path>) -> Vec<PathBuf> {
         let Ok(items) = dlg.GetResults() else { return Vec::new() };
         let n = items.GetCount().unwrap_or(0);
         (0..n).filter_map(|i| items.GetItemAt(i).ok()).filter_map(|it| item_path(&it)).collect()
+    }
+}
+
+/// A web page or a folder opened in its own program (the browser, Explorer); test mode notes it instead (`note`, in
+/// `print:asked`).
+pub fn shell_open(hwnd: HWND, target: &std::ffi::OsStr, note: &str) {
+    if scripted(|s| s.asked.push(note.to_string())).is_some() {
+        return;
+    }
+    unsafe {
+        windows::Win32::UI::Shell::ShellExecuteW(
+            hwnd,
+            w!("open"),
+            &HSTRING::from(target),
+            None,
+            None,
+            windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL,
+        );
     }
 }
 
@@ -635,6 +656,9 @@ pub fn info(hwnd: HWND, title: &str, text: &str) {
 
 /// Opens Explorer with the file selected.
 pub fn reveal_in_explorer(path: &Path) {
+    if scripted(|s| s.asked.push(format!("show in folder {}", path.display()))).is_some() {
+        return;
+    }
     unsafe {
         let p = HSTRING::from(path.as_os_str());
         let pidl = ILCreateFromPathW(PCWSTR(p.as_ptr()));

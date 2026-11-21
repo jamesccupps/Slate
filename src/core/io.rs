@@ -77,6 +77,16 @@ pub fn disk_answer(path: &Path) -> Option<Option<DiskInfo>> {
     }
 }
 
+/// Save's look at its own file just before writing it: the file as it is now, when another program changed it since
+/// the document last read or wrote it (`old`) and the user hasn't been told of that change (`seen`: what the look that
+/// told them found). A file that isn't there, or doesn't answer, isn't such a change (saving puts it back, or says why
+/// it can't). The poll for changes (every 2 s, and when the window comes back) tells of the rest.
+pub fn changed_outside(path: &Path, old: Option<DiskInfo>, seen: Option<Option<DiskInfo>>) -> Option<DiskInfo> {
+    let old = old?;
+    let now = disk_answer(path)??;
+    (!old.same(now) && seen != Some(Some(now))).then_some(now)
+}
+
 /// Whether `e` (from opening `path`) means the file isn't there any more: not found in a folder that is, or (Windows)
 /// a folder on the way isn't there on a fixed disk of this PC (`os::gone_from_local_disk`). A drive or folder that
 /// isn't there otherwise (a USB stick, a VHD that isn't attached, a share) may come back, so that doesn't count.
@@ -410,6 +420,9 @@ pub enum SaveError {
     /// Linux: the new file couldn't get the old one's access list (ACL), or its group, so people they keep out could
     /// read it (`place::copy_identity`); nothing was replaced.
     Access,
+    /// Another program changed the file since Slate read or saved it, and nobody has said so yet (`changed_outside`:
+    /// how it is now); nothing was written.
+    Outside(DiskInfo),
     Io(String),
 }
 
@@ -429,6 +442,11 @@ impl std::fmt::Display for SaveError {
                 f,
                 "Slate couldn't give the new copy this file's access list (ACL) or its group, so saving would let \
                  people they keep out read it. Nothing was saved."
+            ),
+            SaveError::Outside(_) => write!(
+                f,
+                "Another program changed this file just before you saved, so Slate didn't save over its version. \
+                 Your changes are still here: save again to keep yours."
             ),
             SaveError::Io(s) => write!(f, "{s}"),
         }
@@ -1380,6 +1398,24 @@ mod tests {
         #[allow(clippy::permissions_set_readonly_false)]
         p.set_readonly(false);
         fs::set_permissions(&path, p).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_looks_for_a_change_nobody_was_told_of() {
+        let dir = test_dir("outside");
+        let path = dir.join("a.txt");
+        fs::write(&path, b"mine\n").unwrap();
+        let old = disk_info(&path);
+        assert_eq!(changed_outside(&path, old, None), None);
+        fs::write(&path, b"another program's\n").unwrap();
+        let now = disk_info(&path);
+        assert_eq!(changed_outside(&path, old, None), now);
+        // (told of it: saving again keeps the user's version; a new file, or one that's gone, isn't a change)
+        assert_eq!(changed_outside(&path, old, Some(now)), None);
+        assert_eq!(changed_outside(&path, None, None), None);
+        fs::remove_file(&path).unwrap();
+        assert_eq!(changed_outside(&path, old, None), None);
         let _ = fs::remove_dir_all(&dir);
     }
 

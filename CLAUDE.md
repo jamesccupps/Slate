@@ -183,7 +183,7 @@ the part about the area you're changing first, and keep it current in the same c
 
 ## Testing
 
-- `cargo test --lib` — all unit tests, the UI's included (~260, ~5 s).
+- `cargo test --lib` — all unit tests, the UI's included (about 300 on Windows, 260 on Linux, ~5 s).
 - Hostile files: `cargo test --release --lib fuzz -- --ignored --nocapture` (`src/fuzz.rs`) sends random and mutated
   text through every lexer (and in three pieces at line breaks: the same end state as whole), JSON and XML
   Check/Format, the structure scans, CSV Check and Sort, the line tools, search (queries from the input), the
@@ -194,7 +194,8 @@ the part about the area you're changing first, and keep it current in the same c
   `%TEMP%\slate-fuzz-hang.bin`. `SLATE_FUZZ_ROUNDS` (2000) and `SLATE_FUZZ_SEED` choose the inputs.
 - `Slate.exe --test script.txt` drives the real app in a hidden window and renders frames offscreen into PNGs (the
   find bar's edit boxes, Windows' own controls, printed in: `print_children`); the
-  commands are listed at the top of `src/ui/testmode.rs` (`open:`, `type:`, `key:`, `cmd:`, `jobs`, `shot:`,
+  commands are listed at the top of `src/ui/testmode.rs` (`open:`, `type:`, `key:`, `cmd:` (a `Cmd` name, or any
+  command's name in the shortcuts file: `cmd:open`), `jobs`, `shot:`,
   `print:`, `expect:`, `answer:`, `lang:<name>` …; `print:menu0`…`menu4` lists a menu's items). In this mode
   prompts are never shown (they take answers from `answer:` lines and are listed by `print:asked`), nor are menus
   (`print:opened` lists them), the clipboard is a private one, and settings/session aren't written (unless
@@ -229,6 +230,7 @@ the part about the area you're changing first, and keep it current in the same c
   session now, writes it the way the timer does, or restores it. `SLATE_UPDATE_TEST_VERSION=0.1.0` makes Slate
   believe it's that version (to try the updater against the real latest release, in a scratch folder);
   `SLATE_TEST_SLOW_OPEN=<ms>` makes reading each file take that much longer (a slow network drive).
+  `outside:<path>|<text>` (both test modes) writes a file as another program would, unseen until Slate next looks.
 - `printpdf:<file>[|selection]` (both test modes) prints the tab into a PDF file without a dialog (Windows:
   Microsoft Print to PDF; Linux: GTK's export, which the Linux smoke test does). To look at the pages, render them
   with poppler's `pdftoppm` in a throwaway container (the PC has no poppler).
@@ -240,7 +242,8 @@ the part about the area you're changing first, and keep it current in the same c
   `findkey:<combo>` / `replacekey:<combo>` (a key in the find or replace box: `up`, `alt+s`; `key:` goes to the
   text), `imemsg:start|pre|<text>|<cursor>|<clauses>|commit|<text>|end` (the input method's signals on the window's
   input context; `pre` as GTK gives a preedit), `rmenu:<x>,<y>[|<label>]` (the text's menu's spelling part),
-  `print:wrong`, `print:speller`, `down:<x>,<y>[,alt]` / `move:<x>,<y>` / `up:[ctrl]` (the left button in the text, the gutter included),
+  `print:wrong`, `print:speller`, `down:<x>,<y>[,alt|ctrl][,<n>]` / `move:<x>,<y>` / `up:[ctrl]` (the left button in the text, the gutter included;
+  `<n>` is GTK's click count, 2 a double-click's second press),
   `act:<action>=<value>` (a menu item with a value: `act:save-encoding=ansi`, `act:font-size=14`, `act:show-tab=2`),
   `tabclick:<x>[,<button>]` (`list` for the tab list's button; 3 for a tab's menu) and `statusclick:indent|lang|eol|
   encoding|readonly|ovr` (menus are listed in `print:asked`, not shown), `pathclick:<i>` / `rowclick:<k>[,chevron|

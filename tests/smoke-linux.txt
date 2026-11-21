@@ -54,7 +54,8 @@ expect:tabs=3
 expect:dirty=true
 expect:lang=Rust
 cmd:next-tab
-expect:tabnames=smoke.json, Untitled, Untitled
+# (unsaved tabs are numbered, as on Windows)
+expect:tabnames=smoke.json, Untitled, Untitled 2
 expect:dirty=false
 # A line-ending change keeps the caret on its line (it could be left inside the line break, then split it)
 cmd:new-tab
@@ -228,4 +229,71 @@ type:>
 expect:text=>ab\n>cd
 key:escape
 expect:carets=*5
+cmd:multi-cursor
+# Save looks at the file first: another program's change that the look every 2 s hasn't seen isn't saved over
+cmd:new-tab
+type:mine
+answer:smoke-outside.txt
+cmd:save-as
+jobs
+type: too
+outside:smoke-outside.txt|another program's
+cmd:save
+jobs
+expect:dirty=true
+expect:notice=Another program changed this file just before you saved, so Slate didn't save over its version. Your changes are still here: save again to keep yours.
+# (told now: saving again keeps the user's version)
+cmd:save
+jobs
+expect:dirty=false
+expect:notice=
+# Multiple cursors: Home at every cursor stops where the indentation ends (the main one too), and Ctrl+Down keeps them
+cmd:multi-cursor
+cmd:new-tab
+# (Enter indents the next line by itself)
+type:  ab\ncd
+expect:text=  ab\n  cd
+key:ctrl+home
+key:end
+cmd:add-cursor-below
+key:home
+expect:carets=2 *7
+type:>
+expect:text=  >ab\n  >cd
+key:ctrl+down
+expect:carets=3 *9
+key:escape
+cmd:multi-cursor
+# Format: the document is indented by the formatter's rule then (2 spaces), as on Windows
+cmd:new-tab
+type:{"a":1,"b":[1,2]}
+lang:JSON
+cmd:json-format
+jobs
+expect:indent=Spaces(2)
+# EditorConfig for a new tab saved into a folder (its answer can come before the save gives the tab that path)
+outside:.editorconfig|root = true\n[*]\nindent_style = space\nindent_size = 2\nend_of_line = lf\n
+cmd:new-tab
+answer:smoke-ec.txt
+cmd:save-as
+jobs
+wait:100
+jobs
+expect:indent=Spaces(2)
+# Multiple cursors: Ctrl+double-click adds the word there as one more selection, the others kept
+cmd:multi-cursor
+cmd:new-tab
+type:alpha beta gamma
+key:enter
+type:delta epsilon zeta
+key:ctrl+home
+# (the text laid out first: a press before it would go by the old rows)
+wait:100
+down:200,30,ctrl
+up:
+expect:carets=0 *34
+down:200,30,2,ctrl
+up:
+expect:carets=0 *31..35
+key:escape
 cmd:multi-cursor

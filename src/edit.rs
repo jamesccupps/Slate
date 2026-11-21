@@ -819,11 +819,14 @@ pub enum CaretMove {
     End,
 }
 
-/// Moves the cursors besides the main one (the view moves that one) by lines and characters, or grows their
-/// selections (`extend`).
-pub fn move_carets(doc: &Document, c: &mut Carets, how: CaretMove, extend: bool, tab: u32) {
+/// Moves the cursors by lines and characters, or grows their selections (`extend`): the ones besides the main one
+/// always, and for Up, Down, Home and End the main one too (`main`; returns true then), by the same rule, so all of them
+/// go the same way (the view's own rule goes by screen rows when lines wrap, which would put the main one somewhere
+/// else). Left, Right and the word moves are the same for the view: it moves the main one (false).
+pub fn move_carets(doc: &Document, main: &mut Sel, c: &mut Carets, how: CaretMove, extend: bool, tab: u32) -> bool {
     let last = doc.line_of(doc.len());
-    for s in &mut c.more {
+    let all = matches!(how, CaretMove::Up | CaretMove::Down | CaretMove::Home | CaretMove::End);
+    let at = |s: Sel| {
         let p = match how {
             CaretMove::Left if !extend && !s.is_empty() => s.start(),
             CaretMove::Right if !extend && !s.is_empty() => s.end(),
@@ -842,12 +845,25 @@ pub fn move_carets(doc: &Document, c: &mut Carets, how: CaretMove, extend: bool,
                 }
                 _ => s.caret,
             },
-            CaretMove::Home => doc.line_start_of(s.caret),
+            // (where the indentation ends, and from there the line's start, as Home does with one)
+            CaretMove::Home => {
+                let ls = doc.line_start_of(s.caret);
+                let head = doc.read(ls, (ls + 4096).min(doc.len()));
+                let first = ls + head.iter().take_while(|&&b| b == b' ' || b == b'\t').count() as u64;
+                if s.caret == first { ls } else { first }
+            }
             CaretMove::End => doc.line_end_of(s.caret),
         };
-        *s = if extend { Sel::new(s.anchor, p) } else { Sel::at(p) };
+        if extend { Sel::new(s.anchor, p) } else { Sel::at(p) }
+    };
+    for s in &mut c.more {
+        *s = at(*s);
+    }
+    if all {
+        *main = at(*main);
     }
     c.col = None;
+    all
 }
 
 /// Add cursor above / below: a caret on the line above (below) the main one, at the column the first one had; it's
@@ -999,6 +1015,28 @@ pub fn toggle_caret(doc: &Document, main: &mut Sel, c: &mut Carets, pos: u64) ->
         c.more.push(*main);
         *main = Sel::at(pos);
     }
+    c.col = None;
+    c.tidy(main);
+    c.version = doc.version;
+    Ok(())
+}
+
+/// Ctrl+double-click with multiple cursors on: the word at `pos` (Ctrl+triple-click, `line`: its line) is one more
+/// selection, the others kept. The click before it added a caret there (the main one, which becomes the word) or took
+/// one away (the word is a new one then).
+pub fn add_caret_word(doc: &Document, main: &mut Sel, c: &mut Carets, pos: u64, line: bool) -> Result<(), &'static str> {
+    let (a, b) = if line {
+        (doc.line_start_of(pos), doc.next_newline(pos).map_or(doc.len(), |p| p + 1))
+    } else {
+        doc.word_at(pos)
+    };
+    if !(main.start() <= pos && pos <= main.end()) {
+        if c.count() >= CARETS_MAX {
+            return Err(TOO_MANY_CARETS);
+        }
+        c.more.push(*main);
+    }
+    *main = Sel::new(a, b);
     c.col = None;
     c.tidy(main);
     c.version = doc.version;
@@ -2078,6 +2116,17 @@ pub fn delete_lines(doc: &mut Document, sel: Sel) -> Option<Sel> {
     Some(new)
 }
 
+/// Where `p`, an end of a selection in lines `a..block_end` (or just after their line break), is once those lines start
+/// at `to`: the same place in them; after them, the start of the line after them now (the line break after them may
+/// be another kind than before, in a file with both).
+fn moved_to(doc: &Document, p: u64, a: u64, block_end: u64, to: u64) -> u64 {
+    if p <= block_end {
+        to + (p - a)
+    } else {
+        doc.next_newline(to + (block_end - a)).map_or(doc.len(), |n| n + 1)
+    }
+}
+
 /// Moves the selected lines up or down by one.
 pub fn move_lines(doc: &mut Document, sel: Sel, down: bool) -> Result<Sel, &'static str> {
     let lines = selected_lines(doc, sel).ok_or(TOO_MANY_LINES)?;
@@ -2100,8 +2149,8 @@ pub fn move_lines(doc: &mut Document, sel: Sel, down: bool) -> Result<Sel, &'sta
         t.extend_from_slice(&e);
         t.extend_from_slice(&block);
         doc.insert(a, &t);
-        let shift = next.len() as u64 + e.len() as u64;
-        let new = Sel::new(sel.anchor + shift, sel.caret + shift);
+        let to = a + next.len() as u64 + e.len() as u64;
+        let new = Sel::new(moved_to(doc, sel.anchor, a, block_end, to), moved_to(doc, sel.caret, a, block_end, to));
         doc.end(new);
         Ok(new)
     } else {
@@ -2121,8 +2170,8 @@ pub fn move_lines(doc: &mut Document, sel: Sel, down: bool) -> Result<Sel, &'sta
         t.extend_from_slice(&e);
         t.extend_from_slice(&prev);
         doc.insert(prev_start, &t);
-        let shift = a - prev_start;
-        let new = Sel::new(sel.anchor - shift, sel.caret - shift);
+        let to = prev_start;
+        let new = Sel::new(moved_to(doc, sel.anchor, a, block_end, to), moved_to(doc, sel.caret, a, block_end, to));
         doc.end(new);
         Ok(new)
     }
@@ -3080,14 +3129,48 @@ mod caret_tests {
     }
 
     #[test]
-    fn moving_the_others() {
+    fn moving_lines_with_both_kinds_of_line_break() {
+        let mut doc = Document::from_text(b"l1\r\nl2\r\nl3\nl4\n");
+        doc.eol = Eol::Crlf;
+        // l1 and l2 selected whole (to the start of l3), moved down and up: still those two lines, whole
+        let new = move_lines(&mut doc, Sel::new(0, 8), true).unwrap();
+        assert_eq!(&doc.read(0, doc.len())[..], b"l3\r\nl1\r\nl2\nl4\n");
+        assert_eq!(new, Sel::new(4, 11));
+        let back = move_lines(&mut doc, new, false).unwrap();
+        assert_eq!(&doc.read(0, doc.len())[..], b"l1\r\nl2\r\nl3\nl4\n");
+        assert_eq!(back, Sel::new(0, 8));
+    }
+
+    #[test]
+    fn ctrl_double_click_adds_the_word() {
+        let doc = lf("one two\nthree");
+        // (Ctrl+click added a caret in "two", the main one: the double-click makes it the word, "one" stays)
+        let (mut main, mut c) = (Sel::at(5), Carets { more: vec![Sel::at(1)], ..Default::default() });
+        add_caret_word(&doc, &mut main, &mut c, 5, false).unwrap();
+        assert_eq!((main, c.more.clone()), (Sel::new(4, 7), vec![Sel::at(1)]));
+        // (a triple: the line; elsewhere than the main one, a new one)
+        add_caret_word(&doc, &mut main, &mut c, 10, true).unwrap();
+        assert_eq!((main, c.more.clone()), (Sel::new(8, 13), vec![Sel::at(1), Sel::new(4, 7)]));
+    }
+
+    #[test]
+    fn moving_the_cursors() {
         let doc = lf("abc\nde\nfghij");
+        let mut main = Sel::at(0);
         let mut c = Carets { more: vec![Sel::at(2), Sel::at(9)], ..Default::default() };
-        move_carets(&doc, &mut c, CaretMove::Down, false, 4);
-        assert_eq!(c.more, vec![Sel::at(6), Sel::at(12)]);
-        move_carets(&doc, &mut c, CaretMove::Home, true, 4);
-        assert_eq!(c.more, vec![Sel::new(6, 4), Sel::new(12, 7)]);
-        move_carets(&doc, &mut c, CaretMove::Left, false, 4);
-        assert_eq!(c.more, vec![Sel::at(4), Sel::at(7)]);
+        // (Up, Down, Home and End move the main one too, by the same rule; Left and Right leave it to the view)
+        assert!(move_carets(&doc, &mut main, &mut c, CaretMove::Down, false, 4));
+        assert_eq!((main, c.more.clone()), (Sel::at(4), vec![Sel::at(6), Sel::at(12)]));
+        assert!(move_carets(&doc, &mut main, &mut c, CaretMove::Home, true, 4));
+        assert_eq!((main, c.more.clone()), (Sel::at(4), vec![Sel::new(6, 4), Sel::new(12, 7)]));
+        assert!(!move_carets(&doc, &mut main, &mut c, CaretMove::Left, false, 4));
+        assert_eq!((main, c.more.clone()), (Sel::at(4), vec![Sel::at(4), Sel::at(7)]));
+        // Home stops where the indentation ends, then at the line's start, at every cursor
+        let doc = lf("    a\n\tb");
+        let (mut main, mut c) = (Sel::at(5), Carets { more: vec![Sel::at(8)], ..Default::default() });
+        move_carets(&doc, &mut main, &mut c, CaretMove::Home, false, 4);
+        assert_eq!((main, c.more.clone()), (Sel::at(4), vec![Sel::at(7)]));
+        move_carets(&doc, &mut main, &mut c, CaretMove::Home, false, 4);
+        assert_eq!((main, c.more.clone()), (Sel::at(0), vec![Sel::at(6)]));
     }
 }

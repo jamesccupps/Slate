@@ -217,8 +217,21 @@ file over each app's own keys, `crate::shortcuts`), View → Find bar (close on 
 tab), and the find bar's count no longer blinking while typing in the text. Benchmarks against 0.18.0 on both
 platforms: the same. Details in the [0.19.0 release notes](release-notes-0.19.0.md).
 
-0.19.1: a click in the text that closes the find bar lands where it was made (the bar closes once the clicks are
-over, a double-click time after the release, issue #6); Linux Ctrl+Up / Down scroll past the caret.
+## 0.19.2: a review of 0.19.0's features
+
+0.19.1 wasn't released; its two fixes went into 0.19.2: a click in the text that closes the find bar lands where it
+was made (the bar closes once the clicks are over, a double-click time after the release, issue #6), and Linux
+Ctrl+Up / Down scroll past the caret. Then the fixes from a full review on 2026-11-21 (speed the same as 0.18.0 and
+0.19.0 on both platforms, no P1): Save looks at the file again before writing; multiple cursors move by one rule
+(Home to the indentation, Up/Down by lines) and Ctrl+double-click adds the word; the shortcuts file's comma key, a
+bad line keeping its command's keys, Windows' `Ctrl+?` and Alt+letter; Linux menus by Left/Right on Wayland, the
+Print dialog's Text tab, the indentation after Format, numbered Untitled tabs; and small ones (an empty regex
+match inside CRLF, moving mixed line endings, EditorConfig for new files, no spell check in binary files, test
+mode never opening Windows' Open dialog or Explorer). Details in the
+[0.19.2 release notes](release-notes-0.19.2.md). Left from the review for later: typing at thousands of cursors
+and its Undo (one op per cursor per key; `record` should join each cursor's own op), long notices cut off on
+Windows, Close all asking per tab, "put my changes in a new tab" for a big file changed in place, screen readers
+and several cursors, the status bar's size for other encodings, mixed line endings shown as one.
 
 ## Next
 

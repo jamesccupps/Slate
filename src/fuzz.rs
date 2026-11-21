@@ -261,7 +261,7 @@ fn carets(data: &[u8], wrong: &mut Vec<String>) {
     ];
     for (name, what, kind) in steps {
         crate::edit::multi_edit(&mut doc, &mut main, &mut c, what, kind);
-        crate::edit::move_carets(&doc, &mut c, if name == "Enter" { CaretMove::Up } else { CaretMove::Right }, name == "type", 4);
+        crate::edit::move_carets(&doc, &mut main, &mut c, if name == "Enter" { CaretMove::Up } else { CaretMove::Right }, name == "type", 4);
         c.tidy(&mut main);
         let all = c.ordered(main);
         if all.iter().any(|(s, _)| s.anchor > doc.len() || s.caret > doc.len()) {

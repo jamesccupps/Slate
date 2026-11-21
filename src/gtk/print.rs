@@ -149,6 +149,12 @@ pub fn run(ui: &Ui, export: Option<(PathBuf, bool)>, preview: bool) {
         spin.set_value(j.margins[0] as f64 / 100.0);
         row.append(&spin);
         b.append(&row);
+        // (GTK takes the widget it's given as its own, but the binding (gtk4 0.11) hands over a pointer to the box
+        // and lets its own reference go: the box was gone by then, GTK refused it with a GLib-CRITICAL and showed no
+        // "Text" tab. A reference for GTK to take keeps it.)
+        unsafe {
+            gtk4::glib::gobject_ffi::g_object_ref(b.as_ptr() as *mut gtk4::glib::gobject_ffi::GObject);
+        }
         Some(b.upcast())
     });
     // (in these three, a panic can't pass through GTK's call: it would abort, with no session written. Caught and

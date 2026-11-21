@@ -237,6 +237,8 @@ pub struct Tab {
     pub backup_version: u64,
     /// The on-disk state we already told the user about (so a change is announced once).
     pub seen_disk: Option<Option<crate::core::document::DiskInfo>>,
+    /// The file looked like a binary one when it was read (its notice says so): no spell check there.
+    pub binary: bool,
     /// Discard unsaved changes when closing (the user said "Don't save").
     pub discard: bool,
     /// JSON path bar and structure panel state.
@@ -354,6 +356,7 @@ impl Tab {
             backup_name: None,
             backup_version: u64::MAX,
             seen_disk: None,
+            binary: false,
             discard: false,
             structure: Default::default(),
             indent: None,
@@ -1633,6 +1636,7 @@ impl App {
         let mut wrong = Vec::new();
         if self.settings.spell_check
             && !tab.read_only
+            && !tab.binary
             && tab.filter.is_none()
             && coming.is_none()
             && crate::spell::checks(tab.lang)
