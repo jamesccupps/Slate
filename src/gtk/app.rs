@@ -2295,8 +2295,13 @@ impl App {
                     v.want_x = None;
                 });
             }
-            Key::Up | Key::KP_Up if ctrl => moving(self, &mut |v, c| v.scroll_rows(c, -1)),
-            Key::Down | Key::KP_Down if ctrl => moving(self, &mut |v, c| v.scroll_rows(c, 1)),
+            // (Ctrl+Up / Down scroll the text by a row and leave the caret where it is, off screen too, as on
+            // Windows: a move would bring it back into view and undo the scroll)
+            Key::Up | Key::KP_Up | Key::Down | Key::KP_Down if ctrl => {
+                let n = if matches!(key, Key::Up | Key::KP_Up) { -1 } else { 1 };
+                self.with_view(g, |v, c| v.scroll_rows(c, n));
+                self.dirty_view = true;
+            }
             Key::Up | Key::KP_Up => moving(self, &mut |v, c| v.move_rows(c, -1, shift)),
             Key::Down | Key::KP_Down => moving(self, &mut |v, c| v.move_rows(c, 1, shift)),
             // (Ctrl+PgUp / PgDn switch tabs: the menu's shortcuts)
