@@ -1246,7 +1246,18 @@ pub fn run(args: &[String]) -> i32 {
                 out.push_str("crash needs SLATE_DATA_DIR\n");
                 failures += 1;
             }
-            "crash" => unsafe { std::ptr::null_mut::<u8>().write_volatile(1) },
+            "crash" => unsafe {
+                use windows::Win32::System::Diagnostics::Debug::{
+                    RaiseException, SEM_FAILCRITICALERRORS, SEM_NOGPFAULTERRORBOX, SetErrorMode,
+                };
+                // (no Windows Error Reporting window: test mode never shows one)
+                SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
+                // An access violation, raised by Windows as a bad pointer's would be, through the same handler
+                // (`crash::install`'s filter). Writing through a null pointer, as this did, is undefined behavior in
+                // Rust: nothing makes the compiler crash there (CodeQL's rust/access-invalid-pointer).
+                const EXCEPTION_NONCONTINUABLE: u32 = 1;
+                RaiseException(windows::Win32::Foundation::EXCEPTION_ACCESS_VIOLATION.0 as u32, EXCEPTION_NONCONTINUABLE, None);
+            }
             // As if another Slate was running but didn't answer: this window keeps nothing for next time.
             "guest" => super::settings::GUEST.store(true, std::sync::atomic::Ordering::Relaxed),
             // (only with a data folder of the test's own: restoring tidies up the session's folder, and reads it)
