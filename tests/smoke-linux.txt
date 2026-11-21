@@ -164,9 +164,10 @@ find:f
 wait:100
 down:200,40
 up:
-wait:200
+wait:600
 expect:shown=path bar false, panel false, find bar false
-# … when the button is let go (until then nothing moves under the mouse), scrolled back by the bar's height
+# … once the clicks are over, a moment after the button is let go (until then nothing moves under the mouse), scrolled
+# back by the bar's height
 cmd:new-tab
 type:line 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9\nline 10\nline 11\nline 12\nline 13\nline 14\nline 15\nline 16\nline 17\nline 18\nline 19\nline 20\nline 21\nline 22\nline 23\nline 24\nline 25\nline 26\nline 27\nline 28\nline 29\nline 30\nline 31\nline 32\nline 33\nline 34\nline 35\nline 36\nline 37\nline 38\nline 39\nline 40\nline 41\nline 42\nline 43\nline 44\nline 45\nline 46\nline 47\nline 48\nline 49\nline 50\nline 51\nline 52\nline 53\nline 54\nline 55\nline 56\nline 57\nline 58\nline 59\nline 60
 key:ctrl+home
@@ -184,18 +185,18 @@ down:200,100
 wait:100
 expect:shown=path bar false, panel false, find bar true
 up:
-wait:200
-expect:shown=path bar false, panel false, find bar false
-expect:top=21+0
-# … and a press at the same place in the window right after it is that click's second (the text moved up with the
-# bar, here 47 pixels, and GTK alone would count a click of its own): the word under the mouse selected
-down:200,147
+expect:shown=path bar false, panel false, find bar true
+expect:top=35+0
+# (a double-click there then: the word under the mouse; a triple, the line)
+down:200,100,2
 up:
 expect:sel=76..78
-# (and a third, the line)
-down:200,147
+down:200,100,3
 up:
 expect:sel=71..79
+wait:600
+expect:shown=path bar false, panel false, find bar false
+expect:top=21+0
 cmd:find-close-on-leave
 # Help → Change keyboard shortcuts…: a command given other keys loses its own
 cmd:change-shortcuts

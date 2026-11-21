@@ -31,7 +31,7 @@ or MIT or Apache-2.0):
 | graphene-rs | 0.22.8 | The gtk-rs Project Developers | https://github.com/gtk-rs/gtk-rs-core |
 | gdk-pixbuf | 0.22.0 | The gtk-rs Project Developers | https://github.com/gtk-rs/gtk-rs-core |
 | glib-sys, gio-sys, gobject-sys, pango-sys, pangocairo-sys, cairo-sys-rs, gdk-pixbuf-sys, graphene-sys | 0.22.9 | The gtk-rs Project Developers | https://github.com/gtk-rs/gtk-rs-core |
-| libc | 0.2.190 | The Rust Project Developers | https://github.com/rust-lang/libc |
+| libc | 0.2.191 | The Rust Project Developers | https://github.com/rust-lang/libc |
 | bitflags | 2.13.2 | The Rust Project Developers | https://github.com/bitflags/bitflags |
 | futures-channel, futures-core, futures-executor, futures-io, futures-task, futures-util | 0.3.34 | The futures-rs authors | https://github.com/rust-lang/futures-rs |
 | pin-project-lite | 0.2.17 | Taiki Endo | https://github.com/taiki-e/pin-project-lite |

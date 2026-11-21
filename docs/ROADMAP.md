@@ -217,9 +217,8 @@ file over each app's own keys, `crate::shortcuts`), View → Find bar (close on 
 tab), and the find bar's count no longer blinking while typing in the text. Benchmarks against 0.18.0 on both
 platforms: the same. Details in the [0.19.0 release notes](release-notes-0.19.0.md).
 
-0.19.1: a click in the text that closes the find bar lands where it was made (the bar closes on release, issue #6;
-on Linux the clicks after it counted in the window, so a double-click there is one); Linux Ctrl+Up / Down scroll
-past the caret.
+0.19.1: a click in the text that closes the find bar lands where it was made (the bar closes once the clicks are
+over, a double-click time after the release, issue #6); Linux Ctrl+Up / Down scroll past the caret.
 
 ## Next
 

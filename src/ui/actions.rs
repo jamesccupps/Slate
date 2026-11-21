@@ -71,6 +71,8 @@ pub const TIMER_UNCLOAK: usize = 12;
 pub const TIMER_SPELL: usize = 13;
 /// Drawing couldn't start (the graphics device was lost, during a resize say): paint again from a fresh target.
 pub const TIMER_REPAINT: usize = 14;
+/// The clicks in the text that close the find bar are over (`App::close_find_later`).
+pub const TIMER_FIND_CLOSE: usize = 15;
 
 const BIG_CLIPBOARD: u64 = 64 << 20;
 /// What the status bar says when the clipboard couldn't be written.
@@ -3182,11 +3184,21 @@ impl App {
         self.invalidate();
     }
 
-    /// A press in the text that closes the find bar was let go (`close_find_on_up`): the bar goes, and the text stays
-    /// where it is on screen, scrolled back as many rows as the bar was tall (as far as there are rows above).
+    /// A press in the text that closes the find bar was let go (`close_find_on_up`): the bar closes once a double-click
+    /// can't come any more (`TIMER_FIND_CLOSE`; another press in the text puts it off), so nothing moves under the
+    /// mouse while the clicks go on.
     fn close_find_after_click(&mut self) {
         let Some(id) = self.close_find_on_up.take() else { return };
-        if !self.find.open || self.tabs.get(self.active).is_none_or(|t| t.id != id) {
+        self.close_find_later = Some(id);
+        self.timer(TIMER_FIND_CLOSE, unsafe { GetDoubleClickTime() }.clamp(100, 2000));
+    }
+
+    /// `TIMER_FIND_CLOSE`: the clicks are over. The bar goes (unless the keyboard went back to it), and the text stays
+    /// about where it is on screen, scrolled back as many rows as the bar was tall (as far as there are rows above).
+    fn close_find_now(&mut self) {
+        self.kill_timer(TIMER_FIND_CLOSE);
+        let Some(id) = self.close_find_later.take() else { return };
+        if !self.find.open || self.in_find_bar() || self.tabs.get(self.active).is_none_or(|t| t.id != id) {
             return;
         }
         let rows = (self.find.height() / self.style.row_h.max(1.0)).round() as i64;
@@ -3747,9 +3759,12 @@ impl App {
             }
             (0, Hit::Menu(i)) => self.pending.push(Deferred::Menu(i)),
             (0, Hit::Text) | (0, Hit::Gutter) => {
-                // (the bar closes when the button is let go: until then nothing moves under the mouse, so the click
-                // and a drag from it are where they were made)
-                let close = self.settings.find_close_on_leave && self.in_find_bar();
+                // (the bar closes once the clicks are over, a moment after the button is let go: until then nothing
+                // moves under the mouse, so a click, a double-click and a drag are where they were made; this press
+                // may be the next click of a run that began in the bar)
+                self.kill_timer(TIMER_FIND_CLOSE);
+                let more = self.close_find_later.take() == Some(self.tab().id);
+                let close = self.settings.find_close_on_leave && (more || self.in_find_bar());
                 self.close_find_on_up = close.then(|| self.tab().id);
                 win::set_focus(self.hwnd);
                 let n = self.click_count(x, y);
@@ -4406,6 +4421,7 @@ impl App {
                 self.kill_timer(id);
                 self.invalidate();
             }
+            TIMER_FIND_CLOSE => self.close_find_now(),
             TIMER_JOBS => self.poll_jobs(),
             TIMER_DISK => {
                 self.check_disk();

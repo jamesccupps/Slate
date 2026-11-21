@@ -213,12 +213,16 @@ async fn script(lines: Vec<String>, test: Rc<Test>) -> i32 {
             },
             // a key in the find or the replace box (history, Alt+S...)
             // the mouse's left button in the text (`x,y` from the text area's corner, the gutter in it): pressed, moved
-            // there with it held, let go (`up:ctrl` with Ctrl held)
+            // there with it held, let go (`up:ctrl` with Ctrl held); `down:<x>,<y>,2` is a double-click's second press
+            // (GTK's count: 3 a triple's third)
             "down" | "move" => {
-                let (x, y) = arg.trim_end_matches(",alt").trim_end_matches(",ctrl").split_once(',').unwrap_or(("0", "0"));
-                let (x, y) = (x.trim().parse().unwrap_or(0.0), y.trim().parse().unwrap_or(0.0));
+                let parts: Vec<&str> = arg.split(',').map(str::trim).collect();
+                let num = |i: usize| parts.get(i).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+                let (x, y) = (num(0), num(1));
+                let has = |s: &str| parts.iter().skip(2).any(|p| *p == s);
+                let n = parts.iter().skip(2).find_map(|p| p.parse::<i32>().ok()).unwrap_or(1).max(1);
                 if op == "down" {
-                    ui.press_for_test(1, x, y, arg.ends_with(",alt"), arg.ends_with(",ctrl"));
+                    ui.press_for_test(n, x, y, has("alt"), has("ctrl"));
                 } else {
                     ui.drag_for_test(x, y);
                 }
