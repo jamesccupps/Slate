@@ -228,10 +228,7 @@ bad line keeping its command's keys, Windows' `Ctrl+?` and Alt+letter; Linux men
 Print dialog's Text tab, the indentation after Format, numbered Untitled tabs; and small ones (an empty regex
 match inside CRLF, moving mixed line endings, EditorConfig for new files, no spell check in binary files, test
 mode never opening Windows' Open dialog or Explorer). Details in the
-[0.19.2 release notes](release-notes-0.19.2.md). Left from the review for later: typing at thousands of cursors
-and its Undo (one op per cursor per key; `record` should join each cursor's own op), long notices cut off on
-Windows, Close all asking per tab, "put my changes in a new tab" for a big file changed in place, screen readers
-and several cursors, the status bar's size for other encodings, mixed line endings shown as one.
+[0.19.2 release notes](release-notes-0.19.2.md). What the review found that 0.19.2 didn't take is *Next*, item 4.
 
 ## Next
 
@@ -253,6 +250,44 @@ and several cursors, the status bar's size for other encodings, mixed line endin
 3. **Big unsaved files, the rest (S–M).** Keep a big document's newline index in the session so putting it back
    doesn't count the lines again, and keep big documents that Format or Replace All rewrote (today closing still asks
    about those). (Its `.data` is already written anew, with only what the text uses, once most of it isn't.)
+
+4. **The 2026-11-21 review's leftovers.** Found in 0.19.0's features and around them; none loses work or crashes.
+   - Typing at thousands of cursors, and its Undo (M): every key adds one op per cursor (`Document::record` joins an
+     insert to the step's last op only), so at 10,000 cursors a key takes up to ~250 ms and one Undo of 120 keys
+     ~26 s. Join each cursor's insert to its own op (`multi_edit` knows the order); an Undo over many ops on a job or
+     with "Working…"; then the piece table's faster `locate` (L). Until then a lower `CARETS_MAX` (2,000?) is honest.
+   - Windows: a long notice is cut to one line with no way to read the rest (wrap it to two or three lines, or the
+     whole text as its tooltip; for the shortcuts file the first problem and "and 5 more") (S–M).
+   - Close all tabs (and the other Close … commands) ask about each unsaved tab in turn: one question first, "Save
+     changes to 12 tabs?" with Save all / Don't save / Review each / Cancel (M).
+   - A big file another program changed in place: besides "Reload (lose my changes)", "Put my changes in a new tab",
+     as the session's restore already does (M).
+   - Multiple cursors, small ones (S each): Enter after `{` indents a level and `{` gets its closing bracket as with
+     one cursor; Ctrl+Delete with two cursors in one word deletes the next word too; Ctrl+drag adds a caret, not a
+     selection; Add next match / Select all matches from a caret (nothing selected) could match whole words, as VS
+     Code does (a choice: say so in Help if it stays); high contrast draws only the main selection's text in the
+     highlight's text color; screen readers hear only the main cursor (`GetSelection` could return all, with a
+     "3 cursors" notification: item 1).
+   - The status bar's size is the text's in memory (UTF-8), not the file's for UTF-16 and ANSI (S–M); a file with
+     both kinds of line break says one kind ("Mixed") (S); many unsaved tabs all read "Untitle…" (cut in the middle,
+     or name them by their first words) (S–M).
+   - Wording (S): Ctrl+M with the partner over 1 MB away says "No brackets around the caret" (say "more than 1 MB
+     away", or ask the JSON/XML structure index), Add next match "No other match" when none is within 64 MB; the two
+     apps word the binary-file and deleted-file notices differently (one text each in shared code); Linux shows the
+     status message in place of the caret's position for 6 s.
+   - Linux: the Open dialog starts in "Recent", not the file's folder (S). Printing lays the whole document out in
+     begin-print, on the UI thread (200,000 lines: ~7 s), with a progress callback that never cancels (S–M).
+   - Tests and tools (S): Windows test mode can't press punctuation keys (`key:ctrl+/` is VK_HELP: names like
+     `slash`, `comma`, as Linux has); the bench scripts' first mark includes the open.
+   - From the review before (2026-11-14), still open: symbols for crash dumps (`strip = true`, no symbols artifact);
+     three `expect`s in `gfx.rs` (brush, text format, text layout); the updater keeping the download open until the
+     rename; an AppStream metainfo file for Linux.
+   - Docs (S): the README's known limits could say other programs can't replace (rename over) a file over 64 MB
+     while Slate has it open; the README's long unwrapped lines; a comment that the release job doesn't wait for
+     `cargo deny` on purpose; a CI check that THIRD-PARTY-NOTICES' versions are Cargo.lock's.
+   - Code (when a file is opened anyway): the two apps' `exec`s are the same command list written twice (the
+     multiple-cursor rules in `edit.rs` show the better way: the `keeps` list, the notices' texts and what happens
+     after a task are the next to share).
 
 ## Soon
 
