@@ -629,10 +629,14 @@ when it's this user's alone, else a guest window that keeps nothing). Windows: `
   Alt+Down became the move-line actions' accelerators for it (GTK runs the window's accelerators before the text
   has the key; test mode's `key:` does the same: `action_for_accel`).
 - View → Find bar (issue #6; both off by default). *Close when you click in the text*
-  (`Settings::find_close_on_leave`): the keyboard going from the bar to the text closes it, after a click is placed
-  where it was made (Windows: where the app moves it there, a click in the text or gutter, Tab from the find box, a
-  structure jump: `in_find_bar` first; Linux: the window's `focus-widget` going from inside `find_box` to the text,
-  the close on an idle). *One for each tab* (`Settings::find_per_tab`): `App::find_owner` is the tab the bar's
+  (`Settings::find_close_on_leave`): the keyboard going from the bar to the text closes it (Windows: where the app
+  moves it there, Tab from the find box, a structure jump: `in_find_bar` first; Linux: the window's `focus-widget`
+  going from inside `find_box` to the text, the close on an idle). A left press in the text or gutter closes it
+  only when it's let go (`close_find_on_up` / `close_find_on_release`, the tab's id; `close_find_after_click`): the
+  bar is above the text, so closing it at the press moved the text up under a held button and the drag (Windows'
+  own mouse move as the bar's boxes hid was enough) selected from the click to what was under the mouse then
+  (0.19.0; reported on issue #6). Closing, the view scrolls back as many rows as the bar was tall, so the text
+  stays where it is on screen and the caret under the mouse (not at the very top: no rows above). *One for each tab* (`Settings::find_per_tab`): `App::find_owner` is the tab the bar's
   state is about; when another tab shows (Windows `activate`, Linux `Ui::refresh`, so every way of switching
   counts) `follow_find_bar` keeps the bar's state on the old tab (`Tab::find_bar`; Go to's isn't kept) and takes
   the new one's (a new tab's: closed), without taking the keyboard from the text; the search is shared. Turning it

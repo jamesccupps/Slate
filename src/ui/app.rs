@@ -564,6 +564,9 @@ pub struct App {
     pub down: Hit,
     /// What the middle button was pressed on (a tab closes when it's released on it).
     pub middle_down: Hit,
+    /// A press in the text closes the find bar when it's let go (View → Find bar → Close when you click in the
+    /// text): the tab's id.
+    pub close_find_on_up: Option<u64>,
     pub tab_drag: Option<(usize, f32, bool)>,
     pub caret_on: bool,
     pub focused: bool,
@@ -720,6 +723,7 @@ impl App {
             hover: Hit::None,
             down: Hit::None,
             middle_down: Hit::None,
+            close_find_on_up: None,
             tab_drag: None,
             caret_on: true,
             focused: true,

@@ -117,6 +117,9 @@ pub struct Ui {
     syncing: Cell<bool>,
     scroll_acc: Cell<f64>,
     drag_origin: Cell<(f64, f64)>,
+    /// A press in the text closes the find bar when it's let go (View → Find bar → Close when you click in the
+    /// text): the tab's id.
+    close_find_on_release: Cell<Option<u64>>,
     last_input: Cell<Instant>,
     /// The caret's timer, only while it blinks: stopped once the caret has been still for `BLINK_STOP` or the window
     /// is in the background, so an idle Slate doesn't wake up twice a second (`wake_blink` starts it again).
@@ -923,6 +926,7 @@ pub fn window(application: &gtk4::Application, test: Option<Rc<testmode::Test>>)
         syncing: Cell::new(false),
         scroll_acc: Cell::new(0.0),
         drag_origin: Cell::new((0.0, 0.0)),
+        close_find_on_release: Cell::new(None),
         last_input: Cell::new(Instant::now()),
         blink_timer: Cell::new(None),
         polling: Cell::new(false),
@@ -1336,7 +1340,7 @@ fn connect(ui: &Rc<Ui>, prev: &gtk4::Button, next: &gtk4::Button, lines_btn: &gt
         if ui.closing.get() { glib::Propagation::Proceed } else { glib::Propagation::Stop }
     });
     // View → Find bar → Close when you click in the text: the keyboard going from the find bar to the text closes the
-    // bar (a click, a jump from the structure panel; afterwards, so a click lands where it was made).
+    // bar (a jump from the structure panel; a click in the text closes it when it's let go: `text_released`).
     let last_focus: RefCell<Option<glib::WeakRef<gtk4::Widget>>> = RefCell::new(None);
     ui.window.connect_focus_widget_notify(move |w| {
         let Some(ui) = get_ui() else { return };
@@ -1345,7 +1349,7 @@ fn connect(ui: &Rc<Ui>, prev: &gtk4::Button, next: &gtk4::Button, lines_btn: &gt
         let to_text = now.as_ref().is_some_and(|f| f == ui.text.upcast_ref::<gtk4::Widget>());
         let from_bar = was.is_some_and(|f| f.is_ancestor(&ui.find_box));
         let wanted = ui.app.try_borrow().is_ok_and(|a| a.find.open && a.settings.find_close_on_leave);
-        if to_text && from_bar && wanted {
+        if to_text && from_bar && wanted && ui.close_find_on_release.get().is_none() {
             glib::idle_add_local_once(|| {
                 if let Some(ui) = get_ui() {
                     ui.command(Cmd::CloseFind);
@@ -2481,6 +2485,13 @@ impl Ui {
             self.with(|a| a.ime_end());
         }
         self.touch();
+        // (a left press from the find bar closes it when it's let go, View → Find bar → Close when you click in the
+        // text: until then nothing moves under the mouse, so the click and a drag from it are where they were made)
+        let from_bar = GtkWindowExt::focus(&self.window).is_some_and(|f| f.is_ancestor(&self.find_box));
+        let close = self.app.try_borrow().ok().and_then(|a| {
+            (button == 1 && from_bar && a.find.open && a.settings.find_close_on_leave).then(|| a.tab().id)
+        });
+        self.close_find_on_release.set(close);
         self.text.grab_focus();
         let g = self.geom();
         let gw = self.app.try_borrow().map(|a| self.gutter_width(&a)).unwrap_or(0.0);
@@ -2614,6 +2625,26 @@ impl Ui {
         if done.is_some() {
             self.set_primary();
         }
+        self.close_find_after_click();
+    }
+
+    /// A press in the text that closes the find bar was let go (`close_find_on_release`): the bar goes, and the text
+    /// stays where it is on screen, scrolled back as many rows as the bar was tall (as far as there are rows above).
+    fn close_find_after_click(&self) {
+        let Some(id) = self.close_find_on_release.take() else { return };
+        let bar_h = self.find_box.height() as f64;
+        let g = self.geom();
+        self.with(|a| {
+            if !a.find.open || a.tab().id != id {
+                return;
+            }
+            a.exec(Cmd::CloseFind);
+            let rows = (bar_h / a.style.row_h.max(1.0)).round() as i64;
+            if rows > 0 {
+                a.with_view(&g, |v, cx| v.scroll_rows(cx, -rows));
+            }
+            a.dirty_view = true;
+        });
     }
 
     fn text_dragged(&self, x: f64, y: f64) {

@@ -3182,6 +3182,21 @@ impl App {
         self.invalidate();
     }
 
+    /// A press in the text that closes the find bar was let go (`close_find_on_up`): the bar goes, and the text stays
+    /// where it is on screen, scrolled back as many rows as the bar was tall (as far as there are rows above).
+    fn close_find_after_click(&mut self) {
+        let Some(id) = self.close_find_on_up.take() else { return };
+        if !self.find.open || self.tabs.get(self.active).is_none_or(|t| t.id != id) {
+            return;
+        }
+        let rows = (self.find.height() / self.style.row_h.max(1.0)).round() as i64;
+        self.close_find();
+        if rows > 0 {
+            self.with_view(|v, cx| v.scroll_rows(cx, -rows));
+        }
+        self.invalidate();
+    }
+
     /// The find text or options changed.
     pub fn on_find_changed(&mut self) {
         let text = FindBar::text_of(self.find.find_edit);
@@ -3706,6 +3721,9 @@ impl App {
         self.disarm_menu_bar();
         self.hide_tip();
         let hit = self.hit(x, y);
+        if button == 0 {
+            self.close_find_on_up = None;
+        }
         // Only a left press is drawn pressed: the others aren't captured, so their release can come anywhere.
         match button {
             0 if std::mem::replace(&mut self.down, hit) != hit => self.invalidate(),
@@ -3729,15 +3747,14 @@ impl App {
             }
             (0, Hit::Menu(i)) => self.pending.push(Deferred::Menu(i)),
             (0, Hit::Text) | (0, Hit::Gutter) => {
-                // (the bar closes after the click is placed where it was made, before the text moves up)
+                // (the bar closes when the button is let go: until then nothing moves under the mouse, so the click
+                // and a drag from it are where they were made)
                 let close = self.settings.find_close_on_leave && self.in_find_bar();
+                self.close_find_on_up = close.then(|| self.tab().id);
                 win::set_focus(self.hwnd);
                 let n = self.click_count(x, y);
                 self.editor_click(x, y, n, hit == Hit::Gutter);
                 capture(self.hwnd);
-                if close {
-                    self.close_find();
-                }
             }
             (0, Hit::VBar) => {
                 self.vbar_down(y);
@@ -4229,6 +4246,9 @@ impl App {
                 }
                 _ => {}
             }
+        }
+        if button == 0 {
+            self.close_find_after_click();
         }
         self.tab_drag = None;
         match (button, down, hit) {
