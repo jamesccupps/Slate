@@ -985,6 +985,8 @@ pub fn window(application: &gtk4::Application, test: Option<Rc<testmode::Test>>)
     connect(&ui, &prev, &next, &lines_btn, &marks_btn, &close_find, &replace_one, &replace_all, &notice_close);
     actions(&ui);
     hidden_menu_keys(&ui);
+    refused_submenus(&ui);
+    menus_close_quietly(&ui);
     // timers: the caret (while it blinks), files changed by other programs, the session
     ui.wake_blink();
     glib::timeout_add_local(Duration::from_secs(2), || {
@@ -2092,6 +2094,117 @@ fn hidden_menu_keys(ui: &Rc<Ui>) {
                     }
                 });
             });
+        }
+    }
+}
+
+/// Calls `f` once for each menu of the menu bar and each of their submenus (`true` for a submenu), as each first opens
+/// (a submenu is made anew when its items change).
+fn each_menu(ui: &Rc<Ui>, f: impl Fn(&gtk4::Popover, bool) + 'static) {
+    let f = Rc::new(f);
+    let watched: Rc<RefCell<Vec<glib::WeakRef<gtk4::Popover>>>> = Rc::default();
+    for w in ui.menu_items.iter().filter_map(|w| w.upgrade()) {
+        let Some(pop) = popover_of(&w) else { continue };
+        let (f, watched) = (f.clone(), watched.clone());
+        pop.connect_map(move |pop| {
+            let top: &gtk4::Popover = pop.upcast_ref();
+            let mut all = Vec::new();
+            popovers_in(top.upcast_ref(), &mut all);
+            all.push(top.clone());
+            let mut list = watched.borrow_mut();
+            list.retain(|p| p.upgrade().is_some());
+            for p in all {
+                if !list.iter().any(|q| q.upgrade().as_ref() == Some(&p)) {
+                    list.push(p.downgrade());
+                    f(&p, &p != top);
+                }
+            }
+        });
+    }
+}
+
+/// A submenu the compositor refused to show stayed shown to GTK, so its item did nothing ever after, clicked or not:
+/// hidden again, the next click opens it. (GNOME refuses one opened by hovering while the menu's only input serial is
+/// a key's that came before the menu took the keyboard, as with the hidden menu bar's menus, opened once Alt+S is up:
+/// the click's own serial is a new one.)
+fn refused_submenus(ui: &Rc<Ui>) {
+    each_menu(ui, |p, sub| {
+        if !sub {
+            return;
+        }
+        // (shown, it's mapped before this runs; one the compositor refused isn't)
+        p.connect_visible_notify(|sub| {
+            if sub.is_visible() && !sub.is_mapped() {
+                let sub = sub.downgrade();
+                glib::idle_add_local_once(move || {
+                    if let Some(sub) = sub.upgrade()
+                        && sub.is_visible()
+                        && !sub.is_mapped()
+                    {
+                        sub.set_visible(false);
+                    }
+                });
+            }
+        });
+    });
+}
+
+/// An item chosen in a submenu could set GTK's menu bar switching between two of its menus without end on GNOME,
+/// the window busy and looking frozen (0.19 too: View → Zoom → Reset zoom with the mouse; the beta's Settings →
+/// Interface text size → 125%). As the submenu closed, GTK took the pointer's last place in it for a place in the
+/// window: at some heights the menu bar's row, whose item there then opened its menu, the menu it closed still open
+/// at that moment; and back. So from a click or key in a menu, before GTK acts on it, the menu bar ignores the
+/// pointer until it really moves (a motion repeating the last place doesn't count) or something is clicked.
+fn menus_close_quietly(ui: &Rc<Ui>) {
+    // (the pointer's last place since the menu bar stopped taking it)
+    let seen: Rc<RefCell<Option<(gdk::Surface, f64, f64)>>> = Rc::default();
+    let watch = move |w: &gtk4::Widget| {
+        let seen = seen.clone();
+        let input = gtk4::EventControllerLegacy::new();
+        input.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        input.connect_event(move |_, ev| {
+            quiet_menu_bar(ev, &seen);
+            glib::Propagation::Proceed
+        });
+        w.add_controller(input);
+    };
+    watch(ui.window.upcast_ref());
+    // (a menu's events stop at it while it has the pointer grabbed)
+    each_menu(ui, move |p, _| watch(p.upcast_ref()));
+}
+
+fn quiet_menu_bar(ev: &gdk::Event, seen: &RefCell<Option<(gdk::Surface, f64, f64)>>) {
+    use gdk::EventType as T;
+    let Some(ui) = get_ui() else { return };
+    let row = &ui.menu_row;
+    let in_menu = ev.surface().is_some_and(|s| Some(&s) != ui.window.surface().as_ref());
+    match ev.event_type() {
+        T::ButtonPress | T::ButtonRelease | T::KeyPress | T::TouchBegin | T::TouchEnd if in_menu => {
+            row.set_can_target(false);
+            seen.replace(None);
+        }
+        T::MotionNotify if !row.can_target() => {
+            let (Some(s), Some((x, y))) = (ev.surface(), ev.position()) else { return };
+            let moved = seen.borrow().as_ref().is_some_and(|(s0, x0, y0)| *s0 == s && ((x - x0).abs() > 0.5 || (y - y0).abs() > 0.5));
+            if moved {
+                row.set_can_target(true);
+            } else {
+                seen.replace(Some((s, x, y)));
+            }
+        }
+        T::ButtonPress | T::TouchBegin => row.set_can_target(true),
+        _ => {}
+    }
+}
+
+/// The popovers under `w`, the deepest first.
+fn popovers_in(w: &gtk4::Widget, out: &mut Vec<gtk4::Popover>) {
+    let mut child = w.first_child();
+    while let Some(c) = child {
+        child = c.next_sibling();
+        popovers_in(&c, out);
+        if let Ok(p) = c.downcast::<gtk4::Popover>() {
+            out.push(p);
         }
     }
 }

@@ -646,6 +646,16 @@ when it's this user's alone, else a guest window that keeps nothing). Windows: `
   - Hide the menu bar (#10): Windows lays it out at height 0 unless `menu_bar_shown` (Alt armed it, or a menu is
     open: `menu_bar_changed` lays out again at each change); Linux hides the menu row and `hidden_menu_keys` shows
     it for Alt on its own (the first menu) or Alt and a menu's letter (not while the find box has the keyboard).
+    Those menus open once the keys are up, so on GNOME a submenu opened by hovering is refused (its grab's serial
+    is a key's from before the menu had the keyboard) yet stays shown to GTK, and its item then did nothing:
+    `refused_submenus` hides such a submenu again, so a click (a new serial) or the keyboard opens it.
+  - Linux menu bar after a submenu's item is chosen (0.19 too, found with the 0.20 beta; GNOME): as the submenu went,
+    GTK took the pointer's last place in it for a place in the window; at some heights that was the menu bar, whose
+    item there opened its menu (the closing one still counted as open), then the other, without end (the window
+    busy, looking frozen; GDK: "Tried to unmap the parent of a popup"). `menus_close_quietly` makes the menu row
+    ignore the pointer from a click or key in a menu (seen before GTK acts on it: `each_menu` gives each menu and
+    submenu its own controller, as a menu's events stop at it while it holds the pointer) until the pointer really
+    moves (a motion repeating the last place doesn't count) or something is clicked.
   - Find bar at the bottom (#9): `Settings::bars_at_bottom`. Windows puts `r_find` then `r_notice` above the status
     bar and draws their border along their top; Linux reorders the find box and the notice after the scrollbar
     (`place_bars`, CSS `.slate-bottom`). The text's top stays where it was as they open and close.

@@ -20,3 +20,6 @@ Nine things users asked for (issues #7 to #15), on Windows and Linux.
 
 ### Changed
 - A file that can't be opened leaves you on the tab you were on, not the one beside it.
+
+### Fixed
+- Linux (GNOME): choosing some items of a submenu with the mouse (View → Zoom → Reset zoom, among others) could set the menu bar opening two of its menus in turn without end, the window busy and looking frozen.
