@@ -10,7 +10,49 @@ mod code;
 mod config;
 mod markup;
 
+use std::collections::BTreeMap;
+use std::sync::RwLock;
+
 use serde::{Deserialize, Serialize};
+
+/// The user's own file endings (settings.json's `languages`, issue #13), looked at before Slate's own rules: the
+/// ending (lower case, without its dot) or a whole file name, and its language.
+static USER_LANGS: RwLock<Vec<(String, Lang)>> = RwLock::new(Vec::new());
+
+/// Takes settings.json's `languages` (`{"mmd": "Markdown", ".upp": "Lua", "Jenkinsfile": "groovy"}`): an ending,
+/// with or without its dot, or a whole file name, in any case; a language by its name in Format → Language (any case,
+/// or one half of a name like "INI / Config"). One that isn't a language is left out.
+pub fn set_user_langs(map: &BTreeMap<String, String>) {
+    let v: Vec<(String, Lang)> = map
+        .iter()
+        .filter_map(|(k, name)| {
+            let k = k.trim().trim_start_matches('.').to_ascii_lowercase();
+            if k.is_empty() {
+                return None;
+            }
+            Some((k, Lang::by_name(name)?))
+        })
+        .collect();
+    *USER_LANGS.write().unwrap_or_else(|e| e.into_inner()) = v;
+}
+
+/// A file name's ending as `languages` keeps it (`notes.MMD` → `mmd`); None without one.
+pub fn ending_of(name: &str) -> Option<String> {
+    let name = name.rsplit(['\\', '/']).next().unwrap_or(name);
+    let (stem, ext) = name.rsplit_once('.')?;
+    (!stem.is_empty() && !ext.is_empty()).then(|| ext.to_ascii_lowercase())
+}
+
+/// The user's language for a file (by its whole name first, then its ending).
+fn user_lang(path: &str) -> Option<Lang> {
+    let langs = USER_LANGS.read().unwrap_or_else(|e| e.into_inner());
+    if langs.is_empty() {
+        return None;
+    }
+    let name = path.rsplit(['\\', '/']).next().unwrap_or(path).to_ascii_lowercase();
+    let ext = ending_of(&name);
+    langs.iter().find(|(k, _)| *k == name).or_else(|| langs.iter().find(|(k, _)| Some(k) == ext.as_ref())).map(|&(_, l)| l)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Lang {
@@ -289,9 +331,20 @@ impl Lang {
         matches!(self, Lang::Json | Lang::Xml)
     }
 
-    /// Picks a language from the file's path (or just its name), then from the first bytes.
+    /// Picks a language from the file's path (or just its name): the user's own endings first (`set_user_langs`),
+    /// then Slate's; then from the first bytes.
     pub fn detect(path: Option<&str>, head: &[u8]) -> Lang {
-        path.and_then(|p| Lang::from_path(p, head)).unwrap_or_else(|| Lang::sniff(head))
+        path.and_then(|p| user_lang(p).or_else(|| Lang::from_path(p, head))).unwrap_or_else(|| Lang::sniff(head))
+    }
+
+    /// A language by its name in Format → Language, in any case (`markdown`), or one half of a name with a slash
+    /// (`HCL`, `vCard`) or the part before a bracket (`Subtitles`).
+    pub fn by_name(name: &str) -> Option<Lang> {
+        let name = name.trim();
+        let same = |s: &str| s.trim().eq_ignore_ascii_case(name);
+        Lang::ALL.iter().copied().find(|l| same(l.label())).or_else(|| {
+            Lang::ALL.iter().copied().find(|l| l.label().split(" / ").any(same) || l.label().split(" (").next().is_some_and(same))
+        })
     }
 
     /// By the file name, and for server configuration also by the folder it's in (`/etc/nginx/sites-available/x`,
@@ -1560,6 +1613,34 @@ fn csv(t: &[u8], st: State, sep: u8, o: &mut Out) -> State {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_users_own_endings() {
+        // (endings no other test uses: the list is for the whole process)
+        let map: BTreeMap<String, String> = [
+            (".ZZUPP", "lua"),
+            ("zzmmd", "Markdown"),
+            ("zzfile", "HCL"),
+            ("zzsrt", "subtitles"),
+            ("zzbad", "Klingon"),
+            ("Zzbuild", "Python"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        set_user_langs(&map);
+        assert_eq!(Lang::detect(Some(r"C:\x\notes.zzmmd"), b"hello"), Lang::Markdown);
+        assert_eq!(Lang::detect(Some("/x/a.b.ZZupp"), b""), Lang::Lua);
+        assert_eq!(Lang::detect(Some("main.zzfile"), b""), Lang::Hcl);
+        assert_eq!(Lang::detect(Some("a.zzsrt"), b""), Lang::Subtitles);
+        assert_eq!(Lang::detect(Some("/src/zzbuild"), b""), Lang::Python);
+        // a name that isn't a language: as Slate would have it
+        assert_eq!(Lang::detect(Some("a.zzbad"), b"{\"a\": 1}"), Lang::Json);
+        assert_eq!(ending_of("x/.bashrc"), None);
+        assert_eq!(ending_of(r"C:\a.b\Notes.MMD").as_deref(), Some("mmd"));
+        set_user_langs(&BTreeMap::new());
+        assert_eq!(Lang::detect(Some("notes.zzmmd"), b"hello"), Lang::Plain);
+    }
 
     #[test]
     fn language_menu_groups() {

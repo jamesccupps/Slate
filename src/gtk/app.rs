@@ -135,6 +135,8 @@ pub enum Cmd {
     GoTab(usize),
     SetEol(Eol),
     SetLang(Lang),
+    /// Format → Language → Always open .x files as … (the current tab's ending and language; issue #13).
+    LangForEnding,
     InsertDateTime,
     About,
     Shortcuts,
@@ -350,6 +352,11 @@ pub struct FilterOf {
 }
 
 impl Tab {
+    /// Its file's ending (`highlight::ending_of`), for Format → Language → Always open .x files as ….
+    pub fn ending(&self) -> Option<String> {
+        self.doc.path.as_ref().and_then(|p| crate::highlight::ending_of(&p.to_string_lossy()))
+    }
+
     pub fn title(&self) -> String {
         if let Some(t) = &self.title_override {
             return t.clone();
@@ -2853,6 +2860,20 @@ impl App {
                 tab.lang = l;
                 tab.lang_picked = true;
                 tab.view.clear_cache();
+            }
+            Cmd::LangForEnding => {
+                let Some(ext) = self.tab().ending() else { return };
+                let lang = self.tab().lang;
+                let (msg, on) = self.settings.toggle_lang_for_ending(&ext, lang);
+                if on {
+                    // (the other tabs of that ending follow, unless their language was picked by hand)
+                    for t in self.tabs.iter_mut().filter(|t| !t.lang_picked && t.lang != lang && t.ending().as_deref() == Some(ext.as_str())) {
+                        t.lang = lang;
+                        t.view.clear_cache();
+                    }
+                }
+                self.settings.save();
+                self.flash(msg, false);
             }
             Cmd::InsertDateTime => self.insert_text(&now_text()),
             Cmd::About => self.asks.push(Ask::About),

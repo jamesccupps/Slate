@@ -374,6 +374,11 @@ impl Tab {
         }
     }
 
+    /// Its file's ending (`highlight::ending_of`), for Format → Language → Always open .x files as ….
+    pub fn ending(&self) -> Option<String> {
+        self.doc.path.as_ref().and_then(|p| crate::highlight::ending_of(&p.to_string_lossy()))
+    }
+
     pub fn title(&self) -> String {
         if let Some(t) = &self.title_override {
             return t.clone();
@@ -684,6 +689,7 @@ impl App {
             }
         };
         let settings = Settings::load();
+        crate::highlight::set_user_langs(&settings.languages);
         let theme = make_theme(settings.theme);
         let dpi = win::dpi_of(hwnd);
         let fonts = make_fonts(&g);

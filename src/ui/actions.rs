@@ -5167,6 +5167,21 @@ impl App {
                 self.session_dirty = true;
                 self.invalidate();
             }
+            Cmd::LangForEnding => {
+                let Some(ext) = self.tab().ending() else { return };
+                let lang = self.tab().lang;
+                let (msg, on) = self.settings.toggle_lang_for_ending(&ext, lang);
+                if on {
+                    // (the other tabs of that ending follow, unless their language was picked by hand)
+                    for t in self.tabs.iter_mut().filter(|t| !t.lang_picked && t.lang != lang && t.ending().as_deref() == Some(ext.as_str())) {
+                        t.lang = lang;
+                        t.view.clear_cache();
+                    }
+                }
+                self.settings.save();
+                self.flash(msg, false);
+                self.invalidate();
+            }
             Cmd::IndentSpaces(b) => {
                 // For this document (picked: not guessed again), and the default for new ones.
                 let ind = match (b, self.indent_now()) {
@@ -5660,6 +5675,12 @@ impl App {
                 None => format!("&{letters}"),
             };
             v.push(sub(&label, items));
+        }
+        // (this file's ending, always in this language)
+        if let Some(ext) = self.tab().ending() {
+            let on = self.settings.lang_for_ending(&ext) == Some(cur);
+            v.push(Item::Sep);
+            v.push(check(Cmd::LangForEnding, &format!("Al&ways open .{} files as {}", ext.replace('&', "&&"), cur.label()), "", on));
         }
         v
     }

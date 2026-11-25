@@ -139,6 +139,8 @@ pub enum Cmd {
     SaveEncoding(Encoding),
     ReopenEncoding(Encoding),
     SetLang(Lang),
+    /// Format → Language → Always open .x files as … (the current tab's ending and language; issue #13).
+    LangForEnding,
     IndentSpaces(bool),
     TabSize(u32),
     NextTab,

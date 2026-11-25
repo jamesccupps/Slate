@@ -111,6 +111,9 @@ pub struct Ui {
     /// View's JSON or XML items (the structure panel and the path bar), for the language they're shown for.
     view_extra: gio::Menu,
     view_extra_for: Cell<Option<Lang>>,
+    /// Format → Language's last item: Always open .x files as … (the tab's ending and language it's for).
+    lang_extra: gio::Menu,
+    lang_extra_for: RefCell<Option<(String, Lang)>>,
     /// A look again at the status bar's counts is due (`App::doc_counts_now`).
     count_timer: Cell<bool>,
     /// Set while the window sets its own scrollbars and boxes (their signals then aren't the user's).
@@ -722,6 +725,7 @@ pub fn window(application: &gtk4::Application, test: Option<Rc<testmode::Test>>)
     }
     mark("app");
     let settings = Settings::load();
+    crate::highlight::set_user_langs(&settings.languages);
     let (w, h, maximized) = match settings.window {
         Some(p) => (p.w.max(400), p.h.max(300), p.maximized),
         None => (1000, 700, false),
@@ -799,7 +803,14 @@ pub fn window(application: &gtk4::Application, test: Option<Rc<testmode::Test>>)
     let recent_menu = gio::Menu::new();
     let format_extra = gio::Menu::new();
     let view_extra = gio::Menu::new();
-    let menubar = gtk4::PopoverMenuBar::from_model(Some(&menu_model(&recent_menu, &format_extra, &view_extra, &mono_families(&text.pango_context(), &settings.font))));
+    let lang_extra = gio::Menu::new();
+    let menubar = gtk4::PopoverMenuBar::from_model(Some(&menu_model(
+        &recent_menu,
+        &format_extra,
+        &view_extra,
+        &lang_extra,
+        &mono_families(&text.pango_context(), &settings.font),
+    )));
     // A menu bar item clicked kept the keyboard once its menu closed (typing went nowhere, as Ctrl+N's new tab
     // showed): as on Windows, the keyboard stays in the text, and the menus open in popovers of their own.
     let mut items = Vec::new();
@@ -929,6 +940,8 @@ pub fn window(application: &gtk4::Application, test: Option<Rc<testmode::Test>>)
         struct_timer: Cell::new(false),
         view_extra: view_extra.clone(),
         view_extra_for: Cell::new(None),
+        lang_extra: lang_extra.clone(),
+        lang_extra_for: RefCell::new(None),
         syncing: Cell::new(false),
         scroll_acc: Cell::new(0.0),
         drag_origin: Cell::new((0.0, 0.0)),
@@ -1656,6 +1669,7 @@ fn commands() -> Vec<(&'static str, Cmd, &'static [&'static str])> {
         ("xml-check", Cmd::XmlCheck, &[]),
         ("wrap", Cmd::Wrap, &["<Alt>z"]),
         ("char-info", Cmd::CharInfo, &[]),
+        ("lang-for-ending", Cmd::LangForEnding, &[]),
         ("line-numbers", Cmd::LineNumbers, &[]),
         ("zoom-in", Cmd::ZoomIn, &["<Control>plus", "<Control>equal", "<Control>KP_Add"]),
         ("zoom-out", Cmd::ZoomOut, &["<Control>minus", "<Control>KP_Subtract"]),
@@ -1794,7 +1808,7 @@ pub fn action_for_accel(ui: &Ui, accel: &str) -> Option<String> {
 
 /// Menu items that show a check mark: their actions have a true/false state (`Ui::sync_menu`).
 const CHECKED: &[&str] =
-    &["wrap", "line-numbers", "show-whitespace", "spell-check", "title-bar-tabs", "close-with-last-tab", "find-close-on-leave", "find-per-tab", "multi-cursor", "theme-system", "theme-light", "theme-dark", "eol-lf", "eol-crlf", "read-only", "restore-session", "structure-panel", "path-bar"];
+    &["wrap", "line-numbers", "show-whitespace", "spell-check", "title-bar-tabs", "close-with-last-tab", "find-close-on-leave", "find-per-tab", "multi-cursor", "theme-system", "theme-light", "theme-dark", "eol-lf", "eol-crlf", "read-only", "restore-session", "structure-panel", "path-bar", "lang-for-ending"];
 
 fn actions(ui: &Rc<Ui>) {
     // (in place of the window's own "win" group: menus and shortcuts find these the same way)
@@ -2020,7 +2034,7 @@ fn open_menu_soon(items: Rc<Vec<glib::WeakRef<gtk4::Widget>>>, tries: u32) {
     });
 }
 
-fn menu_model(recent: &gio::Menu, format_extra: &gio::Menu, view_extra: &gio::Menu, fonts: &[String]) -> gio::Menu {
+fn menu_model(recent: &gio::Menu, format_extra: &gio::Menu, view_extra: &gio::Menu, lang_extra: &gio::Menu, fonts: &[String]) -> gio::Menu {
     let bar = gio::Menu::new();
     let file = gio::Menu::new();
     let open = section(&[("New tab", "new-tab"), ("Open…", "open")]);
@@ -2120,7 +2134,9 @@ fn menu_model(recent: &gio::Menu, format_extra: &gio::Menu, view_extra: &gio::Me
     }
     let rest = gio::Menu::new();
     rest.append_submenu(Some("Convert"), &convert);
-    rest.append_submenu(Some("Language"), &lang_menu());
+    let lang = lang_menu();
+    lang.append_section(None, lang_extra);
+    rest.append_submenu(Some("Language"), &lang);
     rest.append_submenu(Some("Line endings"), &eol_menu());
     rest.append_submenu(Some("Encoding"), &encoding_menu());
     rest.append_submenu(Some("Indentation"), &indent_menu());
@@ -2976,7 +2992,11 @@ impl Ui {
         let Some(&(k, ix, iw)) = items.iter().find(|(_, ix, iw)| x >= *ix && x < ix + iw) else { return };
         let menu = match k {
             chrome::StatusItem::Indent => indent_menu(),
-            chrome::StatusItem::Lang => lang_menu(),
+            chrome::StatusItem::Lang => {
+                let m = lang_menu();
+                m.append_section(None, &self.lang_extra);
+                m
+            }
             chrome::StatusItem::Eol => eol_menu(),
             chrome::StatusItem::Encoding => encoding_menu(),
             chrome::StatusItem::ReadOnly => return self.command(Cmd::ToggleReadOnly),
@@ -3367,6 +3387,7 @@ impl Ui {
             ("eol-crlf", tab.doc.eol == Eol::Crlf),
             ("read-only", tab.read_only || tab.filter.is_some()),
             ("restore-session", a.settings.restore_session),
+            ("lang-for-ending", tab.ending().is_some_and(|e| a.settings.lang_for_ending(&e) == Some(tab.lang))),
         ];
         for (name, on) in checks {
             self.set_action_state(name, on.to_variant());
@@ -3388,6 +3409,15 @@ impl Ui {
         if self.theme_btn.icon_name().as_deref() != Some(icon) {
             self.theme_btn.set_icon_name(icon);
             self.theme_btn.set_tooltip_text(Some(tip));
+        }
+        // Format → Language → Always open .x files as …: for a file with an ending, named for it and the language
+        let want = tab.ending().map(|e| (e, tab.lang));
+        if *self.lang_extra_for.borrow() != want {
+            self.lang_extra.remove_all();
+            if let Some((e, l)) = &want {
+                self.lang_extra.append(Some(&format!("Always open .{e} files as {}", l.label())), Some("win.lang-for-ending"));
+            }
+            *self.lang_extra_for.borrow_mut() = want;
         }
         // View's structure panel and path bar: for JSON and XML only, named for the one shown
         let lang = tab.lang.has_structure().then_some(tab.lang);

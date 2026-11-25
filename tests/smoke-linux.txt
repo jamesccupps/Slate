@@ -304,3 +304,17 @@ up:
 expect:carets=0 *31..35
 key:escape
 cmd:multi-cursor
+# Format → Language → Always open .x files as … (issue #13): the next file of that ending opens in it; off again
+outside:smoke-own.zzlua|print("one")
+outside:smoke-own2.zzlua|print("two")
+open:smoke-own.zzlua
+jobs
+expect:lang=Plain text
+lang:Lua
+cmd:lang-for-ending
+expect:status=Files ending in .zzlua open as Lua from now on
+open:smoke-own2.zzlua
+jobs
+expect:lang=Lua
+cmd:lang-for-ending
+expect:status=Files ending in .zzlua get their language the usual way again

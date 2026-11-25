@@ -78,6 +78,9 @@ pub struct Settings {
     pub print_colors: bool,
     pub print_line_numbers: bool,
     pub print_header: bool,
+    /// The user's own file endings and their languages (`{"mmd": "Markdown"}`, issue #13; Format → Language →
+    /// Always open .x files as …): `highlight::set_user_langs`.
+    pub languages: std::collections::BTreeMap<String, String>,
     /// Settings this version doesn't know (written by a newer one), kept for it.
     #[serde(flatten)]
     pub other: serde_json::Map<String, serde_json::Value>,
@@ -117,6 +120,7 @@ impl Default for Settings {
             print_colors: true,
             print_line_numbers: true,
             print_header: true,
+            languages: std::collections::BTreeMap::new(),
             other: serde_json::Map::new(),
         }
     }
@@ -351,6 +355,30 @@ impl Settings {
         self.recent.retain(|r| r != p);
         self.recent.insert(0, p.to_path_buf());
         self.recent.truncate(15);
+    }
+
+    /// The language the user set for files ending in `ext` (`highlight::ending_of`'s form), if any.
+    pub fn lang_for_ending(&self, ext: &str) -> Option<crate::highlight::Lang> {
+        let key = |k: &str| k.trim().trim_start_matches('.').to_ascii_lowercase();
+        self.languages.iter().find(|(k, _)| key(k) == ext).and_then(|(_, n)| crate::highlight::Lang::by_name(n))
+    }
+
+    /// Format → Language → Always open .x files as … for a file ending in `ext` shown in `lang`: off if it's on,
+    /// else on (issue #13). Returns what to say, and whether it's on now.
+    pub fn toggle_lang_for_ending(&mut self, ext: &str, lang: crate::highlight::Lang) -> (String, bool) {
+        let on = self.lang_for_ending(ext) != Some(lang);
+        let key = |k: &str| k.trim().trim_start_matches('.').to_ascii_lowercase();
+        self.languages.retain(|k, _| key(k) != ext);
+        if on {
+            self.languages.insert(ext.to_string(), lang.label().to_string());
+        }
+        crate::highlight::set_user_langs(&self.languages);
+        let msg = if on {
+            format!("Files ending in .{ext} open as {} from now on", lang.label())
+        } else {
+            format!("Files ending in .{ext} get their language the usual way again")
+        };
+        (msg, on)
     }
 
     pub fn indent_unit(&self) -> Vec<u8> {
