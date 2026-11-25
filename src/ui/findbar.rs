@@ -321,12 +321,13 @@ impl FindBar {
         x += s(26.0);
         // what the box and the match count after it can have, before the previous / next / matching lines buttons
         let room = (close.x - s(8.0) - (4.0 * btn + s(6.0)) - s(14.0) - x).max(0.0);
-        self.status_w = s(124.0).min(room - s(140.0)).max(0.0);
-        let box_w = (r.w * 0.42).clamp(s(220.0), s(460.0)).min(room - self.status_w).max(s(120.0));
+        // (the box first, with room for some text besides its five toggles; the match count gets what's left)
+        let tw = s(26.0);
+        let box_w = (r.w * 0.42).clamp(s(220.0), s(460.0)).max(5.0 * tw + s(100.0)).min(room).max(s(120.0));
+        self.status_w = (room - box_w).clamp(0.0, s(124.0));
         let b = snap_box(Rect::new(x, y, box_w, box_h));
         self.inputs.push((self.find_edit, b));
         // Toggles sit inside the box on the right.
-        let tw = s(26.0);
         let tx = b.right() - 5.0 * tw - 2.0;
         self.parts.push((Part::Case, Rect::new(tx, y + 2.0, tw, box_h - 4.0)));
         self.parts.push((Part::Word, Rect::new(tx + tw, y + 2.0, tw, box_h - 4.0)));

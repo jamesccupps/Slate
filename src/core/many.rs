@@ -156,7 +156,7 @@ pub fn in_files(m: &Matcher, root: &Path, ctx: &Ctx) -> InFiles {
                 return out;
             }
             let big = std::fs::metadata(&f).map_or(true, |md| md.len() > FILE_SIZE_MAX);
-            let data = if big { None } else { std::fs::read(&f).ok() };
+            let data = if big { None } else { std::fs::read(&f).ok().map(text_of) };
             let Some(data) = data.filter(|d| !d[..d.len().min(8192)].contains(&0)) else {
                 out.skipped += 1;
                 continue;
@@ -170,6 +170,21 @@ pub fn in_files(m: &Matcher, root: &Path, ctx: &Ctx) -> InFiles {
         }
     }
     out
+}
+
+/// A file's text as Find in files searches it: UTF-8 without its byte order mark, or UTF-16 with one (little or big
+/// endian) made UTF-8. Anything else as it is.
+fn text_of(data: Vec<u8>) -> Vec<u8> {
+    let utf16 = |b: &[u8], big: bool| {
+        let units: Vec<u16> = b.as_chunks::<2>().0.iter().map(|&c| if big { u16::from_be_bytes(c) } else { u16::from_le_bytes(c) }).collect();
+        String::from_utf16_lossy(&units).into_bytes()
+    };
+    match data.as_slice() {
+        [0xEF, 0xBB, 0xBF, rest @ ..] => rest.to_vec(),
+        [0xFF, 0xFE, rest @ ..] => utf16(rest, false),
+        [0xFE, 0xFF, rest @ ..] => utf16(rest, true),
+        _ => data,
+    }
 }
 
 /// Where a line of a tab of results goes (`Results::rows`).
@@ -276,6 +291,10 @@ mod tests {
         std::fs::write(root.join(".git").join("c"), "needle").unwrap();
         std::fs::write(root.join("node_modules").join("d.js"), "needle").unwrap();
         std::fs::write(root.join("e.bin"), b"needle\0\0").unwrap();
+        // (a byte order mark isn't part of the line; UTF-16 is read as text, not passed over as binary)
+        std::fs::write(root.join("f.txt"), b"\xEF\xBB\xBFneedle first").unwrap();
+        let wide: Vec<u8> = [0xFFu8, 0xFE].into_iter().chain("x\nneedle".encode_utf16().flat_map(u16::to_le_bytes)).collect();
+        std::fs::write(root.join("g.txt"), wide).unwrap();
         let ctx = Ctx { cancel: Default::default(), progress: Default::default() };
         let r = in_files(&matcher("needle"), &root, &ctx);
         let found: Vec<(String, Vec<u64>)> = r
@@ -283,8 +302,12 @@ mod tests {
             .iter()
             .map(|f| (f.path.strip_prefix(&root).unwrap().to_string_lossy().replace('\\', "/"), f.hits.iter().map(|h| h.line).collect()))
             .collect();
-        assert_eq!(found, vec![("a.txt".to_string(), vec![0]), ("sub/b.md".to_string(), vec![1, 2])]);
-        assert_eq!((r.searched, r.skipped, r.cut), (2, 1, false));
+        assert_eq!(
+            found,
+            vec![("a.txt".to_string(), vec![0]), ("f.txt".to_string(), vec![0]), ("g.txt".to_string(), vec![1]), ("sub/b.md".to_string(), vec![1, 2])]
+        );
+        assert_eq!(r.files[1].hits[0].text, "needle first");
+        assert_eq!((r.searched, r.skipped, r.cut), (4, 1, false));
         let _ = std::fs::remove_dir_all(&root);
     }
 }

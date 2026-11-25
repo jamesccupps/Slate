@@ -2328,7 +2328,7 @@ impl App {
     fn open_selection(&mut self, at: Option<u64>) {
         use crate::links::Target;
         let tab = self.tab();
-        match crate::links::target_in(&tab.doc, tab.view.sel, at) {
+        match crate::links::target_in(&tab.doc, tab.view.sel, at, false) {
             Ok(Target::Link(url)) => {
                 self.flash(format!("Opening {url} in your browser"), false);
                 self.asks.push(Ask::OpenLink(url));

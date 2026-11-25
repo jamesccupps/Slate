@@ -2965,7 +2965,7 @@ impl App {
     fn open_selection(&mut self, at: Option<u64>) {
         use crate::links::Target;
         let tab = self.tab();
-        match crate::links::target_in(&tab.doc, tab.view.sel, at) {
+        match crate::links::target_in(&tab.doc, tab.view.sel, at, false) {
             Ok(Target::Link(url)) => {
                 win::shell_open(self.hwnd, std::ffi::OsStr::new(&url), &format!("open link {url}"));
                 self.flash(format!("Opening {url} in your browser"), false);
@@ -6529,13 +6529,19 @@ pub fn run(cell: &Cell, d: Deferred) {
         Deferred::Cmd(c) => run_cmd(cell, c),
         Deferred::Menu(i) => show_menu_bar(cell, i),
         Deferred::ContextMenu(x, y) => {
+            // (drawn first, while nothing has the App: F7's word shows selected under its menu. Asking the spell
+            // checker for suggestions below can let a paint through while the App is busy, which is then skipped.)
+            let hwnd = cell.borrow().hwnd;
+            unsafe {
+                let _ = windows::Win32::Graphics::Gdi::UpdateWindow(hwnd);
+            }
             let spelling = cell.borrow_mut().spelling_at(x, y);
             // (a file name or a link where it opens, or at the caret for the keyboard's menu: open it, issue #7)
             let open = {
                 let mut a = cell.borrow_mut();
                 let at = if std::mem::take(&mut a.menu_at_caret) { a.tab().view.sel.caret } else { a.with_view(|v, cx| v.pos_at(cx, x, y)).0 };
                 let tab = a.tab();
-                crate::links::target_in(&tab.doc, tab.view.sel, Some(at)).ok().map(|t| (crate::links::menu_label(&t, true), at))
+                crate::links::target_in(&tab.doc, tab.view.sel, Some(at), true).ok().map(|t| (crate::links::menu_label(&t, true), at))
             };
             let items = {
                 let a = cell.borrow();

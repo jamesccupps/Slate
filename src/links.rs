@@ -28,8 +28,9 @@ pub fn around(line: &str, col: usize) -> &str {
 
 /// What Open selected file or link opens in `doc`, whose selection is `sel`: at `at` (a right-click's place) the
 /// selection if `at` is in it, else the name around `at`; with no `at`, the selection, or the name around the caret.
-/// A relative name is in the folder of the document's file.
-pub fn target_in(doc: &Document, sel: Sel, at: Option<u64>) -> Result<Target, String> {
+/// A relative name is in the folder of the document's file. `names_only` (the text's menu, which offers it unasked):
+/// a selection too only if it looks like a name (`plausible`), not any word that happens to be selected.
+pub fn target_in(doc: &Document, sel: Sel, at: Option<u64>, names_only: bool) -> Result<Target, String> {
     let inside = at.is_none_or(|p| !sel.is_empty() && sel.start() <= p && p <= sel.end());
     let text = if !inside || sel.is_empty() {
         let pos = at.unwrap_or(sel.caret).min(doc.len());
@@ -44,7 +45,11 @@ pub fn target_in(doc: &Document, sel: Sel, at: Option<u64>) -> Result<Target, St
     } else if sel.end() - sel.start() > MAX as u64 {
         return Err("Select one file name or link".into());
     } else {
-        String::from_utf8_lossy(&doc.read(sel.start(), sel.end())).into_owned()
+        let text = String::from_utf8_lossy(&doc.read(sel.start(), sel.end())).into_owned();
+        if names_only && !plausible(text.trim()) {
+            return Err("Select a file name or a link first".into());
+        }
+        text
     };
     target_of(&text, doc.path.as_deref().and_then(Path::parent))
 }
@@ -217,6 +222,22 @@ mod tests {
         for no in ["gamma", "1.5", "e.g", "v2.3", "", "end."] {
             assert!(!plausible(no), "{no}");
         }
+    }
+
+    #[test]
+    fn the_texts_menu_offers_names_only() {
+        // a word selected (F7 selects the one spelled wrong) isn't offered as a file; File → Open selected file or
+        // link still takes it
+        let mut doc = Document::from_text(b"see brwn and notes.txt here");
+        doc.path = Some(std::env::temp_dir().join("x.txt"));
+        let word = Sel::new(4, 8);
+        assert!(target_in(&doc, word, Some(5), true).is_err());
+        assert!(matches!(target_in(&doc, word, Some(5), false), Ok(Target::File(..))));
+        let name = Sel::new(13, 22);
+        assert!(matches!(target_in(&doc, name, Some(15), true), Ok(Target::File(..))));
+        // nothing selected: the name around the place, if it looks like one
+        assert!(target_in(&doc, Sel::at(0), Some(5), true).is_err());
+        assert!(matches!(target_in(&doc, Sel::at(0), Some(16), true), Ok(Target::File(..))));
     }
 
     #[test]

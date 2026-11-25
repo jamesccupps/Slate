@@ -3186,7 +3186,7 @@ impl Ui {
         let open = self.guarded(|a| {
             let at = if caret { a.tab().view.sel.caret } else { a.with_view(&g, |v, cx| v.pos_at(cx, x - gw - PAD, y)) };
             let tab = a.tab();
-            crate::links::target_in(&tab.doc, tab.view.sel, Some(at)).ok().map(|t| (crate::links::menu_label(&t, false), at))
+            crate::links::target_in(&tab.doc, tab.view.sel, Some(at), true).ok().map(|t| (crate::links::menu_label(&t, false), at))
         });
         if let Some(Some((label, at))) = open {
             let item = gio::MenuItem::new(Some(&label), None);
