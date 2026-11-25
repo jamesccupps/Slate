@@ -19,21 +19,76 @@ use serde::{Deserialize, Serialize};
 /// ending (lower case, without its dot) or a whole file name, and its language.
 static USER_LANGS: RwLock<Vec<(String, Lang)>> = RwLock::new(Vec::new());
 
-/// Takes settings.json's `languages` (`{"mmd": "Markdown", ".upp": "Lua", "Jenkinsfile": "groovy"}`): an ending,
-/// with or without its dot, or a whole file name, in any case; a language by its name in Format → Language (any case,
-/// or one half of a name like "INI / Config"). One that isn't a language is left out.
+/// Tests that change `USER_LANGS` take this first (the tests run side by side, the list is the process's).
+#[cfg(test)]
+pub static USER_LANGS_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Takes settings.json's `languages` (`{"mmd": "Markdown", ".upp": "Lua", "Jenkinsfile": "groovy", ".env": "INI"}`):
+/// an ending, with or without its dot, or a whole file name (a dot-file's too: `.env` is that file, and files ending in
+/// `.env`), in any case; a language by its name in Format → Language (any case, or one half of a name like "INI /
+/// Config"). One that isn't a language is left out.
 pub fn set_user_langs(map: &BTreeMap<String, String>) {
     let v: Vec<(String, Lang)> = map
         .iter()
         .filter_map(|(k, name)| {
-            let k = k.trim().trim_start_matches('.').to_ascii_lowercase();
-            if k.is_empty() {
+            let k = k.trim().to_ascii_lowercase();
+            if k.trim_start_matches('.').is_empty() {
                 return None;
             }
             Some((k, Lang::by_name(name)?))
         })
         .collect();
     *USER_LANGS.write().unwrap_or_else(|e| e.into_inner()) = v;
+}
+
+/// Whether settings.json's `languages` key `k` (lower case) is for `key`: a whole name (`.env`, `jenkinsfile`) or an
+/// ending (`mmd`, given as `mmd` or `.mmd`).
+pub fn lang_key_is(k: &str, key: &LangKey) -> bool {
+    if key.name { k == key.key } else { k.strip_prefix('.').unwrap_or(k) == key.key }
+}
+
+/// What Format → Language's Always open item is for: a file's ending (`mmd`), or its whole name (lower case) when it
+/// has none (`Jenkinsfile`, `.env`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LangKey {
+    pub key: String,
+    pub name: bool,
+    /// The name as the file has it (for the menu).
+    pub shown: String,
+}
+
+impl LangKey {
+    pub fn of(path: &str) -> Option<LangKey> {
+        let name = path.rsplit(['\\', '/']).next().unwrap_or(path);
+        if name.is_empty() {
+            return None;
+        }
+        Some(match ending_of(name) {
+            Some(ext) => LangKey { shown: name.rsplit_once('.').map_or(ext.as_str(), |(_, e)| e).to_string(), key: ext, name: false },
+            None => LangKey { key: name.to_ascii_lowercase(), name: true, shown: name.to_string() },
+        })
+    }
+
+    /// "Always open .mmd files as Markdown", "Always open files named “Jenkinsfile” as Groovy".
+    pub fn item(&self, lang: Lang) -> String {
+        if self.name {
+            format!("Always open files named “{}” as {}", self.shown, lang.label())
+        } else {
+            format!("Always open .{} files as {}", self.shown, lang.label())
+        }
+    }
+
+    /// What it says once turned on or off.
+    pub fn said(&self, lang: Lang, on: bool) -> String {
+        let what = if self.name { format!("Files named {}", self.shown) } else { format!("Files ending in .{}", self.shown) };
+        if on { format!("{what} open as {} from now on", lang.label()) } else { format!("{what} get their language the usual way again") }
+    }
+}
+
+/// Whether Slate opens a file at `path` in `lang` by itself (by its name or ending): Always open … would change
+/// nothing, so it isn't offered (unless it was set before, to be turned off).
+pub fn own_choice(path: &str, lang: Lang) -> bool {
+    Lang::from_path(path, b"") == Some(lang)
 }
 
 /// A file name's ending as `languages` keeps it (`notes.MMD` → `mmd`); None without one.
@@ -51,7 +106,11 @@ fn user_lang(path: &str) -> Option<Lang> {
     }
     let name = path.rsplit(['\\', '/']).next().unwrap_or(path).to_ascii_lowercase();
     let ext = ending_of(&name);
-    langs.iter().find(|(k, _)| *k == name).or_else(|| langs.iter().find(|(k, _)| Some(k) == ext.as_ref())).map(|&(_, l)| l)
+    langs
+        .iter()
+        .find(|(k, _)| *k == name)
+        .or_else(|| ext.and_then(|e| langs.iter().find(|(k, _)| k.strip_prefix('.').unwrap_or(k) == e)))
+        .map(|&(_, l)| l)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -121,6 +180,8 @@ pub enum Lang {
     InnoSetup,
     /// NSIS installer scripts.
     Nsis,
+    /// A tab of results (Find in all tabs, Find in files): Slate's own, not in Format → Language (`ALL`).
+    Results,
 }
 
 /// How a language writes comments (for "Toggle comment").
@@ -185,6 +246,7 @@ impl Lang {
             Lang::Scala => "Scala",
             Lang::ObjC => "Objective-C",
             Lang::ObjCpp => "Objective-C++",
+            Lang::Results => "Results",
             Lang::GCode => "G-code",
             Lang::InnoSetup => "Inno Setup",
             Lang::Nsis => "NSIS",
@@ -322,7 +384,8 @@ impl Lang {
             | Lang::Tsv
             | Lang::Diff
             | Lang::Subtitles
-            | Lang::Calendar => return None,
+            | Lang::Calendar
+            | Lang::Results => return None,
         })
     }
 
@@ -1041,6 +1104,7 @@ fn lex_in(lang: Lang, text: &[u8], st: State, o: &mut Out) -> State {
         Lang::Plain => st,
         Lang::Json => json(text, st, o),
         Lang::Log => by_line(text, st, o, log_line),
+        Lang::Results => by_line(text, st, o, results_line),
         Lang::Ini => by_line(text, st, o, ini_line),
         Lang::Diff => diff(text, st, o),
         Lang::Csv => csv(text, st, b',', o),
@@ -1344,6 +1408,25 @@ const LEVELS: [(&[u8], Tok); 38] = [
 
 const MONTHS: [&[u8]; 12] = [b"Jan", b"Feb", b"Mar", b"Apr", b"May", b"Jun", b"Jul", b"Aug", b"Sep", b"Oct", b"Nov", b"Dec"];
 
+/// A line of a tab of results (`core::many::Results`): what was looked for (the first line, “…” first) dim, each
+/// source's name a heading, each found line's number (`  12: `) dim.
+fn results_line(t: &[u8], col0: bool, _bol: bool, o: &mut Out) {
+    if !col0 || t.is_empty() {
+        return;
+    }
+    if t.starts_with("“".as_bytes()) {
+        o.put(0, t.len(), Tok::Dim);
+    } else if t.starts_with(b"  ") {
+        let sp = t.iter().take_while(|&&b| b == b' ').count();
+        let digits = t[sp..].iter().take_while(|b| b.is_ascii_digit()).count();
+        if digits > 0 && t.get(sp + digits) == Some(&b':') {
+            o.put(0, sp + digits + 1, Tok::Dim);
+        }
+    } else {
+        o.put(0, t.len(), Tok::Heading);
+    }
+}
+
 fn log_line(t: &[u8], col0: bool, _bol: bool, o: &mut Out) {
     let n = t.len();
     let mut i = 0usize;
@@ -1628,6 +1711,7 @@ mod tests {
         .iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
+        let _lock = USER_LANGS_TEST.lock().unwrap_or_else(|e| e.into_inner());
         set_user_langs(&map);
         assert_eq!(Lang::detect(Some(r"C:\x\notes.zzmmd"), b"hello"), Lang::Markdown);
         assert_eq!(Lang::detect(Some("/x/a.b.ZZupp"), b""), Lang::Lua);

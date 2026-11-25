@@ -387,27 +387,21 @@ impl Settings {
     }
 
     /// The language the user set for files ending in `ext` (`highlight::ending_of`'s form), if any.
-    pub fn lang_for_ending(&self, ext: &str) -> Option<crate::highlight::Lang> {
-        let key = |k: &str| k.trim().trim_start_matches('.').to_ascii_lowercase();
-        self.languages.iter().find(|(k, _)| key(k) == ext).and_then(|(_, n)| crate::highlight::Lang::by_name(n))
+    pub fn lang_for(&self, key: &crate::highlight::LangKey) -> Option<crate::highlight::Lang> {
+        let is = |k: &str| crate::highlight::lang_key_is(&k.trim().to_ascii_lowercase(), key);
+        self.languages.iter().find(|(k, _)| is(k)).and_then(|(_, n)| crate::highlight::Lang::by_name(n))
     }
 
-    /// Format → Language → Always open .x files as … for a file ending in `ext` shown in `lang`: off if it's on,
-    /// else on (issue #13). Returns what to say, and whether it's on now.
-    pub fn toggle_lang_for_ending(&mut self, ext: &str, lang: crate::highlight::Lang) -> (String, bool) {
-        let on = self.lang_for_ending(ext) != Some(lang);
-        let key = |k: &str| k.trim().trim_start_matches('.').to_ascii_lowercase();
-        self.languages.retain(|k, _| key(k) != ext);
+    /// Format → Language → Always open … for files of `key` (an ending or a whole name) shown in `lang`: off if it's
+    /// on, else on (issue #13). Returns what to say, and whether it's on now.
+    pub fn toggle_lang_for(&mut self, key: &crate::highlight::LangKey, lang: crate::highlight::Lang) -> (String, bool) {
+        let on = self.lang_for(key) != Some(lang);
+        self.languages.retain(|k, _| !crate::highlight::lang_key_is(&k.trim().to_ascii_lowercase(), key));
         if on {
-            self.languages.insert(ext.to_string(), lang.label().to_string());
+            self.languages.insert(if key.name { key.shown.clone() } else { key.key.clone() }, lang.label().to_string());
         }
         crate::highlight::set_user_langs(&self.languages);
-        let msg = if on {
-            format!("Files ending in .{ext} open as {} from now on", lang.label())
-        } else {
-            format!("Files ending in .{ext} get their language the usual way again")
-        };
-        (msg, on)
+        (key.said(lang, on), on)
     }
 
     /// Notes where the caret and the top of the view were in `path` as its tab closes (issue #11): one place per file,
@@ -416,16 +410,23 @@ impl Settings {
         if !self.reopen_where_left || path.to_str().is_none() {
             return;
         }
-        self.places.retain(|p| p.path != path);
+        let key = place_key(path);
+        self.places.retain(|p| place_key(&p.path) != key);
         if caret > 0 || top > 0 {
-            self.places.insert(0, FilePlace { path: path.to_path_buf(), caret, top });
+            let path = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+            self.places.insert(0, FilePlace { path, caret, top });
             self.places.truncate(PLACES_MAX);
         }
     }
 
-    /// Where `path` was left (caret, top), if it's to be opened there.
+    /// Where `path` was left (caret, top), if it's to be opened there: the same file however it's written (a relative
+    /// name, on Windows another case).
     pub fn place_of(&self, path: &std::path::Path) -> Option<(u64, u64)> {
-        self.places.iter().find(|p| p.path == path).filter(|_| self.reopen_where_left).map(|p| (p.caret, p.top))
+        if !self.reopen_where_left {
+            return None;
+        }
+        let key = place_key(path);
+        self.places.iter().find(|p| place_key(&p.path) == key).map(|p| (p.caret, p.top))
     }
 
     pub fn indent_unit(&self) -> Vec<u8> {
@@ -433,9 +434,74 @@ impl Settings {
     }
 }
 
+/// A place list's name for `path`: absolute (without asking the disk), and on Windows the same in any case.
+fn place_key(path: &std::path::Path) -> String {
+    let p = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let s = p.to_string_lossy().into_owned();
+    if cfg!(windows) { s.to_lowercase() } else { s }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn places_where_files_were_left() {
+        let mut s = Settings { reopen_where_left: true, ..Default::default() };
+        let dir = std::env::temp_dir();
+        let a = dir.join("slate-place-a.txt");
+        s.remember_place(&a, 120, 80);
+        assert_eq!(s.place_of(&a), Some((120, 80)));
+        // the same file written another way; on Windows in another case too
+        if cfg!(windows) {
+            let upper = std::path::PathBuf::from(a.to_string_lossy().to_uppercase());
+            assert_eq!(s.place_of(&upper), Some((120, 80)));
+        }
+        let dotted = dir.join(".").join("slate-place-a.txt");
+        assert_eq!(s.place_of(&dotted), Some((120, 80)));
+        // one place a file; the top of a file isn't kept (and forgets the one before)
+        s.remember_place(&a, 7, 0);
+        assert_eq!((s.places.len(), s.place_of(&a)), (1, Some((7, 0))));
+        s.remember_place(&a, 0, 0);
+        assert_eq!(s.place_of(&a), None);
+        // newest first, PLACES_MAX at most
+        for i in 0..PLACES_MAX + 5 {
+            s.remember_place(&dir.join(format!("slate-place-{i}.txt")), 1, 0);
+        }
+        assert_eq!(s.places.len(), PLACES_MAX);
+        assert!(s.places[0].path.ends_with(format!("slate-place-{}.txt", PLACES_MAX + 4)));
+        // turned off: none given, none kept
+        s.reopen_where_left = false;
+        assert_eq!(s.place_of(&dir.join("slate-place-300.txt")), None);
+    }
+
+    #[test]
+    fn own_languages_for_endings_and_names() {
+        use crate::highlight::{Lang, LangKey};
+        let _lock = crate::highlight::USER_LANGS_TEST.lock().unwrap_or_else(|e| e.into_inner());
+        let mut s = Settings::default();
+        let mmd = LangKey::of("/x/Notes.MMD").unwrap();
+        assert_eq!((mmd.key.as_str(), mmd.name), ("mmd", false));
+        assert_eq!(s.toggle_lang_for(&mmd, Lang::Markdown), ("Files ending in .MMD open as Markdown from now on".to_string(), true));
+        assert_eq!(s.lang_for(&mmd), Some(Lang::Markdown));
+        assert_eq!(Lang::detect(Some("/y/other.mmd"), b""), Lang::Markdown);
+        assert!(!s.toggle_lang_for(&mmd, Lang::Markdown).1);
+        assert_eq!(s.lang_for(&mmd), None);
+        // a dot-file is a name: `.env` itself, not files ending in "env" alone
+        let env = LangKey::of("/srv/app/.env").unwrap();
+        assert_eq!((env.key.as_str(), env.name), (".env", true));
+        assert_eq!(env.item(Lang::Ini), "Always open files named “.env” as INI / Config");
+        s.toggle_lang_for(&env, Lang::Ini);
+        assert_eq!(Lang::detect(Some("/srv/app/.env"), b""), Lang::Ini);
+        let jenkins = LangKey::of("C:\\ci\\Jenkinsfile").unwrap();
+        assert!(jenkins.name && jenkins.key == "jenkinsfile");
+        // (settings.json's `.upp` is still an ending)
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(".upp".to_string(), "Lua".to_string());
+        crate::highlight::set_user_langs(&map);
+        assert_eq!(Lang::detect(Some("/z/a.upp"), b""), Lang::Lua);
+        crate::highlight::set_user_langs(&Default::default());
+    }
 
     #[cfg(not(windows))]
     #[test]

@@ -636,34 +636,54 @@ pub struct Spot {
     pub pos: u64,
 }
 
-/// A jump is a move to another tab, or more than this many lines away (or 64 KB).
+/// A jump is a move to another tab, or more than this many lines away (or 64 KB), and more than a screenful: Page Up
+/// and Page Down scroll, they don't jump.
 pub const NAV_LINES: usize = 15;
 
-/// Whether moving the caret from `a` to `b` in `doc` is a jump (`NAV_LINES`).
-pub fn far(doc: &Document, a: u64, b: u64) -> bool {
+/// Whether moving the caret from `a` to `b` in `doc` is a jump: more lines than `NAV_LINES` and than `screen` (the
+/// lines the window shows).
+pub fn far(doc: &Document, a: u64, b: u64, screen: usize) -> bool {
     let (a, b) = (a.min(b).min(doc.len()), a.max(b).min(doc.len()));
-    b - a > 64 << 10 || doc.read(a, b).iter().filter(|&&c| c == b'\n').count() > NAV_LINES
+    b - a > 64 << 10 || doc.read(a, b).iter().filter(|&&c| c == b'\n').count() > NAV_LINES.max(screen)
 }
 
 /// Go back and Go forward (Alt+Left, Alt+Right; issue #11): the places the caret jumped away from, in any tab. The
-/// app tells it where the caret is after each change (`note`); a place in a tab that closed is skipped. (Places are
-/// byte offsets, not moved by edits made since: they land near where they were.)
+/// app tells it where the caret is after each change (`note`); a place in a tab that closed is skipped. A place is a
+/// byte offset: an edit since (its tab's text longer or shorter, the edit taken to be at the caret, as typing,
+/// deleting and pasting are) moves the places after it, so they stay on their lines. Only the caret comes back, not a
+/// selection.
 #[derive(Debug, Default)]
 pub struct Nav {
     back: Vec<Spot>,
     fwd: Vec<Spot>,
     here: Option<Spot>,
+    /// Each tab's text's length when last noted.
+    lens: std::collections::HashMap<u64, u64>,
 }
 
 impl Nav {
     /// Places kept each way.
     const MAX: usize = 100;
 
-    /// The caret is at `now` (in `doc`, its tab's text): a jump away from the place before puts that on the back list
-    /// (and forward's list goes, as in a browser).
+    /// `note_in` for a window `NAV_LINES` high.
     pub fn note(&mut self, now: Spot, doc: &Document) {
+        self.note_in(now, doc, 0);
+    }
+
+    /// The caret is at `now` (in `doc`, its tab's text; the window shows `screen` lines): a jump away from the place
+    /// before puts that on the back list (and forward's list goes, as in a browser).
+    pub fn note_in(&mut self, now: Spot, doc: &Document, screen: usize) {
+        let len = doc.len();
+        if let Some(old) = self.lens.insert(now.tab, len).filter(|&old| old != len) {
+            // (the edit was where the caret was: the places after it move with the text)
+            let at = self.here.filter(|h| h.tab == now.tab).map_or(now.pos, |h| h.pos.min(now.pos));
+            let delta = len as i64 - old as i64;
+            for s in self.back.iter_mut().chain(self.fwd.iter_mut()).filter(|s| s.tab == now.tab && s.pos > at) {
+                s.pos = ((s.pos as i64 + delta).max(at as i64) as u64).min(len);
+            }
+        }
         if let Some(h) = self.here.filter(|&h| h != now) {
-            if h.tab != now.tab || far(doc, h.pos, now.pos) {
+            if h.tab != now.tab || far(doc, h.pos, now.pos, screen) {
                 if self.back.last() != Some(&h) {
                     self.back.push(h);
                     if self.back.len() > Self::MAX {
@@ -2335,6 +2355,31 @@ pub fn convert_eol(snap: &Snapshot, to_crlf: bool, w: &mut dyn Write, idx: &mut 
     Ok(changed)
 }
 
+/// `with` in place of each of `places` (byte ranges, in order, not overlapping), as one undo step; the selection
+/// `sel` moves with the text around it. Returns it.
+pub fn replace_places(doc: &mut Document, places: &[(u64, u64)], with: &[u8], sel: Sel) -> Sel {
+    let shift = |p: u64| {
+        let mut d: i64 = 0;
+        for &(a, b) in places {
+            if b <= p {
+                d += with.len() as i64 - (b - a) as i64;
+            } else if a < p {
+                // (inside a place: to its end)
+                return (a as i64 + d + with.len() as i64) as u64;
+            }
+        }
+        (p as i64 + d) as u64
+    };
+    let after = Sel { anchor: shift(sel.anchor), caret: shift(sel.caret) };
+    doc.begin(EditKind::Other, sel);
+    for &(a, b) in places.iter().rev() {
+        doc.delete(a, b);
+        doc.insert(a, with);
+    }
+    doc.end(after);
+    after
+}
+
 /// `n` with thousands separators: 4,851,721.
 pub fn group(n: u64) -> String {
     let s = n.to_string();
@@ -3163,6 +3208,43 @@ mod caret_tests {
         nav.note(at(2, 90), &doc);
         assert_eq!(nav.go(false, at(2, 90), open), None);
         assert_eq!(nav.go(true, at(2, 90), |t| t != 2), Some(at(1, 52)));
+    }
+
+    #[test]
+    fn going_back_after_edits_and_page_keys() {
+        let mut doc = lf(&"line\n".repeat(100));
+        let mut nav = Nav::default();
+        let at = |line: u64| Spot { tab: 1, pos: line * 5 };
+        nav.note(at(80), &doc);
+        nav.note(at(10), &doc);
+        // ten lines deleted at the caret, above the place kept: it stays on its line
+        doc.begin(EditKind::Other, Sel::at(50));
+        doc.delete(50, 100);
+        doc.end(Sel::at(50));
+        nav.note(at(10), &doc);
+        assert_eq!(nav.go(true, at(10), |_| true), Some(at(70)));
+        // a screenful (Page Down) isn't a jump; more is
+        let mut nav = Nav::default();
+        nav.note_in(at(0), &doc, 30);
+        nav.note_in(at(29), &doc, 30);
+        assert_eq!(nav.go(true, at(29), |_| true), None);
+        nav.note_in(at(70), &doc, 30);
+        assert_eq!(nav.go(true, at(70), |_| true), Some(at(29)));
+    }
+
+    #[test]
+    fn several_places_replaced_as_one_step() {
+        let mut doc = Document::from_text(b"a teh b teh c");
+        let sel = Sel::at(12);
+        let after = replace_places(&mut doc, &[(2, 5), (8, 11)], b"thee", sel);
+        assert_eq!(doc.read(0, doc.len()), b"a thee b thee c");
+        assert_eq!(after, Sel::at(14));
+        // inside a place: to its end
+        let mut doc2 = Document::from_text(b"a teh b");
+        assert_eq!(replace_places(&mut doc2, &[(2, 5)], b"the", Sel::at(3)), Sel::at(5));
+        // one undo step
+        doc.undo();
+        assert_eq!(doc.read(0, doc.len()), b"a teh b teh c");
     }
 
     #[test]

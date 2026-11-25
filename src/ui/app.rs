@@ -322,15 +322,6 @@ pub struct Opts {
     pub text_file: Option<PathBuf>,
 }
 
-/// Replace in all tabs (issue #15): the tabs replaced in (each its own task), how many have finished, the matches
-/// replaced and the tabs that had any.
-pub struct Replacing {
-    pub ids: Vec<u64>,
-    pub done: usize,
-    pub count: u64,
-    pub tabs: u64,
-}
-
 /// A tab closed with File → Close (or Ctrl+W...), for Reopen closed tab: its file and where it was in it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ClosedTab {
@@ -390,8 +381,9 @@ impl Tab {
     }
 
     /// Its file's ending (`highlight::ending_of`), for Format → Language → Always open .x files as ….
-    pub fn ending(&self) -> Option<String> {
-        self.doc.path.as_ref().and_then(|p| crate::highlight::ending_of(&p.to_string_lossy()))
+    /// Its file's ending, or whole name without one (`highlight::LangKey`), for Format → Language → Always open ….
+    pub fn lang_key(&self) -> Option<crate::highlight::LangKey> {
+        self.doc.path.as_ref().and_then(|p| crate::highlight::LangKey::of(&p.to_string_lossy()))
     }
 
     pub fn title(&self) -> String {
@@ -646,9 +638,9 @@ pub struct App {
     /// Go back and Go forward's places (Alt+Left, Alt+Right; issue #11).
     pub nav: crate::edit::Nav,
     /// Find in all tabs or in files on another thread, and the title of the tab of results it makes (issue #15).
-    pub many: Option<(Job<Result<crate::core::many::Results, String>>, String)>,
+    pub many: Option<crate::core::many::Running>,
     /// Replace in all tabs, while its tasks run.
-    pub replacing: Option<Replacing>,
+    pub replacing: Option<crate::core::many::ReplaceInTabs>,
     /// The only tab, which the user is closing with Settings → Close Slate with the last tab on: once it's gone (after
     /// its question, or its save), Slate closes (`remove_tab`).
     pub quit_with_tab: Option<u64>,
@@ -669,6 +661,8 @@ pub struct App {
     pub spell_word: Option<SpellWord>,
     /// F7 found a word spelled wrong starting here: the menu it opens is for this word, not the point it opens at.
     pub menu_word: Option<u64>,
+    /// F7 was pressed while the spell checker was starting: it runs once the checker is ready.
+    pub f7_wanted: bool,
     /// The text's menu is opened from the keyboard, below the caret: what it's about is at the caret, not there.
     pub menu_at_caret: bool,
     /// Replace all with this search and replacement instead of the find bar's (a word's spelling changed everywhere).
@@ -723,6 +717,8 @@ impl App {
         let theme = make_theme(settings.theme);
         let dpi = win::dpi_of(hwnd);
         let uik = ui_scale(&settings);
+        super::structure::set_scale(uik);
+        win::set_ui_rel(uik / crate::theme::windows_text_scale().max(0.5));
         let fonts = make_fonts(&g, uik);
         let style = make_style(&g, &settings, 1);
         let mut find = FindBar::new(hwnd);
@@ -813,6 +809,7 @@ impl App {
             speller: Spelling::NotYet,
             spell_word: None,
             menu_word: None,
+            f7_wanted: false,
             menu_at_caret: false,
             replace_with: None,
             spell_shown: Vec::new(),
@@ -928,6 +925,8 @@ impl App {
             return;
         }
         self.uik = k;
+        super::structure::set_scale(k);
+        win::set_ui_rel(k / crate::theme::windows_text_scale().max(0.5));
         self.fonts = make_fonts(&self.g, k);
         self.find.k = k;
         self.find.style_edits(self.dpi, &self.theme);
@@ -994,7 +993,7 @@ impl App {
             y += nh;
         }
         let json = self.tabs.get(self.active).is_some_and(|t| t.lang.has_structure());
-        let ph = if json && self.settings.path_bar { super::structure::PATH_H } else { 0.0 };
+        let ph = if json && self.settings.path_bar { super::structure::path_h() } else { 0.0 };
         self.r_path = band(y, ph);
         y = snap(y + ph);
         let sh = metrics::STATUS_H * k;
@@ -1589,7 +1588,9 @@ impl App {
         let Some(n) = self.tabs[self.active].notice.as_ref() else { return };
         let g = &self.g;
         g.fill(r, t.notice_bg);
-        g.hline(r.x, r.right(), if self.settings.bars_at_bottom { r.y } else { r.bottom() }, true, t.border);
+        // (at the bottom, on its own top row: just above it, the text would paint over it)
+        let bottom = self.settings.bars_at_bottom;
+        g.hline(r.x, r.right(), if bottom { r.y } else { r.bottom() }, !bottom, t.border);
         let icon = match n.kind {
             NoticeKind::Info => "\u{E946}",
             NoticeKind::Warn => "\u{E7BA}",
@@ -2088,6 +2089,10 @@ impl App {
             if at.elapsed().as_secs() < 6 {
                 return Some((m.clone(), *bad));
             }
+        }
+        // (Find in all tabs or in files: how far it is, however long it takes)
+        if let Some(r) = &self.many {
+            return Some((r.status(), false));
         }
         if let Some(j) = &tab.index_job {
             let then = match tab.goto {

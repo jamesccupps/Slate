@@ -17,6 +17,31 @@ pub const HEADER_H: f64 = 34.0;
 pub const PANEL_MIN: f64 = 180.0;
 pub const SPLITTER_W: f64 = 5.0;
 
+static SCALE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0x3FF0_0000_0000_0000);
+
+/// Settings → Interface text size (`chrome::ui_k`, issue #8): the path bar's and the panel's text and rows grow
+/// with it.
+pub fn set_scale(k: f64) {
+    SCALE.store(k.to_bits(), std::sync::atomic::Ordering::Relaxed);
+}
+
+fn scale() -> f64 {
+    f64::from_bits(SCALE.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// A row of the panel, the path bar and the panel's header, at the interface text size.
+pub fn row_h() -> f64 {
+    (ROW_H * scale()).round()
+}
+
+pub fn path_h() -> f64 {
+    (PATH_H * scale()).round()
+}
+
+pub fn header_h() -> f64 {
+    (HEADER_H * scale()).round()
+}
+
 /// A part of the path bar.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PathPart {
@@ -26,7 +51,8 @@ pub enum PathPart {
 }
 
 fn ui_font(ctx: &pango::Context) -> pango::FontDescription {
-    let mut f = pango::FontDescription::from_string("Sans 9");
+    let mut f = pango::FontDescription::from_string("Sans");
+    f.set_size((9.0 * scale() * pango::SCALE as f64) as i32);
     if let Some(d) = ctx.font_description() {
         f.set_family(&d.family().unwrap_or_else(|| "Sans".into()));
     }
@@ -35,12 +61,12 @@ fn ui_font(ctx: &pango::Context) -> pango::FontDescription {
 
 /// The path bar's show/hide panel button.
 fn toggle_rect(w: f64, h: f64) -> (f64, f64, f64, f64) {
-    (w - 40.0, 2.0, 30.0, h - 4.0)
+    (w - 40.0 * scale(), 2.0, 30.0 * scale(), h - 4.0)
 }
 
 /// The panel's close button and the rows' area (from the top).
 fn close_rect(w: f64) -> (f64, f64, f64, f64) {
-    (w - 38.0, 5.0, 28.0, HEADER_H - 10.0)
+    (w - 38.0 * scale(), 5.0, 28.0 * scale(), header_h() - 10.0)
 }
 
 /// What's at `x` in the path bar, by where its parts were drawn last (`segs`).
@@ -87,12 +113,12 @@ pub fn paint_path(cr: &cairo::Context, ctx: &pango::Context, s: &Structure, t: &
         }
     };
     // When it doesn't fit, the end of the path shows: only that much is measured (it can be thousands of steps).
-    let (mut x, limit, sep_w) = (12.0, tx - 8.0, 18.0);
+    let (mut x, limit, sep_w) = (12.0 * scale(), tx - 8.0, 18.0 * scale());
     let mut shown: Vec<(pango::Layout, f64)> = Vec::new();
     let mut need = 0.0;
     for i in (0..n).rev() {
         let l = text_layout(ctx, &font, &seg(i), 4000.0);
-        let sw = l.pixel_size().0 as f64 + 12.0;
+        let sw = l.pixel_size().0 as f64 + 12.0 * scale();
         let more = sw + if shown.is_empty() { 0.0 } else { sep_w };
         if !shown.is_empty() && need + more > limit - x {
             break;
@@ -105,7 +131,7 @@ pub fn paint_path(cr: &cairo::Context, ctx: &pango::Context, s: &Structure, t: &
     let mid = h / 2.0;
     if skip > 0 {
         draw_text(cr, &text_layout(ctx, &font, "… ›", 40.0), x, mid, t.text_faint);
-        x += 30.0;
+        x += 30.0 * scale();
     }
     let mut segs = vec![(0.0, 0.0); skip];
     for (k, (l, sw)) in shown.iter().enumerate() {
@@ -139,11 +165,11 @@ pub fn paint_panel(cr: &cairo::Context, ctx: &pango::Context, s: &mut Structure,
     let font = ui_font(ctx);
     let mut bold = font.clone();
     bold.set_weight(pango::Weight::Semibold);
-    draw_text(cr, &text_layout(ctx, &bold, "Structure", (w - 60.0).max(1.0)), 14.0, HEADER_H / 2.0, t.text);
+    draw_text(cr, &text_layout(ctx, &bold, "Structure", (w - 60.0).max(1.0)), 14.0, header_h() / 2.0, t.text);
     if let Some(p) = s.progress().filter(|_| !s.rows.is_empty()) {
         // read again after an edit; the rows shown are from before it
         let l = text_layout(ctx, &font, &format!("Updating… {:.0}%", p * 100.0), 200.0);
-        draw_text(cr, &l, w - 50.0 - l.pixel_size().0 as f64, HEADER_H / 2.0, t.text_faint);
+        draw_text(cr, &l, w - 50.0 - l.pixel_size().0 as f64, header_h() / 2.0, t.text_faint);
     }
     let (cx, cy, cw, ch) = close_rect(w);
     if close_hover {
@@ -160,11 +186,11 @@ pub fn paint_panel(cr: &cairo::Context, ctx: &pango::Context, s: &mut Structure,
     cr.line_to(mx - 4.5, my + 4.5);
     let _ = cr.stroke();
     set_color(cr, t.border);
-    cr.rectangle(0.0, HEADER_H, w, 1.0);
+    cr.rectangle(0.0, header_h(), w, 1.0);
     let _ = cr.fill();
-    let body_h = (h - HEADER_H).max(0.0);
+    let body_h = (h - header_h()).max(0.0);
     cr.save().ok();
-    cr.rectangle(1.0, HEADER_H + 1.0, w - 1.0, body_h);
+    cr.rectangle(1.0, header_h() + 1.0, w - 1.0, body_h);
     cr.clip();
     let message = if let Some(p) = s.progress() {
         s.rows.is_empty().then(|| format!("Reading the structure… {:.0}%", p * 100.0))
@@ -178,24 +204,24 @@ pub fn paint_panel(cr: &cairo::Context, ctx: &pango::Context, s: &mut Structure,
         None
     };
     if let Some(m) = message {
-        draw_text(cr, &text_layout(ctx, &font, &m, (w - 24.0).max(1.0)), 14.0, HEADER_H + 6.0 + ROW_H / 2.0, t.text_dim);
+        draw_text(cr, &text_layout(ctx, &font, &m, (w - 24.0).max(1.0)), 14.0, header_h() + 6.0 + row_h() / 2.0, t.text_dim);
     }
     clamp_scroll(s, body_h);
-    let first = (s.scroll as f64 / ROW_H).floor() as usize;
-    let count = (body_h / ROW_H).ceil() as usize + 1;
+    let first = (s.scroll as f64 / row_h()).floor() as usize;
+    let count = (body_h / row_h()).ceil() as usize + 1;
     for (k, row) in s.rows.iter().enumerate().skip(first).take(count) {
-        let y = HEADER_H + k as f64 * ROW_H - s.scroll as f64;
+        let y = header_h() + k as f64 * row_h() - s.scroll as f64;
         if s.selected == Some(row.key) || hover_row == Some(k) {
             set_color(cr, if s.selected == Some(row.key) { t.selection_inactive } else { t.hover });
-            cr.rectangle(1.0, y, w - 1.0, ROW_H);
+            cr.rectangle(1.0, y, w - 1.0, row_h());
             let _ = cr.fill();
         }
-        let x0 = 8.0 + row.depth as f64 * 14.0;
-        let mid = y + ROW_H / 2.0;
+        let x0 = (8.0 + row.depth as f64 * 14.0) * scale();
+        let mid = y + row_h() / 2.0;
         if row.expandable {
             // ▸ closed, ▾ open
             set_color(cr, t.text_dim);
-            let cx = x0 + 8.0;
+            let cx = x0 + 8.0 * scale();
             if row.expanded {
                 cr.move_to(cx - 4.0, mid - 2.0);
                 cr.line_to(cx + 4.0, mid - 2.0);
@@ -208,7 +234,7 @@ pub fn paint_panel(cr: &cairo::Context, ctx: &pango::Context, s: &mut Structure,
             cr.close_path();
             let _ = cr.fill();
         }
-        let tx = x0 + 18.0;
+        let tx = x0 + 18.0 * scale();
         let label_color = if row.loading || row.kind.is_none() && !row.expandable {
             t.text_dim
         } else if row.is_key && matches!(row.kind, Some(Kind::Element | Kind::Leaf)) {
@@ -242,14 +268,14 @@ pub fn paint_panel(cr: &cairo::Context, ctx: &pango::Context, s: &mut Structure,
     // the scrollbar's thumb, as the text's
     if let Some((ty, th)) = thumb(s, body_h) {
         set_color(cr, t.scroll_thumb);
-        rounded(cr, w - 8.0, HEADER_H + ty + 2.0, 5.0, th - 4.0, 2.5);
+        rounded(cr, w - 8.0, header_h() + ty + 2.0, 5.0, th - 4.0, 2.5);
         let _ = cr.fill();
     }
 }
 
 /// How far the rows scroll at most in a body `body_h` high (a row's room left after the last one).
 fn max_scroll(s: &Structure, body_h: f64) -> f64 {
-    (s.rows.len() as f64 * ROW_H - body_h + ROW_H).max(0.0)
+    (s.rows.len() as f64 * row_h() - body_h + row_h()).max(0.0)
 }
 
 fn clamp_scroll(s: &mut Structure, body_h: f64) {
@@ -284,17 +310,17 @@ pub fn panel_part_at(s: &Structure, w: f64, h: f64, x: f64, y: f64) -> Option<Pa
     if x >= cx && x < cx + cw && y >= cy && y < cy + ch {
         return Some(PanelPart::Close);
     }
-    if y < HEADER_H {
+    if y < header_h() {
         return None;
     }
-    let body_h = (h - HEADER_H).max(0.0);
+    let body_h = (h - header_h()).max(0.0);
     if x >= w - 12.0 && thumb(s, body_h).is_some() {
-        return Some(PanelPart::Bar(((y - HEADER_H) / body_h).clamp(0.0, 1.0)));
+        return Some(PanelPart::Bar(((y - header_h()) / body_h).clamp(0.0, 1.0)));
     }
-    let k = ((y - HEADER_H + s.scroll as f64) / ROW_H).floor() as usize;
+    let k = ((y - header_h() + s.scroll as f64) / row_h()).floor() as usize;
     let row = s.rows.get(k)?;
-    let x0 = 8.0 + row.depth as f64 * 14.0;
-    Some(PanelPart::Row(k, row.expandable && x >= x0 - 4.0 && x < x0 + 18.0))
+    let x0 = (8.0 + row.depth as f64 * 14.0) * scale();
+    Some(PanelPart::Row(k, row.expandable && x >= x0 - 4.0 && x < x0 + 18.0 * scale()))
 }
 
 /// Scrolls the panel (`body_h` of rows shown) to `f` (0 the top, 1 the end).
@@ -304,18 +330,18 @@ pub fn scroll_to(s: &mut Structure, body_h: f64, f: f64) {
 
 /// Scrolls by `rows` (a wheel's turn).
 pub fn scroll_by(s: &mut Structure, body_h: f64, rows: f64) {
-    s.scroll = (s.scroll as f64 + rows * ROW_H).clamp(0.0, max_scroll(s, body_h)) as f32;
+    s.scroll = (s.scroll as f64 + rows * row_h()).clamp(0.0, max_scroll(s, body_h)) as f32;
 }
 
 /// Scrolls the panel so the selected row shows.
 pub fn scroll_to_selected(s: &mut Structure, body_h: f64) {
     let Some(sel) = s.selected else { return };
     let Some(k) = s.rows.iter().position(|r| r.key == sel) else { return };
-    let y = k as f64 * ROW_H;
+    let y = k as f64 * row_h();
     let top = s.scroll as f64;
     if y < top {
-        s.scroll = (y - ROW_H * 2.0).max(0.0) as f32;
-    } else if y + ROW_H > top + body_h {
-        s.scroll = (y + ROW_H * 3.0 - body_h) as f32;
+        s.scroll = (y - row_h() * 2.0).max(0.0) as f32;
+    } else if y + row_h() > top + body_h {
+        s.scroll = (y + row_h() * 3.0 - body_h) as f32;
     }
 }

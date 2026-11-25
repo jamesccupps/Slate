@@ -233,7 +233,8 @@ the part about the area you're changing first, and keep it current in the same c
   `SLATE_TEST_SLOW_OPEN=<ms>` makes reading each file take that much longer (a slow network drive).
   `outside:<path>|<text>` (both test modes) writes a file as another program would, unseen until Slate next looks.
   Since 0.20: `uisize:<percent>` (Windows; test mode runs at 100% unless it's given, 0 follows Windows' Text size),
-  `print:menubar` (both: whether the menu bar shows), `print:findplace` / `print:bars` (Windows: the find bar above
+  `print:menubar` (both: whether the menu bar shows), Linux `print:findbar` (closed, Find or Replace) and
+  `print:tabtitle` (the tab shown's), `print:findplace` / `print:bars` (Windows: the find bar above
   or under the text, and the bands; Linux `print:bars`: the order of the rows that move), Linux `print:uisize` (the
   tab strip's and status bar's heights; `act:ui-size=<percent>` sets it); F7's menu is in `print:popupitems`
   (Windows) or `print:asked` (Linux).

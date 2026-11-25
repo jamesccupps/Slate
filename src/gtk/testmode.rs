@@ -699,6 +699,9 @@ fn value(what: &str, test: &Test) -> String {
         // the searches kept (newest first) and where Up and Down are in them
         "history" => format!("{:?} at {:?}", a.settings.find_history, a.find.history_at),
         "readonly" => (tab.read_only || tab.filter.is_some()).to_string(),
+        // the find bar: closed, or Find or Replace (as Windows' `print:findbar`); the tab shown's title
+        "findbar" => if a.find.open { if a.find.replace { "Replace" } else { "Find" } } else { "closed" }.to_string(),
+        "tabtitle" => tab.title(),
         // (the lines bookmarked, 1-based)
         "bookmarks" => tab.view.bookmarks.iter().filter_map(|&b| tab.doc.line_of(b)).map(|l| (l + 1).to_string()).collect::<Vec<_>>().join(","),
         // (a tab of matching lines: the line in its file of each of its lines, 1-based)

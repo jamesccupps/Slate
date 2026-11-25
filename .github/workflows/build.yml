@@ -131,7 +131,7 @@ jobs:
           if (Has 'HKCU:\Software\Slate Text Editor\Capabilities\FileAssociations' '.bat') { throw ".bat is in Slate's Default apps list" }
           if (!(Has 'HKCU:\Software\Slate Text Editor\Capabilities\FileAssociations' '.txt')) { throw ".txt isn't in Slate's Default apps list" }
           if (Test-Path -LiteralPath "$fileExts\.bat\UserChoice") { throw "Slate is still chosen to open .bat files" }
-          # Help > Stop opening files with Slate (--unassociate): Open with, Edit with Slate, Default apps and a choice
+          # Settings > Stop opening files with Slate (--unassociate): Open with, Edit with Slate, Default apps and a choice
           # of Slate go; Slate stays installed.
           reg add 'HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts\.conf\UserChoice' /v ProgId /d Slate.TextFile /f | Out-Null
           $p = Start-Process -FilePath $exe -ArgumentList '--unassociate' -Wait -PassThru -NoNewWindow

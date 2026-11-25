@@ -327,13 +327,13 @@ impl FindBar {
         self.status_w = (room - box_w).clamp(0.0, s(124.0));
         let b = snap_box(Rect::new(x, y, box_w, box_h));
         self.inputs.push((self.find_edit, b));
-        // Toggles sit inside the box on the right.
-        let tx = b.right() - 5.0 * tw - 2.0;
-        self.parts.push((Part::Case, Rect::new(tx, y + 2.0, tw, box_h - 4.0)));
-        self.parts.push((Part::Word, Rect::new(tx + tw, y + 2.0, tw, box_h - 4.0)));
-        self.parts.push((Part::Regex, Rect::new(tx + 2.0 * tw, y + 2.0, tw, box_h - 4.0)));
-        self.parts.push((Part::InSel, Rect::new(tx + 3.0 * tw, y + 2.0, tw, box_h - 4.0)));
-        self.parts.push((Part::AllTabs, Rect::new(tx + 4.0 * tw, y + 2.0, tw, box_h - 4.0)));
+        // Toggles sit inside the box on the right; in a box too narrow for all five and some text (a narrow window at
+        // a big interface size) they give way, the last first: their keys still work.
+        let fit = (((b.w - s(60.0)) / tw).floor().max(0.0) as usize).min(5);
+        let tx = b.right() - fit as f32 * tw - 2.0;
+        for (i, p) in [Part::Case, Part::Word, Part::Regex, Part::InSel, Part::AllTabs].into_iter().take(fit).enumerate() {
+            self.parts.push((p, Rect::new(tx + i as f32 * tw, y + 2.0, tw, box_h - 4.0)));
+        }
         place(self.find_edit, Rect::new(b.x + 4.0, b.y, tx - b.x - 6.0, b.h));
         show(self.find_edit, true);
         show(self.goto_edit, false);
@@ -380,7 +380,8 @@ impl FindBar {
             return;
         }
         g.fill(r, t.surface);
-        g.hline(r.x, r.right(), if self.at_bottom { r.y } else { r.bottom() }, true, t.border);
+        // (at the bottom, on its own top row: just above it, the text would paint over it)
+        g.hline(r.x, r.right(), if self.at_bottom { r.y } else { r.bottom() }, !self.at_bottom, t.border);
         // (borders a whole number of pixels thick, on the boxes' pixel edges: crisp at any scale)
         let hair = g.hair();
         for (h, b) in &self.inputs {

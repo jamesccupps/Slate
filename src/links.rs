@@ -16,14 +16,70 @@ pub enum Target {
 /// Longest selection taken as a name.
 const MAX: usize = 2048;
 
-/// The file name or link around byte `col` of `line` (with nothing selected): the run of characters there that has no
-/// spaces, quotes or brackets in it, without punctuation that ends a sentence after it. Empty if there's none.
+/// The file name or link around byte `col` of `line` (with nothing selected): a link there (brackets in it kept,
+/// `…/Slate_(disambiguation)`), else a quoted name the place is inside (`"sub folder\with space.txt"`), else the run
+/// of characters there that has no spaces, quotes or brackets in it; without punctuation that ends a sentence (or a
+/// colon) after it. Empty if there's none.
 pub fn around(line: &str, col: usize) -> &str {
-    let stop = |c: char| c.is_whitespace() || "\"'`<>()[]{}|".contains(c);
     let col = (0..=col.min(line.len())).rev().find(|&i| line.is_char_boundary(i)).unwrap_or(0);
+    if let Some(url) = link_around(line, col) {
+        return url;
+    }
+    if let Some(q) = quoted_around(line, col) {
+        return q;
+    }
+    let stop = |c: char| c.is_whitespace() || "\"'`<>()[]{}|".contains(c);
     let a = line[..col].rfind(stop).map_or(0, |i| i + line[i..].chars().next().map_or(1, char::len_utf8));
     let b = line[col..].find(stop).map_or(line.len(), |i| col + i);
-    line[a..b].trim_end_matches(['.', ',', ';', '!', '?'])
+    line[a..b].trim_end_matches(['.', ',', ';', '!', '?', ':'])
+}
+
+/// A link (http, https, www.) the place `col` is in: up to a space or a quote, brackets in it kept when they pair up
+/// (a closing one more than were opened ends it, as around a link in brackets), and punctuation after it left out.
+fn link_around(line: &str, col: usize) -> Option<&str> {
+    let edge = |c: char| c.is_whitespace() || "\"'`<>".contains(c);
+    let a = line[..col].rfind(edge).map_or(0, |i| i + line[i..].chars().next().map_or(1, char::len_utf8));
+    let token = &line[a..];
+    let lower = token.to_ascii_lowercase();
+    // (the link's start in the token: it may follow a bracket, `(https://…`)
+    let start = ["https://", "http://", "www."].iter().filter_map(|s| lower.find(s)).min()?;
+    if a + start > col {
+        return None;
+    }
+    let mut depth = 0i32;
+    let mut end = token.len();
+    for (i, c) in token[start..].char_indices() {
+        if edge(c) || "[]{}|".contains(c) {
+            end = start + i;
+            break;
+        }
+        match c {
+            '(' => depth += 1,
+            ')' if depth == 0 => {
+                end = start + i;
+                break;
+            }
+            ')' => depth -= 1,
+            _ => {}
+        }
+    }
+    let url = token[start..end].trim_end_matches(['.', ',', ';', '!', '?', ':']);
+    (a + start + url.len() >= col && !url.is_empty()).then_some(url)
+}
+
+/// The text between the quotes the place `col` is inside, on its line, when it looks like a name with a space in it
+/// (one without is `around`'s anyway).
+fn quoted_around(line: &str, col: usize) -> Option<&str> {
+    for q in ['"', '\''] {
+        let Some(a) = line[..col].rfind(q) else { continue };
+        let Some(b) = line[col..].find(q) else { continue };
+        let inner = &line[a + 1..col + b];
+        // (an odd number of quotes before: the place is inside a pair)
+        if line[..a].matches(q).count() % 2 == 0 && inner.contains(' ') && !inner.trim().is_empty() && plausible(inner.trim()) {
+            return Some(inner.trim());
+        }
+    }
+    None
 }
 
 /// What Open selected file or link opens in `doc`, whose selection is `sel`: at `at` (a right-click's place) the
@@ -41,7 +97,12 @@ pub fn target_in(doc: &Document, sel: Sel, at: Option<u64>, names_only: bool) ->
         if !plausible(name) {
             return Err("Select a file name or a link first".into());
         }
-        name.to_string()
+        // (a compiler's place right after it: `main.rs(40,5)`)
+        let end = (name.as_ptr() as usize).saturating_sub(line.as_ptr() as usize) + name.len();
+        match line.get(end..).and_then(|rest| rest.find(')').map(|i| &rest[..=i])) {
+            Some(p) if p.starts_with('(') && paren_suffix(&format!("x{p}")).is_some() => format!("{name}{p}"),
+            _ => name.to_string(),
+        }
     } else if sel.end() - sel.start() > MAX as u64 {
         return Err("Select one file name or link".into());
     } else {
@@ -54,36 +115,55 @@ pub fn target_in(doc: &Document, sel: Sel, at: Option<u64>, names_only: bool) ->
     target_of(&text, doc.path.as_deref().and_then(Path::parent))
 }
 
-/// The menu item for `t`: `Open “name”`, or `Open link` (`&`: Windows' letter).
-pub fn menu_label(t: &Target, amp: bool) -> String {
+/// The menu item for `t`: `Open “name”`, or `Open link “example.com”` (`&`: Windows' letter). A file outside
+/// `folder` (the tab's file's) shows its whole path, so the item says where it goes (`..\..`, a network share,
+/// `%NAME%`); a link its site.
+pub fn menu_label(t: &Target, folder: Option<&Path>, amp: bool) -> String {
     let o = if amp { "&Open" } else { "Open" };
-    match t {
-        Target::Link(_) => format!("{o} link"),
-        Target::File(p, _) => {
-            let name = p.file_name().map_or_else(|| p.to_string_lossy(), |n| n.to_string_lossy());
-            let name = if amp { name.replace('&', "&&") } else { name.into_owned() };
-            format!("{o} “{name}”")
+    let text = match t {
+        Target::Link(url) => {
+            let rest = url.split_once("://").map_or(url.as_str(), |(_, r)| r);
+            let host = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+            return format!("{o} link “{}”", if amp { host.replace('&', "&&") } else { host.to_string() });
         }
-    }
+        Target::File(p, _) if folder.is_some_and(|f| p.starts_with(f)) => {
+            p.file_name().map_or_else(|| p.to_string_lossy().into_owned(), |n| n.to_string_lossy().into_owned())
+        }
+        Target::File(p, _) => {
+            let s = p.to_string_lossy().into_owned();
+            // (a long path: its start and end)
+            if s.chars().count() > 70 { format!("{}…{}", s.chars().take(30).collect::<String>(), s.chars().skip(s.chars().count() - 38).collect::<String>()) } else { s }
+        }
+    };
+    format!("{o} “{}”", if amp { text.replace('&', "&&") } else { text })
 }
 
 /// Whether a name from around the caret (`around`, nothing selected) looks like a file name or a link: it's a link, or
 /// has a folder in it, or an ending with a letter in it (`notes.txt`, `main.rs:40`). A word alone (`gamma`), a number
-/// (`1.5`) or `e.g` isn't one; a selection is taken as it is.
+/// (`1.5`), `e.g`, an abbreviation (`U.S.A`), two sentences without their space (`end.Then`) or a mail address isn't
+/// one. (With `names_only`, a selection is held to the same; else it's taken as it is.)
 pub fn plausible(s: &str) -> bool {
     let lower = s.to_ascii_lowercase();
-    if lower.starts_with("http://") || lower.starts_with("https://") || lower.starts_with("www.") {
+    if lower.starts_with("http://") || lower.starts_with("https://") || lower.starts_with("www.") || lower.starts_with("file://") {
         return true;
     }
-    let base = line_suffix(s).map_or(s, |(b, _, _)| b);
+    let base = paren_suffix(s).or_else(|| line_suffix(s)).map_or(s, |(b, _, _)| b);
+    let folder = base.contains(['/', '\\']);
+    if !folder && base.contains('@') {
+        return false;
+    }
     let ending = base.rsplit_once('.').is_some_and(|(stem, ext)| {
+        let titled = ext.len() >= 3 && ext.starts_with(|c: char| c.is_ascii_uppercase()) && ext[1..].chars().all(|c| c.is_ascii_lowercase());
+        let abbreviation = stem.split('.').all(|p| p.chars().count() == 1) && ext.chars().count() == 1;
         !stem.is_empty()
             && (stem.len() >= 2 || ext.len() >= 2)
             && ext.len() <= 10
             && ext.chars().all(|c| c.is_ascii_alphanumeric())
             && ext.chars().any(|c| c.is_ascii_alphabetic())
+            && !titled
+            && !abbreviation
     });
-    ending || base.contains(['/', '\\'])
+    ending || folder
 }
 
 /// What `text` names (a selection, or what `around` gave): a link, or a file, a relative name being in `folder` (the
@@ -106,6 +186,13 @@ pub fn target_of(text: &str, folder: Option<&Path>) -> Result<Target, String> {
         return Err("That isn't a file name or a link".into());
     }
     let lower = t.to_ascii_lowercase();
+    // (`file:///C:/notes/a%20b.txt`, `file:///home/x`: the file it names)
+    if let Some(rest) = lower.starts_with("file://").then(|| &t["file://".len()..]) {
+        let path = percent_decoded(rest.strip_prefix("localhost").unwrap_or(rest));
+        let path = if cfg!(windows) && path.len() > 2 && path.starts_with('/') && path.as_bytes()[2] == b':' { path[1..].to_string() } else { path };
+        let p = PathBuf::from(local(&path));
+        return if p.is_absolute() { Ok(Target::File(tidy(&p), None)) } else { Err("That isn't a file name or a link".into()) };
+    }
     if lower.starts_with("http://") || lower.starts_with("https://") || lower.starts_with("www.") {
         if t.contains(char::is_whitespace) {
             return Err("A link has no spaces in it".into());
@@ -121,7 +208,7 @@ pub fn target_of(text: &str, folder: Option<&Path>) -> Result<Target, String> {
             return Err("Slate opens web links (http and https) and file names".into());
         }
     }
-    let (name, at) = match line_suffix(t) {
+    let (name, at) = match paren_suffix(t).or_else(|| line_suffix(t)) {
         Some((base, line, col)) => (base, Some((line, col))),
         None => (t, None),
     };
@@ -154,10 +241,46 @@ fn line_suffix(t: &str) -> Option<(&str, u64, u64)> {
     Some((base, line.max(1), col.max(1)))
 }
 
-/// A name as this system writes it: `/` or `\` the separator it uses; on Windows `%NAME%` (an environment variable that
-/// is set) replaced by its value, elsewhere `~/` the home folder.
+/// `main.rs(40,5)` or `main.rs(40)`, as compilers write them: the name, and the line and column (1 when there's none).
+fn paren_suffix(t: &str) -> Option<(&str, u64, u64)> {
+    let (base, inner) = t.strip_suffix(')')?.rsplit_once('(')?;
+    let number = |s: &str| (!s.is_empty() && s.len() <= 18 && s.bytes().all(|b| b.is_ascii_digit())).then(|| s.parse::<u64>().ok()).flatten();
+    let (line, col) = match inner.split_once(',') {
+        Some((l, c)) => (number(l.trim())?, number(c.trim())?),
+        None => (number(inner.trim())?, 1),
+    };
+    (!base.is_empty()).then_some((base, line.max(1), col.max(1)))
+}
+
+/// `%20` and the like made the bytes they stand for (a `file:` address).
+fn percent_decoded(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let hex = |c: u8| (c as char).to_digit(16);
+        match (b[i], b.get(i + 1).and_then(|&c| hex(c)), b.get(i + 2).and_then(|&c| hex(c))) {
+            (b'%', Some(h), Some(l)) => {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+            }
+            (c, ..) => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// A name as this system writes it: `/` or `\` the separator it uses; `~/` (or `~\` on Windows) the home folder; on
+/// Windows `%NAME%` (an environment variable that is set) replaced by its value.
 fn local(name: &str) -> String {
     if cfg!(windows) {
+        let name = match (name.strip_prefix("~\\").or_else(|| name.strip_prefix("~/")), std::env::var_os("USERPROFILE")) {
+            (Some(rest), Some(home)) => Path::new(&home).join(rest).to_string_lossy().into_owned(),
+            _ => name.to_string(),
+        };
         let mut out = String::new();
         let mut rest = name.replace('/', "\\");
         while let Some(a) = rest.find('%') {
@@ -219,9 +342,39 @@ mod tests {
         for yes in ["notes.txt", r".\CSS\a.css", "src/main.rs:40", "https://x.org", "www.x.org", "Makefile/x", "a.md"] {
             assert!(plausible(yes), "{yes}");
         }
-        for no in ["gamma", "1.5", "e.g", "v2.3", "", "end."] {
+        for no in ["gamma", "1.5", "e.g", "v2.3", "", "end.", "U.S.A", "end.Then", "bob@example.com"] {
             assert!(!plausible(no), "{no}");
         }
+        for yes in ["main.rs(40,5)", "a/bob@x.txt", "README.md", "file:///tmp/x"] {
+            assert!(plausible(yes), "{yes}");
+        }
+    }
+
+    #[test]
+    fn links_quotes_and_compilers() {
+        // a link keeps its brackets, wherever the place is in it
+        let line = "see https://en.wikipedia.org/wiki/Slate_(disambiguation). And (https://x.org/a) too";
+        assert_eq!(around(line, 10), "https://en.wikipedia.org/wiki/Slate_(disambiguation)");
+        assert_eq!(around(line, 45), "https://en.wikipedia.org/wiki/Slate_(disambiguation)");
+        assert_eq!(around(line, 70), "https://x.org/a");
+        // a quoted name with a space in it, the place inside
+        let q = r#"<a href="sub folder\with space.txt">"#;
+        assert_eq!(around(q, 22), r"sub folder\with space.txt");
+        // a colon after a name; a compiler's place
+        assert_eq!(around("in notes.txt: see", 5), "notes.txt");
+        let folder = std::env::temp_dir();
+        assert_eq!(target_of("main.rs(40,5)", Some(&folder)), Ok(Target::File(folder.join("main.rs"), Some((40, 5)))));
+        assert_eq!(target_of("main.rs(7)", Some(&folder)), Ok(Target::File(folder.join("main.rs"), Some((7, 1)))));
+    }
+
+    #[test]
+    fn the_menu_says_where_it_goes() {
+        let folder = std::env::temp_dir();
+        let inside = Target::File(folder.join("a.txt"), None);
+        assert_eq!(menu_label(&inside, Some(&folder), false), "Open “a.txt”");
+        let elsewhere = Target::File(Path::new("/srv/other/b.txt").into(), None);
+        assert!(menu_label(&elsewhere, Some(&folder), false).contains("other"));
+        assert_eq!(menu_label(&Target::Link("https://example.com/x?y".into()), None, true), "&Open link “example.com”");
     }
 
     #[test]
@@ -267,6 +420,10 @@ mod tests {
         assert_eq!(f("readme:7"), Ok(Target::File(r"C:\site\pages\readme".into(), Some((7, 1)))));
         assert!(f("mailto:someone").is_err());
         assert!(target_of("a.txt", None).is_err());
+        // `file:` addresses, and the home folder
+        assert_eq!(target_of("file:///C:/notes/a%20b.txt", None), Ok(Target::File(r"C:\notes\a b.txt".into(), None)));
+        let profile = std::env::var("USERPROFILE").unwrap();
+        assert_eq!(f(r"~\notes.txt"), Ok(Target::File(Path::new(&profile).join("notes.txt"), None)));
         // an environment variable that's set, and one that isn't
         let home = std::env::var("SystemRoot").unwrap();
         assert_eq!(f(r"%SystemRoot%\win.ini"), Ok(Target::File(Path::new(&home).join("win.ini"), None)));
@@ -281,6 +438,7 @@ mod tests {
         assert_eq!(f(r".\CSS\normalize.css"), Ok(Target::File("/srv/site/CSS/normalize.css".into(), None)));
         assert_eq!(f("../x/a.lua:3"), Ok(Target::File("/srv/x/a.lua".into(), Some((3, 1)))));
         assert_eq!(f("/etc/hosts"), Ok(Target::File("/etc/hosts".into(), None)));
+        assert_eq!(target_of("file:///home/x/a%20b.txt", None), Ok(Target::File("/home/x/a b.txt".into(), None)));
         assert!(target_of("a.txt", None).is_err());
     }
 }

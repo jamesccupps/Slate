@@ -1,6 +1,7 @@
-//! Spell check (both apps): which words of the text on screen are worth checking, and what's known of each. The
-//! checking is the system's: Windows' own spell checker (`ui::spell`), Enchant on Linux (`gtk::spell`). Only the
-//! words on screen are ever looked at, so a file's size doesn't matter, and each word is asked about once.
+//! Spell check (both apps): which words of the text are worth checking, and what's known of each. The checking is
+//! the system's: Windows' own spell checker (`ui::spell`), Enchant on Linux (`gtk::spell`). The marks are for the
+//! words on screen only, so a file's size doesn't matter to them; F7 (`next_wrong`) and Change every (`places_of`)
+//! look further, a part at a time. Each word is asked about once.
 
 use std::collections::HashMap;
 
@@ -183,18 +184,20 @@ pub enum NextWrong {
 }
 
 /// The first word spelled wrong that starts at `from` or after it and ends by `to`, looking at `budget` bytes at
-/// most. `words(pos)` gives the words worth checking in the segment at `pos` (`words_in`'s, as document ranges, with
-/// the word) and where the next segment starts.
+/// most, and until `until` (a text of words new to the checker takes a while: the window mustn't wait for seconds).
+/// `words(pos)` gives the words worth checking in the segment at `pos` (`words_in`'s, as document ranges, with the
+/// word) and where the next segment starts.
 pub fn next_wrong(
     sp: &mut Speller,
     from: u64,
     to: u64,
     budget: u64,
+    until: std::time::Instant,
     mut words: impl FnMut(u64) -> (u64, Vec<(u64, u64, String)>),
 ) -> NextWrong {
     let mut pos = from;
     while pos < to {
-        if pos - from >= budget {
+        if pos - from >= budget || (pos > from && std::time::Instant::now() >= until) {
             return NextWrong::Stopped(pos);
         }
         let (next, found) = words(pos);
@@ -209,6 +212,33 @@ pub fn next_wrong(
         pos = next;
     }
     NextWrong::Clean
+}
+
+/// How long F7 may look before it stops ("F7 looks on from here"), and the most it reads.
+pub const F7_TIME: std::time::Duration = std::time::Duration::from_millis(150);
+pub const F7_BYTES: u64 = 8 << 20;
+/// The biggest text Change every looks through for the spell check's places (`places_of`); a bigger one gets a
+/// whole-word Replace all.
+pub const CHANGE_EVERY_MAX: u64 = 8 << 20;
+
+/// Where `word` is one of the words worth checking (`words`, as for `next_wrong`) in the text up to `len`: Change
+/// every's places, so the same letters in code, a file name or a link (which the spell check passes over) stay.
+pub fn places_of(word: &str, len: u64, mut words: impl FnMut(u64) -> (u64, Vec<(u64, u64, String)>)) -> Vec<(u64, u64)> {
+    let mut out: Vec<(u64, u64)> = Vec::new();
+    let mut pos = 0;
+    while pos < len {
+        let (next, found) = words(pos);
+        for (a, b, w) in found {
+            if a >= pos && w == word && out.last().is_none_or(|&(_, e)| e <= a) {
+                out.push((a, b));
+            }
+        }
+        if next <= pos {
+            break;
+        }
+        pos = next;
+    }
+    out
 }
 
 #[cfg(test)]
@@ -245,15 +275,40 @@ mod tests {
             ((end + 1) as u64, ws)
         };
         let len = text.len() as u64;
-        assert_eq!(next_wrong(&mut sp, 0, len, 1 << 20, words), NextWrong::Found(4, 9));
+        let far = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        assert_eq!(next_wrong(&mut sp, 0, len, 1 << 20, far, words), NextWrong::Found(4, 9));
         // from the end of that one (F7 again): the next one
-        assert_eq!(next_wrong(&mut sp, 9, len, 1 << 20, words), NextWrong::Found(21, 27));
-        assert_eq!(next_wrong(&mut sp, 27, len, 1 << 20, words), NextWrong::Clean);
+        assert_eq!(next_wrong(&mut sp, 9, len, 1 << 20, far, words), NextWrong::Found(21, 27));
+        assert_eq!(next_wrong(&mut sp, 27, len, 1 << 20, far, words), NextWrong::Clean);
         // only up to `to` (round from the start to where it began)
-        assert_eq!(next_wrong(&mut sp, 0, 20, 1 << 20, words), NextWrong::Found(4, 9));
-        assert_eq!(next_wrong(&mut sp, 10, 26, 1 << 20, words), NextWrong::Clean);
+        assert_eq!(next_wrong(&mut sp, 0, 20, 1 << 20, far, words), NextWrong::Found(4, 9));
+        assert_eq!(next_wrong(&mut sp, 10, 26, 1 << 20, far, words), NextWrong::Clean);
         // allowed to look only so far: stops there
-        assert_eq!(next_wrong(&mut sp, 10, len, 4, words), NextWrong::Stopped(16));
+        assert_eq!(next_wrong(&mut sp, 10, len, 4, far, words), NextWrong::Stopped(16));
+        // (out of time: after the first segment, wherever it is)
+        let past = std::time::Instant::now();
+        assert_eq!(next_wrong(&mut sp, 10, len, 1 << 20, past, words), NextWrong::Stopped(16));
+    }
+
+    #[test]
+    fn change_every_only_where_the_spell_check_looks() {
+        // (code, a file name and a link keep the same letters)
+        let text = "teh one\n`teh` two\nsee teh.txt or http://teh.example.com\nteh end";
+        let words = |pos: u64| {
+            let start = text[..pos as usize].rfind('\n').map_or(0, |i| i + 1);
+            let end = text[start..].find('\n').map_or(text.len(), |i| start + i);
+            let mut spans = Vec::new();
+            let ws = words_in(Lang::Markdown, &text.as_bytes()[start..end], State::START, &mut spans)
+                .into_iter()
+                .map(|(a, b)| ((start + a) as u64, (start + b) as u64, text[start + a..start + b].to_string()))
+                .collect();
+            ((end + 1) as u64, ws)
+        };
+        let places = places_of("teh", text.len() as u64, words);
+        let last = text.rfind("teh").unwrap() as u64;
+        assert_eq!(places, vec![(0, 3), (last, last + 3)]);
+        // (same case only: "Teh" is another word)
+        assert!(places_of("Teh", text.len() as u64, words).is_empty());
     }
 
     fn found(lang: Lang, text: &str) -> Vec<&str> {

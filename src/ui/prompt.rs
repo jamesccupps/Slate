@@ -310,9 +310,13 @@ fn fonts(dpi: u32) -> (HFONT, HFONT) {
     unsafe {
         let mut m = NONCLIENTMETRICSW { cbSize: std::mem::size_of::<NONCLIENTMETRICSW>() as u32, ..Default::default() };
         let _ = SystemParametersInfoForDpi(SPI_GETNONCLIENTMETRICS.0, m.cbSize, Some(&mut m as *mut _ as _), 0, dpi);
-        let mut big = m.lfMessageFont;
+        // (at the interface text size, issue #8)
+        let k = super::win::ui_rel();
+        let mut normal = m.lfMessageFont;
+        normal.lfHeight = (normal.lfHeight as f32 * k).round() as i32;
+        let mut big = normal;
         big.lfHeight = big.lfHeight * 4 / 3;
-        (CreateFontIndirectW(&m.lfMessageFont), CreateFontIndirectW(&big))
+        (CreateFontIndirectW(&normal), CreateFontIndirectW(&big))
     }
 }
 

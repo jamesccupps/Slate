@@ -541,6 +541,12 @@ impl AnsiDecoder {
     }
 }
 
+/// Text in the ANSI code page (`ansi_codepage`) made UTF-8, all at once (Find in files: a file that isn't UTF-8 is
+/// read as Slate opens it).
+pub fn ansi_to_utf8(bytes: &[u8]) -> Vec<u8> {
+    ansi_to_utf8_cp(bytes, ansi_codepage())
+}
+
 fn ansi_to_utf8_cp(bytes: &[u8], cp: u32) -> Vec<u8> {
     if bytes.is_empty() {
         return Vec::new();

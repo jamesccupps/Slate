@@ -26,7 +26,9 @@ JSON file opens instantly, scrolls smoothly, and can be searched, edited, format
   `\t` in a regular expression's replacement for a line break or a tab. *Settings → Find bar* can close the bar
   when you click back in the text, give each tab its own, or put it at the bottom. *Edit → Find in all tabs* lists
   every matching line of every tab, *Find in files* (Ctrl+Shift+F) those of the files in the tab's folder and the
-  folders in it, each in a tab of results (Enter goes to one); *Replace in all tabs* replaces in each tab at once.
+  folders in it, each in a tab of results (Enter goes to one; Esc stops a long one); *Replace in all tabs* replaces,
+  with what the replace box shows, in each tab at once (in the whole of each: Find in selection's range is for the
+  tab it's in).
 - Column selection (Alt+drag, Shift+Alt+arrows: type, paste and delete on every line) and dragging selected text
   to another place (with Ctrl, a copy). Multiple cursors when you turn them on (*Edit → Multiple cursors*):
   Ctrl+click, a cursor above or below, the next match or all of them, one at every selected line's start or end.
@@ -78,8 +80,9 @@ JSON file opens instantly, scrolls smoothly, and can be searched, edited, format
 - Go to line, word wrap, line numbers, show whitespace, the matching bracket highlighted (Ctrl+M goes to it,
   Ctrl+Shift+M selects inside the brackets), overtype, zoom, dark and light themes (follows Windows, or switch with the sun/moon button).
   With Windows' high contrast on, Slate uses its colors, and Magnifier follows the text cursor. *Settings →
-  Interface text size* makes Slate's own tabs, menus, find bar and status bar bigger (they follow Windows' Text size
-  by default), and *Settings → Hide the menu bar* hides it until you press Alt.
+  Interface text size* makes Slate's own tabs, menu bar, find bar, status bar, path bar, structure panel, tooltips and
+  prompts bigger (they follow Windows' Text size by default; the drop-down menus are Windows' own and always follow
+  it; on Linux GTK's menus and dialogs grow too), and *Settings → Hide the menu bar* hides it until you press Alt.
 - Tabs in the title bar, as in Windows 11's Notepad (*Settings → Tabs in the title bar* puts them back under it).
   Reopen closed tabs (Ctrl+Shift+T), close the other, the saved or all tabs, and a list of all tabs when they don't
   fit; *Settings → Close Slate with the last tab* makes closing the only tab close Slate. The files opened last are on the taskbar button's menu (on Linux, in the desktop's recent files). The status

@@ -185,7 +185,7 @@ pub fn report_url() -> String {
     let body = format!(
         "**What happened?**\n\n\n**What did you expect?**\n\n\n**How to make it happen, if you know:**\n1. \n\n---\n\
          Slate {} on {}\n\n\
-         If Slate crashed: crash.log, and any crash-*.dmp file, in Slate's settings folder (Help → Open settings \
+         If Slate crashed: crash.log, and any crash-*.dmp file, in Slate's settings folder (Settings → Open settings \
          folder) help find out why. They can contain bits of the text you had open, so attach them only if that's \
          all right.",
         version(),

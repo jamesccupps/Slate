@@ -1128,14 +1128,14 @@ pub fn run(args: &[String]) -> i32 {
                 let enc = a.tab().doc.encoding;
                 a.start_save(i, PathBuf::from(arg), enc, false);
             }
-            // the text's menu at a point (client DIPs), as a right click there opens it, and an item chosen in it by
-            // its label: `rmenu:<x>,<y>[|<label>]` (`print:popupitems` lists them)
             // the next menu that opens chooses this item (`<submenu> > <item>` inside one)
             "pick" => super::win::SCRIPTED.with(|s| {
                 if let Some(s) = s.borrow_mut().as_mut() {
                     s.pick = Some(arg.to_string());
                 }
             }),
+            // the text's menu at a point (client DIPs), as a right click there opens it, and an item chosen in it by
+            // its label: `rmenu:<x>,<y>[|<label>]` (`print:popupitems` lists them)
             "rmenu" => {
                 let (at, pick) = arg.split_once('|').map_or((arg, None), |(p, l)| (p, Some(l.to_string())));
                 let (x, y) = at.split_once(',').map(|(x, y)| (x.trim().parse().unwrap_or(0.0), y.trim().parse().unwrap_or(0.0))).unwrap_or((0.0, 0.0));

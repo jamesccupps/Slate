@@ -1506,7 +1506,7 @@ fn connect(ui: &Rc<Ui>, prev: &gtk4::Button, next: &gtk4::Button, lines_btn: &gt
     let sscroll = gtk4::EventControllerScroll::new(gtk4::EventControllerScrollFlags::VERTICAL);
     sscroll.connect_scroll(|_, _, dy| {
         if let Some(ui) = get_ui() {
-            let body_h = (ui.panel.height() as f64 - structure::HEADER_H).max(0.0);
+            let body_h = (ui.panel.height() as f64 - structure::header_h()).max(0.0);
             ui.guarded(|a| {
                 let i = a.active;
                 structure::scroll_by(&mut a.tabs[i].structure, body_h, dy * 3.0);
@@ -2084,6 +2084,27 @@ fn hidden_menu_keys(ui: &Rc<Ui>) {
         }
     });
     ui.window.add_controller(keys);
+    // (Alt held for something else: a click or a drag with it (a column selection), the wheel, or Alt+Tab away and back
+    // (its release comes once the window is back): its release opens nothing)
+    let others = gtk4::EventControllerLegacy::new();
+    others.set_propagation_phase(gtk4::PropagationPhase::Capture);
+    others.connect_event(|_, ev| {
+        use gdk::EventType as T;
+        if matches!(ev.event_type(), T::ButtonPress | T::Scroll | T::TouchBegin) {
+            if let Some(ui) = get_ui() {
+                ui.alt_alone.set(false);
+            }
+        }
+        glib::Propagation::Proceed
+    });
+    ui.window.add_controller(others);
+    ui.window.connect_is_active_notify(|w| {
+        if !w.is_active() {
+            if let Some(ui) = get_ui() {
+                ui.alt_alone.set(false);
+            }
+        }
+    });
     // (each menu closing: hidden again, unless another opens)
     for w in ui.menu_items.iter().filter_map(|w| w.upgrade()) {
         if let Some(pop) = popover_of(&w) {
@@ -2156,14 +2177,15 @@ fn refused_submenus(ui: &Rc<Ui>) {
 /// at that moment; and back. So from a click or key in a menu, before GTK acts on it, the menu bar ignores the
 /// pointer until it really moves (a motion repeating the last place doesn't count) or something is clicked.
 fn menus_close_quietly(ui: &Rc<Ui>) {
-    // (the pointer's last place since the menu bar stopped taking it)
+    // (where the pointer was last seen since the menu bar stopped taking it, and whether it was last in a menu)
     let seen: Rc<RefCell<Option<(gdk::Surface, f64, f64)>>> = Rc::default();
+    let inside: Rc<Cell<bool>> = Rc::default();
     let watch = move |w: &gtk4::Widget| {
-        let seen = seen.clone();
+        let (seen, inside) = (seen.clone(), inside.clone());
         let input = gtk4::EventControllerLegacy::new();
         input.set_propagation_phase(gtk4::PropagationPhase::Capture);
         input.connect_event(move |_, ev| {
-            quiet_menu_bar(ev, &seen);
+            quiet_menu_bar(ev, &seen, &inside);
             glib::Propagation::Proceed
         });
         w.add_controller(input);
@@ -2173,13 +2195,19 @@ fn menus_close_quietly(ui: &Rc<Ui>) {
     each_menu(ui, move |p, _| watch(p.upcast_ref()));
 }
 
-fn quiet_menu_bar(ev: &gdk::Event, seen: &RefCell<Option<(gdk::Surface, f64, f64)>>) {
+/// `menus_close_quietly`'s rule. Only a pointer last seen in a menu has a place GTK may take for the window's once
+/// that menu is gone: one resting on the menu bar (a menu opened there, then Esc) leaves it as it is, so a click
+/// there at once works.
+fn quiet_menu_bar(ev: &gdk::Event, seen: &RefCell<Option<(gdk::Surface, f64, f64)>>, inside: &Cell<bool>) {
     use gdk::EventType as T;
     let Some(ui) = get_ui() else { return };
     let row = &ui.menu_row;
     let in_menu = ev.surface().is_some_and(|s| Some(&s) != ui.window.surface().as_ref());
+    if matches!(ev.event_type(), T::MotionNotify | T::EnterNotify) {
+        inside.set(in_menu);
+    }
     match ev.event_type() {
-        T::ButtonPress | T::ButtonRelease | T::KeyPress | T::TouchBegin | T::TouchEnd if in_menu => {
+        T::ButtonPress | T::ButtonRelease | T::KeyPress | T::TouchBegin | T::TouchEnd if in_menu && inside.get() => {
             row.set_can_target(false);
             seen.replace(None);
         }
@@ -2192,7 +2220,7 @@ fn quiet_menu_bar(ev: &gdk::Event, seen: &RefCell<Option<(gdk::Surface, f64, f64
                 seen.replace(Some((s, x, y)));
             }
         }
-        T::ButtonPress | T::TouchBegin => row.set_can_target(true),
+        T::ButtonPress | T::TouchBegin if !in_menu => row.set_can_target(true),
         _ => {}
     }
 }
@@ -2267,7 +2295,7 @@ fn menu_model(recent: &gio::Menu, format_extra: &gio::Menu, view_extra: &gio::Me
     edit.append_section(None, &section(&[("Undo", "undo"), ("Redo", "redo")]));
     edit.append_section(None, &section(&[("Cut", "cut"), ("Copy", "copy"), ("Paste", "paste"), ("Select all", "select-all")]));
     edit.append_section(None, &section(&[("Find…", "find"), ("Replace…", "replace"), ("Find next", "find-next"), ("Find previous", "find-prev"), ("Go to line…", "goto-line")]));
-    edit.append_section(None, &section(&[("Find in all tabs", "find-in-tabs"), ("Replace in all tabs", "replace-in-tabs"), ("Find in files…", "find-in-files")]));
+    edit.append_section(None, &section(&[("Find in all tabs", "find-in-tabs"), ("Replace in all tabs", "replace-in-tabs"), ("Find in files", "find-in-files")]));
     edit.append_section(None, &section(&[("Go back", "go-back"), ("Go forward", "go-forward")]));
     edit.append_section(None, &section(&[("Go to matching bracket", "goto-bracket"), ("Select inside brackets", "select-brackets")]));
     let marks = section(&[("Toggle bookmark", "toggle-bookmark"), ("Next bookmark", "next-bookmark"), ("Previous bookmark", "prev-bookmark")]);
@@ -2620,8 +2648,11 @@ impl Ui {
                 glib::Propagation::Stop
             }
             gdk::Key::Escape => {
-                self.with(|a| a.exec(Cmd::CloseFind));
-                self.text.grab_focus();
+                // (Find in all tabs or in files stops first)
+                if !self.with(|a| a.stop_many()).unwrap_or(false) {
+                    self.with(|a| a.exec(Cmd::CloseFind));
+                    self.text.grab_focus();
+                }
                 glib::Propagation::Stop
             }
             gdk::Key::Return | gdk::Key::KP_Enter if state.contains(gdk::ModifierType::SHIFT_MASK) => {
@@ -2779,6 +2810,11 @@ impl Ui {
         if cmd == Cmd::NextMisspelling {
             let g = self.geom();
             self.with(|a| a.next_misspelling(&g));
+            return;
+        }
+        if let Cmd::SuggestionAll(i) = cmd {
+            let g = self.geom();
+            self.with(|a| a.spell_replace_all(&g, i as usize));
             return;
         }
         self.with(|a| a.exec(cmd));
@@ -3299,7 +3335,7 @@ impl Ui {
         let open = self.guarded(|a| {
             let at = if caret { a.tab().view.sel.caret } else { a.with_view(&g, |v, cx| v.pos_at(cx, x - gw - PAD, y)) };
             let tab = a.tab();
-            crate::links::target_in(&tab.doc, tab.view.sel, Some(at), true).ok().map(|t| (crate::links::menu_label(&t, false), at))
+            crate::links::target_in(&tab.doc, tab.view.sel, Some(at), true).ok().map(|t| (crate::links::menu_label(&t, tab.doc.path.as_deref().and_then(std::path::Path::parent), false), at))
         });
         if let Some(Some((label, at))) = open {
             let item = gio::MenuItem::new(Some(&label), None);
@@ -3453,7 +3489,7 @@ impl Ui {
             Some(structure::PanelPart::Bar(f)) => {
                 self.guarded(|a| {
                     let i = a.active;
-                    structure::scroll_to(&mut a.tabs[i].structure, (h - structure::HEADER_H).max(0.0), f);
+                    structure::scroll_to(&mut a.tabs[i].structure, (h - structure::header_h()).max(0.0), f);
                 });
                 self.panel.queue_draw();
             }
@@ -3558,7 +3594,7 @@ impl Ui {
         }
         let (wait, moved) = a.update_structure(show_path, show_panel);
         if moved {
-            let body_h = (self.panel.height() as f64 - structure::HEADER_H).max(200.0);
+            let body_h = (self.panel.height() as f64 - structure::header_h()).max(200.0);
             let i = a.active;
             structure::scroll_to_selected(&mut a.tabs[i].structure, body_h);
         }
@@ -3662,8 +3698,6 @@ impl Ui {
         self.queue_all();
     }
 
-    /// The menus' check marks and dots follow the app: Word wrap, Line numbers, the theme, the tab's line breaks and
-    /// language.
     /// Settings → Interface text size (issue #8): the tab strip and status bar as high as their text needs, and GTK's
     /// own parts in the font size picked (the desktop's font, scaled; as the desktop has it again for 0).
     fn apply_ui_size(&self, a: &App) {
@@ -3674,6 +3708,10 @@ impl Ui {
         let k = chrome::ui_k(&a.settings);
         self.tabs.set_content_height((chrome::TAB_H * k) as i32);
         self.status.set_content_height((chrome::STATUS_H * k) as i32);
+        structure::set_scale(k);
+        self.path_bar.set_content_height(structure::path_h() as i32);
+        self.path_bar.queue_draw();
+        self.panel.queue_draw();
         if let Some(gs) = gtk4::Settings::default() {
             if self.desktop_font.borrow().is_none() {
                 *self.desktop_font.borrow_mut() = gs.gtk_font_name().map(|f| f.to_string());
@@ -3726,6 +3764,8 @@ impl Ui {
         }
     }
 
+    /// The menus' check marks and dots follow the app: Word wrap, Line numbers, the theme, the tab's line breaks and
+    /// language.
     fn sync_menu(&self, a: &App) {
         let tab = a.tab();
         let theme = a.settings.theme;
@@ -3748,7 +3788,7 @@ impl Ui {
             ("eol-crlf", tab.doc.eol == Eol::Crlf),
             ("read-only", tab.read_only || tab.filter.is_some() || tab.results.is_some()),
             ("restore-session", a.settings.restore_session),
-            ("lang-for-ending", tab.ending().is_some_and(|e| a.settings.lang_for_ending(&e) == Some(tab.lang))),
+            ("lang-for-ending", tab.lang_key().is_some_and(|k| a.settings.lang_for(&k) == Some(tab.lang))),
             ("reopen-where-left", a.settings.reopen_where_left),
             ("hide-menu-bar", a.settings.hide_menu_bar),
             ("bars-at-bottom", a.settings.bars_at_bottom),
@@ -3788,12 +3828,18 @@ impl Ui {
             self.theme_btn.set_icon_name(icon);
             self.theme_btn.set_tooltip_text(Some(tip));
         }
-        // Format → Language → Always open .x files as …: for a file with an ending, named for it and the language
-        let want = tab.ending().map(|e| (e, tab.lang));
+        // Format → Language → Always open …: for a file's ending (or name without one) and its language, unless that's
+        // what Slate does anyway
+        let path = tab.doc.path.as_ref().map(|p| p.to_string_lossy().into_owned());
+        let want = tab
+            .lang_key()
+            .zip(path)
+            .filter(|(k, p)| a.settings.lang_for(k).is_some() || !crate::highlight::own_choice(p, tab.lang))
+            .map(|(k, _)| (k.item(tab.lang), tab.lang));
         if *self.lang_extra_for.borrow() != want {
             self.lang_extra.remove_all();
-            if let Some((e, l)) = &want {
-                self.lang_extra.append(Some(&format!("Always open .{e} files as {}", l.label())), Some("win.lang-for-ending"));
+            if let Some((item, _)) = &want {
+                self.lang_extra.append(Some(item), Some("win.lang-for-ending"));
             }
             *self.lang_extra_for.borrow_mut() = want;
         }
@@ -3926,6 +3972,10 @@ impl Ui {
                 glib::timeout_add_local_once(Duration::from_millis(300), || {
                     if let Some(ui) = get_ui() {
                         ui.with(|a| a.make_speller(false));
+                        // (F7 pressed while it was starting)
+                        if ui.with(|a| std::mem::take(&mut a.f7_wanted)).unwrap_or(false) {
+                            ui.command(Cmd::NextMisspelling);
+                        }
                     }
                 });
             }
@@ -4012,11 +4062,9 @@ impl Ui {
             return;
         }
         let written = self.guarded(|a| {
-            // (in a test, only with `persist`)
+            // (in a test, only with `persist`: then a restart can be tried, as on Windows)
             let ok = session::save(a);
-            if self.test.is_none() {
-                self.save_settings(a);
-            }
+            self.save_settings(a);
             ok || a.session_failed || !a.tabs.iter().any(|t| t.doc.is_dirty()) || {
                 // The session can't be written (a full or read-only disk): every unsaved tab is asked about.
                 a.session_failed = true;

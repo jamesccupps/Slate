@@ -12,6 +12,30 @@ pub const ROW_H: f32 = 24.0;
 pub const PATH_H: f32 = 28.0;
 pub const HEADER_H: f32 = 34.0;
 
+static SCALE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x3F80_0000);
+
+/// Settings → Interface text size (`App::uik`, issue #8): the path bar's and the panel's rows grow with their text.
+pub fn set_scale(k: f32) {
+    SCALE.store(k.to_bits(), std::sync::atomic::Ordering::Relaxed);
+}
+
+fn scale() -> f32 {
+    f32::from_bits(SCALE.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// A row of the panel, the path bar and the panel's header, at the interface text size.
+pub fn row_h() -> f32 {
+    (ROW_H * scale()).round()
+}
+
+pub fn path_h() -> f32 {
+    (PATH_H * scale()).round()
+}
+
+pub fn header_h() -> f32 {
+    (HEADER_H * scale()).round()
+}
+
 impl Structure {
     // ---- painting ----
 
@@ -25,7 +49,7 @@ impl Structure {
             g.fill_round(toggle, 4.0, if panel_open { t.pressed } else { t.hover });
         }
         g.text("\u{E8FD}", icons, toggle, t.text_dim, Align::Center);
-        let mut x = r.x + 12.0;
+        let mut x = r.x + 12.0 * scale();
         let limit = toggle.x - 8.0;
         let label = |s: &str| -> String { if s.chars().count() > 40 { format!("{}…", s.chars().take(39).collect::<String>()) } else { s.to_string() } };
         let n = self.path.as_ref().map_or(1, |p| p.len().max(1));
@@ -38,12 +62,12 @@ impl Structure {
             }
         };
         // When it doesn't fit, show the end of the path: only that much is measured (it can be thousands of steps).
-        let sep_w = 18.0;
+        let sep_w = 18.0 * scale();
         let mut shown: Vec<(String, f32)> = Vec::new();
         let mut need = 0.0;
         for i in (0..n).rev() {
             let s = seg(i);
-            let w = g.measure(&s, ui).0 + 12.0;
+            let w = g.measure(&s, ui).0 + 12.0 * scale();
             let more = w + if shown.is_empty() { 0.0 } else { sep_w };
             if !shown.is_empty() && need + more > limit - x {
                 break;
@@ -54,8 +78,8 @@ impl Structure {
         shown.reverse();
         let skip = n - shown.len();
         if skip > 0 {
-            g.text("… ›", ui, Rect::new(x, r.y, 30.0, r.h), t.text_faint, Align::Left);
-            x += 30.0;
+            g.text("… ›", ui, Rect::new(x, r.y, 30.0 * scale(), r.h), t.text_faint, Align::Left);
+            x += 30.0 * scale();
         }
         rects.resize(skip, Rect::default());
         for (k, (s, w)) in shown.iter().enumerate() {
@@ -90,11 +114,11 @@ impl Structure {
     ) {
         g.fill(r, t.surface);
         g.vline(r.x, r.y, r.bottom(), false, t.border);
-        let head = Rect::new(r.x, r.y, r.w, HEADER_H);
-        g.text("Structure", bold, Rect::new(r.x + 14.0, r.y, r.w - 60.0, HEADER_H), t.text, Align::Left);
+        let head = Rect::new(r.x, r.y, r.w, header_h());
+        g.text("Structure", bold, Rect::new(r.x + 14.0, r.y, r.w - 60.0, header_h()), t.text, Align::Left);
         if let Some(p) = self.progress().filter(|_| !self.rows.is_empty()) {
             // reading the document again after an edit; the rows shown are from before it
-            g.text(&format!("Updating… {:.0}%", p * 100.0), ui, Rect::new(r.x + 14.0, r.y, r.w - 60.0, HEADER_H), t.text_faint, Align::Right);
+            g.text(&format!("Updating… {:.0}%", p * 100.0), ui, Rect::new(r.x + 14.0, r.y, r.w - 60.0, header_h()), t.text_faint, Align::Right);
         }
         let close = close_rect(r);
         if close_hover {
@@ -106,7 +130,7 @@ impl Structure {
         g.push_clip(body);
         if let Some(p) = self.progress() {
             if self.rows.is_empty() {
-                g.text(&format!("Reading the structure… {:.0}%", p * 100.0), ui, Rect::new(body.x + 14.0, body.y + 6.0, body.w - 20.0, ROW_H), t.text_dim, Align::Left);
+                g.text(&format!("Reading the structure… {:.0}%", p * 100.0), ui, Rect::new(body.x + 14.0, body.y + 6.0, body.w - 20.0, row_h()), t.text_dim, Align::Left);
             }
         } else if self.rows.is_empty() {
             let msg = match (self.broken, self.is_xml()) {
@@ -114,26 +138,26 @@ impl Structure {
                 (true, true) => "This doesn't look like well-formed XML.",
                 _ => "Nothing to show.",
             };
-            g.text(msg, ui, Rect::new(body.x + 14.0, body.y + 6.0, body.w - 20.0, ROW_H), t.text_dim, Align::Left);
+            g.text(msg, ui, Rect::new(body.x + 14.0, body.y + 6.0, body.w - 20.0, row_h()), t.text_dim, Align::Left);
         }
-        let max_scroll = (self.rows.len() as f32 * ROW_H - body.h + ROW_H).max(0.0);
+        let max_scroll = (self.rows.len() as f32 * row_h() - body.h + row_h()).max(0.0);
         self.scroll = self.scroll.clamp(0.0, max_scroll);
-        let first = (self.scroll / ROW_H).floor() as usize;
-        let count = (body.h / ROW_H).ceil() as usize + 1;
+        let first = (self.scroll / row_h()).floor() as usize;
+        let count = (body.h / row_h()).ceil() as usize + 1;
         for (k, row) in self.rows.iter().enumerate().skip(first).take(count) {
-            let y = body.y + k as f32 * ROW_H - self.scroll;
-            let rr = Rect::new(body.x, y, body.w, ROW_H);
+            let y = body.y + k as f32 * row_h() - self.scroll;
+            let rr = Rect::new(body.x, y, body.w, row_h());
             if self.selected == Some(row.key) {
                 g.fill(g.snap_rect(rr), t.selection_inactive);
             } else if hover_row == Some(k) {
                 g.fill(g.snap_rect(rr), t.hover);
             }
-            let x0 = body.x + 8.0 + row.depth as f32 * 14.0;
+            let x0 = body.x + 8.0 * scale() + row.depth as f32 * 14.0 * scale();
             if row.expandable {
                 let glyph = if row.expanded { "\u{E70D}" } else { "\u{E76C}" };
-                g.text(glyph, icons, Rect::new(x0, y, 16.0, ROW_H), t.text_dim, Align::Center);
+                g.text(glyph, icons, Rect::new(x0, y, 16.0 * scale(), row_h()), t.text_dim, Align::Center);
             }
-            let tx = x0 + 18.0;
+            let tx = x0 + 18.0 * scale();
             let label_color = if row.loading || row.kind.is_none() && !row.expandable {
                 t.text_dim
             } else if row.is_key && matches!(row.kind, Some(Kind::Element | Kind::Leaf)) {
@@ -145,7 +169,7 @@ impl Structure {
             };
             let (lw, _) = g.measure(&row.label, ui);
             let lw = lw.min((rr.right() - tx - 8.0).max(0.0));
-            g.text(&row.label, ui, Rect::new(tx, y, lw + 2.0, ROW_H), label_color, Align::Left);
+            g.text(&row.label, ui, Rect::new(tx, y, lw + 2.0, row_h()), label_color, Align::Left);
             let px = tx + lw + 8.0;
             let (ptext, pcolor) = match row.kind {
                 Some(Kind::Object) => (if row.preview.is_empty() { "{…}".to_string() } else { format!("{{…}} {}", row.preview) }, t.text_faint),
@@ -160,7 +184,7 @@ impl Structure {
                 None => (String::new(), t.text_dim),
             };
             if !ptext.is_empty() && px < rr.right() - 12.0 {
-                g.text(&ptext, ui, Rect::new(px, y, rr.right() - px - 8.0, ROW_H), pcolor, Align::Left);
+                g.text(&ptext, ui, Rect::new(px, y, rr.right() - px - 8.0, row_h()), pcolor, Align::Left);
             }
         }
         g.pop_clip();
@@ -177,7 +201,7 @@ impl Structure {
     pub fn scrollbar(&self, panel: Rect) -> Option<(Rect, Rect, f32)> {
         let body = body_rect(panel);
         // (as in `paint_panel`: a row's room left after the last one)
-        let max = self.rows.len() as f32 * ROW_H - body.h + ROW_H;
+        let max = self.rows.len() as f32 * row_h() - body.h + row_h();
         if max <= 0.0 || body.h <= 0.0 {
             return None;
         }
@@ -194,10 +218,10 @@ impl Structure {
         if !body.contains(x, y) {
             return None;
         }
-        let k = ((y - body.y + self.scroll) / ROW_H).floor() as usize;
+        let k = ((y - body.y + self.scroll) / row_h()).floor() as usize;
         let row = self.rows.get(k)?;
-        let x0 = body.x + 8.0 + row.depth as f32 * 14.0;
-        let on_chevron = row.expandable && x >= x0 - 4.0 && x < x0 + 18.0;
+        let x0 = body.x + 8.0 * scale() + row.depth as f32 * 14.0 * scale();
+        let on_chevron = row.expandable && x >= x0 - 4.0 && x < x0 + 18.0 * scale();
         Some((k, on_chevron))
     }
 
@@ -206,25 +230,25 @@ impl Structure {
         let Some(sel) = self.selected else { return };
         let Some(k) = self.rows.iter().position(|r| r.key == sel) else { return };
         let body = body_rect(panel);
-        let y = k as f32 * ROW_H;
+        let y = k as f32 * row_h();
         if y < self.scroll {
-            self.scroll = (y - ROW_H * 2.0).max(0.0);
-        } else if y + ROW_H > self.scroll + body.h {
-            self.scroll = y + ROW_H * 3.0 - body.h;
+            self.scroll = (y - row_h() * 2.0).max(0.0);
+        } else if y + row_h() > self.scroll + body.h {
+            self.scroll = y + row_h() * 3.0 - body.h;
         }
     }
 }
 
 pub fn toggle_rect(path_bar: Rect) -> Rect {
-    Rect::new(path_bar.right() - 40.0, path_bar.y + 2.0, 30.0, path_bar.h - 4.0)
+    Rect::new(path_bar.right() - 40.0 * scale(), path_bar.y + 2.0, 30.0 * scale(), path_bar.h - 4.0)
 }
 
 pub fn close_rect(panel: Rect) -> Rect {
-    Rect::new(panel.right() - 38.0, panel.y + 5.0, 28.0, HEADER_H - 10.0)
+    Rect::new(panel.right() - 38.0 * scale(), panel.y + 5.0, 28.0 * scale(), header_h() - 10.0)
 }
 
 pub fn body_rect(panel: Rect) -> Rect {
-    Rect::new(panel.x + 1.0, panel.y + HEADER_H, panel.w - 1.0, panel.h - HEADER_H)
+    Rect::new(panel.x + 1.0, panel.y + header_h(), panel.w - 1.0, panel.h - header_h())
 }
 
 #[cfg(test)]

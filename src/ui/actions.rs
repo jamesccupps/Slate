@@ -447,6 +447,10 @@ impl App {
         if !self.waits.is_empty() {
             self.tab_gone(t.id);
         }
+        // (a tab Replace in all tabs was replacing in: done, as closed)
+        if self.replacing.is_some() {
+            self.replaced_check();
+        }
         // (big piped-in text, opened as the file it was put in: that goes with its tab, and can't be reopened)
         if let Some(path) = t.doc.path.clone().filter(|p| super::handed_text(p)) {
             drop(t);
@@ -845,12 +849,14 @@ impl App {
         } else {
             // (back to the tab it was opened from, not whichever is beside it)
             let back = self.tabs[i].opened_from.filter(|_| i == self.active);
+            // (the whole path: it says where Slate looked)
+            let full = self.tabs[i].doc.path.as_deref().map_or_else(|| name.clone(), |p| p.display().to_string());
             self.tabs[i].restore = None;
             self.remove_tab(i);
             if let Some(k) = back.and_then(|id| self.tabs.iter().position(|t| t.id == id)) {
                 self.activate(k);
             }
-            self.flash(format!("Couldn't open {name}: {}", fileio::friendly_io(&e)), true);
+            self.flash(format!("Couldn't open {full}: {}", fileio::friendly_io(&e)), true);
         }
         self.invalidate();
     }
@@ -1580,7 +1586,7 @@ impl App {
             if let Some(r) = task.job.take() {
                 let task = self.tabs[i].task.take().unwrap();
                 let id = self.tabs[i].id;
-                if task.kind == TaskKind::ReplaceAll && self.replacing.as_ref().is_some_and(|b| b.ids.contains(&id)) {
+                if task.kind == TaskKind::ReplaceAll && self.replacing.as_ref().is_some_and(|b| b.pending.contains(&id)) {
                     self.replaced_in(i, task, r);
                     return self.tabs.iter().any(|t| t.task.is_some());
                 }
@@ -1677,6 +1683,12 @@ impl App {
                 let moved = tab.doc.path.as_deref() != Some(st.path.as_path());
                 tab.doc.path = Some(st.path.clone());
                 tab.canon = Some((st.path.clone(), saved.canon));
+                // (a tab of results saved as a file is that file now: a tab like any other, kept in the session)
+                if tab.results.take().is_some() {
+                    tab.read_only = false;
+                    tab.title_override = None;
+                    tab.lang_picked = false;
+                }
                 tab.doc.encoding = st.encoding;
                 tab.doc.disk = saved.disk;
                 tab.doc.mark_saved_at(st.state);
@@ -2058,12 +2070,12 @@ impl App {
     }
 
     /// Edit → Find in all tabs (issue #15): the lines the find bar's search matches in every tab (not tabs of matching
-    /// lines or of results), listed in a tab of results.
+    /// lines or of results), listed in a tab of results (`many::in_tabs`).
     fn list_in_tabs(&mut self) {
-        use crate::core::many::{self, Place, Results};
+        use crate::core::many;
         let Some(m) = self.search_for_many("Find in all tabs") else { return };
         let q = self.find.query.text.clone();
-        let srcs: Vec<(u64, String, crate::core::buffer::Snapshot)> = self
+        let srcs: Vec<many::TabSource> = self
             .tabs
             .iter_mut()
             .filter(|t| t.filter.is_none() && t.results.is_none() && t.load_job.is_none() && t.restore.is_none())
@@ -2072,43 +2084,18 @@ impl App {
                     Some(dir) => format!("{}  —  {}", t.title(), dir.display()),
                     None => t.title(),
                 };
-                (t.id, name, t.doc.snapshot())
+                (t.id, t.doc.version, name, t.doc.snapshot())
             })
             .collect();
-        let n = srcs.len() as u64;
-        let job = Job::spawn(n, self.notify.clone(), move |ctx| {
-            let mut groups = Vec::new();
-            let mut left = many::HITS_MAX;
-            for (id, name, snap) in srcs {
-                if ctx.cancelled() {
-                    return Err("Stopped".to_string());
-                }
-                let (hits, total) = many::lines_with(&m, &snap, left, Some(ctx));
-                left -= hits.len();
-                if total > 0 {
-                    groups.push((name, hits.into_iter().map(|h| (Place::Tab(id, h.line), h.text)).collect(), total));
-                }
-                ctx.progress.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-            let lines: u64 = groups.iter().map(|g: &(String, Vec<(Place, String)>, u64)| g.2).sum();
-            let head = format!(
-                "“{q}” in {} of {}: {} (Enter or a double-click goes to one)",
-                groups.len(),
-                crate::edit::plural(n, "tab", "tabs"),
-                crate::edit::plural(lines, "line", "lines")
-            );
-            Ok(Results::build(head, groups))
-        });
-        self.many = Some((job, format!("Found: {}", short_query(&self.find.query.text))));
-        self.flash("Looking in every tab…", false);
-        self.timer(TIMER_JOBS, 100);
+        let job = Job::spawn(srcs.len() as u64, self.notify.clone(), move |ctx| Ok(many::in_tabs(&m, &q, srcs, ctx)));
+        self.start_many(job, format!("Found: {}", short_query(&self.find.query.text)), "every tab".into(), false);
     }
 
     /// Edit → Find in files (issue #15): the lines the find bar's search matches in the text files in the folder of the
     /// tab's file and the folders in it (`many::in_files`: not version control, dependencies or build output; not
     /// binary files or ones over 32 MB), listed in a tab of results. On another thread: Esc stops it.
     fn find_in_files(&mut self) {
-        use crate::core::many::{self, Place, Results};
+        use crate::core::many;
         // (a name given relative to where Slate started: in that folder)
         let root = self.tab().doc.path.as_deref().and_then(|p| p.parent()).map(|d| std::path::absolute(if d.as_os_str().is_empty() { Path::new(".") } else { d }).unwrap_or_else(|_| d.to_path_buf()));
         let Some(root) = root else {
@@ -2117,39 +2104,17 @@ impl App {
         };
         let Some(m) = self.search_for_many("Find in files") else { return };
         let q = self.find.query.text.clone();
-        let shown = root.display().to_string();
-        let base = root.clone();
-        let job = Job::spawn(1, self.notify.clone(), move |ctx| {
-            let r = many::in_files(&m, &root, ctx);
-            if ctx.cancelled() {
-                return Err("Find in files stopped".to_string());
-            }
-            let lines: u64 = r.files.iter().map(|f| f.total).sum();
-            let mut head = format!(
-                "“{q}” in {shown}: {} in {} of {} (Enter or a double-click opens one)",
-                crate::edit::plural(lines, "line", "lines"),
-                r.files.len(),
-                crate::edit::plural(r.searched as u64, "file", "files"),
-            );
-            if r.skipped > 0 {
-                head.push_str(&format!("; {} passed over (binary, or over 32 MB)", crate::edit::plural(r.skipped as u64, "file", "files")));
-            }
-            if r.cut {
-                head.push_str("; stopped there: too many to list");
-            }
-            let groups = r
-                .files
-                .into_iter()
-                .map(|f| {
-                    let name = f.path.strip_prefix(&base).unwrap_or(&f.path).display().to_string();
-                    let lines = f.hits.into_iter().map(|h| (Place::File(f.path.clone(), h.line), h.text)).collect();
-                    (name, lines, f.total)
-                })
-                .collect();
-            Ok(Results::build(head, groups))
-        });
-        self.many = Some((job, format!("Found in files: {}", short_query(&self.find.query.text))));
-        self.flash(format!("Looking in the files in {}… (Esc stops)", root_name(self.tab().doc.path.as_deref())), false);
+        let what = format!("the files in {}", root_name(self.tab().doc.path.as_deref()));
+        let job = Job::spawn(1, self.notify.clone(), move |ctx| Ok(many::in_files_results(&m, &q, &root, ctx)));
+        self.start_many(job, format!("Found in files: {}", short_query(&self.find.query.text)), what, true);
+    }
+
+    /// Find in all tabs or in files started: kept running (`many::Running`), the status bar saying so until it ends.
+    fn start_many(&mut self, job: Job<Result<crate::core::many::Results, String>>, title: String, what: String, files: bool) {
+        let from = (self.tab().id, self.tab().doc.version);
+        let r = crate::core::many::Running { job, title, what, files, stopping: false, from };
+        self.flash(r.status(), false);
+        self.many = Some(r);
         self.timer(TIMER_JOBS, 100);
     }
 
@@ -2176,25 +2141,54 @@ impl App {
         }
     }
 
-    /// Find in all tabs or in files finished: its results in a tab of their own (read only, not kept in the session).
+    /// Esc: Find in all tabs or in files stops (what it found so far is still listed). False if none runs.
+    fn stop_many(&mut self) -> bool {
+        let Some(r) = self.many.as_mut() else { return false };
+        if !r.stop() {
+            return false;
+        }
+        let s = r.status();
+        self.flash(s, false);
+        true
+    }
+
+    /// Find in all tabs or in files finished: its results in a tab of their own (read only, not kept in the session),
+    /// shown unless the user went on with something else meanwhile. While it runs, the status bar counts.
     fn poll_many(&mut self) -> bool {
-        let Some((job, _)) = self.many.as_mut() else { return false };
-        let Some(r) = job.take() else { return true };
-        let (_, title) = self.many.take().unwrap_or_else(|| unreachable!());
+        let Some(running) = self.many.as_mut() else { return false };
+        let Some(r) = running.job.take() else {
+            // (the status bar's count, unless a newer message is up)
+            if self.flash.as_ref().is_none_or(|(_, at, _)| at.elapsed() >= std::time::Duration::from_millis(1500)) {
+                self.invalidate();
+            }
+            return true;
+        };
+        let Some(running) = self.many.take() else { return false };
         match r {
+            Ok(results) if results.stopped && results.lines == 0 => self.flash("Stopped: nothing found until then", false),
             Ok(results) => {
+                let (stopped, lines) = (results.stopped, results.lines);
+                let shown = (self.tab().id, self.tab().doc.version);
                 let mut doc = Document::from_text(results.text.as_bytes());
                 doc.mark_saved();
+                let was = self.active;
                 let k = self.add_tab(doc);
                 let tab = &mut self.tabs[k];
-                tab.title_override = Some(title);
+                tab.title_override = Some(running.title.clone());
                 tab.untitled = 0;
                 tab.read_only = true;
-                tab.lang = Lang::Plain;
+                tab.lang = Lang::Results;
                 tab.lang_picked = true;
                 tab.results = Some(Arc::new(results));
-                self.activate(k);
-                self.flash("Enter or a double-click on a line goes there", false);
+                let found = crate::edit::plural(lines, "line", "lines");
+                if running.may_show(shown) {
+                    self.activate(k);
+                    self.flash(if stopped { format!("Stopped: {found} found until then") } else { "Enter or a double-click on a line goes there".to_string() }, false);
+                } else {
+                    // (the user went on meanwhile: the tab waits behind)
+                    self.activate(was);
+                    self.flash(format!("Found {found}: tab “{}”", running.title), false);
+                }
             }
             Err(e) => self.flash(e, false),
         }
@@ -2203,28 +2197,42 @@ impl App {
     }
 
     /// Edit → Replace in all tabs (issue #15): the find bar's search replaced with its replacement in every tab that can
-    /// be edited, each as its own Replace all (one undo step in each tab).
+    /// be edited, each as its own Replace all (one undo step in each tab). Only with the replace box on screen: the
+    /// replacement is what it shows.
     fn replace_in_tabs(&mut self) {
+        self.replaced_check();
         if self.replacing.is_some() {
             self.flash("Still replacing (Esc stops it in the tab shown)", true);
+            return;
+        }
+        if !(self.find.open && self.find.mode == BarMode::Replace) {
+            self.open_find(BarMode::Replace);
+            FindBar::focus(if self.find.matcher.is_some() { self.find.replace_edit } else { self.find.find_edit });
+            self.flash("Type what to find and its replacement, then Edit → Replace in all tabs", false);
             return;
         }
         let Some(m) = self.search_for_many("Replace in all tabs") else { return };
         let typed = FindBar::text_of(self.find.replace_edit);
         crate::edit::remember(&mut self.settings.replace_history, &typed);
-        let ids: Vec<u64> = self
-            .tabs
-            .iter()
-            .filter(|t| {
-                !t.read_only && t.filter.is_none() && t.results.is_none() && t.task.is_none() && t.load_job.is_none() && t.restore.is_none() && t.doc.is_ready()
-            })
-            .map(|t| t.id)
-            .collect();
+        let mut b = crate::core::many::ReplaceInTabs { replacement: typed.clone(), ..Default::default() };
+        let mut ids = Vec::new();
+        for t in &self.tabs {
+            if t.read_only || t.filter.is_some() || t.results.is_some() {
+                b.read_only += 1;
+            } else if t.load_job.is_some() || t.restore.is_some() || !t.doc.is_ready() {
+                b.opening += 1;
+            } else if t.task.is_some() {
+                b.busy += 1;
+            } else {
+                ids.push(t.id);
+            }
+        }
         if ids.is_empty() {
-            self.flash("No tab to replace in", false);
+            self.flash(format!("No tab to replace in: {}", b.message().trim_start_matches("No matches to replace in any tab; ")), false);
             return;
         }
-        self.replacing = Some(Replacing { ids: ids.clone(), done: 0, count: 0, tabs: 0 });
+        b.pending = ids.clone();
+        self.replacing = Some(b);
         for id in ids {
             let Some(i) = self.tabs.iter().position(|t| t.id == id) else { continue };
             let replacement = crate::edit::replacement(&typed, self.find.query.regex, self.tabs[i].doc.eol.as_bytes());
@@ -2233,7 +2241,7 @@ impl App {
             // (a task that didn't start: done at once)
             if self.replace_with.take().is_some() || self.tabs[i].task.is_none() {
                 if let Some(b) = self.replacing.as_mut() {
-                    b.done += 1;
+                    b.finished(id, 0, true);
                 }
             }
         }
@@ -2243,30 +2251,28 @@ impl App {
 
     /// One tab's Replace all of Replace in all tabs finished: its text changed (no message of its own).
     fn replaced_in(&mut self, i: usize, task: Task, r: TaskResult) {
-        let count = match &r {
-            TaskResult::Content { count, .. } => *count,
-            _ => 0,
+        let id = self.tabs[i].id;
+        let (count, applied) = match &r {
+            TaskResult::Content { count, .. } => (*count, self.tabs[i].doc.version == task.version),
+            _ => (0, true),
         };
-        if count > 0 || !matches!(r, TaskResult::Content { .. }) {
+        if (count > 0 && applied) || !matches!(r, TaskResult::Content { .. }) {
             self.finish_task(i, task, r);
         }
         if let Some(b) = self.replacing.as_mut() {
-            b.done += 1;
-            b.count += count;
-            b.tabs += (count > 0) as u64;
+            b.finished(id, count, applied);
         }
         self.replaced_check();
     }
 
-    /// Replace in all tabs: once every tab's is done, what it did.
-    fn replaced_check(&mut self) {
-        if self.replacing.as_ref().is_some_and(|b| b.done >= b.ids.len()) {
-            let b = self.replacing.take().unwrap_or_else(|| unreachable!());
-            let msg = if b.count == 0 {
-                "No matches to replace in any tab".to_string()
-            } else {
-                format!("Replaced {} in {}", crate::edit::plural(b.count, "match", "matches"), crate::edit::plural(b.tabs, "tab", "tabs"))
-            };
+    /// Replace in all tabs: once every tab's is done (or its tab closed), what it did.
+    pub fn replaced_check(&mut self) {
+        let Some(b) = self.replacing.as_mut() else { return };
+        let tabs = &self.tabs;
+        b.prune(|id| tabs.iter().any(|t| t.id == id && t.task.is_some()));
+        if b.done() {
+            let msg = b.message();
+            self.replacing = None;
             self.flash(msg, false);
         }
     }
@@ -2284,9 +2290,13 @@ impl App {
                         self.flash("That tab is closed.", true);
                         return;
                     };
+                    let moved = r.moved(&Place::Tab(id, line), self.tabs[i].doc.version);
                     self.activate(i);
                     self.tabs[i].goto = Some(Goto::Line(line + 1, None));
                     self.apply_goto(i);
+                    if moved {
+                        self.flash(format!("The text changed since the search: line {} may be another now", group(line + 1)), false);
+                    }
                 }
                 Place::File(p, line) => {
                     let goto = Some(Goto::Line(line + 1, None));
@@ -2884,12 +2894,14 @@ impl App {
     /// noted for the menu's commands (`spell_word`). None: not one there.
     pub fn spelling_at(&mut self, x: f32, y: f32) -> Option<Vec<String>> {
         self.spell_word = None;
+        // (F7's word is for this menu only, whatever it shows)
+        let menu_word = self.menu_word.take();
         let tab = self.tab();
-        if !self.settings.spell_check || tab.read_only || tab.filter.is_some() || !matches!(self.speller, Spelling::Ready(_)) {
+        if !self.settings.spell_check || tab.read_only || tab.filter.is_some() || tab.results.is_some() || !matches!(self.speller, Spelling::Ready(_)) {
             return None;
         }
         // (F7's word: by where it is, as the rows on screen may not be laid out for it yet)
-        let (pos, words) = match self.menu_word.take() {
+        let (pos, words) = match menu_word {
             Some(p) => (p, self.with_view(|v, cx| v.words_at(cx, p).1)),
             None => {
                 let (pos, _) = self.with_view(|v, cx| v.pos_at(cx, x, y));
@@ -2925,7 +2937,8 @@ impl App {
     pub fn note_spot(&mut self) {
         let Some(tab) = self.tabs.get(self.active) else { return };
         let now = crate::edit::Spot { tab: tab.id, pos: tab.view.sel.caret };
-        self.nav.note(now, &tab.doc);
+        // (a screenful of lines, as Page Down moves: not a jump)
+        self.nav.note_in(now, &tab.doc, tab.view.rows.len());
     }
 
     /// Edit → Go back (`back`) or Go forward (issue #11): to the tab and place the caret jumped from.
@@ -2978,7 +2991,8 @@ impl App {
                     }
                     self.activate(i);
                 } else if let Some(id) = self.open_path(&p, false, None, None) {
-                    if let Some(t) = self.tabs.iter_mut().find(|t| t.id == id) {
+                    // (no line asked for: where the file was left, which `open_path` set, stays)
+                    if let Some(t) = self.tabs.iter_mut().find(|t| t.id == id).filter(|_| goto.is_some()) {
                         t.goto = goto;
                     }
                     self.settle(&[id]);
@@ -2990,12 +3004,27 @@ impl App {
         }
     }
 
-    /// The spell check menu's Change every … to: suggestion `i` in place of every match of the word (whole word, same
-    /// case), as Replace all does it (one undo step; a big text on a job). Issue #12.
+    /// The spell check menu's Change every … to: suggestion `i` in place of the word everywhere the spell check would
+    /// mark it (`spell::places_of`: not in code, a file name or a link, which it passes over), one undo step. A text
+    /// over `CHANGE_EVERY_MAX` (too much to look through here) gets a whole-word Replace all on a job. Issue #12.
     fn spell_replace_all(&mut self, i: usize) {
         let Some(w) = self.spell_word.take() else { return };
-        let Some(s) = w.suggestions.get(i) else { return };
+        let Some(s) = w.suggestions.get(i).cloned() else { return };
         if self.tab().id != w.tab || !self.editable() {
+            return;
+        }
+        let len = self.tab().doc.len();
+        if len <= crate::spell::CHANGE_EVERY_MAX {
+            let places = self.with_view(|v, cx| crate::spell::places_of(&w.word, len, |p| v.words_at(cx, p)));
+            if places.is_empty() {
+                return;
+            }
+            let tab = self.tab_mut();
+            tab.doc.seal();
+            tab.view.sel = crate::edit::replace_places(&mut tab.doc, &places, s.as_bytes(), tab.view.sel);
+            tab.doc.seal();
+            self.after_edit();
+            self.flash(format!("Changed “{}” to “{s}” in {}", w.word, crate::edit::plural(places.len() as u64, "place", "places")), false);
             return;
         }
         let q = search::Query { text: w.word.clone(), match_case: true, whole_word: true, regex: false };
@@ -3013,14 +3042,23 @@ impl App {
     /// F7: the next word spelled wrong after the caret (round to the start), selected, with the spell check menu
     /// open at it (issue #12). Looks through `LOOK` bytes at a time.
     fn next_misspelling(&mut self) {
-        const LOOK: u64 = 8 << 20;
         let tab = self.tab();
         if !self.settings.spell_check {
             self.flash("Spell check is off (View → Spell check)", false);
             return;
         }
+        if tab.read_only || tab.results.is_some() {
+            self.flash("This tab is read only: F7 finds words to correct", false);
+            return;
+        }
         if tab.binary || tab.filter.is_some() || !crate::spell::checks(tab.lang) {
-            let what = if tab.filter.is_some() { "a tab of matching lines".to_string() } else { format!("{} files", tab.lang.label()) };
+            let what = if tab.binary {
+                "binary files".to_string()
+            } else if tab.filter.is_some() {
+                "a tab of matching lines".to_string()
+            } else {
+                format!("{} files", tab.lang.label())
+            };
             self.flash(format!("Slate doesn't check the spelling in {what}"), false);
             return;
         }
@@ -3032,14 +3070,17 @@ impl App {
                 return;
             }
             other => {
+                // (F7 again by itself once it's ready)
                 self.speller = other;
-                self.flash("Spell check is starting: try again in a moment", false);
+                self.f7_wanted = true;
+                self.flash("Spell check is starting…", false);
                 return;
             }
         };
-        use crate::spell::{next_wrong, NextWrong};
-        let r = self.with_view(|v, cx| match next_wrong(&mut sp, from, len, LOOK, |p| v.words_at(cx, p)) {
-            NextWrong::Clean if from > 0 => next_wrong(&mut sp, 0, from, LOOK, |p| v.words_at(cx, p)),
+        use crate::spell::{next_wrong, NextWrong, F7_BYTES, F7_TIME};
+        let until = std::time::Instant::now() + F7_TIME;
+        let r = self.with_view(|v, cx| match next_wrong(&mut sp, from, len, F7_BYTES, until, |p| v.words_at(cx, p)) {
+            NextWrong::Clean if from > 0 => next_wrong(&mut sp, 0, from, F7_BYTES, until, |p| v.words_at(cx, p)),
             r => r,
         });
         self.speller = Spelling::Ready(sp);
@@ -3060,7 +3101,7 @@ impl App {
                 tab.view.sel = Sel::at(p);
                 self.after_move();
                 self.reveal_caret(true);
-                self.flash("No words spelled wrong in the next 8 MB: F7 looks on from here", false);
+                self.flash("No words spelled wrong so far: F7 looks on from here", false);
             }
         }
     }
@@ -3405,14 +3446,14 @@ impl App {
             }
             VK_INSERT if !m.ctrl && !m.shift => self.exec(Cmd::ToggleOvertype),
             VK_ESCAPE => {
-                // Closing and deselecting come first: a save is cancelled only by an Esc meant for nothing else.
-                if self.find.open {
+                // Find in all tabs or in files stops first (what it found is still listed: the find bar its search
+                // was typed in is usually open); closing and deselecting come next: a save is cancelled only by an
+                // Esc meant for nothing else.
+                if self.stop_many() {
+                } else if self.find.open {
                     self.close_find();
                 } else if let Some(t) = &self.tab().task {
                     t.job.cancel();
-                } else if let Some((job, _)) = &self.many {
-                    // (Find in all tabs or in files: stopped)
-                    job.cancel();
                 } else if self.tab().notice.is_some() {
                     self.tab_mut().notice = None;
                     self.layout();
@@ -4173,7 +4214,10 @@ impl App {
                 true
             }
             VK_ESCAPE => {
-                self.close_find();
+                // (Find in all tabs or in files stops first)
+                if !self.stop_many() {
+                    self.close_find();
+                }
                 true
             }
             VK_UP | VK_DOWN if !m.ctrl && !m.alt && edit != self.find.goto_edit => {
@@ -4320,7 +4364,7 @@ impl App {
         if y >= thumb.y && y < thumb.bottom() {
             self.struct_drag = Some(y - thumb.y);
         } else {
-            let page = (track.h - super::structure::ROW_H).max(super::structure::ROW_H);
+            let page = (track.h - super::structure::row_h()).max(super::structure::row_h());
             let s = &mut self.tab_mut().structure;
             s.scroll = (s.scroll + if y > thumb.y { page } else { -page }).max(0.0);
         }
@@ -4838,7 +4882,7 @@ impl App {
         }
         if self.r_struct.w > 0.0 && self.r_struct.contains(x, y) {
             let s = &mut self.tab_mut().structure;
-            s.scroll = (s.scroll - delta as f32 / 120.0 * 3.0 * super::structure::ROW_H).max(0.0);
+            s.scroll = (s.scroll - delta as f32 / 120.0 * 3.0 * super::structure::row_h()).max(0.0);
             self.invalidate();
             return;
         }
@@ -4923,6 +4967,9 @@ impl App {
                 self.kill_timer(id);
                 self.speller = super::spell::speller(win::testing()).map_or(Spelling::Unavailable, Spelling::Ready);
                 self.invalidate();
+                if std::mem::take(&mut self.f7_wanted) {
+                    self.next_misspelling();
+                }
             }
             TIMER_UNCLOAK => {
                 self.kill_timer(id);
@@ -5650,12 +5697,12 @@ impl App {
                 self.invalidate();
             }
             Cmd::LangForEnding => {
-                let Some(ext) = self.tab().ending() else { return };
+                let Some(k) = self.tab().lang_key() else { return };
                 let lang = self.tab().lang;
-                let (msg, on) = self.settings.toggle_lang_for_ending(&ext, lang);
+                let (msg, on) = self.settings.toggle_lang_for(&k, lang);
                 if on {
-                    // (the other tabs of that ending follow, unless their language was picked by hand)
-                    for t in self.tabs.iter_mut().filter(|t| !t.lang_picked && t.lang != lang && t.ending().as_deref() == Some(ext.as_str())) {
+                    // (the other tabs of that ending or name follow, unless their language was picked by hand)
+                    for t in self.tabs.iter_mut().filter(|t| !t.lang_picked && t.lang != lang && t.lang_key().as_ref() == Some(&k)) {
                         t.lang = lang;
                         t.view.clear_cache();
                     }
@@ -5907,15 +5954,17 @@ impl App {
                 item(Cmd::FindNext, "Find ne&xt", "F3"),
                 item(Cmd::FindPrev, "Find pre&vious", "Shift+F3"),
                 item(Cmd::Replace, "R&eplace…", "Ctrl+H"),
+                item(Cmd::GoToLine, "&Go to line…", "Ctrl+G"),
+                // (in groups, as on Linux; no letters: every one in their words is another item's)
+                Item::Sep,
                 item(Cmd::FindInTabs, "Find in all tabs", ""),
                 item(Cmd::ReplaceInTabs, "Replace in all tabs", ""),
-                item(Cmd::FindInFiles, "Find in files…", "Ctrl+Shift+F"),
-                item(Cmd::GoToLine, "&Go to line…", "Ctrl+G"),
-                item(Cmd::GoToBracket, "Go to matching &bracket", "Ctrl+M"),
-                // (no letter: every one in it is another item's)
-                item(Cmd::SelectBrackets, "Select inside brackets", "Ctrl+Shift+M"),
+                item(Cmd::FindInFiles, "Find in files", "Ctrl+Shift+F"),
+                Item::Sep,
                 item(Cmd::GoBack, "Go back", "Alt+Left"),
                 item(Cmd::GoForward, "Go forward", "Alt+Right"),
+                item(Cmd::GoToBracket, "Go to matching &bracket", "Ctrl+M"),
+                item(Cmd::SelectBrackets, "Select inside brackets", "Ctrl+Shift+M"),
                 sub(
                     "Boo&kmarks",
                     vec![
@@ -6035,7 +6084,13 @@ impl App {
                         [0u32, 100, 125, 150, 175, 200]
                             .iter()
                             .map(|&n| {
-                                let label = if n == 0 { "As &Windows has it (Text size)".to_string() } else { format!("&{n}%") };
+                                // (each its own letter: 1, 2, 5, 7, 0)
+                                let label = match n {
+                                    0 => "As &Windows has it (Text size)".to_string(),
+                                    100 => "&100%".to_string(),
+                                    200 => "2&00%".to_string(),
+                                    _ => format!("1&{}%", n - 100),
+                                };
                                 let on = if n == 0 { s.ui_size < 100 } else { s.ui_size == n };
                                 check(Cmd::UiSize(n), &label, "", on)
                             })
@@ -6190,11 +6245,15 @@ impl App {
             };
             v.push(sub(&label, items));
         }
-        // (this file's ending, always in this language)
-        if let Some(ext) = self.tab().ending() {
-            let on = self.settings.lang_for_ending(&ext) == Some(cur);
-            v.push(Item::Sep);
-            v.push(check(Cmd::LangForEnding, &format!("Al&ways open .{} files as {}", ext.replace('&', "&&"), cur.label()), "", on));
+        // (this file's ending or name, always in this language: unless that's what Slate does anyway)
+        let path = self.tab().doc.path.as_ref().map(|p| p.to_string_lossy().into_owned());
+        if let (Some(k), Some(path)) = (self.tab().lang_key(), path) {
+            let set = self.settings.lang_for(&k);
+            if set.is_some() || !crate::highlight::own_choice(&path, cur) {
+                v.push(Item::Sep);
+                let label = k.item(cur).replace('&', "&&").replacen("Always", "Al&ways", 1);
+                v.push(check(Cmd::LangForEnding, &label, "", set == Some(cur)));
+            }
         }
         v
     }
@@ -6541,7 +6600,7 @@ pub fn run(cell: &Cell, d: Deferred) {
                 let mut a = cell.borrow_mut();
                 let at = if std::mem::take(&mut a.menu_at_caret) { a.tab().view.sel.caret } else { a.with_view(|v, cx| v.pos_at(cx, x, y)).0 };
                 let tab = a.tab();
-                crate::links::target_in(&tab.doc, tab.view.sel, Some(at), true).ok().map(|t| (crate::links::menu_label(&t, true), at))
+                crate::links::target_in(&tab.doc, tab.view.sel, Some(at), true).ok().map(|t| (crate::links::menu_label(&t, tab.doc.path.as_deref().and_then(Path::parent), true), at))
             };
             let items = {
                 let a = cell.borrow();

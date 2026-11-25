@@ -283,11 +283,53 @@ pub struct Tip {
     dark: bool,
     /// What it says while it shows.
     pub text: Option<String>,
+    /// Its font at the interface text size (`sized_font`): the size (percent), the DPI, the font.
+    font: Option<(i32, u32, windows::Win32::Graphics::Gdi::HFONT)>,
+}
+
+static UI_REL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x3F80_0000);
+
+/// Settings → Interface text size against Windows' own text size (1: the same): tooltips and prompts, which take
+/// Windows' fonts, are made that much bigger (issue #8).
+pub fn set_ui_rel(k: f32) {
+    UI_REL.store(k.to_bits(), std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn ui_rel() -> f32 {
+    f32::from_bits(UI_REL.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 impl Tip {
     pub fn new(owner: HWND) -> Tip {
-        Tip { hwnd: HWND::default(), owner, dark: false, text: None }
+        Tip { hwnd: HWND::default(), owner, dark: false, text: None, font: None }
+    }
+
+    /// The tooltip's font at the interface text size (`ui_rel`), when it isn't Windows' own: made once for each size.
+    fn sized_font(&mut self, hwnd: HWND) {
+        use windows::Win32::Graphics::Gdi::{CreateFontIndirectW, DeleteObject};
+        use windows::Win32::UI::HiDpi::SystemParametersInfoForDpi;
+        use windows::Win32::UI::WindowsAndMessaging::{NONCLIENTMETRICSW, SPI_GETNONCLIENTMETRICS, WM_SETFONT};
+        let k = ui_rel();
+        let want = ((k * 100.0).round() as i32, dpi_of(self.owner));
+        if self.font.as_ref().map(|f| (f.0, f.1)) == Some(want) || (self.font.is_none() && want.0 == 100) {
+            return;
+        }
+        unsafe {
+            let font = if want.0 == 100 {
+                None
+            } else {
+                let mut m = NONCLIENTMETRICSW { cbSize: std::mem::size_of::<NONCLIENTMETRICSW>() as u32, ..Default::default() };
+                let _ = SystemParametersInfoForDpi(SPI_GETNONCLIENTMETRICS.0, m.cbSize, Some(&mut m as *mut _ as _), 0, want.1);
+                let mut lf = m.lfStatusFont;
+                lf.lfHeight = (lf.lfHeight as f32 * k).round() as i32;
+                Some(CreateFontIndirectW(&lf))
+            };
+            SendMessageW(hwnd, WM_SETFONT, WPARAM(font.map_or(0, |f| f.0 as usize)), LPARAM(0));
+            if let Some((.., old)) = self.font.take() {
+                let _ = DeleteObject(old);
+            }
+            self.font = font.map(|f| (want.0, want.1, f));
+        }
     }
 
     /// The tooltip window, made if it isn't yet (None in test mode).
@@ -349,6 +391,7 @@ impl Tip {
         };
         self.text = Some(text.to_string());
         let Some(hwnd) = self.window() else { return };
+        self.sized_font(hwnd);
         let w: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
         let ti = TTTOOLINFOW {
             cbSize: std::mem::size_of::<TTTOOLINFOW>() as u32,
