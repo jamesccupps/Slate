@@ -23,6 +23,15 @@ pub enum Cmd {
     /// File → Open selected file or link: the selection (or the name at the caret) as a file in a tab, or a web
     /// link in the browser (`crate::links`, issue #7).
     OpenSelection,
+    /// View → Find bar → At the bottom (`Settings::bars_at_bottom`, issue #9).
+    ToggleBarsAtBottom,
+    /// View → Hide the menu bar (`Settings::hide_menu_bar`, issue #10).
+    ToggleHideMenuBar,
+    /// Edit → Go back / Go forward: where the caret jumped from (`edit::Nav`, issue #11).
+    GoBack,
+    GoForward,
+    /// File → Reopen files where you left them (`Settings::reopen_where_left`).
+    ToggleReopenWhereLeft,
     /// The text's menu's Open “name”: what's at this place (`links::target_in`).
     OpenAt(u64),
     OpenRecent(usize),
@@ -286,6 +295,8 @@ pub fn editor_key(vk: u16, m: &Mods) -> Option<Cmd> {
         return match k {
             VK_UP if !m.shift => Some(Cmd::MoveLineUp),
             VK_DOWN if !m.shift => Some(Cmd::MoveLineDown),
+            VK_LEFT if !m.shift => Some(Cmd::GoBack),
+            VK_RIGHT if !m.shift => Some(Cmd::GoForward),
             VK_OEM_4 if !m.shift => Some(Cmd::LineStartCarets),
             VK_OEM_6 if !m.shift => Some(Cmd::LineEndCarets),
             _ => None,
@@ -349,6 +360,11 @@ const IDS: &[(&str, Cmd)] = &[
     ("new-tab", Cmd::NewTab),
     ("open", Cmd::Open),
     ("open-selection", Cmd::OpenSelection),
+    ("bars-at-bottom", Cmd::ToggleBarsAtBottom),
+    ("hide-menu-bar", Cmd::ToggleHideMenuBar),
+    ("reopen-where-left", Cmd::ToggleReopenWhereLeft),
+    ("go-back", Cmd::GoBack),
+    ("go-forward", Cmd::GoForward),
     ("reopen-closed", Cmd::ReopenClosed),
     ("save", Cmd::Save),
     ("save-as", Cmd::SaveAs),

@@ -628,6 +628,8 @@ pub struct App {
     pub keyboard_cues: bool,
     /// Tabs closed recently (with a file), the last one closed last; Ctrl+Shift+T opens them again.
     pub closed_tabs: Vec<ClosedTab>,
+    /// Go back and Go forward's places (Alt+Left, Alt+Right; issue #11).
+    pub nav: crate::edit::Nav,
     /// The only tab, which the user is closing with View → Close Slate with the last tab on: once it's gone (after
     /// its question, or its save), Slate closes (`remove_tab`).
     pub quit_with_tab: Option<u64>,
@@ -777,6 +779,7 @@ impl App {
             overtype: false,
             keyboard_cues: super::actions::keyboard_cues(),
             closed_tabs: Vec::new(),
+            nav: Default::default(),
             quit_with_tab: None,
             find_owner: 0,
             keymap: crate::shortcuts::Keymap::new(&crate::shortcuts::read()),
@@ -935,14 +938,20 @@ impl App {
         } else {
             [Rect::default(); 3]
         };
-        self.r_menu = band(y, metrics::MENU_BAR_H);
-        y += metrics::MENU_BAR_H;
+        // (hidden unless Alt gave it the keyboard or a menu is open: View → Hide the menu bar)
+        let mh = if self.menu_bar_shown() { metrics::MENU_BAR_H } else { 0.0 };
+        self.r_menu = band(y, mh);
+        y += mh;
         let fh = self.find.height();
-        self.r_find = band(y, fh);
-        y += fh;
         let nh = if self.tabs.get(self.active).is_some_and(|t| t.notice.is_some()) { metrics::NOTICE_H } else { 0.0 };
-        self.r_notice = band(y, nh);
-        y += nh;
+        let bottom = self.settings.bars_at_bottom;
+        self.find.at_bottom = bottom;
+        if !bottom {
+            self.r_find = band(y, fh);
+            y += fh;
+            self.r_notice = band(y, nh);
+            y += nh;
+        }
         let json = self.tabs.get(self.active).is_some_and(|t| t.lang.has_structure());
         let ph = if json && self.settings.path_bar { super::structure::PATH_H } else { 0.0 };
         self.r_path = band(y, ph);
@@ -950,7 +959,17 @@ impl App {
         let sh = metrics::STATUS_H;
         let sy = snap((h - sh).max(y));
         self.r_status = Rect::new(0.0, sy, w, (h - sy).max(sh));
-        let body_h = (sy - y).max(0.0);
+        // (View → Find bar → At the bottom: the find bar, then a notice, above the status bar; the text's top stays put
+        // as they open and close, issue #9)
+        let mut end = sy;
+        if bottom {
+            let fy = snap((sy - fh).max(y));
+            self.r_find = Rect::new(0.0, fy, w, sy - fy);
+            let ny = snap((fy - nh).max(y));
+            self.r_notice = Rect::new(0.0, ny, w, fy - ny);
+            end = ny;
+        }
+        let body_h = (end - y).max(0.0);
         if json && self.settings.structure_panel {
             let pw = self.settings.structure_width.clamp(200.0, panel_max(w));
             let x = snap((w - pw).max(0.0));
@@ -1044,7 +1063,7 @@ impl App {
         let mut x = self.r_menu.x + 6.0;
         for t in MENU_TITLES {
             let (w, _) = self.g.measure(t, &self.fonts.ui);
-            let r = Rect::new(x, self.r_menu.y + 3.0, w + 20.0, self.r_menu.h - 6.0);
+            let r = Rect::new(x, self.r_menu.y + 3.0, w + 20.0, (self.r_menu.h - 6.0).max(0.0));
             self.menu_rects.push(r);
             x += w + 22.0;
         }
@@ -1052,7 +1071,7 @@ impl App {
         self.theme_rect = if self.theme.hc {
             Rect::default()
         } else {
-            Rect::new(self.r_menu.right() - 44.0, self.r_menu.y + 3.0, 34.0, self.r_menu.h - 6.0)
+            Rect::new(self.r_menu.right() - 44.0, self.r_menu.y + 3.0, 34.0, (self.r_menu.h - 6.0).max(0.0))
         };
     }
 
@@ -1472,6 +1491,10 @@ impl App {
     }
 
     fn paint_menu(&mut self) {
+        // (hidden: View → Hide the menu bar)
+        if self.r_menu.h <= 0.0 {
+            return;
+        }
         let t = &self.theme;
         let g = &self.g;
         g.fill(self.r_menu, t.surface);
@@ -1502,10 +1525,16 @@ impl App {
         if self.theme_rect.w > 0.0 {
             g.text(glyph, &self.fonts.icons, self.theme_rect, t.text_dim, Align::Center);
         }
-        if self.find.open || self.tab().notice.is_some() {
+        if self.bar_under_menu() {
             return;
         }
         g.hline(0.0, self.r_menu.right(), self.r_menu.bottom(), true, t.border);
+    }
+
+    /// Whether a bar right under the menu bar draws the line there (the find bar or a notice, unless they're at the
+    /// bottom).
+    fn bar_under_menu(&self) -> bool {
+        !self.settings.bars_at_bottom && (self.find.open || self.tab().notice.is_some())
     }
 
     fn paint_notice(&mut self) {
@@ -1518,7 +1547,7 @@ impl App {
         let Some(n) = self.tabs[self.active].notice.as_ref() else { return };
         let g = &self.g;
         g.fill(r, t.notice_bg);
-        g.hline(r.x, r.right(), r.bottom(), true, t.border);
+        g.hline(r.x, r.right(), if self.settings.bars_at_bottom { r.y } else { r.bottom() }, true, t.border);
         let icon = match n.kind {
             NoticeKind::Info => "\u{E946}",
             NoticeKind::Warn => "\u{E7BA}",

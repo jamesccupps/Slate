@@ -17,6 +17,17 @@ pub enum ThemeMode {
     Dark,
 }
 
+/// Where the caret was in a file when its tab closed (`Settings::places`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FilePlace {
+    pub path: PathBuf,
+    pub caret: u64,
+    pub top: u64,
+}
+
+/// Files whose place is kept (`Settings::places`).
+pub const PLACES_MAX: usize = 300;
+
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Placement {
     pub x: i32,
@@ -37,6 +48,8 @@ pub struct Settings {
     pub line_numbers: bool,
     /// Dots for spaces, arrows for tabs, marks for line breaks.
     pub show_whitespace: bool,
+    /// View → Hide the menu bar (issue #10): it shows while Alt (or F10) gives it the keyboard, or a menu is open.
+    pub hide_menu_bar: bool,
     /// Words spelled wrong underlined (`crate::spell`).
     pub spell_check: bool,
     /// Windows: the tabs in the title bar, as in Windows 11's Notepad (Windows' own title bar in high contrast).
@@ -50,6 +63,9 @@ pub struct Settings {
     /// View → Find bar → One for each tab: each tab keeps its find bar open or closed, a new one's closed; the
     /// search itself is shared. Off: one bar for the window, open whichever tab shows.
     pub find_per_tab: bool,
+    /// View → Find bar → At the bottom (issue #9): the find bar and a tab's notice sit above the status bar, so opening
+    /// them doesn't move the text.
+    pub bars_at_bottom: bool,
     /// Edit → Multiple cursors → Use multiple cursors: Ctrl+click and the Multiple cursors commands make more than one
     /// (issue #5). Off: Ctrl+click does what it always did and the commands only say how to turn it on.
     pub multi_cursor: bool,
@@ -58,6 +74,11 @@ pub struct Settings {
     pub use_spaces: bool,
     pub json_indent: u32,
     pub restore_session: bool,
+    /// File → Reopen files where you left them: a file opened again starts where its caret and scroll were when its
+    /// tab closed (`places`, issue #11).
+    pub reopen_where_left: bool,
+    /// Those places, newest first (`PLACES_MAX`).
+    pub places: Vec<FilePlace>,
     /// JSON: the path bar above the text, and the structure panel (with its width in DIPs).
     pub path_bar: bool,
     pub structure_panel: bool,
@@ -95,17 +116,21 @@ impl Default for Settings {
             wrap: true,
             line_numbers: true,
             show_whitespace: false,
+            hide_menu_bar: false,
             spell_check: true,
             tabs_in_title_bar: true,
             close_with_last_tab: false,
             find_close_on_leave: false,
             find_per_tab: false,
+            bars_at_bottom: false,
             multi_cursor: false,
             theme: ThemeMode::System,
             tab_size: 4,
             use_spaces: true,
             json_indent: 2,
             restore_session: true,
+            reopen_where_left: true,
+            places: Vec::new(),
             path_bar: true,
             structure_panel: false,
             structure_width: 340.0,
@@ -379,6 +404,24 @@ impl Settings {
             format!("Files ending in .{ext} get their language the usual way again")
         };
         (msg, on)
+    }
+
+    /// Notes where the caret and the top of the view were in `path` as its tab closes (issue #11): one place per file,
+    /// newest first; none for the start of the file.
+    pub fn remember_place(&mut self, path: &std::path::Path, caret: u64, top: u64) {
+        if !self.reopen_where_left || path.to_str().is_none() {
+            return;
+        }
+        self.places.retain(|p| p.path != path);
+        if caret > 0 || top > 0 {
+            self.places.insert(0, FilePlace { path: path.to_path_buf(), caret, top });
+            self.places.truncate(PLACES_MAX);
+        }
+    }
+
+    /// Where `path` was left (caret, top), if it's to be opened there.
+    pub fn place_of(&self, path: &std::path::Path) -> Option<(u64, u64)> {
+        self.places.iter().find(|p| p.path == path).filter(|_| self.reopen_where_left).map(|p| (p.caret, p.top))
     }
 
     pub fn indent_unit(&self) -> Vec<u8> {

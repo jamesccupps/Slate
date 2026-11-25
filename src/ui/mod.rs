@@ -261,6 +261,10 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
         }
         // Screen readers hear what changed (only while they listen).
         uia::after(&cell);
+        // (Go back's places follow the caret)
+        if let Ok(mut a) = cell.try_borrow_mut() {
+            a.note_spot();
+        }
         r
     });
     match r {

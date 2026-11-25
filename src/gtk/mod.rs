@@ -111,6 +111,13 @@ pub struct Ui {
     /// View's JSON or XML items (the structure panel and the path bar), for the language they're shown for.
     view_extra: gio::Menu,
     view_extra_for: Cell<Option<Lang>>,
+    /// The menu bar's row (with the theme button), and its menus (View → Hide the menu bar: shown while Alt opens one).
+    menu_row: gtk4::Box,
+    menu_items: Rc<Vec<glib::WeakRef<gtk4::Widget>>>,
+    /// Alt is down with no other key since: letting it go opens the hidden menu bar's first menu.
+    alt_alone: Cell<bool>,
+    /// The find bar and the notice are above the status bar (View → Find bar → At the bottom).
+    bars_bottom: Cell<bool>,
     /// Format → Language's last item: Always open .x files as … (the tab's ending and language it's for).
     lang_extra: gio::Menu,
     lang_extra_for: RefCell<Option<(String, Lang)>>,
@@ -845,6 +852,7 @@ pub fn window(application: &gtk4::Application, test: Option<Rc<testmode::Test>>)
     menu_row.append(&theme_btn);
     let root = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
     root.append(&menu_row);
+    menu_row.set_visible(!settings.hide_menu_bar);
     // Tabs in the title bar (the setting as Slate starts): the strip and the desktop's own window buttons are the
     // window's title bar, which GTK draws; else the strip goes under the menu bar.
     if settings.tabs_in_title_bar {
@@ -940,6 +948,10 @@ pub fn window(application: &gtk4::Application, test: Option<Rc<testmode::Test>>)
         struct_timer: Cell::new(false),
         view_extra: view_extra.clone(),
         view_extra_for: Cell::new(None),
+        menu_row: menu_row.clone(),
+        menu_items: Rc::new(items.iter().map(|w| w.downgrade()).collect()),
+        alt_alone: Cell::new(false),
+        bars_bottom: Cell::new(false),
         lang_extra: lang_extra.clone(),
         lang_extra_for: RefCell::new(None),
         syncing: Cell::new(false),
@@ -966,6 +978,7 @@ pub fn window(application: &gtk4::Application, test: Option<Rc<testmode::Test>>)
     UI.with(|u| *u.borrow_mut() = Some(ui.clone()));
     connect(&ui, &prev, &next, &lines_btn, &marks_btn, &close_find, &replace_one, &replace_all, &notice_close);
     actions(&ui);
+    hidden_menu_keys(&ui);
     // timers: the caret (while it blinks), files changed by other programs, the session
     ui.wake_blink();
     glib::timeout_add_local(Duration::from_secs(2), || {
@@ -1620,6 +1633,9 @@ fn commands() -> Vec<(&'static str, Cmd, &'static [&'static str])> {
     vec![
         ("new-tab", Cmd::NewTab, &["<Control>n", "<Control>t"]),
         ("open-selection", Cmd::OpenSelection, &[]),
+        ("reopen-where-left", Cmd::ReopenWhereLeft, &[]),
+        ("go-back", Cmd::GoBack, &["<Alt>Left"]),
+        ("go-forward", Cmd::GoForward, &["<Alt>Right"]),
         ("open", Cmd::Open, &["<Control>o"]),
         ("save", Cmd::Save, &["<Control>s"]),
         ("save-as", Cmd::SaveAs, &["<Control><Shift>s"]),
@@ -1670,6 +1686,8 @@ fn commands() -> Vec<(&'static str, Cmd, &'static [&'static str])> {
         ("xml-check", Cmd::XmlCheck, &[]),
         ("wrap", Cmd::Wrap, &["<Alt>z"]),
         ("char-info", Cmd::CharInfo, &[]),
+        ("hide-menu-bar", Cmd::HideMenuBar, &[]),
+        ("bars-at-bottom", Cmd::BarsAtBottom, &[]),
         ("lang-for-ending", Cmd::LangForEnding, &[]),
         ("line-numbers", Cmd::LineNumbers, &[]),
         ("zoom-in", Cmd::ZoomIn, &["<Control>plus", "<Control>equal", "<Control>KP_Add"]),
@@ -1815,7 +1833,7 @@ pub fn action_for_accel(ui: &Ui, accel: &str) -> Option<String> {
 
 /// Menu items that show a check mark: their actions have a true/false state (`Ui::sync_menu`).
 const CHECKED: &[&str] =
-    &["wrap", "line-numbers", "show-whitespace", "spell-check", "title-bar-tabs", "close-with-last-tab", "find-close-on-leave", "find-per-tab", "multi-cursor", "theme-system", "theme-light", "theme-dark", "eol-lf", "eol-crlf", "read-only", "restore-session", "structure-panel", "path-bar", "lang-for-ending"];
+    &["wrap", "line-numbers", "show-whitespace", "spell-check", "title-bar-tabs", "close-with-last-tab", "find-close-on-leave", "find-per-tab", "multi-cursor", "theme-system", "theme-light", "theme-dark", "eol-lf", "eol-crlf", "read-only", "restore-session", "structure-panel", "path-bar", "lang-for-ending", "reopen-where-left", "hide-menu-bar", "bars-at-bottom"];
 
 fn actions(ui: &Rc<Ui>) {
     // (in place of the window's own "win" group: menus and shortcuts find these the same way)
@@ -2014,6 +2032,53 @@ fn menus_beside(window: &gtk4::ApplicationWindow, items: &[gtk4::Widget]) {
     window.add_controller(keys);
 }
 
+/// View → Hide the menu bar (issue #10): Alt on its own opens the first menu, Alt and a menu's letter that menu (a
+/// hidden menu bar's letters aren't GTK's), the bar showing while one is; it hides again once they're all closed.
+fn hidden_menu_keys(ui: &Rc<Ui>) {
+    let alt = |k: gdk::Key| matches!(k, gdk::Key::Alt_L | gdk::Key::Alt_R | gdk::Key::Meta_L | gdk::Key::Meta_R);
+    let others = gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::SHIFT_MASK | gdk::ModifierType::SUPER_MASK;
+    let keys = gtk4::EventControllerKey::new();
+    keys.set_propagation_phase(gtk4::PropagationPhase::Capture);
+    keys.connect_key_pressed(move |_, key, _, state| {
+        let Some(ui) = get_ui() else { return glib::Propagation::Proceed };
+        ui.alt_alone.set(alt(key) && !state.intersects(others));
+        let hidden = ui.app.try_borrow().is_ok_and(|a| a.settings.hide_menu_bar) && !ui.menu_row.is_visible();
+        if !hidden || !state.contains(gdk::ModifierType::ALT_MASK) || state.intersects(others) {
+            return glib::Propagation::Proceed;
+        }
+        // (the letters of _File, _Edit, _View, F_ormat, _Help)
+        let i = match key.to_lower() {
+            gdk::Key::f => 0,
+            gdk::Key::e => 1,
+            gdk::Key::v => 2,
+            gdk::Key::o => 3,
+            gdk::Key::h => 4,
+            _ => return glib::Propagation::Proceed,
+        };
+        ui.open_hidden_menu(i);
+        glib::Propagation::Stop
+    });
+    keys.connect_key_released(move |_, key, _, _| {
+        let Some(ui) = get_ui() else { return };
+        if alt(key) && ui.alt_alone.replace(false) && ui.app.try_borrow().is_ok_and(|a| a.settings.hide_menu_bar) {
+            ui.open_hidden_menu(0);
+        }
+    });
+    ui.window.add_controller(keys);
+    // (each menu closing: hidden again, unless another opens)
+    for w in ui.menu_items.iter().filter_map(|w| w.upgrade()) {
+        if let Some(pop) = popover_of(&w) {
+            pop.connect_closed(|_| {
+                glib::timeout_add_local_once(Duration::from_millis(300), || {
+                    if let Some(ui) = get_ui() {
+                        ui.hide_menu_row_if_idle();
+                    }
+                });
+            });
+        }
+    }
+}
+
 /// A menu bar item's menu.
 fn popover_of(item: &gtk4::Widget) -> Option<gtk4::PopoverMenu> {
     let mut child = item.first_child();
@@ -2066,12 +2131,16 @@ fn menu_model(recent: &gio::Menu, format_extra: &gio::Menu, view_extra: &gio::Me
         None,
         &section(&[("Close tab", "close-tab"), ("Close other tabs", "close-others"), ("Close saved tabs", "close-saved"), ("Close all tabs", "close-all")]),
     );
-    file.append_section(None, &section(&[("Restore last session", "restore-session"), ("Quit", "quit")]));
+    file.append_section(
+        None,
+        &section(&[("Restore last session", "restore-session"), ("Reopen files where you left them", "reopen-where-left"), ("Quit", "quit")]),
+    );
     bar.append_submenu(Some("_File"), &file);
     let edit = gio::Menu::new();
     edit.append_section(None, &section(&[("Undo", "undo"), ("Redo", "redo")]));
     edit.append_section(None, &section(&[("Cut", "cut"), ("Copy", "copy"), ("Paste", "paste"), ("Select all", "select-all")]));
     edit.append_section(None, &section(&[("Find…", "find"), ("Replace…", "replace"), ("Find next", "find-next"), ("Find previous", "find-prev"), ("Go to line…", "goto-line")]));
+    edit.append_section(None, &section(&[("Go back", "go-back"), ("Go forward", "go-forward")]));
     edit.append_section(None, &section(&[("Go to matching bracket", "goto-bracket"), ("Select inside brackets", "select-brackets")]));
     let marks = section(&[("Toggle bookmark", "toggle-bookmark"), ("Next bookmark", "next-bookmark"), ("Previous bookmark", "prev-bookmark")]);
     marks.append_section(None, &section(&[("Clear bookmarks", "clear-bookmarks")]));
@@ -2113,13 +2182,18 @@ fn menu_model(recent: &gio::Menu, format_extra: &gio::Menu, view_extra: &gio::Me
         ("Word wrap", "wrap"),
         ("Line numbers", "line-numbers"),
         ("Show whitespace", "show-whitespace"),
+        ("Hide the menu bar", "hide-menu-bar"),
         ("Spell check", "spell-check"),
         ("Next word spelled wrong", "next-misspelling"),
         ("Tabs in the title bar", "title-bar-tabs"),
         ("Close Slate with the last tab", "close-with-last-tab"),
         ("Character at the caret", "char-info"),
     ]);
-    let find_bar = section(&[("Close when you click in the text", "find-close-on-leave"), ("One for each tab", "find-per-tab")]);
+    let find_bar = section(&[
+        ("Close when you click in the text", "find-close-on-leave"),
+        ("One for each tab", "find-per-tab"),
+        ("At the bottom (notices too)", "bars-at-bottom"),
+    ]);
     first.insert_submenu(6, Some("Find bar"), &find_bar);
     view.append_section(None, &first);
     view.append_section(None, &section(&[("Show only matching lines", "filter-lines"), ("Show lines not matching", "filter-lines-not"), ("Clear highlights", "clear-highlights")]));
@@ -2504,6 +2578,7 @@ impl Ui {
     }
 
     fn save_settings(&self, a: &mut App) {
+        a.remember_places();
         let (w, h) = self.window.default_size();
         a.settings.window = Some(crate::settings::Placement { x: 0, y: 0, w, h, maximized: self.window.is_maximized() });
         if crate::settings::persist() {
@@ -3171,6 +3246,7 @@ impl Ui {
         self.css_dark.set(Some(dark));
         let css = format!(
             ".slate-bar {{ background-color: {frame}; padding: 6px 10px; border-bottom: 1px solid {border}; }}
+             .slate-bar.slate-bottom {{ border-bottom: none; border-top: 1px solid {border}; }}
              .slate-bar button.toggle {{ min-width: 0; padding-left: 6px; padding-right: 6px; }}
              .slate-notice {{ background-color: {notice}; color: {text}; padding: 6px 12px; }}
              .slate-notice label {{ color: {text}; }}
@@ -3252,6 +3328,10 @@ impl Ui {
     }
 
     fn refresh_now(&self) {
+        // (Go back's places follow the caret: after every change, which all end here)
+        if let Ok(mut a) = self.app.try_borrow_mut() {
+            a.note_spot();
+        }
         loop {
             let asks = match self.app.try_borrow_mut() {
                 Ok(mut a) => std::mem::take(&mut a.asks),
@@ -3438,6 +3518,42 @@ impl Ui {
 
     /// The menus' check marks and dots follow the app: Word wrap, Line numbers, the theme, the tab's line breaks and
     /// language.
+    /// View → Find bar → At the bottom (issue #9): the notice, then the find bar, just above the status bar; else under
+    /// the menu bar (and the tab strip) as usual. Opening them then doesn't move the text.
+    fn place_bars(&self, bottom: bool) {
+        if self.bars_bottom.replace(bottom) == bottom {
+            return;
+        }
+        let Some(root) = self.find_box.parent().and_then(|p| p.downcast::<gtk4::Box>().ok()) else { return };
+        if bottom {
+            root.reorder_child_after(&self.notice, Some(&self.hbar));
+            root.reorder_child_after(&self.find_box, Some(&self.notice));
+            self.find_box.add_css_class("slate-bottom");
+        } else {
+            // (the path bar's neighbor above them now: the tab strip, or the menu bar)
+            let above = self.path_bar.prev_sibling();
+            root.reorder_child_after(&self.find_box, above.as_ref());
+            root.reorder_child_after(&self.notice, Some(&self.find_box));
+            self.find_box.remove_css_class("slate-bottom");
+        }
+    }
+
+    /// View → Hide the menu bar: the bar shows, and menu `i` opens.
+    fn open_hidden_menu(&self, i: usize) {
+        self.menu_row.set_visible(true);
+        MENU_NEXT.set(Some(i));
+        open_menu_soon(self.menu_items.clone(), 5);
+    }
+
+    /// The hidden menu bar goes once no menu of it is open (or on its way).
+    fn hide_menu_row_if_idle(&self) {
+        let hide = self.app.try_borrow().is_ok_and(|a| a.settings.hide_menu_bar);
+        let open = MENU_NEXT.get().is_some() || self.menu_items.iter().filter_map(|w| w.upgrade()).any(|w| popover_of(&w).is_some_and(|p| p.is_visible()));
+        if hide && !open {
+            self.menu_row.set_visible(false);
+        }
+    }
+
     fn sync_menu(&self, a: &App) {
         let tab = a.tab();
         let theme = a.settings.theme;
@@ -3461,11 +3577,25 @@ impl Ui {
             ("read-only", tab.read_only || tab.filter.is_some()),
             ("restore-session", a.settings.restore_session),
             ("lang-for-ending", tab.ending().is_some_and(|e| a.settings.lang_for_ending(&e) == Some(tab.lang))),
+            ("reopen-where-left", a.settings.reopen_where_left),
+            ("hide-menu-bar", a.settings.hide_menu_bar),
+            ("bars-at-bottom", a.settings.bars_at_bottom),
         ];
         for (name, on) in checks {
             self.set_action_state(name, on.to_variant());
         }
         self.set_action_state("set-lang", tab.lang.label().to_variant());
+        self.place_bars(a.settings.bars_at_bottom);
+        // View → Hide the menu bar: shown again at once; hidden once its menus are closed
+        if !a.settings.hide_menu_bar && !self.menu_row.is_visible() {
+            self.menu_row.set_visible(true);
+        } else if a.settings.hide_menu_bar && self.menu_row.is_visible() {
+            glib::timeout_add_local_once(Duration::from_millis(300), || {
+                if let Some(ui) = get_ui() {
+                    ui.hide_menu_row_if_idle();
+                }
+            });
+        }
         self.set_action_state("save-encoding", encoding_key(tab.doc.encoding).to_variant());
         self.set_action_state("indent", if tab.indent == crate::edit::Indent::Tabs { "tabs" } else { "spaces" }.to_variant());
         let width = match tab.indent {

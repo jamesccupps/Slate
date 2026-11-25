@@ -400,9 +400,11 @@ impl App {
             }
             Goto::Place { caret, top } => {
                 tab.goto = None;
+                // (the file may be shorter now)
+                let len = tab.doc.len();
                 let v = &mut tab.view;
-                v.sel = Sel::at(editor::char_start(&tab.doc, caret));
-                v.top = editor::char_start(&tab.doc, top);
+                v.sel = Sel::at(editor::char_start(&tab.doc, caret.min(len)));
+                v.top = editor::char_start(&tab.doc, top.min(len));
                 v.upstream = false;
                 v.want_x = None;
                 self.restart_caret();
@@ -450,6 +452,7 @@ impl App {
             drop(t);
             let _ = std::fs::remove_file(&path);
         } else if let (Some(path), Some(_), None) = (&t.doc.path, t.doc.disk, &t.title_override) {
+            self.settings.remember_place(path, t.view.sel.caret, t.view.top);
             self.closed_tabs.retain(|c| &c.path != path);
             self.closed_tabs.push(ClosedTab { path: path.clone(), caret: t.view.sel.caret, top: t.view.top });
             if self.closed_tabs.len() > 20 {
@@ -622,10 +625,13 @@ impl App {
         // Opening into a single blank tab replaces it, like Notepad.
         let replace_blank = self.tabs.len() == 1 && self.tabs[0].is_blank();
         let from = self.tabs.get(self.active).map(|t| t.id).filter(|_| !replace_blank);
+        // (where it was left, unless it's a tab from the session, which has its own place)
+        let left = if place.is_none() { self.settings.place_of(&p) } else { None };
         let mut doc = Document::new();
         doc.path = Some(p);
         let mut i = self.add_tab(doc);
         self.tabs[i].opened_from = from;
+        self.tabs[i].goto = left.map(|(caret, top)| Goto::Place { caret, top });
         if replace_blank && i == 1 {
             self.tabs.remove(0);
             self.active = 0;
@@ -2656,6 +2662,44 @@ impl App {
         self.after_edit();
     }
 
+    /// Go back's places follow the caret (`edit::Nav`): after each message, and each test-mode step.
+    pub fn note_spot(&mut self) {
+        let Some(tab) = self.tabs.get(self.active) else { return };
+        let now = crate::edit::Spot { tab: tab.id, pos: tab.view.sel.caret };
+        self.nav.note(now, &tab.doc);
+    }
+
+    /// Edit → Go back (`back`) or Go forward (issue #11): to the tab and place the caret jumped from.
+    fn go_nav(&mut self, back: bool) {
+        let tab = self.tab();
+        let now = crate::edit::Spot { tab: tab.id, pos: tab.view.sel.caret };
+        let ids: Vec<u64> = self.tabs.iter().map(|t| t.id).collect();
+        match self.nav.go(back, now, |t| ids.contains(&t)) {
+            Some(s) => {
+                if let Some(k) = self.tabs.iter().position(|t| t.id == s.tab) {
+                    self.activate(k);
+                }
+                let doc = &self.tab().doc;
+                let pos = editor::char_start(doc, s.pos.min(doc.len()));
+                self.go_to(pos, true);
+            }
+            None => self.flash(if back { "Nothing to go back to" } else { "Nothing to go forward to" }, false),
+        }
+    }
+
+    /// Notes where each tab's file was left (File → Reopen files where you left them), as Slate closes.
+    pub fn remember_places(&mut self) {
+        let places: Vec<(PathBuf, u64, u64)> = self
+            .tabs
+            .iter()
+            .filter(|t| t.doc.disk.is_some() && t.title_override.is_none())
+            .filter_map(|t| Some((t.doc.path.clone()?, t.view.sel.caret, t.view.top)))
+            .collect();
+        for (p, caret, top) in places.into_iter().rev() {
+            self.settings.remember_place(&p, caret, top);
+        }
+    }
+
     /// File → Open selected file or link (issue #7; `at`: the text's menu's place, see `links::target_in`): a file in a
     /// tab of its own (at its line, for `name:12`), opened as Open does it; a web link in the browser. Never runs a
     /// program.
@@ -2838,11 +2882,27 @@ impl App {
     /// Pressing Alt again leaves it.
     pub fn toggle_menu_bar(&mut self) {
         self.menu_armed = if self.menu_armed.is_some() { None } else { Some(0) };
+        self.menu_bar_changed();
         self.invalidate();
     }
 
     pub fn disarm_menu_bar(&mut self) {
         if self.menu_armed.take().is_some() {
+            self.menu_bar_changed();
+            self.invalidate();
+        }
+    }
+
+    /// Whether the menu bar shows: always, unless View → Hide the menu bar is on (issue #10); then while Alt has given
+    /// it the keyboard or one of its menus is open.
+    pub fn menu_bar_shown(&self) -> bool {
+        !self.settings.hide_menu_bar || self.menu_armed.is_some() || self.menu_open.is_some()
+    }
+
+    /// The window laid out again when the menu bar shows or hides (`menu_bar_shown`).
+    fn menu_bar_changed(&mut self) {
+        if (self.r_menu.h > 0.0) != self.menu_bar_shown() {
+            self.layout();
             self.invalidate();
         }
     }
@@ -4971,6 +5031,29 @@ impl App {
                 self.settings_changed();
             }
             Cmd::OpenSelection => self.open_selection(None),
+            Cmd::ToggleBarsAtBottom => {
+                self.settings.bars_at_bottom = !self.settings.bars_at_bottom;
+                self.settings_changed();
+                self.invalidate();
+            }
+            Cmd::ToggleHideMenuBar => {
+                self.settings.hide_menu_bar = !self.settings.hide_menu_bar;
+                self.settings.save();
+                self.menu_bar_changed();
+                if self.settings.hide_menu_bar {
+                    self.flash("The menu bar shows when you press Alt (View → Hide the menu bar brings it back)", false);
+                }
+            }
+            Cmd::GoBack => self.go_nav(true),
+            Cmd::GoForward => self.go_nav(false),
+            Cmd::ToggleReopenWhereLeft => {
+                // (off: what was kept goes too)
+                self.settings.reopen_where_left = !self.settings.reopen_where_left;
+                if !self.settings.reopen_where_left {
+                    self.settings.places.clear();
+                }
+                self.settings.save();
+            }
             Cmd::OpenAt(p) => self.open_selection(Some(p)),
             Cmd::Suggestion(i) => self.spell_replace(i as usize),
             Cmd::SuggestionAll(i) => self.spell_replace_all(i as usize),
@@ -5539,6 +5622,7 @@ impl App {
                     item(Cmd::CloseAll, "Close all ta&bs", ""),
                     Item::Sep,
                     check(Cmd::ToggleRestoreSession, "Restore last sess&ion", "", s.restore_session),
+                    check(Cmd::ToggleReopenWhereLeft, "Reopen files where you left the&m", "", s.reopen_where_left),
                     item(Cmd::Exit, "E&xit", "Alt+F4"),
                 ]
             }
@@ -5559,6 +5643,8 @@ impl App {
                 item(Cmd::GoToBracket, "Go to matching &bracket", "Ctrl+M"),
                 // (no letter: every one in it is another item's)
                 item(Cmd::SelectBrackets, "Select inside brackets", "Ctrl+Shift+M"),
+                item(Cmd::GoBack, "Go back", "Alt+Left"),
+                item(Cmd::GoForward, "Go forward", "Alt+Right"),
                 sub(
                     "Boo&kmarks",
                     vec![
@@ -5637,6 +5723,7 @@ impl App {
                     check(Cmd::ToggleWrap, "&Word wrap", "Alt+Z", s.wrap),
                     check(Cmd::ToggleLineNumbers, "&Line numbers", "", s.line_numbers),
                     check(Cmd::ToggleWhitespace, "Show w&hitespace", "", s.show_whitespace),
+                    check(Cmd::ToggleHideMenuBar, "Hide the men&u bar", "", s.hide_menu_bar),
                     check(Cmd::ToggleTitleBarTabs, "&Tabs in the title bar", "", s.tabs_in_title_bar && !self.theme.hc),
                     check(Cmd::ToggleCloseWithLastTab, "Close Slate with the last ta&b", "", s.close_with_last_tab),
                     sub(
@@ -5644,6 +5731,7 @@ impl App {
                         vec![
                             check(Cmd::ToggleFindCloseOnLeave, "&Close when you click in the text", "", s.find_close_on_leave),
                             check(Cmd::ToggleFindPerTab, "&One for each tab", "", s.find_per_tab),
+                            check(Cmd::ToggleBarsAtBottom, "At the &bottom (notices too)", "", s.bars_at_bottom),
                         ],
                     ),
                     check(Cmd::ToggleSpellCheck, if matches!(self.speller, Spelling::Unavailable) { "Spell chec&k (Windows has no dictionary for it)" } else { "Spell chec&k" }, "", s.spell_check),
@@ -6083,6 +6171,8 @@ fn show_menu_bar(cell: &Cell, mut idx: usize) {
         let (items, rect, rects_screen, hwnd) = {
             let mut a = cell.borrow_mut();
             a.menu_open = Some(idx);
+            // (a hidden menu bar shows while its menu is open: View → Hide the menu bar)
+            a.menu_bar_changed();
             a.hover = Hit::None;
             a.invalidate();
             let items = a.menu_items(idx);
@@ -6112,7 +6202,11 @@ fn show_menu_bar(cell: &Cell, mut idx: usize) {
             }
         }
         MENU_BAR.with(|b| b.borrow_mut().0.clear());
-        cell.borrow_mut().menu_open = None;
+        {
+            let mut a = cell.borrow_mut();
+            a.menu_open = None;
+            a.menu_bar_changed();
+        }
         cell.borrow().invalidate();
         if let Some(next) = MENU_SWITCH.with(|s| s.take()) {
             idx = next;
@@ -6908,6 +7002,7 @@ pub fn close_window(cell: &Cell) {
             return;
         }
         a.save_window_placement();
+        a.remember_places();
         a.end_waits();
         if restore {
             a.save_session();

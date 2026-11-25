@@ -299,3 +299,22 @@ jobs
 expect:lang=Lua
 cmd:LangForEnding
 expect:status=Files ending in .zzlua get their language the usual way again
+# View → Hide the menu bar (issue #10): it's back while Alt gives it the keyboard
+cmd:ToggleHideMenuBar
+expect:menubar=false
+altkey
+expect:menubar=true
+altkey
+expect:menubar=false
+cmd:ToggleHideMenuBar
+expect:menubar=true
+# View → Find bar → At the bottom (issue #9): under the text, which doesn't move as it opens
+cmd:Find
+expect:findplace=above the text, text at 110
+key:escape
+cmd:ToggleBarsAtBottom
+cmd:Find
+expect:findplace=under the text, text at 70
+key:escape
+expect:findplace=under the text, text at 70
+cmd:ToggleBarsAtBottom

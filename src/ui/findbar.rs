@@ -61,6 +61,8 @@ pub enum Part {
 
 pub struct FindBar {
     pub open: bool,
+    /// Above the status bar (View → Find bar → At the bottom): its border is along its top.
+    pub at_bottom: bool,
     pub mode: Mode,
     pub find_edit: HWND,
     pub replace_edit: HWND,
@@ -122,6 +124,7 @@ impl FindBar {
     pub fn new(parent: HWND) -> FindBar {
         FindBar {
             open: false,
+            at_bottom: false,
             mode: Mode::Find,
             find_edit: make_edit(parent, ID_FIND, "Find"),
             replace_edit: make_edit(parent, ID_REPLACE, "Replace with"),
@@ -366,7 +369,7 @@ impl FindBar {
             return;
         }
         g.fill(r, t.surface);
-        g.hline(r.x, r.right(), r.bottom(), true, t.border);
+        g.hline(r.x, r.right(), if self.at_bottom { r.y } else { r.bottom() }, true, t.border);
         // (borders a whole number of pixels thick, on the boxes' pixel edges: crisp at any scale)
         let hair = g.hair();
         for (h, b) in &self.inputs {

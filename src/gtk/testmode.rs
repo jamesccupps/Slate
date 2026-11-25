@@ -656,6 +656,25 @@ fn value(what: &str, test: &Test) -> String {
             ui.panel.is_visible(),
             ui.find_box.is_visible()
         ),
+        "menubar" => ui.menu_row.is_visible().to_string(),
+        // the window's rows from the top, of those that move (View → Find bar → At the bottom)
+        "bars" => {
+            let mut names = Vec::new();
+            let mut w = ui.find_box.parent().and_then(|p| p.first_child());
+            while let Some(c) = w {
+                if c == ui.find_box.clone().upcast::<gtk4::Widget>() {
+                    names.push("find");
+                } else if c == ui.notice.clone().upcast::<gtk4::Widget>() {
+                    names.push("notice");
+                } else if c == ui.path_bar.clone().upcast::<gtk4::Widget>() {
+                    names.push("path");
+                } else if c == ui.status.clone().upcast::<gtk4::Widget>() {
+                    names.push("status");
+                }
+                w = c.next_sibling();
+            }
+            names.join(", ")
+        }
         "indent" => format!("{:?}{}", tab.indent, if tab.indent_picked { " (picked)" } else { "" }),
         "font" => format!("{} {}", a.settings.font, a.settings.font_size),
         "settings" => format!(

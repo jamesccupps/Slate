@@ -627,6 +627,72 @@ pub fn block_edit(doc: &mut Document, b: &Block, tab: u32, what: BlockEdit) -> B
     after
 }
 
+// ---- go back and forward ----
+
+/// A place to go back to: a tab (its id) and a byte offset in its text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Spot {
+    pub tab: u64,
+    pub pos: u64,
+}
+
+/// A jump is a move to another tab, or more than this many lines away (or 64 KB).
+pub const NAV_LINES: usize = 15;
+
+/// Whether moving the caret from `a` to `b` in `doc` is a jump (`NAV_LINES`).
+pub fn far(doc: &Document, a: u64, b: u64) -> bool {
+    let (a, b) = (a.min(b).min(doc.len()), a.max(b).min(doc.len()));
+    b - a > 64 << 10 || doc.read(a, b).iter().filter(|&&c| c == b'\n').count() > NAV_LINES
+}
+
+/// Go back and Go forward (Alt+Left, Alt+Right; issue #11): the places the caret jumped away from, in any tab. The
+/// app tells it where the caret is after each change (`note`); a place in a tab that closed is skipped. (Places are
+/// byte offsets, not moved by edits made since: they land near where they were.)
+#[derive(Debug, Default)]
+pub struct Nav {
+    back: Vec<Spot>,
+    fwd: Vec<Spot>,
+    here: Option<Spot>,
+}
+
+impl Nav {
+    /// Places kept each way.
+    const MAX: usize = 100;
+
+    /// The caret is at `now` (in `doc`, its tab's text): a jump away from the place before puts that on the back list
+    /// (and forward's list goes, as in a browser).
+    pub fn note(&mut self, now: Spot, doc: &Document) {
+        if let Some(h) = self.here.filter(|&h| h != now) {
+            if h.tab != now.tab || far(doc, h.pos, now.pos) {
+                if self.back.last() != Some(&h) {
+                    self.back.push(h);
+                    if self.back.len() > Self::MAX {
+                        self.back.remove(0);
+                    }
+                }
+                self.fwd.clear();
+            }
+        }
+        self.here = Some(now);
+    }
+
+    /// Go back (`back`) or forward from `now`: where to go, in a tab `open` says is still there. None: nowhere.
+    pub fn go(&mut self, back: bool, now: Spot, open: impl Fn(u64) -> bool) -> Option<Spot> {
+        let (from, to) = if back { (&mut self.back, &mut self.fwd) } else { (&mut self.fwd, &mut self.back) };
+        while let Some(s) = from.pop() {
+            if open(s.tab) && s != now {
+                to.push(now);
+                if to.len() > Self::MAX {
+                    to.remove(0);
+                }
+                self.here = Some(s);
+                return Some(s);
+            }
+        }
+        None
+    }
+}
+
 // ---- multiple cursors ----
 
 /// The most cursors (each a caret or a selection) there can be at once.
@@ -3068,6 +3134,35 @@ mod caret_tests {
         assert_eq!(text(&doc), "a\n\n\n\ne\n");
         assert_eq!(c.count(), 3);
         assert_eq!(c.version, doc.version);
+    }
+
+    #[test]
+    fn going_back_and_forward() {
+        let doc = lf(&"line\n".repeat(100));
+        let mut nav = Nav::default();
+        let at = |tab, line: u64| Spot { tab, pos: line * 5 };
+        // small moves aren't jumps; a jump keeps where it came from
+        nav.note(at(1, 0), &doc);
+        nav.note(at(1, 3), &doc);
+        nav.note(at(1, 50), &doc);
+        nav.note(at(1, 52), &doc);
+        // another tab is a jump too
+        nav.note(at(2, 0), &doc);
+        let open = |_| true;
+        assert_eq!(nav.go(true, at(2, 0), open), Some(at(1, 52)));
+        nav.note(at(1, 52), &doc);
+        assert_eq!(nav.go(true, at(1, 52), open), Some(at(1, 3)));
+        nav.note(at(1, 3), &doc);
+        assert_eq!(nav.go(true, at(1, 3), open), None);
+        // forward retraces them
+        assert_eq!(nav.go(false, at(1, 3), open), Some(at(1, 52)));
+        nav.note(at(1, 52), &doc);
+        assert_eq!(nav.go(false, at(1, 52), open), Some(at(2, 0)));
+        // a jump after going back drops what was forward; a closed tab's places are passed over
+        nav.note(at(2, 0), &doc);
+        nav.note(at(2, 90), &doc);
+        assert_eq!(nav.go(false, at(2, 90), open), None);
+        assert_eq!(nav.go(true, at(2, 90), |t| t != 2), Some(at(1, 52)));
     }
 
     #[test]

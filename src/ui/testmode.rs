@@ -224,6 +224,11 @@ fn cmd_of(name: &str) -> Option<Cmd> {
         "ToggleWrap" => Cmd::ToggleWrap,
         "ToggleSpellCheck" => Cmd::ToggleSpellCheck,
         "OpenSelection" => Cmd::OpenSelection,
+        "GoBack" => Cmd::GoBack,
+        "ToggleBarsAtBottom" => Cmd::ToggleBarsAtBottom,
+        "ToggleHideMenuBar" => Cmd::ToggleHideMenuBar,
+        "ToggleReopenWhereLeft" => Cmd::ToggleReopenWhereLeft,
+        "GoForward" => Cmd::GoForward,
         "LangForEnding" => Cmd::LangForEnding,
         "ToggleTitleBarTabs" => Cmd::ToggleTitleBarTabs,
         "ToggleCloseWithLastTab" => Cmd::ToggleCloseWithLastTab,
@@ -598,6 +603,14 @@ fn describe(cell: &Cell, what: &str) -> String {
         "len" => a.tab().doc.len().to_string(),
         "title" => a.tab().title(),
         "lang" => a.tab().lang.label().to_string(),
+        "menubar" => (a.r_menu.h > 0.0).to_string(),
+        // the find bar above the text or under it, and where the text starts
+        "findplace" => format!("{} the text, text at {}", if a.r_find.y >= a.r_edit.bottom() { "under" } else { "above" }, a.r_edit.y),
+        // where the find bar, a notice and the text are (DIPs from the top, and heights)
+        "bars" => format!(
+            "find {}+{}, notice {}+{}, text {}+{}",
+            a.r_find.y, a.r_find.h, a.r_notice.y, a.r_notice.h, a.r_edit.y, a.r_edit.h
+        ),
         "update" => match &a.update {
             super::app::UpdateState::Idle => "idle".into(),
             super::app::UpdateState::Checking { .. } => "checking".into(),
@@ -966,6 +979,10 @@ pub fn run(args: &[String]) -> i32 {
     let mut failures = 0;
     let mut out = String::new();
     for line in lines.iter().map(|l| l.trim()).filter(|l| !l.is_empty() && !l.starts_with('#')) {
+        // (Go back's places follow the caret, as after each message in the real window)
+        if let Ok(mut a) = cell.try_borrow_mut() {
+            a.note_spot();
+        }
         let (op, arg) = line.split_once(':').unwrap_or((line, ""));
         let unescape = |s: &str| s.replace("\\r", "\r").replace("\\n", "\n").replace("\\t", "\t");
         match op {

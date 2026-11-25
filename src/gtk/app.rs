@@ -85,6 +85,11 @@ pub enum Cmd {
     OpenSelection,
     /// The text's menu's Open “name”: what's at this place (`links::target_in`).
     OpenAt(u64),
+    /// Edit → Go back / Go forward: where the caret jumped from (`edit::Nav`, issue #11).
+    GoBack,
+    GoForward,
+    /// File → Reopen files where you left them (`Settings::reopen_where_left`).
+    ReopenWhereLeft,
     Open,
     Save,
     SaveAs,
@@ -145,6 +150,10 @@ pub enum Cmd {
     SetLang(Lang),
     /// Format → Language → Always open .x files as … (the current tab's ending and language; issue #13).
     LangForEnding,
+    /// View → Hide the menu bar (`Settings::hide_menu_bar`, issue #10).
+    HideMenuBar,
+    /// View → Find bar → At the bottom (`Settings::bars_at_bottom`, issue #9).
+    BarsAtBottom,
     InsertDateTime,
     About,
     Shortcuts,
@@ -529,6 +538,8 @@ pub struct App {
     pub spell_word: Option<SpellWord>,
     /// F7 found a word spelled wrong starting here: the menu it opens is for this word, not the point it opens at.
     pub menu_word: Option<u64>,
+    /// Go back and Go forward's places (Alt+Left, Alt+Right; issue #11).
+    pub nav: edit::Nav,
     /// Replace all with this search and replacement instead of the find bar's (a word's spelling changed everywhere).
     pub replace_with: Option<(Matcher, Vec<u8>)>,
     /// The status bar's column (document version, caret, column) and selection size (version, start, end,
@@ -605,6 +616,7 @@ impl App {
             speller_wanted: false,
             spell_word: None,
             menu_word: None,
+            nav: Default::default(),
             replace_with: None,
             col_cache: Default::default(),
             sel_cache: Default::default(),
@@ -787,6 +799,8 @@ impl App {
             doc.path = Some(p.clone());
             let mut tab = self.make_tab(doc);
             tab.opened_from = self.tabs.get(self.active).map(|t| t.id).filter(|_| !reuse);
+            // (where it was left: File → Reopen files where you left them)
+            tab.restore_at = self.settings.place_of(p).map(|(caret, top)| (caret, caret, top));
             let notify = self.notify.clone();
             let full = p.clone();
             tab.load = Some(match suffix {
@@ -1844,6 +1858,9 @@ impl App {
                 let _ = std::fs::remove_file(&p);
             }
             Some(p) => {
+                if tab.doc.disk.is_some() {
+                    self.settings.remember_place(&p, tab.view.sel.caret, tab.view.top);
+                }
                 self.closed.retain(|q| q != &p);
                 self.closed.push(p);
                 if self.closed.len() > 20 {
@@ -2003,6 +2020,49 @@ impl App {
         tab.view.sel = edit::replace_selection(&mut tab.doc, Sel { anchor: w.start, caret: w.end }, s.as_bytes(), EditKind::Other);
         tab.doc.seal();
         self.after_edit(true);
+    }
+
+    /// Go back's places follow the caret (`edit::Nav`): after each change (`Ui::with`).
+    pub fn note_spot(&mut self) {
+        let Some(tab) = self.tabs.get(self.active) else { return };
+        let now = edit::Spot { tab: tab.id, pos: tab.view.sel.caret };
+        self.nav.note(now, &tab.doc);
+    }
+
+    /// Edit → Go back (`back`) or Go forward (issue #11): to the tab and place the caret jumped from.
+    fn go_nav(&mut self, back: bool) {
+        let tab = self.tab();
+        let now = edit::Spot { tab: tab.id, pos: tab.view.sel.caret };
+        let ids: Vec<u64> = self.tabs.iter().map(|t| t.id).collect();
+        match self.nav.go(back, now, |t| ids.contains(&t)) {
+            Some(s) => {
+                if let Some(k) = self.tabs.iter().position(|t| t.id == s.tab) {
+                    self.activate(k);
+                }
+                let tab = &mut self.tabs[self.active];
+                let pos = edit::char_start(&tab.doc, s.pos.min(tab.doc.len()));
+                tab.view.block = None;
+                tab.view.sel = Sel::at(pos);
+                tab.view.want_x = None;
+                tab.doc.seal();
+                self.reveal_pending = true;
+                self.reveal_center = true;
+            }
+            None => self.flash(if back { "Nothing to go back to" } else { "Nothing to go forward to" }, false),
+        }
+    }
+
+    /// Notes where each tab's file was left (File → Reopen files where you left them), as Slate closes.
+    pub fn remember_places(&mut self) {
+        let places: Vec<(PathBuf, u64, u64)> = self
+            .tabs
+            .iter()
+            .filter(|t| t.doc.disk.is_some())
+            .filter_map(|t| Some((t.doc.path.clone()?, t.view.sel.caret, t.view.top)))
+            .collect();
+        for (p, caret, top) in places.into_iter().rev() {
+            self.settings.remember_place(&p, caret, top);
+        }
     }
 
     /// File → Open selected file or link (issue #7; `at`: the text's menu's place, see `links::target_in`): a file in a
@@ -2683,6 +2743,16 @@ impl App {
             | Cmd::LineEndCarets
             | Cmd::RemoveLastCaret => self.caret_cmd(cmd),
             Cmd::OpenSelection => self.open_selection(None),
+            Cmd::GoBack => self.go_nav(true),
+            Cmd::GoForward => self.go_nav(false),
+            Cmd::ReopenWhereLeft => {
+                // (off: what was kept goes too)
+                self.settings.reopen_where_left = !self.settings.reopen_where_left;
+                if !self.settings.reopen_where_left {
+                    self.settings.places.clear();
+                }
+                self.settings.save();
+            }
             Cmd::OpenAt(p) => self.open_selection(Some(p)),
             Cmd::NewTab => {
                 self.new_untitled();
@@ -2998,6 +3068,17 @@ impl App {
                 tab.lang = l;
                 tab.lang_picked = true;
                 tab.view.clear_cache();
+            }
+            Cmd::BarsAtBottom => {
+                self.settings.bars_at_bottom = !self.settings.bars_at_bottom;
+                self.settings.save();
+            }
+            Cmd::HideMenuBar => {
+                self.settings.hide_menu_bar = !self.settings.hide_menu_bar;
+                self.settings.save();
+                if self.settings.hide_menu_bar {
+                    self.flash("The menu bar shows when you press Alt (View → Hide the menu bar brings it back)", false);
+                }
             }
             Cmd::LangForEnding => {
                 let Some(ext) = self.tab().ending() else { return };
