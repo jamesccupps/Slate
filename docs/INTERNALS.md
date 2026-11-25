@@ -625,8 +625,11 @@ when it's this user's alone, else a guest window that keeps nothing). Windows: `
   column 0: typed text landed at two columns); Home goes where the indentation ends, then the line's start, at each.
   Ctrl+double-click (triple) adds the word (line) as one more selection (`add_caret_word`); Ctrl+Up/Down scroll and
   keep them. Keys and commands that don't work with several (Page Up,
-  Ctrl+Home, Undo, a format…) leave only the main one first (`exec`'s `keeps`). The cursors are for one document
-  version (`Carets::version`): `View::sync` drops them if the text changed otherwise. Copy joins the selections with
+  Ctrl+Home, a format…) leave only the main one first (`exec`'s `keeps`). The cursors are for one document
+  version (`Carets::version`): `View::sync` drops them if the text changed otherwise. Undo and Redo put them back
+  (since 0.19.3, issue #5): an undo step keeps the other cursors' selections before and after it
+  (`Step::more`, given by `Document::begin_more` / `end_more`; a typing run continues only while all of them are
+  where it left them), and `edit::carets_after_undo` takes them from `undone_more` / `redone_more`. Copy joins the selections with
   line breaks; Paste puts a line at each when the text has as many (`paste_parts`). Up to `CARETS_MAX` (10,000);
   Add next match looks 64 MB each way, Select all matches works in texts up to 64 MB. Each app draws the others'
   selections and carets for the rows on screen only; with none, nothing runs (`is_empty` checks).

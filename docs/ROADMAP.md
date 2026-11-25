@@ -230,6 +230,13 @@ match inside CRLF, moving mixed line endings, EditorConfig for new files, no spe
 mode never opening Windows' Open dialog or Explorer). Details in the
 [0.19.2 release notes](release-notes-0.19.2.md). What the review found that 0.19.2 didn't take is *Next*, item 4.
 
+## 0.19.3
+
+Two fixes for issues a user opened after 0.19.2: Windows' Format → Language (and the status bar's language menu)
+in dark colors when menus are (its three columns made Windows draw it light: plain text, then the languages in
+letter groups, `Lang::menu_groups`, issue #16), and Undo and Redo after typing at several cursors put all of them
+back (issue #5). Details in the [0.19.3 release notes](release-notes-0.19.3.md).
+
 ## Next
 
 1. **Accessibility: screen readers, the rest (M).** The text is read since 0.12.0 (checked in test mode and by a real

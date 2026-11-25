@@ -898,7 +898,6 @@ fn labels(items: &[super::commands::Item]) -> String {
                 format!("{label}{}{}", if *checked { " (on)" } else { "" }, if *enabled { "" } else { " (off)" })
             }
             super::commands::Item::Sep => "-".into(),
-            super::commands::Item::ColBreak => "||".into(),
             super::commands::Item::Sub { label, items } => format!("{} [{}]", label.replace('&', ""), labels(items)),
         })
         .collect::<Vec<_>>()

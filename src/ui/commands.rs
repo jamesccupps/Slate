@@ -2,7 +2,7 @@
 
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, HMENU, MENU_ITEM_FLAGS, MF_CHECKED, MF_GRAYED, MF_MENUBARBREAK, MF_POPUP, MF_SEPARATOR,
+    AppendMenuW, CreatePopupMenu, HMENU, MENU_ITEM_FLAGS, MF_CHECKED, MF_GRAYED, MF_POPUP, MF_SEPARATOR,
     MF_STRING,
 };
 use windows::core::HSTRING;
@@ -314,8 +314,6 @@ pub enum Item {
     Cmd { cmd: Cmd, label: String, keys: String, checked: bool, enabled: bool },
     Sep,
     Sub { label: String, items: Vec<Item> },
-    /// The next items go in a new column.
-    ColBreak,
 }
 
 pub fn item(cmd: Cmd, label: &str, keys: &'static str) -> Item {
@@ -519,10 +517,8 @@ pub fn keyed(items: Vec<Item>, km: &Keymap) -> Vec<Item> {
 pub fn build_menu(items: &[Item], ids: &mut Vec<Cmd>) -> HMENU {
     unsafe {
         let m = CreatePopupMenu().expect("menu");
-        let mut col_break = false;
         for it in items {
             match it {
-                Item::ColBreak => col_break = true,
                 Item::Sep => {
                     let _ = AppendMenuW(m, MF_SEPARATOR, 0, None);
                 }
@@ -530,9 +526,6 @@ pub fn build_menu(items: &[Item], ids: &mut Vec<Cmd>) -> HMENU {
                     ids.push(*cmd);
                     let text = if keys.is_empty() { label.clone() } else { format!("{label}\t{keys}") };
                     let mut flags = MF_STRING;
-                    if std::mem::take(&mut col_break) {
-                        flags |= MF_MENUBARBREAK;
-                    }
                     if *checked {
                         flags |= MF_CHECKED;
                     }

@@ -227,6 +227,13 @@ cmd:add-cursor-below
 expect:carets=0 *3
 type:>
 expect:text=>ab\n>cd
+# (Undo takes the typing back with every cursor where it was, issue #5; Redo does it again)
+cmd:undo
+expect:text=ab\ncd
+expect:carets=0 *3
+cmd:redo
+expect:text=>ab\n>cd
+expect:carets=1 *5
 key:escape
 expect:carets=*5
 cmd:multi-cursor

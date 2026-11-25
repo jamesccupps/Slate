@@ -79,6 +79,15 @@ struct Step {
     /// State id after this step, and before it.
     state: u64,
     prev: u64,
+    /// Multiple cursors: the other cursors' selections before the step and after it (None: there was one cursor),
+    /// so Undo and Redo put them back too (issue #5).
+    more: Option<Box<(Vec<Sel>, Vec<Sel>)>>,
+}
+
+impl Step {
+    fn more_after(&self) -> &[Sel] {
+        self.more.as_deref().map_or(&[], |m| &m.1)
+    }
 }
 
 /// One change to the text, for views that keep positions (scroll position, search results) up to date.
@@ -537,6 +546,12 @@ impl Document {
     /// Starts an edit. Typing / backspacing right where the previous step of the same kind left the caret
     /// continues that step.
     pub fn begin(&mut self, kind: EditKind, before: Sel) {
+        self.begin_more(kind, before, &[]);
+    }
+
+    /// `begin` with multiple cursors: `more` are the other cursors' selections (the previous step continues only if
+    /// they're all where it left them too).
+    pub fn begin_more(&mut self, kind: EditKind, before: Sel, more: &[Sel]) {
         if let Some(open) = &self.cur {
             // An edit was interrupted (a panic between begin and end): keep what it did as its own step.
             let after = open.after;
@@ -544,14 +559,15 @@ impl Document {
         }
         if kind != EditKind::Other && !self.sealed && before.is_empty() && self.redo.is_empty() {
             if let Some(top) = self.undo.last() {
-                if top.kind == kind && top.after == before && top.state == self.state {
+                if top.kind == kind && top.after == before && top.state == self.state && top.more_after() == more {
                     self.cur = self.undo.pop();
                     self.cur_reopened = true;
                     return;
                 }
             }
         }
-        self.cur = Some(Step { ops: Vec::new(), before, after: before, kind, state: 0, prev: self.state });
+        let more = (!more.is_empty()).then(|| Box::new((more.to_vec(), more.to_vec())));
+        self.cur = Some(Step { ops: Vec::new(), before, after: before, kind, state: 0, prev: self.state, more });
         self.cur_reopened = false;
     }
 
@@ -615,6 +631,11 @@ impl Document {
     }
 
     pub fn end(&mut self, after: Sel) {
+        self.end_more(after, &[]);
+    }
+
+    /// `end` with multiple cursors: `more` are the other cursors' selections after the edit.
+    pub fn end_more(&mut self, after: Sel, more: &[Sel]) {
         let mut step = self.cur.take().expect("end() without begin()");
         if step.ops.is_empty() {
             if self.cur_reopened {
@@ -623,6 +644,11 @@ impl Document {
             return;
         }
         step.after = after;
+        match &mut step.more {
+            Some(m) => m.1 = more.to_vec(),
+            None if !more.is_empty() => step.more = Some(Box::new((Vec::new(), more.to_vec()))),
+            None => {}
+        }
         step.state = self.next_state;
         self.next_state += 1;
         self.state = step.state;
@@ -654,6 +680,17 @@ impl Document {
         self.sealed = true;
         self.version = next_version();
         Some(sel)
+    }
+
+    /// The other cursors (multiple cursors) as they were before the step the last Undo took back, to put back with
+    /// the selection it returned (none if there was one cursor).
+    pub fn undone_more(&self) -> &[Sel] {
+        self.redo.last().and_then(|s| s.more.as_deref()).map_or(&[], |m| &m.0)
+    }
+
+    /// The other cursors after the step the last Redo did again.
+    pub fn redone_more(&self) -> &[Sel] {
+        self.undo.last().map_or(&[], |s| s.more_after())
     }
 
     pub fn redo(&mut self) -> Option<Sel> {

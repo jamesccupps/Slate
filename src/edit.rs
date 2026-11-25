@@ -735,7 +735,7 @@ pub fn multi_edit(doc: &mut Document, main: &mut Sel, c: &mut Carets, what: Mult
     let order = c.ordered(*main);
     let n = order.len();
     let eol = eol(doc).to_vec();
-    doc.begin(kind, *main);
+    doc.begin_more(kind, *main, &c.more);
     let (mut delta, mut floor) = (0i64, 0u64);
     let mut after = Vec::with_capacity(n);
     for (k, (s, from)) in order.into_iter().enumerate() {
@@ -776,7 +776,7 @@ pub fn multi_edit(doc: &mut Document, main: &mut Sel, c: &mut Carets, what: Mult
     }
     c.col = None;
     c.tidy(main);
-    doc.end(*main);
+    doc.end_more(*main, &c.more);
     c.version = doc.version;
 }
 
@@ -996,6 +996,15 @@ pub fn carets_on_lines(doc: &Document, main: &mut Sel, c: &mut Carets, ends: boo
     c.tidy(main);
     c.version = doc.version;
     Ok(())
+}
+
+/// After Undo (`undo`) or Redo put `main` back: the other cursors as that step had them (none if it had one cursor),
+/// so typing at several cursors is undone with all of them back where they were (issue #5).
+pub fn carets_after_undo(doc: &Document, main: &mut Sel, c: &mut Carets, undo: bool) {
+    c.more = if undo { doc.undone_more() } else { doc.redone_more() }.to_vec();
+    c.col = None;
+    c.tidy(main);
+    c.version = doc.version;
 }
 
 /// Ctrl+click with multiple cursors on: a caret added at `pos` (it's the main one then), or the cursor there taken
@@ -3059,6 +3068,39 @@ mod caret_tests {
         assert_eq!(text(&doc), "a\n\n\n\ne\n");
         assert_eq!(c.count(), 3);
         assert_eq!(c.version, doc.version);
+    }
+
+    #[test]
+    fn undo_puts_the_cursors_back() {
+        // issue #5: typing at three cursors, then Undo: the text as it was, and all three cursors where they were
+        let mut doc = lf("ab\ncd\nef");
+        let (mut main, mut c) = (Sel::at(8), Carets { more: vec![Sel::at(2), Sel::at(5)], ..Default::default() });
+        for t in [&b"x"[..], b"y"] {
+            multi_edit(&mut doc, &mut main, &mut c, MultiEdit::Put(vec![t]), EditKind::Typing);
+        }
+        assert_eq!(text(&doc), "abxy\ncdxy\nefxy");
+        let mut sel = doc.undo().unwrap();
+        carets_after_undo(&doc, &mut sel, &mut c, true);
+        assert_eq!(text(&doc), "ab\ncd\nef");
+        assert_eq!((sel, c.ordered(sel).into_iter().map(|(s, _)| s.caret).collect::<Vec<_>>()), (Sel::at(8), vec![2, 5, 8]));
+        // Redo: the typing again, the cursors after it
+        let mut sel = doc.redo().unwrap();
+        carets_after_undo(&doc, &mut sel, &mut c, false);
+        assert_eq!(c.ordered(sel).into_iter().map(|(s, _)| s.caret).collect::<Vec<_>>(), vec![4, 9, 14]);
+        assert_eq!(c.version, doc.version);
+        // a step with one cursor brings none back; adding a cursor starts a new step
+        let mut doc = lf("ab\ncd");
+        let mut main = Sel::at(2);
+        main = replace_selection(&mut doc, main, b"x", EditKind::Typing);
+        let mut c = Carets { more: vec![Sel::at(6)], ..Default::default() };
+        multi_edit(&mut doc, &mut main, &mut c, MultiEdit::Put(vec![b"y"]), EditKind::Typing);
+        assert_eq!(text(&doc), "abxy\ncdy");
+        let mut sel = doc.undo().unwrap();
+        carets_after_undo(&doc, &mut sel, &mut c, true);
+        assert_eq!((text(&doc).as_str(), sel, c.count()), ("abx\ncd", Sel::at(3), 2));
+        let mut sel = doc.undo().unwrap();
+        carets_after_undo(&doc, &mut sel, &mut c, true);
+        assert_eq!((text(&doc).as_str(), sel, c.count()), ("ab\ncd", Sel::at(2), 1));
     }
 
     #[test]

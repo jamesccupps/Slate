@@ -206,6 +206,30 @@ impl Lang {
         Lang::Yaml,
     ];
 
+    /// Every language but plain text in the order of their names, in groups for a menu (Windows' Format → Language,
+    /// issue #16): a group takes at least 9, and all those with the same first letter; each is named by its first
+    /// and last letter ("A – C").
+    pub fn menu_groups() -> Vec<(String, Vec<Lang>)> {
+        let mut all: Vec<Lang> = Lang::ALL.iter().copied().filter(|&l| l != Lang::Plain).collect();
+        all.sort_by_key(|l| l.label().to_ascii_lowercase());
+        let letter = |l: Lang| l.label().chars().next().unwrap_or(' ').to_ascii_uppercase();
+        let mut groups: Vec<Vec<Lang>> = Vec::new();
+        for l in all {
+            match groups.last_mut() {
+                Some(g) if g.len() < 9 || letter(g[g.len() - 1]) == letter(l) => g.push(l),
+                _ => groups.push(vec![l]),
+            }
+        }
+        // (a short last group joins the one before: V – Y alone would be four)
+        if groups.len() > 1 && groups[groups.len() - 1].len() < 5 {
+            let last = groups.pop().unwrap_or_default();
+            if let Some(g) = groups.last_mut() {
+                g.extend(last);
+            }
+        }
+        groups.into_iter().map(|g| (format!("{} – {}", letter(g[0]), letter(g[g.len() - 1])), g)).collect()
+    }
+
     pub fn comment(self) -> Option<CommentStyle> {
         use CommentStyle::*;
         Some(match self {
@@ -1536,6 +1560,17 @@ fn csv(t: &[u8], st: State, sep: u8, o: &mut Out) -> State {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn language_menu_groups() {
+        let groups = Lang::menu_groups();
+        let names: Vec<&str> = groups.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["A – C", "D – I", "J – N", "O – R", "S – Y"]);
+        let all: Vec<Lang> = groups.iter().flat_map(|(_, g)| g.iter().copied()).collect();
+        assert_eq!(all.len(), Lang::ALL.len() - 1);
+        assert!(Lang::ALL.iter().all(|l| *l == Lang::Plain || all.contains(l)));
+        assert!(groups.iter().all(|(_, g)| (9..=15).contains(&g.len())), "{groups:?}");
+    }
 
     pub(super) fn toks(lang: Lang, text: &str, st: State) -> Vec<(String, Tok)> {
         let mut v = Vec::new();

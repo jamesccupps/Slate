@@ -4692,7 +4692,8 @@ impl App {
                 }
                 let tab = self.tab_mut();
                 let r = if cmd == Cmd::Undo { tab.doc.undo() } else { tab.doc.redo() };
-                if let Some(sel) = r {
+                if let Some(mut sel) = r {
+                    crate::edit::carets_after_undo(&tab.doc, &mut sel, &mut tab.view.carets, cmd == Cmd::Undo);
                     tab.view.sel = sel;
                     tab.view.upstream = false;
                     // (An edit out of view comes back into the middle of it, not at its edge.)
@@ -5645,14 +5646,20 @@ impl App {
             .collect()
     }
 
+    /// Format → Language, also the status bar's language menu: plain text, then the languages in groups by their first
+    /// letter (`Lang::menu_groups`). Not in columns: Windows draws a menu with columns in light colors even when menus
+    /// are dark (issue #16).
     pub fn lang_items(&self) -> Vec<Item> {
         let cur = self.tab().lang;
-        let mut v = Vec::new();
-        for (k, &l) in Lang::ALL.iter().enumerate() {
-            if k > 0 && k % 18 == 0 {
-                v.push(Item::ColBreak);
-            }
-            v.push(check(Cmd::SetLang(l), l.label(), "", l == cur));
+        let mut v = vec![check(Cmd::SetLang(Lang::Plain), Lang::Plain.label(), "", cur == Lang::Plain), Item::Sep];
+        for (letters, langs) in Lang::menu_groups() {
+            let items = langs.iter().map(|&l| check(Cmd::SetLang(l), l.label(), "", l == cur)).collect();
+            // (the group with the language in use says so)
+            let label = match langs.iter().find(|&&l| l == cur) {
+                Some(l) => format!("&{letters}\t{}", l.label()),
+                None => format!("&{letters}"),
+            };
+            v.push(sub(&label, items));
         }
         v
     }

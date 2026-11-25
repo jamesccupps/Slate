@@ -2572,7 +2572,8 @@ impl App {
                 let tab = &mut self.tabs[self.active];
                 let r = if cmd == Cmd::Undo { tab.doc.undo() } else { tab.doc.redo() };
                 match r {
-                    Some(sel) => {
+                    Some(mut sel) => {
+                        edit::carets_after_undo(&tab.doc, &mut sel, &mut tab.view.carets, cmd == Cmd::Undo);
                         tab.view.sel = sel;
                         self.after_edit(true);
                         self.reveal_center = true;
