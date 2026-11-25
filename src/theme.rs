@@ -414,6 +414,13 @@ pub fn high_contrast_on() -> bool {
     ok && hc.dwFlags.0 & HCF_HIGHCONTRASTON.0 != 0
 }
 
+/// Windows' Text size (Settings → Accessibility → Text size) as a factor, 1 to 2.25: the default size of Slate's own
+/// tabs, menu bar, find bar and status bar (issue #8).
+#[cfg(windows)]
+pub fn windows_text_scale() -> f32 {
+    reg_dword(w!(r"Software\Microsoft\Accessibility"), w!("TextScaleFactor")).map_or(1.0, |v| (v as f32 / 100.0).clamp(1.0, 2.25))
+}
+
 #[cfg(windows)]
 fn reg_dword(path: windows::core::PCWSTR, name: windows::core::PCWSTR) -> Option<u32> {
     let mut v = 0u32;

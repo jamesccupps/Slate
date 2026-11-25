@@ -35,16 +35,31 @@ pub struct TabStrip {
     pub width: f64,
 }
 
+/// Settings → Interface text size (issue #8): Slate's own tab strip and status bar this many times their size. (The
+/// desktop's text scaling reaches their text already, through Pango, as it does GTK's own parts.)
+pub fn ui_k(s: &crate::settings::Settings) -> f64 {
+    if s.ui_size >= 100 { s.ui_size.min(200) as f64 / 100.0 } else { 1.0 }
+}
+
+/// A font of `points` at the interface size.
+fn ui_font(points: f64, app: &App) -> pango::FontDescription {
+    let mut font = pango::FontDescription::from_string("Sans");
+    font.set_size((points * ui_k(&app.settings) * pango::SCALE as f64) as i32);
+    font
+}
+
 /// How the tabs are laid out in `width`, starting at tab `first` (when they don't all fit).
 pub fn tab_strip(app: &App, width: f64, first: &mut usize) -> TabStrip {
+    let k = ui_k(&app.settings);
+    let (min_w, max_w) = (TAB_MIN_W * k, TAB_MAX_W * k);
     let n = app.tabs.len().max(1);
     let arrows_w = 3.0 * 28.0;
-    let avail = (width - PLUS_W - 8.0).max(TAB_MIN_W);
-    let w = (avail / n as f64).clamp(TAB_MIN_W, TAB_MAX_W);
+    let avail = (width - PLUS_W - 8.0).max(min_w);
+    let w = (avail / n as f64).clamp(min_w, max_w);
     let mut strip = TabStrip { width, ..Default::default() };
     // (whether they all fit, not by dividing back: avail / (avail / 7) can come out as 6.999…, and then as many tabs
     // as fit with the arrows could be more than there are)
-    if n as f64 * TAB_MIN_W <= avail {
+    if n as f64 * min_w <= avail {
         *first = 0;
         for i in 0..n {
             strip.tabs.push((i, i as f64 * w, w));
@@ -53,8 +68,8 @@ pub fn tab_strip(app: &App, width: f64, first: &mut usize) -> TabStrip {
         return strip;
     }
     // more than fit: arrows at the right, and the active tab always among those shown
-    let fit = (((avail - arrows_w) / TAB_MIN_W).floor() as usize).clamp(1, n);
-    let w = ((avail - arrows_w) / fit as f64).min(TAB_MAX_W);
+    let fit = (((avail - arrows_w) / min_w).floor() as usize).clamp(1, n);
+    let w = ((avail - arrows_w) / fit as f64).min(max_w);
     if app.active < *first {
         *first = app.active;
     } else if app.active >= *first + fit {
@@ -149,7 +164,7 @@ pub fn paint_tabs(cr: &cairo::Context, ctx: &pango::Context, app: &App, strip: &
     let t = &app.theme;
     set_color(cr, t.frame);
     cr.paint().ok();
-    let mut font = pango::FontDescription::from_string("Sans 10");
+    let mut font = ui_font(10.0, app);
     if let Some(f) = ctx.font_description() {
         font.set_family(&f.family().unwrap_or_else(|| "Sans".into()));
     }
@@ -404,7 +419,7 @@ pub fn paint_status(cr: &cairo::Context, ctx: &pango::Context, app: &App, width:
     set_color(cr, t.border);
     cr.rectangle(0.0, 0.0, width, 1.0);
     let _ = cr.fill();
-    let font = pango::FontDescription::from_string("Sans 9");
+    let font = ui_font(9.0, app);
     let (left, mut right, bad) = status_texts(app);
     // In a narrow window things give way, the least needed first (as on Windows): the counts, the indentation, the
     // line endings, the language. The caret's place keeps its room (a message gets as much).

@@ -24,13 +24,15 @@ JSON file opens instantly, scrolls smoothly, and can be searched, edited, format
   Find in selection (Alt+S), Find next and previous through all open tabs (Alt+A), searches kept highlighted in
   every tab, each in a color of its own (Alt+H), the last searches and replacements with Up and Down, and `\n` /
   `\t` in a regular expression's replacement for a line break or a tab. *Settings → Find bar* can close the bar
-  when you click back in the text, or give each tab its own.
+  when you click back in the text, give each tab its own, or put it at the bottom. *Edit → Find in all tabs* lists
+  every matching line of every tab, *Find in files* (Ctrl+Shift+F) those of the files in the tab's folder and the
+  folders in it, each in a tab of results (Enter goes to one); *Replace in all tabs* replaces in each tab at once.
 - Column selection (Alt+drag, Shift+Alt+arrows: type, paste and delete on every line) and dragging selected text
   to another place (with Ctrl, a copy). Multiple cursors when you turn them on (*Edit → Multiple cursors*):
   Ctrl+click, a cursor above or below, the next match or all of them, one at every selected line's start or end.
 - Spell check, like Notepad's: words spelled wrong get a wavy red line, in plain text, Markdown's prose and comments
-  in code (not names, links, numbers or data files); right-click one for suggestions, Add to dictionary or Ignore.
-  It's Windows' own spell checker, in Windows' language (on Linux, Enchant, which Slate's package brings along when
+  in code (not names, links, numbers or data files); right-click one for suggestions, Change every one, Add to
+  dictionary or Ignore; F7 goes to the next one. It's Windows' own spell checker, in Windows' language (on Linux, Enchant, which Slate's package brings along when
   it can). *View → Spell check* turns it off.
 - Input methods for Chinese, Japanese and Korean: what's being composed shows right in the text at the cursor, in
   the theme's colors, its clauses underlined.
@@ -38,14 +40,17 @@ JSON file opens instantly, scrolls smoothly, and can be searched, edited, format
   their own with each line's number in the file; Enter or a double-click goes to that line in the file, and it
   follows a log as it grows. 809,820 lines out of a 400 MB log in 0.23 s.
 - Bookmarks (Ctrl+F2, then F2 / Shift+F2 to go from one to the next), kept with the tabs; read-only tabs (File → Read
-  only; a file you can't write opens that way).
+  only; a file you can't write opens that way). Go back and forward (Alt+Left / Alt+Right) to where the cursor jumped
+  from, and files reopen where you left them. *File → Open selected file or link* (also on the right-click menu)
+  opens a file named in the text, or a web link in your browser.
 - Syntax colors for 52 kinds of files: Python, PowerShell, Batch, Shell, VBScript/VBA, AutoHotkey, Perl, R, C, C++,
   C#, Objective-C and Objective-C++, Java, Kotlin, Scala, Swift, Dart, Go, Rust, JavaScript, TypeScript, PHP, Ruby,
   Lua, SQL, HTML (with its CSS and scripts), CSS, XML, Markdown (code blocks in their language), YAML, JSON, TOML,
   INI, Java properties, nginx and Apache configuration, Terraform/HCL, CMake, Dockerfiles, Inno Setup and NSIS
   installer scripts, G-code (3D printers, CNC), PPCL programs (Siemens APOGEE and Desigo), CSV with commas or
   semicolons and TSV (each column its own color), logs, diffs, subtitles (SRT, WebVTT), calendars and contacts
-  (iCalendar, vCard) and Visual Studio solutions. Block comments and multi-line strings are followed correctly.
+  (iCalendar, vCard) and Visual Studio solutions. Block comments and multi-line strings are followed correctly. Your
+  own endings too: *Format → Language → Always open .x files as …*.
 - Line tools: sort lines (`file2` before `file10`), remove duplicate or blank lines, trim spaces at line ends;
   UPPERCASE / lowercase / Title Case; comment or uncomment lines with Ctrl+/; duplicate, delete and move lines.
 - *Format → Convert*: Base64, URL encoding and JSON string escapes, each way, on the selection (or the whole text);
@@ -72,7 +77,9 @@ JSON file opens instantly, scrolls smoothly, and can be searched, edited, format
   `some-command | slate -` opens what it prints in a new tab.
 - Go to line, word wrap, line numbers, show whitespace, the matching bracket highlighted (Ctrl+M goes to it,
   Ctrl+Shift+M selects inside the brackets), overtype, zoom, dark and light themes (follows Windows, or switch with the sun/moon button).
-  With Windows' high contrast on, Slate uses its colors, and Magnifier follows the text cursor.
+  With Windows' high contrast on, Slate uses its colors, and Magnifier follows the text cursor. *Settings →
+  Interface text size* makes Slate's own tabs, menus, find bar and status bar bigger (they follow Windows' Text size
+  by default), and *Settings → Hide the menu bar* hides it until you press Alt.
 - Tabs in the title bar, as in Windows 11's Notepad (*Settings → Tabs in the title bar* puts them back under it).
   Reopen closed tabs (Ctrl+Shift+T), close the other, the saved or all tabs, and a list of all tabs when they don't
   fit; *Settings → Close Slate with the last tab* makes closing the only tab close Slate. The files opened last are on the taskbar button's menu (on Linux, in the desktop's recent files). The status

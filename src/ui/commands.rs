@@ -31,6 +31,8 @@ pub enum Cmd {
     ToggleBarsAtBottom,
     /// Settings → Hide the menu bar (`Settings::hide_menu_bar`, issue #10).
     ToggleHideMenuBar,
+    /// Settings → Interface text size: percent, 0 for Windows' Text size (`Settings::ui_size`, issue #8).
+    UiSize(u32),
     /// Edit → Go back / Go forward: where the caret jumped from (`edit::Nav`, issue #11).
     GoBack,
     GoForward,

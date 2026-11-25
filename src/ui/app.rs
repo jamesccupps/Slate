@@ -550,6 +550,9 @@ pub struct App {
     pub next_id: u64,
     pub find: FindBar,
     pub dpi: u32,
+    /// Settings → Interface text size: Slate's own tabs, menu bar, find bar and status bar are this many times their
+    /// size (`ui_scale`, issue #8).
+    pub uik: f32,
     pub size: (f32, f32),
     pub r_tabs: Rect,
     /// Tabs in the title bar (`super::CUSTOM_FRAME`): the frame has no caption, the tab strip is the window's top,
@@ -719,9 +722,11 @@ impl App {
         crate::highlight::set_user_langs(&settings.languages);
         let theme = make_theme(settings.theme);
         let dpi = win::dpi_of(hwnd);
-        let fonts = make_fonts(&g);
+        let uik = ui_scale(&settings);
+        let fonts = make_fonts(&g, uik);
         let style = make_style(&g, &settings, 1);
         let mut find = FindBar::new(hwnd);
+        find.k = uik;
         find.style_edits(dpi, &theme);
         let mut app = App {
             hwnd,
@@ -735,6 +740,7 @@ impl App {
             next_id: 1,
             find,
             dpi,
+            uik,
             size: (800.0, 600.0),
             r_tabs: Rect::default(),
             custom_frame: super::CUSTOM_FRAME.with(|c| c.get()),
@@ -914,6 +920,21 @@ impl App {
         self.invalidate();
     }
 
+    /// Settings → Interface text size changed (or Windows' Text size, which it follows unless one is picked): the bars
+    /// made again at that size.
+    pub fn apply_ui_size(&mut self) {
+        let k = ui_scale(&self.settings);
+        if (k - self.uik).abs() < 0.001 {
+            return;
+        }
+        self.uik = k;
+        self.fonts = make_fonts(&self.g, k);
+        self.find.k = k;
+        self.find.style_edits(self.dpi, &self.theme);
+        self.layout();
+        self.invalidate();
+    }
+
     pub fn update_dpi(&mut self) {
         self.dpi = win::dpi_of(self.hwnd);
         self.find.style_edits(self.dpi, &self.theme);
@@ -948,8 +969,10 @@ impl App {
         let snap = |v: f32| super::gfx::snap(v, dpi);
         let band = |y: f32, bh: f32| Rect::new(0.0, snap(y), w, snap(y + bh) - snap(y));
         let mut y = 0.0;
-        self.r_tabs = band(y, metrics::TAB_BAR_H);
-        y += metrics::TAB_BAR_H;
+        // (Settings → Interface text size: the bars as many times higher)
+        let k = self.uik;
+        self.r_tabs = band(y, metrics::TAB_BAR_H * k);
+        y += metrics::TAB_BAR_H * k;
         self.caption_rects = if self.custom_frame {
             let r = self.r_tabs;
             std::array::from_fn(|k| Rect::new(r.right() - (3 - k) as f32 * metrics::CAPTION_W, r.y, metrics::CAPTION_W, r.h))
@@ -957,11 +980,11 @@ impl App {
             [Rect::default(); 3]
         };
         // (hidden unless Alt gave it the keyboard or a menu is open: Settings → Hide the menu bar)
-        let mh = if self.menu_bar_shown() { metrics::MENU_BAR_H } else { 0.0 };
+        let mh = if self.menu_bar_shown() { metrics::MENU_BAR_H * k } else { 0.0 };
         self.r_menu = band(y, mh);
         y += mh;
         let fh = self.find.height();
-        let nh = if self.tabs.get(self.active).is_some_and(|t| t.notice.is_some()) { metrics::NOTICE_H } else { 0.0 };
+        let nh = if self.tabs.get(self.active).is_some_and(|t| t.notice.is_some()) { metrics::NOTICE_H * k } else { 0.0 };
         let bottom = self.settings.bars_at_bottom;
         self.find.at_bottom = bottom;
         if !bottom {
@@ -974,7 +997,7 @@ impl App {
         let ph = if json && self.settings.path_bar { super::structure::PATH_H } else { 0.0 };
         self.r_path = band(y, ph);
         y = snap(y + ph);
-        let sh = metrics::STATUS_H;
+        let sh = metrics::STATUS_H * k;
         let sy = snap((h - sh).max(y));
         self.r_status = Rect::new(0.0, sy, w, (h - sy).max(sh));
         // (Settings → Find bar → At the bottom: the find bar, then a notice, above the status bar; the text's top stays put
@@ -1019,19 +1042,20 @@ impl App {
         let new_w = 36.0;
         // (tabs in the title bar: room for the window's buttons, and some to drag the window by)
         let reserved = if self.custom_frame { 3.0 * metrics::CAPTION_W + metrics::DRAG_MIN } else { 0.0 };
-        let mut avail = (bar.w - left - new_w - 16.0 - reserved).max(metrics::TAB_MIN_W);
+        let (tab_min, tab_max) = (metrics::TAB_MIN_W * self.uik, metrics::TAB_MAX_W * self.uik);
+        let mut avail = (bar.w - left - new_w - 16.0 - reserved).max(tab_min);
         // Tabs that don't all fit: a button after the new-tab one lists them all.
-        let overflow = self.tabs.len() as f32 * metrics::TAB_MIN_W > avail;
+        let overflow = self.tabs.len() as f32 * tab_min > avail;
         if overflow {
-            avail = (avail - 32.0).max(metrics::TAB_MIN_W);
+            avail = (avail - 32.0).max(tab_min);
         }
         let n = self.tabs.len().max(1) as f32;
         // When they don't all fit, as many whole tabs as fit share the room and the strip scrolls by whole tabs, so
         // none shows cut off at the edge.
         let tw = if overflow {
-            avail / (avail / metrics::TAB_MIN_W).floor().max(1.0)
+            avail / (avail / tab_min).floor().max(1.0)
         } else {
-            (avail / n).clamp(metrics::TAB_MIN_W, metrics::TAB_MAX_W)
+            (avail / n).clamp(tab_min, tab_max)
         };
         let total = tw * self.tabs.len() as f32;
         let max_scroll = (total - avail).max(0.0);
@@ -2222,14 +2246,20 @@ pub fn make_theme(mode: ThemeMode) -> Theme {
     if dark { Theme::dark(accent) } else { Theme::light(accent) }
 }
 
-fn make_fonts(g: &Gfx) -> UiFonts {
+/// Settings → Interface text size (issue #8): the size of Slate's own tabs, menu bar, find bar and status bar, as a
+/// factor: the one picked, else Windows' Text size (Settings → Accessibility).
+pub fn ui_scale(s: &Settings) -> f32 {
+    if s.ui_size >= 100 { s.ui_size.min(200) as f32 / 100.0 } else { crate::theme::windows_text_scale() }
+}
+
+fn make_fonts(g: &Gfx, k: f32) -> UiFonts {
     let family = pick_family(&g.dw, &["Segoe UI Variable Text", "Segoe UI"]);
     let icon_family = pick_family(&g.dw, &["Segoe Fluent Icons", "Segoe MDL2 Assets"]);
     UiFonts {
-        ui: g.ui_format(&family, metrics::UI_FONT_SIZE + 0.5, DWRITE_FONT_WEIGHT_NORMAL),
-        ui_semibold: g.ui_format(&family, metrics::UI_FONT_SIZE + 0.5, DWRITE_FONT_WEIGHT_SEMI_BOLD),
-        icons: g.ui_format(&icon_family, 14.0, DWRITE_FONT_WEIGHT_NORMAL),
-        icons_small: g.ui_format(&icon_family, 10.0, DWRITE_FONT_WEIGHT_NORMAL),
+        ui: g.ui_format(&family, (metrics::UI_FONT_SIZE + 0.5) * k, DWRITE_FONT_WEIGHT_NORMAL),
+        ui_semibold: g.ui_format(&family, (metrics::UI_FONT_SIZE + 0.5) * k, DWRITE_FONT_WEIGHT_SEMI_BOLD),
+        icons: g.ui_format(&icon_family, 14.0 * k, DWRITE_FONT_WEIGHT_NORMAL),
+        icons_small: g.ui_format(&icon_family, 10.0 * k, DWRITE_FONT_WEIGHT_NORMAL),
         family,
     }
 }

@@ -330,6 +330,12 @@ cmd:bars-at-bottom
 expect:bars=path, notice, find, status
 cmd:bars-at-bottom
 expect:bars=find, notice, path, status
+# Settings → Interface text size (issue #8): the tab strip and status bar at 150%
+expect:uisize=tabs 36, status 26
+act:ui-size=150
+expect:uisize=tabs 54, status 39
+act:ui-size=0
+expect:uisize=tabs 36, status 26
 # Edit → Find in all tabs (issue #15): the lines in a tab of results, read only; Enter goes to one
 cmd:new-tab
 type:first\nsecond zzneedle

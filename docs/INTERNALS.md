@@ -80,6 +80,14 @@ when it's this user's alone, else a guest window that keeps nothing). Windows: `
     leftover. Saving as UTF-16 asks first (`Lossy`) when a mostly-UTF-8 document's stray bytes would become U+FFFD.
     `open_either` (`name.txt:120:5`) falls back to the name without the suffix on "not found" and on Windows'
     "invalid name" (a stream `120` of type `5`).
+  - `many.rs` (since 0.20, issue #15) — Edit → Find in all tabs and Find in files: `lines_with` (the lines a
+    search matches, counted as it goes, each once, its text cut to 300 bytes around the match), `in_files` (the text
+    files under a folder in name order: not hidden or `SKIP_DIRS` folders, not links, not over 32 MB or with a zero
+    byte in their first 8 KB; 20,000 files, 20,000 results at most) and `Results` (a tab of results' text and where
+    each line goes, `Place::Tab` or `Place::File`). Each app runs it as a job (`App::many`, Esc stops it) and shows
+    the result in a read-only tab (`Tab::results`, not kept in the session; Enter or a double-click goes there,
+    through `go_to_source`). Replace in all tabs runs each tab's Replace all as its own task (`start_task_in` with
+    the find bar's search in `replace_with`), one message once all are done (`App::replacing`).
   - `search.rs` — byte-regex search in windows with an overlap after each (a match running into a window's end is
     searched again in a bigger one): find next/prev, count all, streaming replace-all (the text between matches is
     copied from the window searched). A regex's `\n` is `(?:\r?\n)` and a class leaving `\n` out leaves `\r` out too
@@ -242,7 +250,20 @@ when it's this user's alone, else a guest window that keeps nothing). Windows: `
     dictionary goes into the user's own dictionary, which other programs share (test mode only ignores). The word
     the caret is at the end of isn't marked while the text has the keyboard (being typed); tabs that can't be
     edited aren't checked. The right-click menu's first items: up to 5 suggestions (`Cmd::Suggestion`, applied only
-    while the document's version is the one the menu was opened on), Add to dictionary, Ignore.
+    while the document's version is the one the menu was opened on), Change every “word” to › suggestion
+    (`SuggestionAll`: Replace all with that word, whole word and same case, through `start_task`'s `replace_with`:
+    one undo step, a job for big texts), Add to dictionary, Ignore. F7 (`NextMisspelling`, since 0.20, issue #12):
+    `spell::next_wrong` from the selection's end to the text's end, then round from the start, over each view's
+    `words_at` (a segment at a time, so rows not on screen count too; 8 MB a press, then "F7 looks on from here");
+    the word is selected and the text's menu opens below it for that word (`App::menu_word`; Linux `Ask::SpellMenu`,
+    test mode notes its items in `print:asked`).
+  - `src/links.rs` (shared, since 0.20, issue #7) — File → Open selected file or link and the text's menu's Open
+    “name”: `target_in` takes the selection, or around a place (`around`, only what `plausible` says looks like a
+    name: a folder or an ending in it, or a link), `target_of` makes it an http(s) link (for the browser: Windows
+    `win::shell_open`, Linux `Ask::OpenLink`) or a full path (relative to the tab's file's folder; `/` or `\` either
+    way, `%VAR%` on Windows, `~/` on Linux; `name:12:3` a line and column). Other schemes are refused; a name is only
+    ever opened as a text file in a tab, never run. A file that can't be opened shows the tab it was opened from
+    again (`Tab::opened_from`, both apps).
   - `job.rs` — background jobs with progress/cancel, notify the UI by posting a window message (on Linux: an idle
     callback on GLib's main loop).
 - `src/gtk/` — the Linux app (GTK 4): `mod.rs` the window (menu bar from a `gio::Menu`, actions with accelerators
@@ -612,6 +633,29 @@ when it's this user's alone, else a guest window that keeps nothing). Windows: `
 - Settings → Close Slate with the last tab (`Settings::close_with_last_tab`, off by default): Ctrl+W or a tab's × on the
   only tab marks it (`App::quit_with_tab`); once it's gone (after its question, or its save) `remove_tab` closes
   Slate (Windows `Deferred::Cmd(Cmd::Exit)`, Linux `Ask::Quit`). Close all/other tabs don't (an empty tab stays).
+- 0.20's settings and places (issues #8 to #14):
+  - Your own endings (#13): `Settings::languages` (`{"mmd": "Markdown"}`) is given to `highlight::set_user_langs` at
+    the start and when Format → Language → Always open .x files as … changes it (`toggle_lang_for_ending`);
+    `Lang::detect` asks it first, by the whole name and then the ending.
+  - Go back / forward (#11): `edit::Nav` keeps the places the caret jumped from (another tab, or more than
+    `NAV_LINES` lines or 64 KB away), noted after every message (Windows' `wndproc`), every refresh (Linux's
+    `refresh_now`) and every test-mode step; byte offsets, not moved by later edits, so they land near. Reopen
+    where you left them: `Settings::places` (300 files, newest first) noted as a tab with a read file closes and at
+    exit, given to a file opened again as `Goto::Place` (Linux `restore_at`), not to session tabs (they have their
+    own place).
+  - Hide the menu bar (#10): Windows lays it out at height 0 unless `menu_bar_shown` (Alt armed it, or a menu is
+    open: `menu_bar_changed` lays out again at each change); Linux hides the menu row and `hidden_menu_keys` shows
+    it for Alt on its own (the first menu) or Alt and a menu's letter (not while the find box has the keyboard).
+  - Find bar at the bottom (#9): `Settings::bars_at_bottom`. Windows puts `r_find` then `r_notice` above the status
+    bar and draws their border along their top; Linux reorders the find box and the notice after the scrollbar
+    (`place_bars`, CSS `.slate-bottom`). The text's top stays where it was as they open and close.
+  - The Settings menu (#14): Windows' fifth (Alt+S; `MENU_TITLES`, Help is the sixth), Linux's `_Settings`.
+  - Interface text size (#8): `Settings::ui_size` (0: the system's). Windows multiplies the bars' heights, the tab
+    widths, the UI fonts and the find bar's sizes by `App::uik` (`ui_scale`: the size picked, else Windows' Text size
+    from `HKCU\Software\Microsoft\Accessibility\TextScaleFactor`, read again at WM_SETTINGCHANGE); test mode uses
+    100% unless `uisize:` says otherwise. Linux scales the tab strip, the status bar and their fonts
+    (`chrome::ui_k`), and GTK's own parts through `gtk-font-name` (the desktop's font, sized); with 0 the desktop's
+    own text scaling applies, as it does to every GTK app.
 - Multiple cursors (Edit → Multiple cursors, issue #5; `Settings::multi_cursor`, off by default: its menu items only
   say how to turn it on, its keys aren't bound (Windows `key_cmd`, GTK `set_accels`: `shortcuts::CARET_COMMANDS`)
   and do what they did, Ctrl+click stays an ordinary click). Above/below are Ctrl+Shift+Up/Down, not Ctrl+Alt:

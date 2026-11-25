@@ -54,6 +54,9 @@ pub struct Settings {
     pub spell_check: bool,
     /// Windows: the tabs in the title bar, as in Windows 11's Notepad (Windows' own title bar in high contrast).
     pub tabs_in_title_bar: bool,
+    /// Settings → Interface text size (issue #8): Slate's own tabs, menu bar, find bar and status bar, in percent (100 to
+    /// 200); 0: as the system has it (Windows' Text size, the desktop's text scaling on Linux).
+    pub ui_size: u32,
     /// Settings → Close Slate with the last tab: closing the only tab (Ctrl+W, its ×) closes Slate too; off, an empty tab
     /// stays, as in Notepad.
     pub close_with_last_tab: bool,
@@ -119,6 +122,7 @@ impl Default for Settings {
             hide_menu_bar: false,
             spell_check: true,
             tabs_in_title_bar: true,
+            ui_size: 0,
             close_with_last_tab: false,
             find_close_on_leave: false,
             find_per_tab: false,

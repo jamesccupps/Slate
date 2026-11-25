@@ -471,8 +471,10 @@ fn handle(cell: &Cell, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<L
                     a.apply_theme();
                 }
             }
-            // (Underline access keys: read again whatever changed, as not every way of switching it says which)
+            // (Underline access keys: read again whatever changed, as not every way of switching it says which; so is
+            // Windows' Text size, which Slate's own bars follow unless Settings → Interface text size says otherwise)
             if let Ok(mut a) = cell.try_borrow_mut() {
+                a.apply_ui_size();
                 let cues = actions::keyboard_cues();
                 if cues != a.keyboard_cues {
                     a.keyboard_cues = cues;

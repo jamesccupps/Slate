@@ -958,6 +958,9 @@ pub fn run(args: &[String]) -> i32 {
     {
         let mut a = cell.borrow_mut();
         a.settings = s;
+        // (the bars at their own size whatever Windows' Text size is here: `uisize:0` follows it)
+        a.settings.ui_size = 100;
+        a.apply_ui_size();
         a.apply_theme();
         a.new_untitled();
     }
@@ -1017,6 +1020,12 @@ pub fn run(args: &[String]) -> i32 {
                 if !visible && !gpu {
                     let _ = offscreen(&cell);
                 }
+            }
+            // Settings → Interface text size, in percent (0: Windows')
+            "uisize" => {
+                let mut a = cell.borrow_mut();
+                a.settings.ui_size = arg.parse().unwrap_or(0);
+                a.apply_ui_size();
             }
             "theme" => {
                 let mut a = cell.borrow_mut();

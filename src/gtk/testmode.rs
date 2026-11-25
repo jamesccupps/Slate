@@ -657,6 +657,8 @@ fn value(what: &str, test: &Test) -> String {
             ui.find_box.is_visible()
         ),
         "menubar" => ui.menu_row.is_visible().to_string(),
+        // Settings → Interface text size: the tab strip's and the status bar's heights
+        "uisize" => format!("tabs {}, status {}", ui.tabs.content_height(), ui.status.content_height()),
         // the window's rows from the top, of those that move (Settings → Find bar → At the bottom)
         "bars" => {
             let mut names = Vec::new();

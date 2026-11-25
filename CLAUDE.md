@@ -196,7 +196,8 @@ the part about the area you're changing first, and keep it current in the same c
   find bar's edit boxes, Windows' own controls, printed in: `print_children`); the
   commands are listed at the top of `src/ui/testmode.rs` (`open:`, `type:`, `key:`, `cmd:` (a `Cmd` name, or any
   command's name in the shortcuts file: `cmd:open`), `jobs`, `shot:`,
-  `print:`, `expect:`, `answer:`, `lang:<name>` …; `print:menu0`…`menu4` lists a menu's items). In this mode
+  `print:`, `expect:`, `answer:`, `lang:<name>` …; `print:menu0`…`menu5` lists a menu's items, submenus in brackets;
+  `pick:<label>` chooses the next menu's item, `<submenu> > <item>` inside one). In this mode
   prompts are never shown (they take answers from `answer:` lines and are listed by `print:asked`), nor are menus
   (`print:opened` lists them), the clipboard is a private one, and settings/session aren't written (unless
   `persist`, which needs `SLATE_DATA_DIR`). Mouse drags, raw wheel deltas, Alt, AltGr and window activation have
@@ -205,7 +206,7 @@ the part about the area you're changing first, and keep it current in the same c
   as a second start with `--read-only` / `--wait` / `-` does (`waitevent:<name>` makes the event, `print:waits`
   shows the waits and whether it's set), `print:findtext` the find bar's boxes and Find in selection's range,
   `print:findbar` (closed, or its mode), `print:carets` (multiple cursors, the main one starred; both test modes),
-  `print:menukeys0`…`4` (a menu's items with the keys they show, the user's included: `crate::shortcuts`),
+  `print:menukeys0`…`5` (a menu's items with the keys they show, the user's included: `crate::shortcuts`),
   `print:rows` the structure panel's rows (`row:<n>` / `rowopen:<n>` click one, or its arrow),
   `previewshot:<png>|<page>[|width|noprinter]` the print preview drawn into a picture (laid out for Microsoft Print
   to PDF, or as it shows without a printer), `previewrun:<steps, | between>` File → Print preview run for real
@@ -231,6 +232,11 @@ the part about the area you're changing first, and keep it current in the same c
   believe it's that version (to try the updater against the real latest release, in a scratch folder);
   `SLATE_TEST_SLOW_OPEN=<ms>` makes reading each file take that much longer (a slow network drive).
   `outside:<path>|<text>` (both test modes) writes a file as another program would, unseen until Slate next looks.
+  Since 0.20: `uisize:<percent>` (Windows; test mode runs at 100% unless it's given, 0 follows Windows' Text size),
+  `print:menubar` (both: whether the menu bar shows), `print:findplace` / `print:bars` (Windows: the find bar above
+  or under the text, and the bands; Linux `print:bars`: the order of the rows that move), Linux `print:uisize` (the
+  tab strip's and status bar's heights; `act:ui-size=<percent>` sets it); F7's menu is in `print:popupitems`
+  (Windows) or `print:asked` (Linux).
 - `printpdf:<file>[|selection]` (both test modes) prints the tab into a PDF file without a dialog (Windows:
   Microsoft Print to PDF; Linux: GTK's export, which the Linux smoke test does). To look at the pages, render them
   with poppler's `pdftoppm` in a throwaway container (the PC has no poppler).

@@ -230,6 +230,15 @@ match inside CRLF, moving mixed line endings, EditorConfig for new files, no spe
 mode never opening Windows' Open dialog or Explorer). Details in the
 [0.19.2 release notes](release-notes-0.19.2.md). What the review found that 0.19.2 didn't take is *Next*, item 4.
 
+## 0.20.0 (beta, branch `beta-0.20`, being reviewed)
+
+The nine things a user asked for after 0.19.2 (issues #7 to #15), on both platforms: Find in all tabs, Find in
+files and Replace in all tabs (#15); Go back / forward and files reopening where you left them (#11); F7 and Change
+every … to (#12); Open selected file or link (#7); your own file endings (#13); Interface text size (#8); Hide the
+menu bar (#10); the find bar at the bottom (#9); a Settings menu (#14). Details in the
+[0.20.0 release notes](release-notes-0.20.0.md). Not done from those issues: a command palette (*Later*), a list
+to pick a place to go back to, hiding the status bar (its messages need a place).
+
 ## 0.19.3
 
 Two fixes for issues a user opened after 0.19.2: Windows' Format → Language (and the status bar's language menu)

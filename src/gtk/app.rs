@@ -156,6 +156,8 @@ pub enum Cmd {
     LangForEnding,
     /// Settings → Hide the menu bar (`Settings::hide_menu_bar`, issue #10).
     HideMenuBar,
+    /// Settings → Interface text size: percent, 0 for the desktop's (`Settings::ui_size`, issue #8).
+    UiSize(u32),
     /// Settings → Find bar → At the bottom (`Settings::bars_at_bottom`, issue #9).
     BarsAtBottom,
     InsertDateTime,
@@ -3332,6 +3334,10 @@ impl App {
             }
             Cmd::BarsAtBottom => {
                 self.settings.bars_at_bottom = !self.settings.bars_at_bottom;
+                self.settings.save();
+            }
+            Cmd::UiSize(n) => {
+                self.settings.ui_size = n;
                 self.settings.save();
             }
             Cmd::HideMenuBar => {

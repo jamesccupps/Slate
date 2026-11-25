@@ -5301,6 +5301,11 @@ impl App {
                 self.settings_changed();
                 self.invalidate();
             }
+            Cmd::UiSize(n) => {
+                self.settings.ui_size = n;
+                self.settings.save();
+                self.apply_ui_size();
+            }
             Cmd::ToggleHideMenuBar => {
                 self.settings.hide_menu_bar = !self.settings.hide_menu_bar;
                 self.settings.save();
@@ -6025,6 +6030,17 @@ impl App {
                     check(Cmd::ToggleLineNumbers, "&Line numbers", "", s.line_numbers),
                     check(Cmd::ToggleTitleBarTabs, "&Tabs in the title bar", "", s.tabs_in_title_bar && !self.theme.hc),
                     check(Cmd::ToggleHideMenuBar, "Hide the men&u bar", "", s.hide_menu_bar),
+                    sub(
+                        "Interface te&xt size",
+                        [0u32, 100, 125, 150, 175, 200]
+                            .iter()
+                            .map(|&n| {
+                                let label = if n == 0 { "As &Windows has it (Text size)".to_string() } else { format!("&{n}%") };
+                                let on = if n == 0 { s.ui_size < 100 } else { s.ui_size == n };
+                                check(Cmd::UiSize(n), &label, "", on)
+                            })
+                            .collect(),
+                    ),
                     sub(
                         "Fin&d bar",
                         vec![

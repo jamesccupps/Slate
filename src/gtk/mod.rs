@@ -116,6 +116,10 @@ pub struct Ui {
     menu_items: Rc<Vec<glib::WeakRef<gtk4::Widget>>>,
     /// Alt is down with no other key since: letting it go opens the hidden menu bar's first menu.
     alt_alone: Cell<bool>,
+    /// Settings → Interface text size: the size in use (percent; 0: the desktop's), and GTK's own font as the desktop
+    /// gives it (its size is scaled for GTK's parts: menus, boxes, buttons).
+    ui_size: Cell<u32>,
+    desktop_font: RefCell<Option<String>>,
     /// The find bar and the notice are above the status bar (Settings → Find bar → At the bottom).
     bars_bottom: Cell<bool>,
     /// Format → Language's last item: Always open .x files as … (the tab's ending and language it's for).
@@ -951,6 +955,8 @@ pub fn window(application: &gtk4::Application, test: Option<Rc<testmode::Test>>)
         menu_row: menu_row.clone(),
         menu_items: Rc::new(items.iter().map(|w| w.downgrade()).collect()),
         alt_alone: Cell::new(false),
+        ui_size: Cell::new(0),
+        desktop_font: RefCell::new(None),
         bars_bottom: Cell::new(false),
         lang_extra: lang_extra.clone(),
         lang_extra_for: RefCell::new(None),
@@ -1915,6 +1921,11 @@ fn actions(ui: &Rc<Ui>) {
             ui.command(Cmd::JsonIndent(n.clamp(1, 8) as u32));
         }
     });
+    valued("ui-size", glib::VariantTy::INT32, 0i32.to_variant(), |ui, v| {
+        if let Some(n) = v.get::<i32>() {
+            ui.command(Cmd::UiSize(n.clamp(0, 200) as u32));
+        }
+    });
     valued("font-size", glib::VariantTy::INT32, 11i32.to_variant(), |ui, v| {
         if let Some(n) = v.get::<i32>() {
             ui.command(Cmd::FontSize(n.clamp(6, 72) as u8));
@@ -2230,6 +2241,12 @@ fn menu_model(recent: &gio::Menu, format_extra: &gio::Menu, view_extra: &gio::Me
         ("One for each tab", "find-per-tab"),
         ("At the bottom (notices too)", "bars-at-bottom"),
     ]);
+    let sizes = gio::Menu::new();
+    sizes.append_item(&valued_item("As the desktop has it", "ui-size", 0i32));
+    for n in [100i32, 125, 150, 175, 200] {
+        sizes.append_item(&valued_item(&format!("{n}%"), "ui-size", n));
+    }
+    looks.append_submenu(Some("Interface text size"), &sizes);
     looks.append_submenu(Some("Find bar"), &find_bar);
     looks.append_submenu(Some("Font"), &font_menu(fonts));
     let theme = section(&[("Use system setting", "theme-system"), ("Light", "theme-light"), ("Dark", "theme-dark")]);
@@ -3084,7 +3101,7 @@ impl Ui {
 
     /// The tab's menu or the list of tabs, under the strip at `x`.
     fn popup_tab_menu(&self, menu: &gio::Menu, x: f64) {
-        let at = gdk::Rectangle::new(x as i32, (chrome::TAB_H - 4.0) as i32, 1, 1);
+        let at = gdk::Rectangle::new(x as i32, (self.tabs.content_height() as f64 - 4.0) as i32, 1, 1);
         self.popup(&self.tab_menu, menu, at);
     }
 
@@ -3115,7 +3132,7 @@ impl Ui {
             chrome::StatusItem::Overtype => return self.command(Cmd::ToggleOvertype),
             chrome::StatusItem::Size => return,
         };
-        self.popup(&self.status_menu, &menu, gdk::Rectangle::new(ix as i32, 0, iw as i32, chrome::STATUS_H as i32));
+        self.popup(&self.status_menu, &menu, gdk::Rectangle::new(ix as i32, 0, iw as i32, self.status.content_height()));
     }
 
     /// The spelling part of the text's menu for a word spelled wrong at (`x`, `y`) in the text area: (label, action).
@@ -3534,6 +3551,32 @@ impl Ui {
 
     /// The menus' check marks and dots follow the app: Word wrap, Line numbers, the theme, the tab's line breaks and
     /// language.
+    /// Settings → Interface text size (issue #8): the tab strip and status bar as high as their text needs, and GTK's
+    /// own parts in the font size picked (the desktop's font, scaled; as the desktop has it again for 0).
+    fn apply_ui_size(&self, a: &App) {
+        let n = if a.settings.ui_size >= 100 { a.settings.ui_size.min(200) } else { 0 };
+        if self.ui_size.replace(n) == n {
+            return;
+        }
+        let k = chrome::ui_k(&a.settings);
+        self.tabs.set_content_height((chrome::TAB_H * k) as i32);
+        self.status.set_content_height((chrome::STATUS_H * k) as i32);
+        if let Some(gs) = gtk4::Settings::default() {
+            if self.desktop_font.borrow().is_none() {
+                *self.desktop_font.borrow_mut() = gs.gtk_font_name().map(|f| f.to_string());
+            }
+            if let Some(base) = self.desktop_font.borrow().clone() {
+                let mut d = pango::FontDescription::from_string(&base);
+                if n >= 100 && d.size() > 0 {
+                    d.set_size((d.size() as f64 * k) as i32);
+                }
+                gs.set_gtk_font_name(Some(&d.to_string()));
+            }
+        }
+        self.tabs.queue_draw();
+        self.status.queue_draw();
+    }
+
     /// Settings → Find bar → At the bottom (issue #9): the notice, then the find bar, just above the status bar; else under
     /// the menu bar (and the tab strip) as usual. Opening them then doesn't move the text.
     fn place_bars(&self, bottom: bool) {
@@ -3621,6 +3664,9 @@ impl Ui {
         self.set_action_state("tab-size", (width as i32).to_variant());
         self.set_action_state("json-indent", (a.settings.json_indent as i32).to_variant());
         self.set_action_state("font-size", (a.settings.font_size.round() as i32).to_variant());
+        let ui_size = if a.settings.ui_size >= 100 { a.settings.ui_size.min(200) } else { 0 };
+        self.set_action_state("ui-size", (ui_size as i32).to_variant());
+        self.apply_ui_size(a);
         self.set_action_state("font", a.settings.font.to_variant());
         self.set_action_state("show-tab", (a.active as i32).to_variant());
         // (what the button switches to)

@@ -318,6 +318,11 @@ expect:findplace=under the text, text at 70
 key:escape
 expect:findplace=under the text, text at 70
 cmd:ToggleBarsAtBottom
+# Settings → Interface text size (issue #8): the bars at 150%, the text where they end
+uisize:150
+expect:findplace=above the text, text at 105
+uisize:100
+expect:findplace=above the text, text at 70
 # Edit → Find in all tabs (issue #15): the lines in a tab of results, read only; Enter goes to one
 cmd:NewTab
 type:first\nsecond zzneedle

@@ -95,6 +95,10 @@ pub struct FindBar {
     font: HFONT,
     pub brush: HBRUSH,
     font_dpi: u32,
+    /// Settings → Interface text size: the bar's sizes are this many times their own (`App::uik`), and its boxes' font
+    /// was made for `font_k`.
+    pub k: f32,
+    font_k: f32,
 }
 
 fn make_edit(parent: HWND, id: usize, cue: &str) -> HWND {
@@ -149,6 +153,8 @@ impl FindBar {
             font: HFONT::default(),
             brush: HBRUSH::default(),
             font_dpi: 0,
+            k: 1.0,
+            font_k: 0.0,
         }
     }
 
@@ -156,9 +162,9 @@ impl FindBar {
         if !self.open {
             0.0
         } else if self.mode == Mode::Replace {
-            metrics::FIND_ROW_H * 2.0 - 6.0
+            (metrics::FIND_ROW_H * 2.0 - 6.0) * self.k
         } else {
-            metrics::FIND_ROW_H
+            metrics::FIND_ROW_H * self.k
         }
     }
 
@@ -207,11 +213,11 @@ impl FindBar {
     /// Fonts and colors for the edit boxes (DPI and theme dependent).
     pub fn style_edits(&mut self, dpi: u32, theme: &Theme) {
         unsafe {
-            if self.font_dpi != dpi {
+            if self.font_dpi != dpi || self.font_k != self.k {
                 if !self.font.is_invalid() {
                     let _ = DeleteObject(self.font);
                 }
-                let px = -((13.0 * dpi as f32 / 96.0).round() as i32);
+                let px = -((13.0 * self.k * dpi as f32 / 96.0).round() as i32);
                 self.font = CreateFontW(
                     px,
                     0,
@@ -229,6 +235,7 @@ impl FindBar {
                     w!("Segoe UI"),
                 );
                 self.font_dpi = dpi;
+                self.font_k = self.k;
                 let m = (4.0 * dpi as f32 / 96.0) as isize;
                 for h in [self.find_edit, self.replace_edit, self.goto_edit] {
                     SendMessageW(h, WM_SETFONT, WPARAM(self.font.0 as usize), LPARAM(1));
@@ -259,10 +266,13 @@ impl FindBar {
             }
             return;
         }
-        let row_h = metrics::FIND_ROW_H;
-        let pad = 8.0;
-        let btn = 28.0;
-        let box_h = 28.0;
+        // (sizes in the bar's own scale: Settings → Interface text size)
+        let k = self.k;
+        let s = |v: f32| v * k;
+        let row_h = s(metrics::FIND_ROW_H);
+        let pad = s(8.0);
+        let btn = s(28.0);
+        let box_h = s(28.0);
         // (the window's DPI, which the boxes are styled for: the render target's catches up at the next paint)
         let dpi = self.font_dpi.max(96) as f32;
         let snap = |v: f32| super::gfx::snap(v, dpi);
@@ -274,8 +284,8 @@ impl FindBar {
         let y = r.y + (row_h - box_h) / 2.0;
         let mut x = r.x + pad;
         let place = |h: HWND, b: Rect| unsafe {
+            let eh = (20.0 * k * dpi / 96.0).round();
             let k = dpi / 96.0;
-            let eh = (20.0 * k).round();
             let left = (b.x * k).round() as i32;
             let top = ((b.y * k) + (b.h * k - eh) / 2.0).round() as i32;
             let _ = SetWindowPos(
@@ -293,30 +303,30 @@ impl FindBar {
         let close = Rect::new(r.right() - pad - btn, y, btn, box_h);
         if self.mode == Mode::GoTo {
             let (lw, _) = gfx.measure("Go to line", ui);
-            x += lw + 12.0;
-            let box_w = 260f32.min(close.x - 8.0 - 52.0 - 8.0 - x).max(80.0);
+            x += lw + s(12.0);
+            let box_w = s(260.0).min(close.x - s(68.0) - x).max(s(80.0));
             let b = snap_box(Rect::new(x, y, box_w, box_h));
             self.inputs.push((self.goto_edit, b));
             place(self.goto_edit, Rect::new(b.x + 4.0, b.y, b.w - 8.0, b.h));
             show(self.goto_edit, true);
             show(self.find_edit, false);
             show(self.replace_edit, false);
-            x = b.right() + 8.0;
-            self.parts.push((Part::Go, Rect::new(x, y, 52.0, box_h)));
-            self.status_w = (close.x - 8.0 - (x + 60.0)).clamp(0.0, 300.0);
+            x = b.right() + s(8.0);
+            self.parts.push((Part::Go, Rect::new(x, y, s(52.0), box_h)));
+            self.status_w = (close.x - s(8.0) - (x + s(60.0))).clamp(0.0, s(300.0));
             self.parts.push((Part::Close, close));
             return;
         }
-        self.parts.push((Part::Expand, Rect::new(x, y, 22.0, box_h)));
-        x += 26.0;
+        self.parts.push((Part::Expand, Rect::new(x, y, s(22.0), box_h)));
+        x += s(26.0);
         // what the box and the match count after it can have, before the previous / next / matching lines buttons
-        let room = (close.x - 8.0 - (4.0 * btn + 6.0) - 14.0 - x).max(0.0);
-        self.status_w = 124f32.min(room - 140.0).max(0.0);
-        let box_w = (r.w * 0.42).clamp(220.0, 460.0).min(room - self.status_w).max(120.0);
+        let room = (close.x - s(8.0) - (4.0 * btn + s(6.0)) - s(14.0) - x).max(0.0);
+        self.status_w = s(124.0).min(room - s(140.0)).max(0.0);
+        let box_w = (r.w * 0.42).clamp(s(220.0), s(460.0)).min(room - self.status_w).max(s(120.0));
         let b = snap_box(Rect::new(x, y, box_w, box_h));
         self.inputs.push((self.find_edit, b));
         // Toggles sit inside the box on the right.
-        let tw = 26.0;
+        let tw = s(26.0);
         let tx = b.right() - 5.0 * tw - 2.0;
         self.parts.push((Part::Case, Rect::new(tx, y + 2.0, tw, box_h - 4.0)));
         self.parts.push((Part::Word, Rect::new(tx + tw, y + 2.0, tw, box_h - 4.0)));
@@ -326,23 +336,23 @@ impl FindBar {
         place(self.find_edit, Rect::new(b.x + 4.0, b.y, tx - b.x - 6.0, b.h));
         show(self.find_edit, true);
         show(self.goto_edit, false);
-        x = b.right() + 10.0 + self.status_w + 4.0;
+        x = b.right() + s(10.0) + self.status_w + s(4.0);
         self.parts.push((Part::Prev, Rect::new(x, y, btn, box_h)));
         self.parts.push((Part::Next, Rect::new(x + btn + 2.0, y, btn, box_h)));
         self.parts.push((Part::Filter, Rect::new(x + 2.0 * (btn + 2.0), y, btn, box_h)));
         self.parts.push((Part::Highlight, Rect::new(x + 3.0 * (btn + 2.0), y, btn, box_h)));
         self.parts.push((Part::Close, close));
         if self.mode == Mode::Replace {
-            let y2 = y + row_h - 6.0;
+            let y2 = y + row_h - s(6.0);
             let b2 = snap_box(Rect::new(b.x, y2, box_w, box_h));
             self.inputs.push((self.replace_edit, b2));
             place(self.replace_edit, Rect::new(b2.x + 4.0, b2.y, b2.w - 8.0, b2.h));
             show(self.replace_edit, true);
             let (w1, _) = gfx.measure("Replace", ui);
             let (w2, _) = gfx.measure("Replace all", ui);
-            let one = snap_box(Rect::new(b2.right() + 8.0, y2, w1 + 20.0, box_h));
+            let one = snap_box(Rect::new(b2.right() + s(8.0), y2, w1 + s(20.0), box_h));
             self.parts.push((Part::ReplaceOne, one));
-            let all = snap_box(Rect::new(b2.right() + 8.0 + w1 + 24.0, y2, w2 + 20.0, box_h));
+            let all = snap_box(Rect::new(b2.right() + s(8.0) + w1 + s(24.0), y2, w2 + s(20.0), box_h));
             self.parts.push((Part::ReplaceAll, all));
         } else {
             show(self.replace_edit, false);
@@ -379,10 +389,10 @@ impl FindBar {
         }
         if self.mode == Mode::GoTo {
             let (lw, _) = g.measure("Go to line", ui);
-            g.text("Go to line", ui, Rect::new(r.x + 8.0, r.y, lw + 4.0, metrics::FIND_ROW_H), t.text, Align::Left);
+            g.text("Go to line", ui, Rect::new(r.x + 8.0 * self.k, r.y, lw + 4.0, metrics::FIND_ROW_H * self.k), t.text, Align::Left);
             if let Some((_, b)) = self.inputs.first() {
-                let hint_x = b.right() + 68.0;
-                g.text(&self.goto_hint, ui, Rect::new(hint_x, r.y, self.status_w, metrics::FIND_ROW_H), t.text_faint, Align::Left);
+                let hint_x = b.right() + 68.0 * self.k;
+                g.text(&self.goto_hint, ui, Rect::new(hint_x, r.y, self.status_w, metrics::FIND_ROW_H * self.k), t.text_faint, Align::Left);
             }
         }
         for (p, b) in &self.parts {
