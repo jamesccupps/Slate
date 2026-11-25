@@ -663,6 +663,11 @@ pub struct App {
     pub menu_word: Option<u64>,
     /// F7 was pressed while the spell checker was starting: it runs once the checker is ready.
     pub f7_wanted: bool,
+    /// F7 going round the text, a part at a time (`spell::Round`).
+    pub f7: Option<crate::spell::Round>,
+    /// Change every's whole-word Replace all in a text too big to look through word by word: in this tab (its message
+    /// says so).
+    pub change_every_whole: Option<u64>,
     /// The text's menu is opened from the keyboard, below the caret: what it's about is at the caret, not there.
     pub menu_at_caret: bool,
     /// Replace all with this search and replacement instead of the find bar's (a word's spelling changed everywhere).
@@ -810,6 +815,8 @@ impl App {
             spell_word: None,
             menu_word: None,
             f7_wanted: false,
+            f7: None,
+            change_every_whole: None,
             menu_at_caret: false,
             replace_with: None,
             spell_shown: Vec::new(),

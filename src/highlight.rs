@@ -49,13 +49,21 @@ pub fn lang_key_is(k: &str, key: &LangKey) -> bool {
 
 /// What Format → Language's Always open item is for: a file's ending (`mmd`), or its whole name (lower case) when it
 /// has none (`Jenkinsfile`, `.env`).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct LangKey {
     pub key: String,
     pub name: bool,
-    /// The name as the file has it (for the menu).
+    /// The name as the file has it (for the menu); not part of what it is (`.MMD` is `.mmd`).
     pub shown: String,
 }
+
+impl PartialEq for LangKey {
+    fn eq(&self, other: &LangKey) -> bool {
+        self.key == other.key && self.name == other.name
+    }
+}
+
+impl Eq for LangKey {}
 
 impl LangKey {
     pub fn of(path: &str) -> Option<LangKey> {

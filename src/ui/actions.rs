@@ -72,6 +72,8 @@ pub const TIMER_SPELL: usize = 13;
 pub const TIMER_REPAINT: usize = 14;
 /// The clicks in the text that close the find bar are over (`App::close_find_later`).
 pub const TIMER_FIND_CLOSE: usize = 15;
+/// F7's next part (`App::f7`).
+pub const TIMER_F7: usize = 16;
 
 const BIG_CLIPBOARD: u64 = 64 << 20;
 /// What the status bar says when the clipboard couldn't be written.
@@ -1873,9 +1875,11 @@ impl App {
                 } else if !keep_place {
                     tab.view.top = 0;
                 }
+                let whole = task.kind == TaskKind::ReplaceAll && self.change_every_whole.take_if(|t| *t == tab.id).is_some();
                 let msg = match task.kind {
                     TaskKind::Format(_) => "Formatted".to_string(),
                     TaskKind::Minify(_) => "Minified".to_string(),
+                    TaskKind::ReplaceAll if whole => format!("Replaced {} (every whole word: in a text this big, in code and names too)", plural(count, "match", "matches")),
                     TaskKind::ReplaceAll => format!("Replaced {}", plural(count, "match", "matches")),
                     TaskKind::Eol(e) => format!("Line endings changed to {} ({})", e.short(), plural(count, "line", "lines")),
                     TaskKind::Lines(op) => lines_done(op, count),
@@ -2112,10 +2116,11 @@ impl App {
     /// Find in all tabs or in files started: kept running (`many::Running`), the status bar saying so until it ends.
     fn start_many(&mut self, job: Job<Result<crate::core::many::Results, String>>, title: String, what: String, files: bool) {
         let from = (self.tab().id, self.tab().doc.version);
-        let r = crate::core::many::Running { job, title, what, files, stopping: false, from };
-        self.flash(r.status(), false);
-        self.many = Some(r);
+        // (no message of its own: the status bar's count shows at once, `status_message`)
+        self.flash = None;
+        self.many = Some(crate::core::many::Running { job, title, what, files, stopping: false, from });
         self.timer(TIMER_JOBS, 100);
+        self.invalidate();
     }
 
     /// The find bar's search for `what` (Find in all tabs, …), or None with the find bar opened to type one.
@@ -3027,6 +3032,8 @@ impl App {
             self.flash(format!("Changed “{}” to “{s}” in {}", w.word, crate::edit::plural(places.len() as u64, "place", "places")), false);
             return;
         }
+        // (its message says it was every whole word this time)
+        self.change_every_whole = Some(self.tab().id);
         let q = search::Query { text: w.word.clone(), match_case: true, whole_word: true, regex: false };
         match Matcher::new(&q) {
             Ok(m) => {
@@ -3062,30 +3069,54 @@ impl App {
             self.flash(format!("Slate doesn't check the spelling in {what}"), false);
             return;
         }
-        let (from, len) = (tab.view.sel.end(), tab.doc.len());
-        let mut sp = match std::mem::replace(&mut self.speller, Spelling::Unavailable) {
-            Spelling::Ready(sp) => sp,
+        match &self.speller {
+            Spelling::Ready(_) => {}
             Spelling::Unavailable => {
                 self.flash("Windows has no dictionary for its language, so there's no spell check", true);
                 return;
             }
-            other => {
+            _ => {
                 // (F7 again by itself once it's ready)
-                self.speller = other;
                 self.f7_wanted = true;
                 self.flash("Spell check is starting…", false);
                 return;
             }
+        }
+        // (F7 again while one goes round in this text: it goes on; else one starts at the selection's end)
+        let (id, version, from) = (tab.id, tab.doc.version, tab.view.sel.end());
+        if !self.f7.is_some_and(|r| r.tab == id && r.version == version) {
+            self.f7 = Some(crate::spell::Round::new(id, version, from));
+        }
+        // (test mode: all at once, its windows have no timers running)
+        if win::testing() {
+            while self.f7_slice() {}
+        } else if self.f7_slice() {
+            self.timer(TIMER_F7, 1);
+        }
+    }
+
+    /// A part of F7's round (`spell::Round`, `F7_TIME` long): the word it finds selected with its menu, "No words spelled
+    /// wrong" back where it began, else how far it is (true: more to look at). Another tab or an edit ends it.
+    fn f7_slice(&mut self) -> bool {
+        use crate::spell::Step;
+        let Some(mut round) = self.f7.take() else { return false };
+        let tab = self.tab();
+        if tab.id != round.tab || tab.doc.version != round.version {
+            return false;
+        }
+        let len = tab.doc.len();
+        let mut sp = match std::mem::replace(&mut self.speller, Spelling::Unavailable) {
+            Spelling::Ready(sp) => sp,
+            other => {
+                self.speller = other;
+                return false;
+            }
         };
-        use crate::spell::{next_wrong, NextWrong, F7_BYTES, F7_TIME};
-        let until = std::time::Instant::now() + F7_TIME;
-        let r = self.with_view(|v, cx| match next_wrong(&mut sp, from, len, F7_BYTES, until, |p| v.words_at(cx, p)) {
-            NextWrong::Clean if from > 0 => next_wrong(&mut sp, 0, from, F7_BYTES, until, |p| v.words_at(cx, p)),
-            r => r,
-        });
+        let until = std::time::Instant::now() + crate::spell::F7_TIME;
+        let step = self.with_view(|v, cx| round.step(&mut sp, len, until, |p| v.words_at(cx, p)));
         self.speller = Spelling::Ready(sp);
-        match r {
-            NextWrong::Found(a, b) => {
+        match step {
+            Step::Found(a, b) => {
                 let tab = self.tab_mut();
                 tab.view.sel = Sel { anchor: a, caret: b };
                 tab.doc.seal();
@@ -3093,17 +3124,37 @@ impl App {
                 self.reveal_caret(true);
                 self.menu_word = Some(a);
                 self.context_menu_at_caret();
+                false
             }
-            NextWrong::Clean => self.flash("No words spelled wrong", false),
-            NextWrong::Stopped(p) => {
-                // (from there next time)
-                let tab = self.tab_mut();
-                tab.view.sel = Sel::at(p);
-                self.after_move();
-                self.reveal_caret(true);
-                self.flash("No words spelled wrong so far: F7 looks on from here", false);
+            Step::Done => {
+                self.flash("No words spelled wrong", false);
+                false
+            }
+            Step::More(pct) => {
+                self.f7 = Some(round);
+                self.flash(format!("Looking for words spelled wrong… {pct}% (Esc stops)"), false);
+                true
             }
         }
+    }
+
+    /// Esc before anything else: F7 going round, Find in all tabs or in files, or the tab shown's part of Replace in all
+    /// tabs (whose replace box is open) stops. True if one did.
+    fn stop_first(&mut self) -> bool {
+        if self.f7.take().is_some() {
+            self.kill_timer(TIMER_F7);
+            self.flash("Stopped looking for words spelled wrong", false);
+            return true;
+        }
+        if self.stop_many() {
+            return true;
+        }
+        if let Some(t) = self.tab().task.as_ref().filter(|_| self.replacing.is_some()) {
+            t.job.cancel();
+            self.flash("Cancelling…", false);
+            return true;
+        }
+        false
     }
 
     // ---- input methods (`ime`) ----
@@ -3449,7 +3500,7 @@ impl App {
                 // Find in all tabs or in files stops first (what it found is still listed: the find bar its search
                 // was typed in is usually open); closing and deselecting come next: a save is cancelled only by an
                 // Esc meant for nothing else.
-                if self.stop_many() {
+                if self.stop_first() {
                 } else if self.find.open {
                     self.close_find();
                 } else if let Some(t) = &self.tab().task {
@@ -4214,8 +4265,8 @@ impl App {
                 true
             }
             VK_ESCAPE => {
-                // (Find in all tabs or in files stops first)
-                if !self.stop_many() {
+                // (F7, Find in all tabs or in files, or Replace in all tabs stops first)
+                if !self.stop_first() {
                     self.close_find();
                 }
                 true
@@ -4982,6 +5033,12 @@ impl App {
                 self.invalidate();
             }
             TIMER_FIND_CLOSE => self.close_find_now(),
+            TIMER_F7 => {
+                self.kill_timer(id);
+                if self.f7_slice() {
+                    self.timer(TIMER_F7, 1);
+                }
+            }
             TIMER_JOBS => self.poll_jobs(),
             TIMER_DISK => {
                 self.check_disk();

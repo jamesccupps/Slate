@@ -434,3 +434,16 @@ key:enter
 jobs
 expect:tabtitle=smoke-files.txt
 expect:sel=6..6
+# Your own languages (issue #13): an open tab whose ending is written in another case follows a new rule
+outside:smoke-case-a.zzmd|one
+outside:smoke-case-b.ZZMD|two
+open:smoke-case-a.zzmd
+open:smoke-case-b.ZZMD
+jobs
+cmd:prev-tab
+lang:Lua
+cmd:lang-for-ending
+cmd:next-tab
+expect:lang=Lua
+cmd:prev-tab
+cmd:lang-for-ending

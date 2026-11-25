@@ -69,6 +69,8 @@ pub enum Ask {
     RevealFile(PathBuf),
     /// Open selected file or link found a web link: the browser opens it.
     OpenLink(String),
+    /// F7's next part (`App::f7_slice`), a moment later.
+    F7More,
     /// F7 found a word spelled wrong (`App::menu_word`): the text's menu at the caret, with its suggestions.
     SpellMenu,
     /// Format → Convert → SHA-256's answer: of what (the selection, the file), and the hash (Copy, or OK).
@@ -548,6 +550,11 @@ pub struct App {
     pub menu_word: Option<u64>,
     /// F7 was pressed while the spell checker was starting: it runs once the checker is ready.
     pub f7_wanted: bool,
+    /// F7 going round the text, a part at a time (`spell::Round`).
+    pub f7: Option<crate::spell::Round>,
+    /// Change every's whole-word Replace all in a text too big to look through word by word: in this tab (its message
+    /// says so).
+    pub change_every_whole: Option<u64>,
     /// Go back and Go forward's places (Alt+Left, Alt+Right; issue #11).
     pub nav: edit::Nav,
     /// Replace all with this search and replacement instead of the find bar's (a word's spelling changed everywhere).
@@ -631,6 +638,8 @@ impl App {
             spell_word: None,
             menu_word: None,
             f7_wanted: false,
+            f7: None,
+            change_every_whole: None,
             nav: Default::default(),
             replace_with: None,
             many: None,
@@ -1110,9 +1119,10 @@ impl App {
     /// Find in all tabs or in files started: kept running (`many::Running`), the status bar saying so until it ends.
     fn start_many(&mut self, job: Job<Result<crate::core::many::Results, String>>, title: String, what: String, files: bool) {
         let from = (self.tab().id, self.tab().doc.version);
-        let r = crate::core::many::Running { job, title, what, files, stopping: false, from };
-        self.flash(r.status(), false);
-        self.many = Some(r);
+        // (no message of its own: the status bar's count shows at once, `status_message`)
+        self.flash = None;
+        self.many = Some(crate::core::many::Running { job, title, what, files, stopping: false, from });
+        self.dirty_view = true;
     }
 
     /// The find bar's search for `what` (Find in all tabs, …), or None with the find bar opened to type one.
@@ -1155,7 +1165,7 @@ impl App {
         let Some(running) = self.many.as_mut() else { return false };
         let Some(r) = running.job.take() else {
             // (the status bar's count)
-            if self.flash_at.elapsed() >= Duration::from_millis(1500) {
+            if self.flash.is_none() || self.flash_at.elapsed() >= Duration::from_millis(1500) {
                 self.dirty_view = true;
             }
             return true;
@@ -1346,6 +1356,7 @@ impl App {
             || self.disk_job.is_some()
             || self.session_job.is_some()
             || self.many.is_some()
+            || self.f7.is_some()
     }
 
     /// The status bar's word count runs (test mode's `jobs:counts` waits for it too).
@@ -1769,7 +1780,8 @@ impl App {
                 self.flash(format!("{name} is a new file: saving creates it."), false);
             }
             Err(e) => {
-                let name = self.tabs[i].doc.path.as_deref().unwrap_or(&opened.path).display().to_string();
+                // (the file looked for: not `name:line` as it was asked for)
+                let name = opened.path.display().to_string();
                 if reading_again {
                     // (the text as it was stays)
                     self.tabs[i].reload = None;
@@ -2395,6 +2407,8 @@ impl App {
             self.flash(format!("Changed “{}” to “{s}” in {}", w.word, edit::plural(places.len() as u64, "place", "places")), false);
             return;
         }
+        // (its message says it was every whole word this time)
+        self.change_every_whole = Some(self.tab().id);
         let q = Query { text: w.word.clone(), match_case: true, whole_word: true, regex: false };
         match Matcher::new(&q) {
             Ok(m) => {
@@ -2430,32 +2444,54 @@ impl App {
             self.flash(format!("Slate doesn't check the spelling in {what}"), false);
             return;
         }
-        let (from, len) = (tab.view.sel.end(), tab.doc.len());
-        let mut sp = match std::mem::replace(&mut self.speller, Spelling::Unavailable) {
-            Spelling::Ready(sp) => sp,
+        match &self.speller {
+            Spelling::Ready(_) => {}
             Spelling::Unavailable => {
                 self.flash("There's no spell checker: Slate uses Enchant, with a dictionary for your language", true);
                 return;
             }
             other => {
-                // (made a moment after it's asked for)
-                // (F7 again by itself once it's ready)
-                self.speller = if matches!(other, Spelling::NotYet) { Spelling::Soon } else { other };
+                // (made a moment after it's asked for; F7 again by itself once it's ready)
+                if matches!(other, Spelling::NotYet) {
+                    self.speller = Spelling::Soon;
+                }
                 self.speller_wanted = true;
                 self.f7_wanted = true;
                 self.flash("Spell check is starting…", false);
                 return;
             }
+        }
+        // (F7 again while one goes round in this text: it goes on; else one starts at the selection's end)
+        let (id, version, from) = (tab.id, tab.doc.version, tab.view.sel.end());
+        if !self.f7.is_some_and(|r| r.tab == id && r.version == version) {
+            self.f7 = Some(crate::spell::Round::new(id, version, from));
+        }
+        self.f7_slice(g);
+    }
+
+    /// A part of F7's round (`spell::Round`, `F7_TIME` long): the word it finds selected with its menu, "No words spelled
+    /// wrong" back where it began, else how far it is, and the next part a moment later (`Ask::F7More`: the window
+    /// answers in between). Another tab or an edit ends it.
+    pub fn f7_slice(&mut self, g: &Geom) {
+        use crate::spell::Step;
+        let Some(mut round) = self.f7.take() else { return };
+        let tab = self.tab();
+        if tab.id != round.tab || tab.doc.version != round.version {
+            return;
+        }
+        let len = tab.doc.len();
+        let mut sp = match std::mem::replace(&mut self.speller, Spelling::Unavailable) {
+            Spelling::Ready(sp) => sp,
+            other => {
+                self.speller = other;
+                return;
+            }
         };
-        use crate::spell::{next_wrong, NextWrong, F7_BYTES, F7_TIME};
-        let until = std::time::Instant::now() + F7_TIME;
-        let r = self.with_view(g, |v, cx| match next_wrong(&mut sp, from, len, F7_BYTES, until, |p| v.words_at(cx, p)) {
-            NextWrong::Clean if from > 0 => next_wrong(&mut sp, 0, from, F7_BYTES, until, |p| v.words_at(cx, p)),
-            r => r,
-        });
+        let until = std::time::Instant::now() + crate::spell::F7_TIME;
+        let step = self.with_view(g, |v, cx| round.step(&mut sp, len, until, |p| v.words_at(cx, p)));
         self.speller = Spelling::Ready(sp);
-        match r {
-            NextWrong::Found(a, b) => {
+        match step {
+            Step::Found(a, b) => {
                 let tab = &mut self.tabs[self.active];
                 tab.view.block = None;
                 tab.view.sel = Sel { anchor: a, caret: b };
@@ -2465,17 +2501,31 @@ impl App {
                 self.menu_word = Some(a);
                 self.asks.push(Ask::SpellMenu);
             }
-            NextWrong::Clean => self.flash("No words spelled wrong", false),
-            NextWrong::Stopped(p) => {
-                // (from there next time)
-                let tab = &mut self.tabs[self.active];
-                tab.view.block = None;
-                tab.view.sel = Sel::at(p);
-                tab.view.want_x = None;
-                self.reveal_pending = true;
-                self.flash("No words spelled wrong so far: F7 looks on from here", false);
+            Step::Done => self.flash("No words spelled wrong", false),
+            Step::More(pct) => {
+                self.f7 = Some(round);
+                self.flash(format!("Looking for words spelled wrong… {pct}% (Esc stops)"), false);
+                self.asks.push(Ask::F7More);
             }
         }
+    }
+
+    /// Esc before anything else: F7 going round, Find in all tabs or in files, or the tab shown's part of Replace in all
+    /// tabs (whose replace box is open) stops. True if one did.
+    pub fn stop_first(&mut self) -> bool {
+        if self.f7.take().is_some() {
+            self.flash("Stopped looking for words spelled wrong", false);
+            return true;
+        }
+        if self.stop_many() {
+            return true;
+        }
+        if let Some(t) = self.tabs[self.active].task.as_ref().filter(|_| self.replacing.is_some()) {
+            t.job.cancel();
+            self.flash("Cancelling…", false);
+            return true;
+        }
+        false
     }
 
     // ---- input methods ----
@@ -2947,8 +2997,8 @@ impl App {
             Key::Insert | Key::KP_Insert if ctrl && !shift && !alt => self.exec(Cmd::Copy),
             Key::Insert | Key::KP_Insert if shift && !ctrl && !alt => self.exec(Cmd::Paste),
             Key::Escape => {
-                // (Find in all tabs or in files stops first: the find bar its search was typed in is usually open)
-                if self.stop_many() {
+                // (F7, Find in all tabs or in files, or Replace in all tabs stops first: the find bar is usually open)
+                if self.stop_first() {
                 } else if self.find.open {
                     self.exec(Cmd::CloseFind);
                 } else if let Some(t) = self.tabs[self.active].task.as_ref() {
@@ -4028,7 +4078,9 @@ impl App {
                     tab.view.top = 0;
                     tab.view.top_row = 0;
                 }
+                let whole = kind == TaskKind::ReplaceAll && self.change_every_whole.take_if(|t| *t == tab.id).is_some();
                 let msg = match kind {
+                    TaskKind::ReplaceAll if whole => format!("Replaced {} (every whole word: in a text this big, in code and names too)", edit::plural(count, "match", "matches")),
                     TaskKind::ReplaceAll => format!("Replaced {}", edit::plural(count, "match", "matches")),
                     TaskKind::Lines(op) => edit::lines_done(op, count),
                     TaskKind::SortColumn { col, d, header, .. } => {

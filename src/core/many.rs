@@ -295,11 +295,14 @@ fn read_text(path: &Path) -> Got {
 }
 
 /// Whether a file starting with `head` is UTF-16 (`Some(true)`: big endian): a byte order mark, or text that is
-/// mostly ASCII with every other byte zero (and the others almost never zero or control characters).
+/// mostly ASCII with every other byte zero: at least 70% of the pairs ASCII text (a letter, digit, space or
+/// punctuation beside a zero), almost none a control character or two zeros. An archive (`!<arch>`, Rust's `.rlib`)
+/// isn't, whatever its bytes.
 fn utf16_kind(head: &[u8]) -> Option<bool> {
     match head {
         [0xFF, 0xFE, ..] => return Some(false),
         [0xFE, 0xFF, ..] => return Some(true),
+        _ if head.starts_with(b"!<arch>") => return None,
         _ => {}
     }
     let pairs = head.as_chunks::<2>().0;
@@ -308,9 +311,10 @@ fn utf16_kind(head: &[u8]) -> Option<bool> {
     }
     let n = pairs.len();
     let looks = |hi: usize, lo: usize| {
-        let zero_hi = pairs.iter().filter(|p| p[hi] == 0).count();
+        let text = |c: u8| (0x20..0x7F).contains(&c) || matches!(c, b'\t' | b'\n' | b'\r');
+        let ascii = pairs.iter().filter(|p| p[hi] == 0 && text(p[lo])).count();
         let odd_lo = pairs.iter().filter(|p| p[lo] == 0 || (p[lo] < 0x20 && !matches!(p[lo], b'\t' | b'\n' | b'\r'))).count();
-        zero_hi * 10 >= n * 4 && odd_lo * 20 <= n
+        ascii * 10 >= n * 7 && odd_lo * 20 <= n
     };
     if looks(1, 0) {
         Some(false)
@@ -706,6 +710,10 @@ mod tests {
         // (a binary file's zeros aren't every other byte)
         assert_eq!(utf16_kind(b"\x7FELF\x02\x01\x01\0\0\0\0\0\0\0\0\0\x03\0>\0\x01\0\0\0"), None);
         assert_eq!(utf16_kind(b"text"), None);
+        // an archive (`.rlib`) isn't, nor mostly zeros beside control bytes
+        assert_eq!(utf16_kind(b"!<arch>\n/ 0 0 0 0 8 `\n\0\0\0\x01\0\0\0\x02"), None);
+        let half: Vec<u8> = (0..64u8).flat_map(|i| [if i % 2 == 0 { b'a' } else { 0x01 }, 0]).collect();
+        assert_eq!(utf16_kind(&half), None);
         // ANSI: read as Slate reads it
         assert_eq!(text_of(b"caf\xE9".to_vec(), None), "café".as_bytes());
         assert_eq!(text_of(b"\xEF\xBB\xBFok".to_vec(), None), b"ok");

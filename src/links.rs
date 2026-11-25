@@ -28,7 +28,7 @@ pub fn around(line: &str, col: usize) -> &str {
     if let Some(q) = quoted_around(line, col) {
         return q;
     }
-    let stop = |c: char| c.is_whitespace() || "\"'`<>()[]{}|".contains(c);
+    let stop = |c: char| c.is_whitespace() || "\"'`<>()[]{}|“”‘’«»".contains(c);
     let a = line[..col].rfind(stop).map_or(0, |i| i + line[i..].chars().next().map_or(1, char::len_utf8));
     let b = line[col..].find(stop).map_or(line.len(), |i| col + i);
     line[a..b].trim_end_matches(['.', ',', ';', '!', '?', ':'])
@@ -37,7 +37,7 @@ pub fn around(line: &str, col: usize) -> &str {
 /// A link (http, https, www.) the place `col` is in: up to a space or a quote, brackets in it kept when they pair up
 /// (a closing one more than were opened ends it, as around a link in brackets), and punctuation after it left out.
 fn link_around(line: &str, col: usize) -> Option<&str> {
-    let edge = |c: char| c.is_whitespace() || "\"'`<>".contains(c);
+    let edge = |c: char| c.is_whitespace() || "\"'`<>“”‘’«»".contains(c);
     let a = line[..col].rfind(edge).map_or(0, |i| i + line[i..].chars().next().map_or(1, char::len_utf8));
     let token = &line[a..];
     let lower = token.to_ascii_lowercase();
@@ -48,7 +48,13 @@ fn link_around(line: &str, col: usize) -> Option<&str> {
     }
     let mut depth = 0i32;
     let mut end = token.len();
+    // (a host in brackets, `https://[::1]:8080/`, is part of it)
+    let host_at = token[start..].find("://").map_or(0, |i| i + 3);
+    let bracket_end = token[start + host_at..].starts_with('[').then(|| token[start + host_at..].find(']')).flatten().map(|i| host_at + i);
     for (i, c) in token[start..].char_indices() {
+        if bracket_end.is_some_and(|e| i >= host_at && i <= e) {
+            continue;
+        }
         if edge(c) || "[]{}|".contains(c) {
             end = start + i;
             break;
@@ -141,7 +147,9 @@ pub fn menu_label(t: &Target, folder: Option<&Path>, amp: bool) -> String {
 /// Whether a name from around the caret (`around`, nothing selected) looks like a file name or a link: it's a link, or
 /// has a folder in it, or an ending with a letter in it (`notes.txt`, `main.rs:40`). A word alone (`gamma`), a number
 /// (`1.5`), `e.g`, an abbreviation (`U.S.A`), two sentences without their space (`end.Then`) or a mail address isn't
-/// one. (With `names_only`, a selection is held to the same; else it's taken as it is.)
+/// one. (With `names_only`, a selection is held to the same; else it's taken as it is.) The price: a dot-file
+/// (`.env`) or an ending with a capital (`notes.Txt`) isn't offered at the caret; selected, File → Open selected file
+/// or link still opens it.
 pub fn plausible(s: &str) -> bool {
     let lower = s.to_ascii_lowercase();
     if lower.starts_with("http://") || lower.starts_with("https://") || lower.starts_with("www.") || lower.starts_with("file://") {
@@ -198,6 +206,11 @@ pub fn target_of(text: &str, folder: Option<&Path>) -> Result<Target, String> {
             return Err("A link has no spaces in it".into());
         }
         let url = if lower.starts_with("www.") { format!("https://{t}") } else { t.to_string() };
+        // (an address needs a site: not `https://` alone)
+        let rest = url.split_once("://").map_or("", |(_, r)| r);
+        if rest.split(['/', '?', '#']).next().is_none_or(str::is_empty) {
+            return Err("That link has no address".into());
+        }
         return Ok(Target::Link(url));
     }
     // (another kind of address, `mailto:`, `ms-settings:`: not for Slate to open; `C:\…` is a drive, `notes:12` a
@@ -357,6 +370,11 @@ mod tests {
         assert_eq!(around(line, 10), "https://en.wikipedia.org/wiki/Slate_(disambiguation)");
         assert_eq!(around(line, 45), "https://en.wikipedia.org/wiki/Slate_(disambiguation)");
         assert_eq!(around(line, 70), "https://x.org/a");
+        // curly quotes around a link aren't part of it; a host in brackets is; no host, no link
+        assert_eq!(around("see “https://example.com/a” now", 10), "https://example.com/a");
+        assert_eq!(around("at https://[::1]:8080/x here", 8), "https://[::1]:8080/x");
+        assert!(target_of("https://", None).is_err());
+        assert_eq!(target_of("https://[::1]:8080/x", None), Ok(Target::Link("https://[::1]:8080/x".into())));
         // a quoted name with a space in it, the place inside
         let q = r#"<a href="sub folder\with space.txt">"#;
         assert_eq!(around(q, 22), r"sub folder\with space.txt");

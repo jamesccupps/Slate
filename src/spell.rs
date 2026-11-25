@@ -214,7 +214,63 @@ pub fn next_wrong(
     NextWrong::Clean
 }
 
-/// How long F7 may look before it stops ("F7 looks on from here"), and the most it reads.
+/// F7 going round the text (issue #12): a part at a time, `F7_TIME` each, the window answering in between, until it
+/// finds a word spelled wrong or comes back to where it began (the selection's end when it started). For the tab and
+/// its text's version it began in: another tab or an edit ends it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Round {
+    pub tab: u64,
+    pub version: u64,
+    pub start: u64,
+    pub pos: u64,
+    /// Gone round from the top (after the text's end): looking up to `start` now.
+    pub wrapped: bool,
+}
+
+/// What a part of F7's round came to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Step {
+    Found(u64, u64),
+    /// Back where it began: none spelled wrong.
+    Done,
+    /// More to look at; how far it is, in percent.
+    More(u8),
+}
+
+impl Round {
+    pub fn new(tab: u64, version: u64, start: u64) -> Round {
+        Round { tab, version, start, pos: start, wrapped: false }
+    }
+
+    /// Looks on until `until` in a text `len` long (`words` as for `next_wrong`).
+    pub fn step(&mut self, sp: &mut Speller, len: u64, until: std::time::Instant, mut words: impl FnMut(u64) -> (u64, Vec<(u64, u64, String)>)) -> Step {
+        loop {
+            let to = if self.wrapped { self.start.min(len) } else { len };
+            match next_wrong(sp, self.pos.min(to), to, F7_BYTES, until, &mut words) {
+                NextWrong::Found(a, b) => return Step::Found(a, b),
+                NextWrong::Stopped(p) => {
+                    self.pos = p;
+                    return Step::More(self.percent(len));
+                }
+                NextWrong::Clean if !self.wrapped && self.start > 0 => {
+                    self.wrapped = true;
+                    self.pos = 0;
+                    if std::time::Instant::now() >= until {
+                        return Step::More(self.percent(len));
+                    }
+                }
+                NextWrong::Clean => return Step::Done,
+            }
+        }
+    }
+
+    fn percent(&self, len: u64) -> u8 {
+        let covered = if self.wrapped { len.saturating_sub(self.start) + self.pos } else { self.pos.saturating_sub(self.start) };
+        (covered * 100 / len.max(1)).min(99) as u8
+    }
+}
+
+/// How long a part of F7's round looks (the window answers in between), and the most it reads.
 pub const F7_TIME: std::time::Duration = std::time::Duration::from_millis(150);
 pub const F7_BYTES: u64 = 8 << 20;
 /// The biggest text Change every looks through for the spell check's places (`places_of`); a bigger one gets a
@@ -309,6 +365,57 @@ mod tests {
         assert_eq!(places, vec![(0, 3), (last, last + 3)]);
         // (same case only: "Teh" is another word)
         assert!(places_of("Teh", text.len() as u64, words).is_empty());
+    }
+
+    #[test]
+    fn f7_goes_round_and_says_when_none() {
+        let text = "one zztwo\nthree\nfour five six";
+        let words = |pos: u64| {
+            let start = text[..pos as usize].rfind('\n').map_or(0, |i| i + 1);
+            let end = text[start..].find('\n').map_or(text.len(), |i| start + i);
+            let mut spans = Vec::new();
+            let ws = words_in(Lang::Plain, &text.as_bytes()[start..end], State::START, &mut spans)
+                .into_iter()
+                .map(|(a, b)| ((start + a) as u64, (start + b) as u64, text[start + a..start + b].to_string()))
+                .collect();
+            ((end + 1) as u64, ws)
+        };
+        let len = text.len() as u64;
+        let far = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut sp = Speller::new(Box::new(Zz), "xx".into());
+        // from after the only wrong word: round from the top to it
+        let mut r = Round::new(1, 1, 12);
+        assert_eq!(r.step(&mut sp, len, far, words), Step::Found(4, 9));
+        // from just after it: back where it began, none
+        let mut r = Round::new(1, 1, 9);
+        let mut found = None;
+        for _ in 0..10 {
+            match r.step(&mut sp, len, far, words) {
+                Step::More(_) => continue,
+                s => {
+                    found = Some(s);
+                    break;
+                }
+            }
+        }
+        assert_eq!(found, Some(Step::Found(4, 9)));
+        let clean = "one two\nthree";
+        let cw = |pos: u64| {
+            let start = clean[..pos as usize].rfind('\n').map_or(0, |i| i + 1);
+            let end = clean[start..].find('\n').map_or(clean.len(), |i| start + i);
+            let mut spans = Vec::new();
+            let ws = words_in(Lang::Plain, &clean.as_bytes()[start..end], State::START, &mut spans)
+                .into_iter()
+                .map(|(a, b)| ((start + a) as u64, (start + b) as u64, clean[start + a..start + b].to_string()))
+                .collect();
+            ((end + 1) as u64, ws)
+        };
+        let mut r = Round::new(1, 1, 4);
+        assert_eq!(r.step(&mut sp, clean.len() as u64, far, cw), Step::Done);
+        // out of time: a part at a time, how far it is
+        let mut r = Round::new(1, 1, 0);
+        let past = std::time::Instant::now();
+        assert!(matches!(r.step(&mut sp, clean.len() as u64, past, cw), Step::More(p) if p < 100));
     }
 
     fn found(lang: Lang, text: &str) -> Vec<&str> {

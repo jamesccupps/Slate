@@ -104,7 +104,7 @@ fn work(data: &[u8], step: &Mutex<String>, ticks: &AtomicU64) -> Vec<String> {
         *step.lock().unwrap() = what;
         ticks.fetch_add(1, Ordering::Relaxed);
     };
-    for &lang in Lang::ALL.iter() {
+    for &lang in Lang::ALL.iter().chain([Lang::Results].iter()) {
         at(format!("lexing as {}", lang.label()));
         spans.clear();
         let _ = highlight::lex(lang, data, State::START, Some(&mut spans));
@@ -120,7 +120,7 @@ fn work(data: &[u8], step: &Mutex<String>, ticks: &AtomicU64) -> Vec<String> {
     if breaks.len() >= 2 {
         let (c1, c2) = (breaks[breaks.len() / 3] + 1, breaks[breaks.len() * 2 / 3] + 1);
         if c1 < c2 {
-            for &lang in Lang::ALL.iter() {
+            for &lang in Lang::ALL.iter().chain([Lang::Results].iter()) {
                 at(format!("lexing as {} in three pieces", lang.label()));
                 let whole = highlight::lex(lang, data, State::START, None);
                 let s = highlight::lex(lang, &data[..c1], State::START, None);

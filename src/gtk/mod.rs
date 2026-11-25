@@ -2648,8 +2648,8 @@ impl Ui {
                 glib::Propagation::Stop
             }
             gdk::Key::Escape => {
-                // (Find in all tabs or in files stops first)
-                if !self.with(|a| a.stop_many()).unwrap_or(false) {
+                // (F7, Find in all tabs or in files, or Replace in all tabs stops first)
+                if !self.with(|a| a.stop_first()).unwrap_or(false) {
                     self.with(|a| a.exec(Cmd::CloseFind));
                     self.text.grab_focus();
                 }
@@ -4107,6 +4107,16 @@ impl Ui {
         if matches!(ask, Ask::SpellMenu) {
             return self.spell_menu_at_caret();
         }
+        // (F7's next part, once the window has answered what came in)
+        if matches!(ask, Ask::F7More) {
+            glib::timeout_add_local_once(Duration::from_millis(1), || {
+                if let Some(ui) = get_ui() {
+                    let g = ui.geom();
+                    ui.with(|a| a.f7_slice(&g));
+                }
+            });
+            return;
+        }
         if let Some(test) = &self.test {
             test.asked.borrow_mut().push(format!("{ask:?}"));
             let answer = test.answers.borrow_mut().pop_front().unwrap_or_default();
@@ -4330,7 +4340,7 @@ impl Ui {
                 let _ = gio::AppInfo::launch_default_for_uri(&url, gio::AppLaunchContext::NONE);
             }
             // (shown above)
-            Ask::SpellMenu => {}
+            Ask::SpellMenu | Ask::F7More => {}
             Ask::Hash { what, hex } => {
                 let ask = Ask::Hash { what: what.clone(), hex: hex.clone() };
                 self.dialog(&format!("SHA-256 of {what}"), &hex, &[("OK", "ok"), ("Copy", "copy")], move |answer| {

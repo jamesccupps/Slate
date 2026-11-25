@@ -86,13 +86,13 @@ when it's this user's alone, else a guest window that keeps nothing). Windows: `
     `in_files` (the text files under a folder in name order: not hidden or `SKIP_DIRS` folders, `bin` only beside an
     `obj` (.NET's output; alone it's often scripts); a link to a file read, one to a folder not followed; a file over
     32 MB, online only (Windows' recall-on-access attributes: reading would download it), or binary passed over,
-    the binary check on its first 8 KB read before the rest; UTF-16 with or without a byte order mark and ANSI made
-    UTF-8; 20,000 files, 20,000 results at most; the job's progress counts the files), `in_tabs` / `in_files_results`
+    the binary check on its first 8 KB read before the rest; UTF-16 with or without a byte order mark (without one:
+    70% of the first 8 KB's pairs ASCII text beside a zero, never an `!<arch>` archive) and ANSI made UTF-8; 20,000 files, 20,000 results at most; the job's progress counts the files), `in_tabs` / `in_files_results`
     (the jobs: a tab of results whose first line says what was found, what was passed over, and why it ended early:
     a limit, or Esc, which keeps what was found) and `Results` (its text, where each line goes, `Place::Tab` or
     `Place::File`, and each tab's text's version, so Enter says when a line may have moved). `Running` is a search
-    on its way (`App::many`): the status bar counts (`status`), Esc stops it first (before closing the find bar:
-    `stop_many`), and its tab comes to the front only if the tab shown and its text are as they were when it started
+    on its way (`App::many`): the status bar counts from the start (`status`; no message of its own, which would
+    hide the count), Esc stops it first (before closing the find bar: `stop_many`), and its tab comes to the front only if the tab shown and its text are as they were when it started
     (`may_show`), else waits behind. The tab of results is read only, not kept in the session, colored as
     `Lang::Results` (Slate's own, not in Format → Language); Enter or a double-click goes there (`go_to_source`; a
     file not there any more isn't made anew); Save as makes it the file (an ordinary tab). Replace in all tabs needs
@@ -267,20 +267,25 @@ when it's this user's alone, else a guest window that keeps nothing). Windows: `
     (`SuggestionAll`: the places the spell check would mark that word, `spell::places_of` over each view's
     `words_at`, so not in code, a file name or a link, replaced as one undo step, `edit::replace_places`; a text over
     `CHANGE_EVERY_MAX` (8 MB) gets a whole-word, same-case Replace all on a job instead; Linux through `Ui::command`,
-    as it needs the view's size), Add to dictionary, Ignore. F7 (`NextMisspelling`, since 0.20, issue #12):
-    `spell::next_wrong` from the selection's end to the text's end, then round from the start, over each view's
-    `words_at` (a segment at a time, so rows not on screen count too; `F7_TIME` (150 ms) and 8 MB a press, then "F7
-    looks on from here": words new to the checker are slow); the word is selected and the text's menu opens below it
-    for that word (`App::menu_word`, taken by the next menu whatever it shows; Linux `Ask::SpellMenu`, test mode notes
-    its items in `print:asked`). F7 while the checker is still starting runs once it's ready (`App::f7_wanted`); in
-    a read-only tab or one of results it says so.
+    as it needs the view's size; the message says when it was the whole-word Replace all, `App::change_every_whole`),
+    Add to dictionary, Ignore. F7 (`NextMisspelling`, since 0.20, issue #12): a `spell::Round` (`App::f7`) from the
+    selection's end to the text's end, then from the top back to where it began, over each view's `words_at` (a
+    segment at a time, so rows not on screen count too), in parts of `F7_TIME` (150 ms: words new to the checker are
+    slow), the next part a moment later (Windows `TIMER_F7`, Linux `Ask::F7More`; test mode on Windows all at once)
+    so the window answers in between, the status bar saying how far it is; Esc stops it, an edit or another tab ends
+    it; back where it began it says "No words spelled wrong". The word found is selected and the text's menu opens
+    below it for that word (`App::menu_word`, taken by the next menu whatever it shows; Linux `Ask::SpellMenu`, test
+    mode notes its items in `print:asked`). F7 while the checker is still starting runs once it's ready
+    (`App::f7_wanted`); in a read-only tab or one of results it says so. Esc stops what goes on before anything else
+    (`stop_first`, both apps): F7's round, then Find in all tabs or in files, then the tab shown's part of Replace in
+    all tabs (whose replace box is open); only then does it close the find bar.
   - `src/links.rs` (shared, since 0.20, issue #7) — File → Open selected file or link and the text's menu's Open
     “name”: `target_in` takes the selection, or around a place (`around`, only what `plausible` says looks like a
     name: a folder or an ending in it, or a link), `target_of` makes it an http(s) link (for the browser: Windows
     `win::shell_open`, Linux `Ask::OpenLink`) or a full path (relative to the tab's file's folder; `/` or `\` either
     way, `%VAR%` on Windows, `~` the home folder; `name:12:3` and a compiler's `name(12,3)` a line and column;
-    `file:` addresses). `around` takes a link with its brackets (`link_around`) and a quoted name with spaces
-    (`quoted_around`) first; `plausible` turns down abbreviations, two sentences without their space and mail
+    `file:` addresses). `around` takes a link with its brackets and a host in brackets, never the curly quotes
+    around it (`link_around`; a link without a site isn't one), and a quoted name with spaces (`quoted_around`) first; `plausible` turns down abbreviations, two sentences without their space and mail
     addresses. Other schemes are refused; a name is only ever opened as a text file in a tab, never run, and never
     made anew (Linux `open_paths_as(.., false)`). `menu_label` shows the whole path for a file outside the tab's
     folder, and a link's site. A file that can't be opened shows the tab it was opened from again
