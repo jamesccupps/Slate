@@ -296,6 +296,7 @@ const ALL: &[Command] = &[
     any(V, "line-numbers", ""),
     any(V, "show-whitespace", ""),
     any(V, "spell-check", ""),
+    text(V, "next-misspelling", "F7"),
     any(V, "title-bar-tabs", ""),
     any(V, "close-with-last-tab", ""),
     any(V, "find-close-on-leave", ""),

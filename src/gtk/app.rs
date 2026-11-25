@@ -67,6 +67,8 @@ pub enum Ask {
     Reload { tab: u64, encoding: Option<Encoding> },
     /// File → Show in folder: the file manager shows the file.
     RevealFile(PathBuf),
+    /// F7 found a word spelled wrong (`App::menu_word`): the text's menu at the caret, with its suggestions.
+    SpellMenu,
     /// Format → Convert → SHA-256's answer: of what (the selection, the file), and the hash (Copy, or OK).
     Hash { what: String, hex: String },
     /// A link or a folder opened with the desktop's app for it (Help → Report a problem…, Open settings folder).
@@ -172,6 +174,10 @@ pub enum Cmd {
     RemoveLastCaret,
     /// The spell check menu's suggestion (`App::spell_word`).
     Suggestion(u8),
+    /// The spell check menu's Change every … to: suggestion `n` for every whole-word, same-case match (issue #12).
+    SuggestionAll(u8),
+    /// The next word spelled wrong after the caret, with its suggestions (F7, issue #12).
+    NextMisspelling,
     AddWord,
     IgnoreWord,
     /// Bookmarks: the caret's line marked or not (Ctrl+F2), the next and previous (F2, Shift+F2), none.
@@ -513,6 +519,10 @@ pub struct App {
     pub speller_wanted: bool,
     /// The word spelled wrong the text's menu was opened on (for its suggestions, Add to dictionary, Ignore).
     pub spell_word: Option<SpellWord>,
+    /// F7 found a word spelled wrong starting here: the menu it opens is for this word, not the point it opens at.
+    pub menu_word: Option<u64>,
+    /// Replace all with this search and replacement instead of the find bar's (a word's spelling changed everywhere).
+    pub replace_with: Option<(Matcher, Vec<u8>)>,
     /// The status bar's column (document version, caret, column) and selection size (version, start, end,
     /// characters), counted once for each.
     pub col_cache: std::cell::Cell<Option<(u64, u64, u64)>>,
@@ -586,6 +596,8 @@ impl App {
             speller: Spelling::NotYet,
             speller_wanted: false,
             spell_word: None,
+            menu_word: None,
+            replace_with: None,
             col_cache: Default::default(),
             sel_cache: Default::default(),
             field_cache: Default::default(),
@@ -1948,7 +1960,11 @@ impl App {
         if !self.settings.spell_check || tab.read_only || tab.filter.is_some() || !matches!(self.speller, Spelling::Ready(_)) {
             return None;
         }
-        let (pos, words) = self.with_view(g, |v, cx| (v.pos_at(cx, x, y), v.spell_words(cx)));
+        // (F7's word: by where it is, as the rows on screen may not be laid out for it yet)
+        let (pos, words) = match self.menu_word.take() {
+            Some(p) => (p, self.with_view(g, |v, cx| v.words_at(cx, p).1)),
+            None => self.with_view(g, |v, cx| (v.pos_at(cx, x, y), v.spell_words(cx))),
+        };
         let (start, end, word) = words.into_iter().find(|&(a, b, _)| a <= pos && pos <= b)?;
         let Spelling::Ready(s) = &mut self.speller else { return None };
         if !s.wrong(&word) {
@@ -1972,6 +1988,85 @@ impl App {
         tab.view.sel = edit::replace_selection(&mut tab.doc, Sel { anchor: w.start, caret: w.end }, s.as_bytes(), EditKind::Other);
         tab.doc.seal();
         self.after_edit(true);
+    }
+
+    /// The spell check menu's Change every … to: suggestion `i` in place of every match of the word (whole word, same
+    /// case), as Replace all does it (one undo step; a big text on a job). Issue #12.
+    fn spell_replace_all(&mut self, i: usize) {
+        let Some(w) = self.spell_word.take() else { return };
+        let Some(s) = w.suggestions.get(i) else { return };
+        if self.tab().id != w.tab || !self.editable() {
+            return;
+        }
+        let q = Query { text: w.word.clone(), match_case: true, whole_word: true, regex: false };
+        match Matcher::new(&q) {
+            Ok(m) => {
+                self.replace_with = Some((m, s.as_bytes().to_vec()));
+                self.start_task(TaskKind::ReplaceAll);
+                // (not taken if the task didn't start)
+                self.replace_with = None;
+            }
+            Err(e) => self.flash(e, true),
+        }
+    }
+
+    /// F7: the next word spelled wrong after the caret (round to the start), selected, with the spell check menu
+    /// open at it (issue #12). Looks through `LOOK` bytes at a time.
+    pub fn next_misspelling(&mut self, g: &Geom) {
+        const LOOK: u64 = 8 << 20;
+        let tab = self.tab();
+        if !self.settings.spell_check {
+            self.flash("Spell check is off (View → Spell check)", false);
+            return;
+        }
+        if tab.binary || tab.filter.is_some() || !crate::spell::checks(tab.lang) {
+            let what = if tab.filter.is_some() { "a tab of matching lines".to_string() } else { format!("{} files", tab.lang.label()) };
+            self.flash(format!("Slate doesn't check the spelling in {what}"), false);
+            return;
+        }
+        let (from, len) = (tab.view.sel.end(), tab.doc.len());
+        let mut sp = match std::mem::replace(&mut self.speller, Spelling::Unavailable) {
+            Spelling::Ready(sp) => sp,
+            Spelling::Unavailable => {
+                self.flash("There's no spell checker: Slate uses Enchant, with a dictionary for your language", true);
+                return;
+            }
+            other => {
+                // (made a moment after it's asked for)
+                self.speller = if matches!(other, Spelling::NotYet) { Spelling::Soon } else { other };
+                self.speller_wanted = true;
+                self.flash("Spell check is starting: try again in a moment", false);
+                return;
+            }
+        };
+        use crate::spell::{next_wrong, NextWrong};
+        let r = self.with_view(g, |v, cx| match next_wrong(&mut sp, from, len, LOOK, |p| v.words_at(cx, p)) {
+            NextWrong::Clean if from > 0 => next_wrong(&mut sp, 0, from, LOOK, |p| v.words_at(cx, p)),
+            r => r,
+        });
+        self.speller = Spelling::Ready(sp);
+        match r {
+            NextWrong::Found(a, b) => {
+                let tab = &mut self.tabs[self.active];
+                tab.view.block = None;
+                tab.view.sel = Sel { anchor: a, caret: b };
+                tab.view.want_x = None;
+                tab.doc.seal();
+                self.reveal_pending = true;
+                self.menu_word = Some(a);
+                self.asks.push(Ask::SpellMenu);
+            }
+            NextWrong::Clean => self.flash("No words spelled wrong", false),
+            NextWrong::Stopped(p) => {
+                // (from there next time)
+                let tab = &mut self.tabs[self.active];
+                tab.view.block = None;
+                tab.view.sel = Sel::at(p);
+                tab.view.want_x = None;
+                self.reveal_pending = true;
+                self.flash("No words spelled wrong in the next 8 MB: F7 looks on from here", false);
+            }
+        }
     }
 
     // ---- input methods ----
@@ -2817,6 +2912,9 @@ impl App {
                 self.flash(format!("The tabs go {where_} from the next start."), false);
             }
             Cmd::Suggestion(i) => self.spell_replace(i as usize),
+            Cmd::SuggestionAll(i) => self.spell_replace_all(i as usize),
+            // (`Ui::command` calls `next_misspelling` with the view's geometry)
+            Cmd::NextMisspelling => {}
             Cmd::AddWord | Cmd::IgnoreWord => {
                 if let (Some(w), Spelling::Ready(s)) = (self.spell_word.take(), &mut self.speller) {
                     s.accept(&w.word, cmd == Cmd::AddWord);
@@ -3211,6 +3309,8 @@ impl App {
                     }
                 }
             }
+            // (a word's spelling changed everywhere: its own search and replacement, not the find bar's)
+            TaskKind::ReplaceAll if self.replace_with.is_some() => self.replace_with.as_ref().map(|(m, _)| m.clone()),
             TaskKind::ReplaceAll | TaskKind::Filter(_) => match self.find.matcher.clone() {
                 Some(m) => Some(m),
                 None => {
@@ -3220,13 +3320,17 @@ impl App {
             },
             _ => None,
         };
-        let replacement = edit::replacement(&self.find.replacement, self.find.query.regex, self.tab().doc.eol.as_bytes());
-        if kind == TaskKind::ReplaceAll {
-            let typed = self.find.replacement.clone();
-            edit::remember(&mut self.settings.replace_history, &typed);
-            edit::remember(&mut self.settings.find_history, &self.find.query.text.clone());
+        let mut replacement = edit::replacement(&self.find.replacement, self.find.query.regex, self.tab().doc.eol.as_bytes());
+        let mut scope = self.tab().view.scope;
+        match self.replace_with.take().filter(|_| kind == TaskKind::ReplaceAll) {
+            Some((_, r)) => (replacement, scope) = (r, None),
+            None if kind == TaskKind::ReplaceAll => {
+                let typed = self.find.replacement.clone();
+                edit::remember(&mut self.settings.replace_history, &typed);
+                edit::remember(&mut self.settings.find_history, &self.find.query.text.clone());
+            }
+            None => {}
         }
-        let scope = self.tab().view.scope;
         let tab = &mut self.tabs[self.active];
         if tab.task.is_some() {
             self.flash("Still working on the previous task (Esc cancels it).", true);

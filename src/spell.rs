@@ -171,9 +171,90 @@ fn char_before(text: &[u8], i: usize) -> Option<char> {
     (1..=head.len().min(4)).find_map(|k| std::str::from_utf8(&head[head.len() - k..]).ok()).and_then(|s| s.chars().next())
 }
 
+/// Where the next word spelled wrong is (F7, issue #12).
+#[derive(Debug, PartialEq, Eq)]
+pub enum NextWrong {
+    /// Its byte range in the document.
+    Found(u64, u64),
+    /// None up to the end of the range looked at.
+    Clean,
+    /// None in the bytes it may look at (`budget`), which end here.
+    Stopped(u64),
+}
+
+/// The first word spelled wrong that starts at `from` or after it and ends by `to`, looking at `budget` bytes at
+/// most. `words(pos)` gives the words worth checking in the segment at `pos` (`words_in`'s, as document ranges, with
+/// the word) and where the next segment starts.
+pub fn next_wrong(
+    sp: &mut Speller,
+    from: u64,
+    to: u64,
+    budget: u64,
+    mut words: impl FnMut(u64) -> (u64, Vec<(u64, u64, String)>),
+) -> NextWrong {
+    let mut pos = from;
+    while pos < to {
+        if pos - from >= budget {
+            return NextWrong::Stopped(pos);
+        }
+        let (next, found) = words(pos);
+        for (a, b, w) in found {
+            if a >= from && b <= to && sp.wrong(&w) {
+                return NextWrong::Found(a, b);
+            }
+        }
+        if next <= pos {
+            break;
+        }
+        pos = next;
+    }
+    NextWrong::Clean
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Words starting with "zz" are wrong.
+    struct Zz;
+
+    impl Checker for Zz {
+        fn check(&self, w: &str) -> bool {
+            !w.starts_with("zz")
+        }
+        fn suggest(&self, _: &str) -> Vec<String> {
+            Vec::new()
+        }
+        fn add(&self, _: &str) {}
+        fn ignore(&self, _: &str) {}
+    }
+
+    #[test]
+    fn the_next_word_spelled_wrong() {
+        let text = "one zztwo\nthree\nfour zzfive six";
+        let mut sp = Speller::new(Box::new(Zz), "xx".into());
+        // (each line a segment)
+        let words = |pos: u64| {
+            let start = text[..pos as usize].rfind('\n').map_or(0, |i| i + 1);
+            let end = text[start..].find('\n').map_or(text.len(), |i| start + i);
+            let mut spans = Vec::new();
+            let ws = words_in(Lang::Plain, &text.as_bytes()[start..end], State::START, &mut spans)
+                .into_iter()
+                .map(|(a, b)| ((start + a) as u64, (start + b) as u64, text[start + a..start + b].to_string()))
+                .collect();
+            ((end + 1) as u64, ws)
+        };
+        let len = text.len() as u64;
+        assert_eq!(next_wrong(&mut sp, 0, len, 1 << 20, words), NextWrong::Found(4, 9));
+        // from the end of that one (F7 again): the next one
+        assert_eq!(next_wrong(&mut sp, 9, len, 1 << 20, words), NextWrong::Found(21, 27));
+        assert_eq!(next_wrong(&mut sp, 27, len, 1 << 20, words), NextWrong::Clean);
+        // only up to `to` (round from the start to where it began)
+        assert_eq!(next_wrong(&mut sp, 0, 20, 1 << 20, words), NextWrong::Found(4, 9));
+        assert_eq!(next_wrong(&mut sp, 10, 26, 1 << 20, words), NextWrong::Clean);
+        // allowed to look only so far: stops there
+        assert_eq!(next_wrong(&mut sp, 10, len, 4, words), NextWrong::Stopped(16));
+    }
 
     fn found(lang: Lang, text: &str) -> Vec<&str> {
         let mut spans = Vec::new();

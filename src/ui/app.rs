@@ -643,6 +643,10 @@ pub struct App {
     pub speller: Spelling,
     /// The word spelled wrong the text's menu was opened on (for its suggestions, Add to dictionary, Ignore).
     pub spell_word: Option<SpellWord>,
+    /// F7 found a word spelled wrong starting here: the menu it opens is for this word, not the point it opens at.
+    pub menu_word: Option<u64>,
+    /// Replace all with this search and replacement instead of the find bar's (a word's spelling changed everywhere).
+    pub replace_with: Option<(Arc<crate::core::search::Matcher>, Vec<u8>)>,
     /// The words spelled wrong shown last (test mode's `print:wrong`).
     pub spell_shown: Vec<(u64, u64)>,
     /// The button listing all tabs, at the end of the tab strip (zero size while all tabs fit).
@@ -776,6 +780,8 @@ impl App {
             highlights: Vec::new(),
             speller: Spelling::NotYet,
             spell_word: None,
+            menu_word: None,
+            replace_with: None,
             spell_shown: Vec::new(),
             tablist_rect: Rect::default(),
             doc_counts: None,

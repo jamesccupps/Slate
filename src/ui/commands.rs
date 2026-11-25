@@ -107,6 +107,10 @@ pub enum Cmd {
     RemoveLastCaret,
     /// The spell check menu's suggestion (`App::spell_word`).
     Suggestion(u8),
+    /// The spell check menu's Change every … to: suggestion `n` for every whole-word, same-case match (issue #12).
+    SuggestionAll(u8),
+    /// The next word spelled wrong after the caret, with its suggestions (F7, issue #12).
+    NextMisspelling,
     AddWord,
     IgnoreWord,
     /// Typing replaces the character after the caret (Insert).
@@ -306,6 +310,7 @@ pub fn editor_key(vk: u16, m: &Mods) -> Option<Cmd> {
     }
     match (k, m.shift) {
         (VK_F5, false) => Some(Cmd::InsertDateTime),
+        (VK_F7, false) => Some(Cmd::NextMisspelling),
         (VK_INSERT, true) => Some(Cmd::Paste),
         (VK_DELETE, true) => Some(Cmd::Cut),
         _ => None,
@@ -402,6 +407,7 @@ const IDS: &[(&str, Cmd)] = &[
     ("line-numbers", Cmd::ToggleLineNumbers),
     ("show-whitespace", Cmd::ToggleWhitespace),
     ("spell-check", Cmd::ToggleSpellCheck),
+    ("next-misspelling", Cmd::NextMisspelling),
     ("title-bar-tabs", Cmd::ToggleTitleBarTabs),
     ("close-with-last-tab", Cmd::ToggleCloseWithLastTab),
     ("find-close-on-leave", Cmd::ToggleFindCloseOnLeave),

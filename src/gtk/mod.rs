@@ -1692,6 +1692,7 @@ fn commands() -> Vec<(&'static str, Cmd, &'static [&'static str])> {
         ("filter-lines-not", Cmd::FilterLines(true), &[]),
         ("clear-highlights", Cmd::ClearHighlights, &[]),
         ("spell-check", Cmd::SpellCheck, &[]),
+        ("next-misspelling", Cmd::NextMisspelling, &["F7"]),
         ("title-bar-tabs", Cmd::TitleBarTabs, &[]),
         ("close-with-last-tab", Cmd::CloseWithLastTab, &[]),
         ("find-close-on-leave", Cmd::FindCloseOnLeave, &[]),
@@ -1710,6 +1711,11 @@ fn commands() -> Vec<(&'static str, Cmd, &'static [&'static str])> {
         ("suggest-2", Cmd::Suggestion(2), &[]),
         ("suggest-3", Cmd::Suggestion(3), &[]),
         ("suggest-4", Cmd::Suggestion(4), &[]),
+        ("suggest-all-0", Cmd::SuggestionAll(0), &[]),
+        ("suggest-all-1", Cmd::SuggestionAll(1), &[]),
+        ("suggest-all-2", Cmd::SuggestionAll(2), &[]),
+        ("suggest-all-3", Cmd::SuggestionAll(3), &[]),
+        ("suggest-all-4", Cmd::SuggestionAll(4), &[]),
         ("add-word", Cmd::AddWord, &[]),
         ("ignore-word", Cmd::IgnoreWord, &[]),
         ("toggle-bookmark", Cmd::ToggleBookmark, &["<Control>F2"]),
@@ -2099,6 +2105,7 @@ fn menu_model(recent: &gio::Menu, format_extra: &gio::Menu, view_extra: &gio::Me
         ("Line numbers", "line-numbers"),
         ("Show whitespace", "show-whitespace"),
         ("Spell check", "spell-check"),
+        ("Next word spelled wrong", "next-misspelling"),
         ("Tabs in the title bar", "title-bar-tabs"),
         ("Close Slate with the last tab", "close-with-last-tab"),
         ("Character at the caret", "char-info"),
@@ -2538,6 +2545,11 @@ impl Ui {
                 let _ = text.activate_action(name, None);
                 return;
             }
+        }
+        if cmd == Cmd::NextMisspelling {
+            let g = self.geom();
+            self.with(|a| a.next_misspelling(&g));
+            return;
         }
         self.with(|a| a.exec(cmd));
         match cmd {
@@ -3014,10 +3026,36 @@ impl Ui {
         if v.is_empty() {
             // (an action there isn't: shown greyed out)
             v.push(("(No suggestions)".into(), "no-suggestions".into()));
+        } else {
+            // every match of the word (issue #12): a submenu, "<its label> > <item>"
+            let word = self.app.try_borrow().ok().and_then(|a| a.spell_word.as_ref().map(|w| w.word.clone())).unwrap_or_default();
+            for (i, s) in sugg.iter().enumerate() {
+                v.push((format!("Change every “{word}” to > {s}"), format!("suggest-all-{i}")));
+            }
         }
         v.push(("Add to dictionary".into(), "add-word".into()));
         v.push(("Ignore".into(), "ignore-word".into()));
         v
+    }
+
+    /// F7 found a word spelled wrong: the text's menu below the caret, for that word (`App::menu_word`). Test mode
+    /// notes its spelling part in `print:asked` and takes the item an `answer:` names.
+    fn spell_menu_at_caret(&self) {
+        let g = self.geom();
+        let Some(Some((x, y, _, h))) = self.guarded(|a| a.with_view(&g, |v, cx| v.caret_rect(cx))) else { return };
+        if let Some(test) = &self.test {
+            let items = self.spell_items(x, y);
+            test.asked.borrow_mut().push(format!("spellmenu: {}", items.iter().map(|(l, _)| l.as_str()).collect::<Vec<_>>().join(" | ")));
+            let pick = test.answers.borrow_mut().pop_front().unwrap_or_default();
+            if let Some((_, action)) = items.iter().find(|(l, _)| *l == pick) {
+                if let Some((_, cmd, _)) = commands().into_iter().find(|(n, _, _)| n == action) {
+                    self.command(cmd);
+                }
+            }
+            return;
+        }
+        let gw = self.app.try_borrow().map(|a| self.gutter_width(&a)).unwrap_or(0.0);
+        self.context_menu(x + gw + PAD, y + h);
     }
 
     fn context_menu(&self, x: f64, y: f64) {
@@ -3026,9 +3064,20 @@ impl Ui {
         let gw = self.app.try_borrow().map(|a| self.gutter_width(&a)).unwrap_or(0.0);
         let spell = self.spell_items(x - gw - PAD, y);
         if let Some(k) = spell.iter().position(|(_, a)| a == "add-word") {
-            let pairs: Vec<(&str, &str)> = spell.iter().map(|(l, a)| (l.as_str(), a.as_str())).collect();
-            menu.append_section(None, &section(&pairs[..k]));
-            menu.append_section(None, &section(&pairs[k..]));
+            let (all, one): (Vec<_>, Vec<_>) = spell[..k].iter().partition(|(_, a)| a.starts_with("suggest-all-"));
+            let pairs: Vec<(&str, &str)> = one.iter().map(|(l, a)| (l.as_str(), a.as_str())).collect();
+            let first = section(&pairs);
+            // (Change every … to: a submenu)
+            if let Some((label, _)) = all.first().and_then(|(l, _)| l.split_once(" > ")) {
+                let sub = gio::Menu::new();
+                for (l, a) in &all {
+                    sub.append(l.split_once(" > ").map(|(_, s)| s), Some(&format!("win.{a}")));
+                }
+                first.append_submenu(Some(label), &sub);
+            }
+            menu.append_section(None, &first);
+            let rest: Vec<(&str, &str)> = spell[k..].iter().map(|(l, a)| (l.as_str(), a.as_str())).collect();
+            menu.append_section(None, &section(&rest));
         }
         menu.append_section(None, &section(&[("Cut", "cut"), ("Copy", "copy"), ("Paste", "paste")]));
         menu.append_section(None, &section(&[("Select all", "select-all")]));
@@ -3677,6 +3726,9 @@ impl Ui {
         }
         if matches!(ask, Ask::ChangeShortcuts) {
             return self.change_shortcuts();
+        }
+        if matches!(ask, Ask::SpellMenu) {
+            return self.spell_menu_at_caret();
         }
         if let Some(test) = &self.test {
             test.asked.borrow_mut().push(format!("{ask:?}"));

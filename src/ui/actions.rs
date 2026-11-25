@@ -2082,14 +2082,19 @@ impl App {
         }
         let query = self.find.query.text.clone();
         let indent = vec![b' '; self.settings.json_indent as usize];
+        // (a word's spelling changed everywhere: its own search and replacement, not the find bar's)
+        let given = if kind == TaskKind::ReplaceAll { self.replace_with.take() } else { None };
         let typed = FindBar::text_of(self.find.replace_edit);
-        let replacement = crate::edit::replacement(&typed, self.find.query.regex, self.tab().doc.eol.as_bytes());
-        if kind == TaskKind::ReplaceAll {
+        let mut replacement = crate::edit::replacement(&typed, self.find.query.regex, self.tab().doc.eol.as_bytes());
+        if kind == TaskKind::ReplaceAll && given.is_none() {
             crate::edit::remember(&mut self.settings.replace_history, &typed);
             crate::edit::remember(&mut self.settings.find_history, &self.find.query.text);
         }
-        let scope = self.tab().view.scope;
+        let mut scope = self.tab().view.scope;
         let mut matcher = self.find.matcher.clone();
+        if let Some((m, r)) = given {
+            (matcher, replacement, scope) = (Some(m), r, None);
+        }
         let mut query = query;
         // (with highlighted searches, the lines with any of them, or with this one)
         if matches!(kind, TaskKind::Filter(_)) && !self.highlights.is_empty() {
@@ -2611,8 +2616,14 @@ impl App {
         if !self.settings.spell_check || tab.read_only || tab.filter.is_some() || !matches!(self.speller, Spelling::Ready(_)) {
             return None;
         }
-        let (pos, _) = self.with_view(|v, cx| v.pos_at(cx, x, y));
-        let words = self.with_view(|v, cx| v.spell_words(cx));
+        // (F7's word: by where it is, as the rows on screen may not be laid out for it yet)
+        let (pos, words) = match self.menu_word.take() {
+            Some(p) => (p, self.with_view(|v, cx| v.words_at(cx, p).1)),
+            None => {
+                let (pos, _) = self.with_view(|v, cx| v.pos_at(cx, x, y));
+                (pos, self.with_view(|v, cx| v.spell_words(cx)))
+            }
+        };
         let (start, end, word) = words.into_iter().find(|&(a, b, _)| a <= pos && pos <= b)?;
         let Spelling::Ready(s) = &mut self.speller else { return None };
         if !s.wrong(&word) {
@@ -2636,6 +2647,81 @@ impl App {
         tab.view.sel = editor::replace_selection(&mut tab.doc, Sel { anchor: w.start, caret: w.end }, s.as_bytes(), EditKind::Other);
         tab.doc.seal();
         self.after_edit();
+    }
+
+    /// The spell check menu's Change every … to: suggestion `i` in place of every match of the word (whole word, same
+    /// case), as Replace all does it (one undo step; a big text on a job). Issue #12.
+    fn spell_replace_all(&mut self, i: usize) {
+        let Some(w) = self.spell_word.take() else { return };
+        let Some(s) = w.suggestions.get(i) else { return };
+        if self.tab().id != w.tab || !self.editable() {
+            return;
+        }
+        let q = search::Query { text: w.word.clone(), match_case: true, whole_word: true, regex: false };
+        match Matcher::new(&q) {
+            Ok(m) => {
+                self.replace_with = Some((Arc::new(m), s.as_bytes().to_vec()));
+                self.start_task(TaskKind::ReplaceAll);
+                // (not taken if the task didn't start)
+                self.replace_with = None;
+            }
+            Err(e) => self.flash(e, true),
+        }
+    }
+
+    /// F7: the next word spelled wrong after the caret (round to the start), selected, with the spell check menu
+    /// open at it (issue #12). Looks through `LOOK` bytes at a time.
+    fn next_misspelling(&mut self) {
+        const LOOK: u64 = 8 << 20;
+        let tab = self.tab();
+        if !self.settings.spell_check {
+            self.flash("Spell check is off (View → Spell check)", false);
+            return;
+        }
+        if tab.binary || tab.filter.is_some() || !crate::spell::checks(tab.lang) {
+            let what = if tab.filter.is_some() { "a tab of matching lines".to_string() } else { format!("{} files", tab.lang.label()) };
+            self.flash(format!("Slate doesn't check the spelling in {what}"), false);
+            return;
+        }
+        let (from, len) = (tab.view.sel.end(), tab.doc.len());
+        let mut sp = match std::mem::replace(&mut self.speller, Spelling::Unavailable) {
+            Spelling::Ready(sp) => sp,
+            Spelling::Unavailable => {
+                self.flash("Windows has no dictionary for its language, so there's no spell check", true);
+                return;
+            }
+            other => {
+                self.speller = other;
+                self.flash("Spell check is starting: try again in a moment", false);
+                return;
+            }
+        };
+        use crate::spell::{next_wrong, NextWrong};
+        let r = self.with_view(|v, cx| match next_wrong(&mut sp, from, len, LOOK, |p| v.words_at(cx, p)) {
+            NextWrong::Clean if from > 0 => next_wrong(&mut sp, 0, from, LOOK, |p| v.words_at(cx, p)),
+            r => r,
+        });
+        self.speller = Spelling::Ready(sp);
+        match r {
+            NextWrong::Found(a, b) => {
+                let tab = self.tab_mut();
+                tab.view.sel = Sel { anchor: a, caret: b };
+                tab.doc.seal();
+                self.after_move();
+                self.reveal_caret(true);
+                self.menu_word = Some(a);
+                self.context_menu_at_caret();
+            }
+            NextWrong::Clean => self.flash("No words spelled wrong", false),
+            NextWrong::Stopped(p) => {
+                // (from there next time)
+                let tab = self.tab_mut();
+                tab.view.sel = Sel::at(p);
+                self.after_move();
+                self.reveal_caret(true);
+                self.flash("No words spelled wrong in the next 8 MB: F7 looks on from here", false);
+            }
+        }
     }
 
     // ---- input methods (`ime`) ----
@@ -4846,6 +4932,8 @@ impl App {
                 self.settings_changed();
             }
             Cmd::Suggestion(i) => self.spell_replace(i as usize),
+            Cmd::SuggestionAll(i) => self.spell_replace_all(i as usize),
+            Cmd::NextMisspelling => self.next_misspelling(),
             Cmd::AddWord | Cmd::IgnoreWord => {
                 if let (Some(w), Spelling::Ready(s)) = (self.spell_word.take(), &mut self.speller) {
                     s.accept(&w.word, cmd == Cmd::AddWord);
@@ -5517,6 +5605,7 @@ impl App {
                         ],
                     ),
                     check(Cmd::ToggleSpellCheck, if matches!(self.speller, Spelling::Unavailable) { "Spell chec&k (Windows has no dictionary for it)" } else { "Spell chec&k" }, "", s.spell_check),
+                    item(Cmd::NextMisspelling, "Ne&xt word spelled wrong", "F7"),
                     item(Cmd::CharInfo, "&Character at the caret", ""),
                     Item::Sep,
                     item(Cmd::FilterLines(false), "Show only &matching lines", "Alt+L"),
@@ -6045,6 +6134,12 @@ pub fn run(cell: &Cell, d: Deferred) {
                     let mut first: Vec<Item> = sugg.iter().enumerate().map(|(i, s)| item(Cmd::Suggestion(i as u8), &s.replace('&', "&&"), "")).collect();
                     if first.is_empty() {
                         first.push(enabled(Cmd::Suggestion(0), "(No suggestions)", "", false));
+                    }
+                    // (every match of the word: issue #12)
+                    if !sugg.is_empty() {
+                        let word = a.spell_word.as_ref().map(|w| w.word.replace('&', "&&")).unwrap_or_default();
+                        let all = sugg.iter().enumerate().map(|(i, s)| item(Cmd::SuggestionAll(i as u8), &s.replace('&', "&&"), "")).collect();
+                        first.push(sub(&format!("Change &every “{word}” to"), all));
                     }
                     first.extend([Item::Sep, item(Cmd::AddWord, "&Add to dictionary", ""), item(Cmd::IgnoreWord, "&Ignore", ""), Item::Sep]);
                     v.splice(0..0, first);

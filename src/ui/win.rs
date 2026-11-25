@@ -78,16 +78,24 @@ pub fn focus() -> HWND {
 /// Test mode: notes a menu that would have opened and its items, and gives the item `rmenu:` chose, if any. None:
 /// not test mode.
 pub fn scripted_menu(name: &str, items: &[super::commands::Item]) -> Option<Option<super::commands::Cmd>> {
-    use super::commands::Item;
-    let label = |l: &str| l.replace('&', "");
+    use super::commands::{Cmd, Item};
+    // (a submenu's items as "<submenu> > <item>")
+    fn flat(items: &[Item], within: &str, out: &mut Vec<(String, Cmd, bool)>) {
+        for i in items {
+            match i {
+                Item::Cmd { cmd, label, enabled, .. } => out.push((format!("{within}{}", label.replace('&', "")), *cmd, *enabled)),
+                Item::Sub { label, items } => flat(items, &format!("{within}{} > ", label.replace('&', "")), out),
+                Item::Sep => {}
+            }
+        }
+    }
+    let mut all = Vec::new();
+    flat(items, "", &mut all);
     scripted(|s| {
         s.menus.push(name.to_string());
-        s.menu_items = items.iter().filter_map(|i| if let Item::Cmd { label: l, .. } = i { Some(label(l)) } else { None }).collect();
+        s.menu_items = all.iter().map(|(l, _, _)| l.clone()).collect();
         let pick = s.pick.take()?;
-        items.iter().find_map(|i| match i {
-            Item::Cmd { cmd, label: l, enabled: true, .. } if label(l) == pick => Some(*cmd),
-            _ => None,
-        })
+        all.iter().find_map(|(l, cmd, enabled)| (*enabled && *l == pick).then_some(*cmd))
     })
 }
 

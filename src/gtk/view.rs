@@ -755,6 +755,23 @@ impl View {
         out
     }
 
+    /// The words worth spell checking in the segment at `pos` (`crate::spell::words_in`), and where the next segment
+    /// starts: F7's search (`spell::next_wrong`), which goes past the rows on screen.
+    pub fn words_at(&mut self, cx: &Ctx, pos: u64) -> (u64, Vec<(u64, u64, String)>) {
+        let seg = self.segment_at(cx.doc, pos);
+        let st = self.hl_state(cx, &seg);
+        let bytes = cx.doc.read(seg.start, seg.end);
+        let mut spans = std::mem::take(&mut self.spans);
+        let mut out = Vec::new();
+        for (a, b) in crate::spell::words_in(cx.lang, &bytes, st, &mut spans) {
+            if let Ok(w) = std::str::from_utf8(&bytes[a..b]) {
+                out.push((seg.start + a as u64, seg.start + b as u64, w.to_string()));
+            }
+        }
+        self.spans = spans;
+        (seg.next_start().max(pos + 1), out)
+    }
+
     /// The text an input method composes at the caret (None: it's done).
     pub fn set_composing(&mut self, c: Option<edit::Composing>) {
         if self.composing != c {
