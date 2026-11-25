@@ -20,6 +20,11 @@ use super::settings::ThemeMode;
 pub enum Cmd {
     NewTab,
     Open,
+    /// File → Open selected file or link: the selection (or the name at the caret) as a file in a tab, or a web
+    /// link in the browser (`crate::links`, issue #7).
+    OpenSelection,
+    /// The text's menu's Open “name”: what's at this place (`links::target_in`).
+    OpenAt(u64),
     OpenRecent(usize),
     ClearRecent,
     Save,
@@ -343,6 +348,7 @@ pub fn sub(label: &str, items: Vec<Item>) -> Item {
 const IDS: &[(&str, Cmd)] = &[
     ("new-tab", Cmd::NewTab),
     ("open", Cmd::Open),
+    ("open-selection", Cmd::OpenSelection),
     ("reopen-closed", Cmd::ReopenClosed),
     ("save", Cmd::Save),
     ("save-as", Cmd::SaveAs),

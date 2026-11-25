@@ -67,6 +67,8 @@ pub enum Ask {
     Reload { tab: u64, encoding: Option<Encoding> },
     /// File → Show in folder: the file manager shows the file.
     RevealFile(PathBuf),
+    /// Open selected file or link found a web link: the browser opens it.
+    OpenLink(String),
     /// F7 found a word spelled wrong (`App::menu_word`): the text's menu at the caret, with its suggestions.
     SpellMenu,
     /// Format → Convert → SHA-256's answer: of what (the selection, the file), and the hash (Copy, or OK).
@@ -79,6 +81,10 @@ pub enum Ask {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Cmd {
     NewTab,
+    /// File → Open selected file or link (`crate::links`, issue #7).
+    OpenSelection,
+    /// The text's menu's Open “name”: what's at this place (`links::target_in`).
+    OpenAt(u64),
     Open,
     Save,
     SaveAs,
@@ -295,6 +301,8 @@ pub struct Tab {
     pub lang: Lang,
     /// The user picked the language (it's not detected again on saving under another name).
     pub lang_picked: bool,
+    /// The tab shown when this one was opened: shown again if its file can't be opened.
+    pub opened_from: Option<u64>,
     pub indent: Indent,
     /// The user picked the indentation (Format → Indentation): it's not guessed again when the file is read again.
     pub indent_picked: bool,
@@ -692,6 +700,7 @@ impl App {
             find_bar: None,
             lang: Lang::Plain,
             lang_picked: false,
+            opened_from: None,
             indent,
             indent_picked: false,
             editorconfig: None,
@@ -777,6 +786,7 @@ impl App {
             let mut doc = Document::new();
             doc.path = Some(p.clone());
             let mut tab = self.make_tab(doc);
+            tab.opened_from = self.tabs.get(self.active).map(|t| t.id).filter(|_| !reuse);
             let notify = self.notify.clone();
             let full = p.clone();
             tab.load = Some(match suffix {
@@ -1490,8 +1500,13 @@ impl App {
                 self.flash(format!("Couldn't open {name}: {}", fileio::friendly_io(&e)), true);
                 // the tab goes (unless it's the only one); the tab shown stays shown
                 if self.tabs.len() > 1 {
+                    // (back to the tab it was opened from, not whichever is beside it)
+                    let back = self.tabs[i].opened_from.filter(|_| i == self.active);
                     self.tabs.remove(i);
                     self.keep_shown(i);
+                    if let Some(k) = back.and_then(|b| self.tabs.iter().position(|t| t.id == b)) {
+                        self.active = k;
+                    }
                     self.tab_gone(id);
                     return false;
                 }
@@ -1988,6 +2003,29 @@ impl App {
         tab.view.sel = edit::replace_selection(&mut tab.doc, Sel { anchor: w.start, caret: w.end }, s.as_bytes(), EditKind::Other);
         tab.doc.seal();
         self.after_edit(true);
+    }
+
+    /// File → Open selected file or link (issue #7; `at`: the text's menu's place, see `links::target_in`): a file in a
+    /// tab of its own (at its line, for `name:12`), opened as Open does it; a web link in the browser. Never runs a
+    /// program.
+    fn open_selection(&mut self, at: Option<u64>) {
+        use crate::links::Target;
+        let tab = self.tab();
+        match crate::links::target_in(&tab.doc, tab.view.sel, at) {
+            Ok(Target::Link(url)) => {
+                self.flash(format!("Opening {url} in your browser"), false);
+                self.asks.push(Ask::OpenLink(url));
+            }
+            Ok(Target::File(p, at)) => {
+                // (`open_paths` takes `name:line:column` as Slate's command line does)
+                let p = match at {
+                    Some((l, c)) => PathBuf::from(format!("{}:{l}:{c}", p.display())),
+                    None => p,
+                };
+                self.open_paths(&[p]);
+            }
+            Err(e) => self.flash(e, false),
+        }
     }
 
     /// The spell check menu's Change every … to: suggestion `i` in place of every match of the word (whole word, same
@@ -2644,6 +2682,8 @@ impl App {
             | Cmd::LineStartCarets
             | Cmd::LineEndCarets
             | Cmd::RemoveLastCaret => self.caret_cmd(cmd),
+            Cmd::OpenSelection => self.open_selection(None),
+            Cmd::OpenAt(p) => self.open_selection(Some(p)),
             Cmd::NewTab => {
                 self.new_untitled();
             }

@@ -621,9 +621,11 @@ impl App {
         }
         // Opening into a single blank tab replaces it, like Notepad.
         let replace_blank = self.tabs.len() == 1 && self.tabs[0].is_blank();
+        let from = self.tabs.get(self.active).map(|t| t.id).filter(|_| !replace_blank);
         let mut doc = Document::new();
         doc.path = Some(p);
         let mut i = self.add_tab(doc);
+        self.tabs[i].opened_from = from;
         if replace_blank && i == 1 {
             self.tabs.remove(0);
             self.active = 0;
@@ -835,8 +837,13 @@ impl App {
             }
             self.wait_for_file(i, Some(fileio::friendly_io(&e)));
         } else {
+            // (back to the tab it was opened from, not whichever is beside it)
+            let back = self.tabs[i].opened_from.filter(|_| i == self.active);
             self.tabs[i].restore = None;
             self.remove_tab(i);
+            if let Some(k) = back.and_then(|id| self.tabs.iter().position(|t| t.id == id)) {
+                self.activate(k);
+            }
             self.flash(format!("Couldn't open {name}: {}", fileio::friendly_io(&e)), true);
         }
         self.invalidate();
@@ -2649,6 +2656,37 @@ impl App {
         self.after_edit();
     }
 
+    /// File → Open selected file or link (issue #7; `at`: the text's menu's place, see `links::target_in`): a file in a
+    /// tab of its own (at its line, for `name:12`), opened as Open does it; a web link in the browser. Never runs a
+    /// program.
+    fn open_selection(&mut self, at: Option<u64>) {
+        use crate::links::Target;
+        let tab = self.tab();
+        match crate::links::target_in(&tab.doc, tab.view.sel, at) {
+            Ok(Target::Link(url)) => {
+                win::shell_open(self.hwnd, std::ffi::OsStr::new(&url), &format!("open link {url}"));
+                self.flash(format!("Opening {url} in your browser"), false);
+            }
+            Ok(Target::File(p, at)) => {
+                let goto = at.map(|(l, c)| Goto::Line(l, Some(c)));
+                if let Some(i) = self.tabs.iter().position(|t| has_file(t, &p, None)) {
+                    if goto.is_some() {
+                        self.tabs[i].goto = goto;
+                    }
+                    self.activate(i);
+                } else if let Some(id) = self.open_path(&p, false, None, None) {
+                    if let Some(t) = self.tabs.iter_mut().find(|t| t.id == id) {
+                        t.goto = goto;
+                    }
+                    self.settle(&[id]);
+                    let a = self.active;
+                    self.activate(a);
+                }
+            }
+            Err(e) => self.flash(e, false),
+        }
+    }
+
     /// The spell check menu's Change every … to: suggestion `i` in place of every match of the word (whole word, same
     /// case), as Replace all does it (one undo step; a big text on a job). Issue #12.
     fn spell_replace_all(&mut self, i: usize) {
@@ -3097,6 +3135,7 @@ impl App {
     }
 
     fn context_menu_at_caret(&mut self) {
+        self.menu_at_caret = true;
         let p = self.with_view(|v, cx| v.caret_point(cx));
         let (x, y) = p.map(|(x, y)| (x, y + self.style.row_h)).unwrap_or((self.r_edit.x + 40.0, self.r_edit.y + 40.0));
         self.pending.push(Deferred::ContextMenu(x, y));
@@ -4931,6 +4970,8 @@ impl App {
                 self.find_owner = self.tab().id;
                 self.settings_changed();
             }
+            Cmd::OpenSelection => self.open_selection(None),
+            Cmd::OpenAt(p) => self.open_selection(Some(p)),
             Cmd::Suggestion(i) => self.spell_replace(i as usize),
             Cmd::SuggestionAll(i) => self.spell_replace_all(i as usize),
             Cmd::NextMisspelling => self.next_misspelling(),
@@ -5475,6 +5516,7 @@ impl App {
                 vec![
                     item(Cmd::NewTab, "&New tab", "Ctrl+N"),
                     item(Cmd::Open, "&Open…", "Ctrl+O"),
+                    item(Cmd::OpenSelection, "Open selected file or lin&k", ""),
                     sub("Open &recent", recent),
                     enabled(Cmd::ReopenClosed, "Reop&en closed tab", "Ctrl+Shift+T", !self.closed_tabs.is_empty()),
                     Item::Sep,
@@ -6089,6 +6131,13 @@ pub fn run(cell: &Cell, d: Deferred) {
         Deferred::Menu(i) => show_menu_bar(cell, i),
         Deferred::ContextMenu(x, y) => {
             let spelling = cell.borrow_mut().spelling_at(x, y);
+            // (a file name or a link where it opens, or at the caret for the keyboard's menu: open it, issue #7)
+            let open = {
+                let mut a = cell.borrow_mut();
+                let at = if std::mem::take(&mut a.menu_at_caret) { a.tab().view.sel.caret } else { a.with_view(|v, cx| v.pos_at(cx, x, y)).0 };
+                let tab = a.tab();
+                crate::links::target_in(&tab.doc, tab.view.sel, Some(at)).ok().map(|t| (crate::links::menu_label(&t, true), at))
+            };
             let items = {
                 let a = cell.borrow();
                 let tab = a.tab();
@@ -6128,6 +6177,9 @@ pub fn run(cell: &Cell, d: Deferred) {
                     v.push(item(Cmd::CopyJsonPath, "Copy JSON pat&h", ""));
                 } else if tab.lang == Lang::Xml {
                     v.push(item(Cmd::CopyJsonPath, "Copy XML pat&h (XPath)", ""));
+                }
+                if let Some((label, at)) = open {
+                    v.splice(0..0, [item(Cmd::OpenAt(at), &label, ""), Item::Sep]);
                 }
                 // a word spelled wrong: what it may have been meant to be, first
                 if let Some(sugg) = spelling {

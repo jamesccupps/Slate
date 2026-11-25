@@ -1619,6 +1619,7 @@ fn follow_portal_appearance() {
 fn commands() -> Vec<(&'static str, Cmd, &'static [&'static str])> {
     vec![
         ("new-tab", Cmd::NewTab, &["<Control>n", "<Control>t"]),
+        ("open-selection", Cmd::OpenSelection, &[]),
         ("open", Cmd::Open, &["<Control>o"]),
         ("save", Cmd::Save, &["<Control>s"]),
         ("save-as", Cmd::SaveAs, &["<Control><Shift>s"]),
@@ -1843,6 +1844,14 @@ fn actions(ui: &Rc<Ui>) {
         ui.win_actions.add_action(&a);
     }
     set_accels(ui);
+    // (the text's menu's Open “name”, with the place it's about)
+    let open_at = gio::SimpleAction::new("open-at", Some(glib::VariantTy::UINT64));
+    open_at.connect_activate(|_, v| {
+        if let (Some(ui), Some(p)) = (get_ui(), v.and_then(|v| v.get::<u64>())) {
+            ui.command(Cmd::OpenAt(p));
+        }
+    });
+    ui.win_actions.add_action(&open_at);
     // (its state is the tab's language: the menu shows a dot at that one)
     let lang = gio::SimpleAction::new_stateful("set-lang", Some(glib::VariantTy::STRING), &"".to_variant());
     lang.connect_activate(|_, v| {
@@ -2043,7 +2052,7 @@ fn open_menu_soon(items: Rc<Vec<glib::WeakRef<gtk4::Widget>>>, tries: u32) {
 fn menu_model(recent: &gio::Menu, format_extra: &gio::Menu, view_extra: &gio::Menu, lang_extra: &gio::Menu, fonts: &[String]) -> gio::Menu {
     let bar = gio::Menu::new();
     let file = gio::Menu::new();
-    let open = section(&[("New tab", "new-tab"), ("Open…", "open")]);
+    let open = section(&[("New tab", "new-tab"), ("Open…", "open"), ("Open selected file or link", "open-selection")]);
     open.append_submenu(Some("Open recent"), recent);
     open.append_section(None, &section(&[("Reopen closed tab", "reopen-closed")]));
     file.append_section(None, &open);
@@ -2662,7 +2671,7 @@ impl Ui {
         }
         if button != 1 {
             if button == 3 {
-                self.context_menu(x + gw + PAD, y);
+                self.context_menu(x + gw + PAD, y, false);
             }
             return;
         }
@@ -3055,14 +3064,29 @@ impl Ui {
             return;
         }
         let gw = self.app.try_borrow().map(|a| self.gutter_width(&a)).unwrap_or(0.0);
-        self.context_menu(x + gw + PAD, y + h);
+        self.context_menu(x + gw + PAD, y + h, true);
     }
 
-    fn context_menu(&self, x: f64, y: f64) {
+    /// The text's menu at (`x`, `y`) in the text area's widget; `caret`: about what's at the caret (F7), not there.
+    fn context_menu(&self, x: f64, y: f64, caret: bool) {
         let menu = gio::Menu::new();
         // a word spelled wrong: what it may have been meant to be, first
         let gw = self.app.try_borrow().map(|a| self.gutter_width(&a)).unwrap_or(0.0);
         let spell = self.spell_items(x - gw - PAD, y);
+        // a file name or a link there: open it (issue #7)
+        let g = self.geom();
+        let open = self.guarded(|a| {
+            let at = if caret { a.tab().view.sel.caret } else { a.with_view(&g, |v, cx| v.pos_at(cx, x - gw - PAD, y)) };
+            let tab = a.tab();
+            crate::links::target_in(&tab.doc, tab.view.sel, Some(at)).ok().map(|t| (crate::links::menu_label(&t, false), at))
+        });
+        if let Some(Some((label, at))) = open {
+            let item = gio::MenuItem::new(Some(&label), None);
+            item.set_action_and_target_value(Some("win.open-at"), Some(&at.to_variant()));
+            let s = gio::Menu::new();
+            s.append_item(&item);
+            menu.append_section(None, &s);
+        }
         if let Some(k) = spell.iter().position(|(_, a)| a == "add-word") {
             let (all, one): (Vec<_>, Vec<_>) = spell[..k].iter().partition(|(_, a)| a.starts_with("suggest-all-"));
             let pairs: Vec<(&str, &str)> = one.iter().map(|(l, a)| (l.as_str(), a.as_str())).collect();
@@ -3949,6 +3973,11 @@ impl Ui {
                 });
             }
             Ask::RevealFile(path) => reveal_file(&path),
+            Ask::OpenLink(url) => {
+                let _ = gio::AppInfo::launch_default_for_uri(&url, gio::AppLaunchContext::NONE);
+            }
+            // (shown above)
+            Ask::SpellMenu => {}
             Ask::Hash { what, hex } => {
                 let ask = Ask::Hash { what: what.clone(), hex: hex.clone() };
                 self.dialog(&format!("SHA-256 of {what}"), &hex, &[("OK", "ok"), ("Copy", "copy")], move |answer| {

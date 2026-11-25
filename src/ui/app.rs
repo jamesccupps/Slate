@@ -213,6 +213,8 @@ pub struct Tab {
     pub lang: Lang,
     /// The user picked `lang` (so it isn't guessed again).
     pub lang_picked: bool,
+    /// The tab shown when this one was opened: shown again if its file can't be opened (`load_failed`).
+    pub opened_from: Option<u64>,
     pub untitled: u32,
     pub index_job: Option<Job<bool>>,
     /// Reading its file on another thread (opening or reloading it).
@@ -341,6 +343,7 @@ impl Tab {
             find_bar: None,
             lang: Lang::Plain,
             lang_picked: false,
+            opened_from: None,
             untitled: 0,
             index_job: None,
             load_job: None,
@@ -645,6 +648,8 @@ pub struct App {
     pub spell_word: Option<SpellWord>,
     /// F7 found a word spelled wrong starting here: the menu it opens is for this word, not the point it opens at.
     pub menu_word: Option<u64>,
+    /// The text's menu is opened from the keyboard, below the caret: what it's about is at the caret, not there.
+    pub menu_at_caret: bool,
     /// Replace all with this search and replacement instead of the find bar's (a word's spelling changed everywhere).
     pub replace_with: Option<(Arc<crate::core::search::Matcher>, Vec<u8>)>,
     /// The words spelled wrong shown last (test mode's `print:wrong`).
@@ -781,6 +786,7 @@ impl App {
             speller: Spelling::NotYet,
             spell_word: None,
             menu_word: None,
+            menu_at_caret: false,
             replace_with: None,
             spell_shown: Vec::new(),
             tablist_rect: Rect::default(),

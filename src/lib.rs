@@ -7,6 +7,7 @@ pub mod core;
 pub mod edit;
 pub mod editorconfig;
 pub mod highlight;
+pub mod links;
 pub mod print;
 pub mod settings;
 pub mod shortcuts;

@@ -223,6 +223,7 @@ fn cmd_of(name: &str) -> Option<Cmd> {
         "MoveLineDown" => Cmd::MoveLineDown,
         "ToggleWrap" => Cmd::ToggleWrap,
         "ToggleSpellCheck" => Cmd::ToggleSpellCheck,
+        "OpenSelection" => Cmd::OpenSelection,
         "LangForEnding" => Cmd::LangForEnding,
         "ToggleTitleBarTabs" => Cmd::ToggleTitleBarTabs,
         "ToggleCloseWithLastTab" => Cmd::ToggleCloseWithLastTab,

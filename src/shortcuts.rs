@@ -230,6 +230,7 @@ const H: &str = "Help";
 const ALL: &[Command] = &[
     any(F, "new-tab", "Ctrl+N, Ctrl+T"),
     any(F, "open", "Ctrl+O"),
+    text(F, "open-selection", ""),
     any(F, "reopen-closed", "Ctrl+Shift+T"),
     any(F, "save", "Ctrl+S"),
     any(F, "save-as", "Ctrl+Shift+S"),
