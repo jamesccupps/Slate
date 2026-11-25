@@ -238,7 +238,7 @@ fn plan_in(d: PathBuf, tabs: &mut [Tab], active: usize, closing: bool) -> Plan {
             continue;
         }
         // (a tab of matching lines isn't kept: it's made again from its file in a moment)
-        if tab.filter.is_some() {
+        if tab.filter.is_some() || tab.results.is_some() {
             continue;
         }
         // Not back yet: as it was (its files are still needed). Its file still being read: as the session had it.

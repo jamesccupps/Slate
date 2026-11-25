@@ -251,6 +251,8 @@ pub struct Tab {
     pub indent_picked: bool,
     /// A name for a tab that isn't a file (the keyboard shortcuts).
     pub title_override: Option<String>,
+    /// A tab of results (Find in all tabs, Find in files): where each of its lines goes (Enter, a double-click).
+    pub results: Option<Arc<crate::core::many::Results>>,
     /// A save stopped because ANSI can't hold some characters: (path, close after, closing the window), for the
     /// question that follows (`Deferred::AskLossy`).
     pub ask_lossy: Option<(PathBuf, bool, bool, Encoding)>,
@@ -320,6 +322,15 @@ pub struct Opts {
     pub text_file: Option<PathBuf>,
 }
 
+/// Replace in all tabs (issue #15): the tabs replaced in (each its own task), how many have finished, the matches
+/// replaced and the tabs that had any.
+pub struct Replacing {
+    pub ids: Vec<u64>,
+    pub done: usize,
+    pub count: u64,
+    pub tabs: u64,
+}
+
 /// A tab closed with File → Close (or Ctrl+W...), for Reopen closed tab: its file and where it was in it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ClosedTab {
@@ -365,6 +376,7 @@ impl Tab {
             indent: None,
             indent_picked: false,
             title_override: None,
+            results: None,
             ask_lossy: None,
             canon: None,
             goto: None,
@@ -575,7 +587,7 @@ pub struct App {
     pub down: Hit,
     /// What the middle button was pressed on (a tab closes when it's released on it).
     pub middle_down: Hit,
-    /// A press in the text closes the find bar (View → Find bar → Close when you click in the text), once it's let go
+    /// A press in the text closes the find bar (Settings → Find bar → Close when you click in the text), once it's let go
     /// and no more clicks follow: the tab's id.
     pub close_find_on_up: Option<u64>,
     /// … and it was let go: the bar closes when `TIMER_FIND_CLOSE` comes, unless another press in the text goes on
@@ -630,12 +642,16 @@ pub struct App {
     pub closed_tabs: Vec<ClosedTab>,
     /// Go back and Go forward's places (Alt+Left, Alt+Right; issue #11).
     pub nav: crate::edit::Nav,
-    /// The only tab, which the user is closing with View → Close Slate with the last tab on: once it's gone (after
+    /// Find in all tabs or in files on another thread, and the title of the tab of results it makes (issue #15).
+    pub many: Option<(Job<Result<crate::core::many::Results, String>>, String)>,
+    /// Replace in all tabs, while its tasks run.
+    pub replacing: Option<Replacing>,
+    /// The only tab, which the user is closing with Settings → Close Slate with the last tab on: once it's gone (after
     /// its question, or its save), Slate closes (`remove_tab`).
     pub quit_with_tab: Option<u64>,
     /// The tab the find bar's state (`find.open`, `find.mode`) is about (`App::follow_find_bar`).
     pub find_owner: u64,
-    /// The user's keyboard shortcuts (Help → Change keyboard shortcuts…), over Slate's own.
+    /// The user's keyboard shortcuts (Settings → Change keyboard shortcuts…), over Slate's own.
     pub keymap: crate::shortcuts::Keymap,
     /// `slate --wait`: an event to set once all of its tabs are closed (`Opts::wait`).
     pub waits: Vec<(String, Vec<u64>)>,
@@ -780,6 +796,8 @@ impl App {
             keyboard_cues: super::actions::keyboard_cues(),
             closed_tabs: Vec::new(),
             nav: Default::default(),
+            many: None,
+            replacing: None,
             quit_with_tab: None,
             find_owner: 0,
             keymap: crate::shortcuts::Keymap::new(&crate::shortcuts::read()),
@@ -938,7 +956,7 @@ impl App {
         } else {
             [Rect::default(); 3]
         };
-        // (hidden unless Alt gave it the keyboard or a menu is open: View → Hide the menu bar)
+        // (hidden unless Alt gave it the keyboard or a menu is open: Settings → Hide the menu bar)
         let mh = if self.menu_bar_shown() { metrics::MENU_BAR_H } else { 0.0 };
         self.r_menu = band(y, mh);
         y += mh;
@@ -959,7 +977,7 @@ impl App {
         let sh = metrics::STATUS_H;
         let sy = snap((h - sh).max(y));
         self.r_status = Rect::new(0.0, sy, w, (h - sy).max(sh));
-        // (View → Find bar → At the bottom: the find bar, then a notice, above the status bar; the text's top stays put
+        // (Settings → Find bar → At the bottom: the find bar, then a notice, above the status bar; the text's top stays put
         // as they open and close, issue #9)
         let mut end = sy;
         if bottom {
@@ -1491,7 +1509,7 @@ impl App {
     }
 
     fn paint_menu(&mut self) {
-        // (hidden: View → Hide the menu bar)
+        // (hidden: Settings → Hide the menu bar)
         if self.r_menu.h <= 0.0 {
             return;
         }

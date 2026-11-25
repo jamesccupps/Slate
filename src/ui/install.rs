@@ -512,7 +512,7 @@ fn forget_unregistered() {
     }
 }
 
-/// Help → Stop opening files with Slate… (and `Slate.exe --unassociate`): takes back what "Open files with Slate…"
+/// Settings → Stop opening files with Slate… (and `Slate.exe --unassociate`): takes back what "Open files with Slate…"
 /// set up for files: Slate in "Open with", "Edit with Slate", its Default apps entry, and every file type set to
 /// open with Slate, which opens the way Windows opens it without a choice again (or Windows asks). Slate stays
 /// installed: its folder, the Start menu, Installed apps.
@@ -551,17 +551,17 @@ pub fn unassociate() {
     }
 }
 
-/// Help → Stop opening files with Slate…: asks, then `unassociate`.
+/// Settings → Stop opening files with Slate…: asks, then `unassociate`.
 pub fn stop_default(cell: &Cell) {
     let hwnd = cell.borrow().hwnd;
     let detail = "Slate comes off \"Open with\", the right-click menu and Default apps, and the file types you set to \
                   open with Slate open the way they did without it (or Windows asks which app to use). Slate stays \
-                  installed, with your settings and tabs; Help → Open files with Slate… sets it up again.";
+                  installed, with your settings and tabs; Settings → Open files with Slate… sets it up again.";
     if win::ask(hwnd, "Slate", "Stop opening files with Slate?", detail, &["&Stop", "Cancel"]) != Some(0) {
         return;
     }
     unassociate();
-    cell.borrow_mut().flash("Slate no longer opens files by itself. Help → Open files with Slate… sets it up again.", false);
+    cell.borrow_mut().flash("Slate no longer opens files by itself. Settings → Open files with Slate… sets it up again.", false);
 }
 
 fn set_dword(path: &str, name: &str, value: u32) -> bool {

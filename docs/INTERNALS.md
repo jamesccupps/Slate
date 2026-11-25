@@ -295,7 +295,7 @@ when it's this user's alone, else a guest window that keeps nothing). Windows: `
     in `selection_text`, the active tab outlined; test mode: `set:high_contrast=true`, `print:contrast`. Selections
     made any way become the primary selection (middle-click paste: `refresh_now`, the mouse's on release). Close other
     / saved / all tabs (`App::closing`, `close_next`) close one by one, an unsaved one asked about first (Save as
-    answered, then on; Cancel stops). Not on Linux yet: big unsaved documents in the session (README lists it all). Help → Open files with Slate… (`make_default`) makes Slate the default for the
+    answered, then on; Cancel stops). Not on Linux yet: big unsaved documents in the session (README lists it all). Settings → Open files with Slate… (`make_default`) makes Slate the default for the
     desktop file's MimeType list through GIO (`~/.config/mimeapps.list`; Linux lets an app do that itself); Stop
     opening files with Slate… takes only Slate's entries out of that file (GIO's reset would forget other apps' too).
     File dialogs (`FileChooserNative`) must be kept alive until answered (`keep_until_answered`): GTK drops them
@@ -360,7 +360,7 @@ when it's this user's alone, else a guest window that keeps nothing). Windows: `
     time; a managed PC whose policy turns that question off just opens Slate), so after setting up a note above the
     text says which usual kinds open with Slate, which Windows still asks about, which another app opens
     (`choice_of` reads UserChoiceLatest/UserChoice, `choices_note`); `Slate.exe --install` does the setup
-    silently for winget and scripts; Help → Stop opening files with Slate… / `--unassociate` takes back the file
+    silently for winget and scripts; Settings → Stop opening files with Slate… / `--unassociate` takes back the file
     part, every UserChoice naming Slate included, and Slate stays installed; `--uninstall --quiet` removes it all, the
     installed copy too when it's the one running, by a hidden `cmd` once it has ended (the paths in environment
     variables read with `!`, `cleanup_command`, so no folder name is taken as a command); CI runs all three on a
@@ -609,7 +609,7 @@ when it's this user's alone, else a guest window that keeps nothing). Windows: `
   the closing one of the pair around it) and Select inside brackets (Ctrl+Shift+M, `bracket_select`: inside, then the
   brackets too, then inside the pair around those; `enclosing_brackets`). Brackets in strings and comments count, up
   to 1 MB away (`BRACKET_REACH`). Sublime Text's keys (asked for by a user who comes from it).
-- View → Close Slate with the last tab (`Settings::close_with_last_tab`, off by default): Ctrl+W or a tab's × on the
+- Settings → Close Slate with the last tab (`Settings::close_with_last_tab`, off by default): Ctrl+W or a tab's × on the
   only tab marks it (`App::quit_with_tab`); once it's gone (after its question, or its save) `remove_tab` closes
   Slate (Windows `Deferred::Cmd(Cmd::Exit)`, Linux `Ask::Quit`). Close all/other tabs don't (an empty tab stays).
 - Multiple cursors (Edit → Multiple cursors, issue #5; `Settings::multi_cursor`, off by default: its menu items only
@@ -633,7 +633,7 @@ when it's this user's alone, else a guest window that keeps nothing). Windows: `
   line breaks; Paste puts a line at each when the text has as many (`paste_parts`). Up to `CARETS_MAX` (10,000);
   Add next match looks 64 MB each way, Select all matches works in texts up to 64 MB. Each app draws the others'
   selections and carets for the rows on screen only; with none, nothing runs (`is_empty` checks).
-- Keyboard shortcuts the user changes (Help → Change keyboard shortcuts…, `crate::shortcuts`): one list of the
+- Keyboard shortcuts the user changes (Settings → Change keyboard shortcuts…, `crate::shortcuts`): one list of the
   commands for both apps (the GTK app's action names, the keys each has, whether it works in the find bar's boxes
   on Windows) and the user's `shortcuts.txt` in the data folder, made the first time it's opened with every command
   on a `#` line. A line without the `#` gives that command its own keys (or none), and those keys stop doing
@@ -649,7 +649,7 @@ when it's this user's alone, else a guest window that keeps nothing). Windows: `
   the ones the app has. Moving and typing keys (arrows, Home, Backspace, Ctrl+1–9) aren't in it. Linux's Alt+Up and
   Alt+Down became the move-line actions' accelerators for it (GTK runs the window's accelerators before the text
   has the key; test mode's `key:` does the same: `action_for_accel`).
-- View → Find bar (issue #6; both off by default). *Close when you click in the text*
+- Settings → Find bar (issue #6; both off by default). *Close when you click in the text*
   (`Settings::find_close_on_leave`): the keyboard going from the bar to the text closes it (Windows: where the app
   moves it there, Tab from the find box, a structure jump: `in_find_bar` first; Linux: the window's `focus-widget`
   going from inside `find_box` to the text, the close on an idle). A left press in the text or gutter closes it
@@ -682,7 +682,7 @@ when it's this user's alone, else a guest window that keeps nothing). Windows: `
   method (one may end a syllable itself with its result still on the way: finishing on the key too typed it twice).
   Linux: GTK's preedit signals (preedit-start/changed/end; attributes to clauses in `view::composing_of`, a
   background marking the clause being converted); a click resets the input context first, as GtkTextView does.
-- Tabs in the title bar (`Settings::tabs_in_title_bar`, View → Tabs in the title bar, on by default; Windows'
+- Tabs in the title bar (`Settings::tabs_in_title_bar`, Settings → Tabs in the title bar, on by default; Windows'
   title bar in high contrast). Windows: `CUSTOM_FRAME` (a thread-local, as WM_NCCALCSIZE comes while the window is
   made, before there's an App, and while it's borrowed; `wndproc` answers it before looking for the App) takes the
   caption off (`calc_frame`: DefWindowProc's rectangle, its top put back; maximized, in by the frame, which reaches

@@ -23,14 +23,18 @@ pub enum Cmd {
     /// File → Open selected file or link: the selection (or the name at the caret) as a file in a tab, or a web
     /// link in the browser (`crate::links`, issue #7).
     OpenSelection,
-    /// View → Find bar → At the bottom (`Settings::bars_at_bottom`, issue #9).
+    /// Edit → Find in all tabs, Replace in all tabs, Find in files (the find bar's search; `core::many`, issue #15).
+    FindInTabs,
+    ReplaceInTabs,
+    FindInFiles,
+    /// Settings → Find bar → At the bottom (`Settings::bars_at_bottom`, issue #9).
     ToggleBarsAtBottom,
-    /// View → Hide the menu bar (`Settings::hide_menu_bar`, issue #10).
+    /// Settings → Hide the menu bar (`Settings::hide_menu_bar`, issue #10).
     ToggleHideMenuBar,
     /// Edit → Go back / Go forward: where the caret jumped from (`edit::Nav`, issue #11).
     GoBack,
     GoForward,
-    /// File → Reopen files where you left them (`Settings::reopen_where_left`).
+    /// Settings → Reopen files where you left them (`Settings::reopen_where_left`).
     ToggleReopenWhereLeft,
     /// The text's menu's Open “name”: what's at this place (`links::target_in`).
     OpenAt(u64),
@@ -102,9 +106,9 @@ pub enum Cmd {
     ToggleWhitespace,
     ToggleSpellCheck,
     ToggleTitleBarTabs,
-    /// View → Close Slate with the last tab (`Settings::close_with_last_tab`).
+    /// Settings → Close Slate with the last tab (`Settings::close_with_last_tab`).
     ToggleCloseWithLastTab,
-    /// View → Find bar: Close when you click in the text (`Settings::find_close_on_leave`), One for each tab
+    /// Settings → Find bar: Close when you click in the text (`Settings::find_close_on_leave`), One for each tab
     /// (`Settings::find_per_tab`).
     ToggleFindCloseOnLeave,
     ToggleFindPerTab,
@@ -166,7 +170,7 @@ pub enum Cmd {
     ActivateTab(usize),
     About,
     Shortcuts,
-    /// Help → Change keyboard shortcuts…: the user's file (`crate::shortcuts`), made the first time.
+    /// Settings → Change keyboard shortcuts…: the user's file (`crate::shortcuts`), made the first time.
     ChangeShortcuts,
     MakeDefault,
     StopDefault,
@@ -253,6 +257,7 @@ pub fn global_key(vk: u16, m: &Mods) -> Option<Cmd> {
         (VK_P, true, false) => Cmd::Print,
         (VK_W, true, false) | (VK_F4, true, false) => Cmd::CloseTab,
         (VK_F, true, false) => Cmd::Find,
+        (VK_F, true, true) => Cmd::FindInFiles,
         (VK_H, true, false) => Cmd::Replace,
         (VK_G, true, false) => Cmd::GoToLine,
         (VK_O, true, true) => Cmd::ToggleStructure,
@@ -360,6 +365,9 @@ const IDS: &[(&str, Cmd)] = &[
     ("new-tab", Cmd::NewTab),
     ("open", Cmd::Open),
     ("open-selection", Cmd::OpenSelection),
+    ("find-in-tabs", Cmd::FindInTabs),
+    ("replace-in-tabs", Cmd::ReplaceInTabs),
+    ("find-in-files", Cmd::FindInFiles),
     ("bars-at-bottom", Cmd::ToggleBarsAtBottom),
     ("hide-menu-bar", Cmd::ToggleHideMenuBar),
     ("reopen-where-left", Cmd::ToggleReopenWhereLeft),
@@ -574,9 +582,9 @@ pub fn build_menu(items: &[Item], ids: &mut Vec<Cmd>) -> HMENU {
     }
 }
 
-pub const MENU_TITLES: [&str; 5] = ["File", "Edit", "View", "Format", "Help"];
-/// The letter of each title that opens it with Alt (F, E, V, O, H), underlined while the menu bar has the keyboard.
-pub const MENU_KEYS: [u32; 5] = [0, 0, 0, 1, 0];
+pub const MENU_TITLES: [&str; 6] = ["File", "Edit", "View", "Format", "Settings", "Help"];
+/// The letter of each title that opens it with Alt (F, E, V, O, S, H), underlined while the menu bar has the keyboard.
+pub const MENU_KEYS: [u32; 6] = [0, 0, 0, 1, 0, 0];
 
 /// Menu bar shortcut letters (Alt+F etc.).
 pub fn menu_for_letter(vk: u16) -> Option<usize> {
@@ -585,13 +593,14 @@ pub fn menu_for_letter(vk: u16) -> Option<usize> {
         VK_E => Some(1),
         VK_V => Some(2),
         VK_O => Some(3),
-        VK_H => Some(4),
+        VK_S => Some(4),
+        VK_H => Some(5),
         _ => None,
     }
 }
 
 pub const SHORTCUTS: &str = "\
-Keyboard shortcuts (Help → Change keyboard shortcuts… gives commands other keys)
+Keyboard shortcuts (Settings → Change keyboard shortcuts… gives commands other keys)
 
 Files
   Ctrl+N / Ctrl+T               New tab
@@ -643,6 +652,7 @@ Moving around
                                 pair around them)
   Ctrl+F2                       Bookmark the line (or take the bookmark off)
   F2 / Shift+F2                 Next / previous bookmark
+  Alt+Left / Alt+Right          Go back / forward to where the caret jumped from (any tab)
 
 Find and replace
   Ctrl+F / Ctrl+H               Find / Replace
@@ -659,16 +669,18 @@ Find and replace
   Tab                           Switch between the find and replace boxes
   Alt+L                         Show only the lines with a match, in a tab of their own
                                 (Enter or a double-click there goes to a line in the file)
+  Ctrl+Shift+F                  Find in files (the folder of the tab's file, and its folders)
   Esc                           Close the find bar
 
 View
   Alt+Z                         Word wrap
+  F7                            Next word spelled wrong (with its suggestions)
   Ctrl+Plus / Ctrl+Minus        Zoom in / out (or Ctrl+mouse wheel)
   Ctrl+0                        Reset zoom
   Ctrl+Shift+O                  JSON and XML structure panel
 
 Menus
-  Alt, then a letter            Open a menu (or Alt+F, Alt+E, Alt+V, Alt+O, Alt+H)
+  Alt, then a letter            Open a menu (or Alt+F, Alt+E, Alt+V, Alt+O, Alt+S, Alt+H)
   F10                           File menu
   Shift+F10 / Menu key          Context menu
 

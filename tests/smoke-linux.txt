@@ -151,7 +151,7 @@ key:ctrl+shift+m
 expect:sel=6..10
 key:ctrl+shift+m
 expect:sel=5..11
-# View → Find bar: one for each tab (a new tab's is closed), and closed by a click in the text
+# Settings → Find bar: one for each tab (a new tab's is closed), and closed by a click in the text
 cmd:find-per-tab
 find:f
 expect:shown=path bar false, panel false, find bar true
@@ -199,7 +199,7 @@ wait:600
 expect:shown=path bar false, panel false, find bar false
 expect:top=21+0
 cmd:find-close-on-leave
-# Help → Change keyboard shortcuts…: a command given other keys loses its own
+# Settings → Change keyboard shortcuts…: a command given other keys loses its own
 cmd:change-shortcuts
 jobs
 key:ctrl+a
@@ -318,15 +318,29 @@ jobs
 expect:lang=Lua
 cmd:lang-for-ending
 expect:status=Files ending in .zzlua get their language the usual way again
-# View → Hide the menu bar (issue #10)
+# Settings → Hide the menu bar (issue #10)
 cmd:hide-menu-bar
 wait:400
 expect:menubar=false
 cmd:hide-menu-bar
 expect:menubar=true
-# View → Find bar → At the bottom (issue #9): the notice and the find bar above the status bar
+# Settings → Find bar → At the bottom (issue #9): the notice and the find bar above the status bar
 expect:bars=find, notice, path, status
 cmd:bars-at-bottom
 expect:bars=path, notice, find, status
 cmd:bars-at-bottom
 expect:bars=find, notice, path, status
+# Edit → Find in all tabs (issue #15): the lines in a tab of results, read only; Enter goes to one
+cmd:new-tab
+type:first\nsecond zzneedle
+find:zzneedle
+key:escape
+cmd:find-in-tabs
+jobs
+expect:readonly=true
+key:ctrl+home
+key:down
+key:down
+key:down
+key:enter
+expect:sel=6..6

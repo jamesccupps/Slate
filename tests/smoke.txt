@@ -122,7 +122,7 @@ key:ctrl+shift+m
 expect:sel=6..10
 key:ctrl+shift+m
 expect:sel=5..11
-# View → Find bar: one for each tab (a new tab's is closed), and closed by a click in the text
+# Settings → Find bar: one for each tab (a new tab's is closed), and closed by a click in the text
 cmd:ToggleFindPerTab
 find:f
 expect:findbar=Find
@@ -164,7 +164,7 @@ timer:15
 expect:findbar=closed
 expect:top=21
 cmd:ToggleFindCloseOnLeave
-# Help → Change keyboard shortcuts…: a command given other keys loses its own
+# Settings → Change keyboard shortcuts…: a command given other keys loses its own
 cmd:ChangeShortcuts
 jobs
 expect:title=shortcuts.txt
@@ -299,7 +299,7 @@ jobs
 expect:lang=Lua
 cmd:LangForEnding
 expect:status=Files ending in .zzlua get their language the usual way again
-# View → Hide the menu bar (issue #10): it's back while Alt gives it the keyboard
+# Settings → Hide the menu bar (issue #10): it's back while Alt gives it the keyboard
 cmd:ToggleHideMenuBar
 expect:menubar=false
 altkey
@@ -308,7 +308,7 @@ altkey
 expect:menubar=false
 cmd:ToggleHideMenuBar
 expect:menubar=true
-# View → Find bar → At the bottom (issue #9): under the text, which doesn't move as it opens
+# Settings → Find bar → At the bottom (issue #9): under the text, which doesn't move as it opens
 cmd:Find
 expect:findplace=above the text, text at 110
 key:escape
@@ -318,3 +318,18 @@ expect:findplace=under the text, text at 70
 key:escape
 expect:findplace=under the text, text at 70
 cmd:ToggleBarsAtBottom
+# Edit → Find in all tabs (issue #15): the lines in a tab of results, read only; Enter goes to one
+cmd:NewTab
+type:first\nsecond zzneedle
+find:zzneedle
+key:escape
+cmd:FindInTabs
+jobs
+expect:title=Found: zzneedle
+expect:readonly=true
+key:ctrl+home
+key:down
+key:down
+key:down
+key:enter
+expect:sel=6..6

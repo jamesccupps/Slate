@@ -111,12 +111,12 @@ pub struct Ui {
     /// View's JSON or XML items (the structure panel and the path bar), for the language they're shown for.
     view_extra: gio::Menu,
     view_extra_for: Cell<Option<Lang>>,
-    /// The menu bar's row (with the theme button), and its menus (View → Hide the menu bar: shown while Alt opens one).
+    /// The menu bar's row (with the theme button), and its menus (Settings → Hide the menu bar: shown while Alt opens one).
     menu_row: gtk4::Box,
     menu_items: Rc<Vec<glib::WeakRef<gtk4::Widget>>>,
     /// Alt is down with no other key since: letting it go opens the hidden menu bar's first menu.
     alt_alone: Cell<bool>,
-    /// The find bar and the notice are above the status bar (View → Find bar → At the bottom).
+    /// The find bar and the notice are above the status bar (Settings → Find bar → At the bottom).
     bars_bottom: Cell<bool>,
     /// Format → Language's last item: Always open .x files as … (the tab's ending and language it's for).
     lang_extra: gio::Menu,
@@ -127,7 +127,7 @@ pub struct Ui {
     syncing: Cell<bool>,
     scroll_acc: Cell<f64>,
     drag_origin: Cell<(f64, f64)>,
-    /// A press in the text closes the find bar (View → Find bar → Close when you click in the text), once it's let go
+    /// A press in the text closes the find bar (Settings → Find bar → Close when you click in the text), once it's let go
     /// and no more clicks follow: the tab's id.
     close_find_on_release: Cell<Option<u64>>,
     /// … and it was let go: the bar closes when this timer comes, unless another press in the text goes on with the
@@ -599,7 +599,7 @@ fn slate_is_default() -> bool {
     gio::AppInfo::default_for_type("text/plain", false).and_then(|d| d.id()).is_some_and(|d| d == id)
 }
 
-/// Help → Stop opening files with Slate…: the kinds of files Slate is the default for go back to the system's own
+/// Settings → Stop opening files with Slate…: the kinds of files Slate is the default for go back to the system's own
 /// choice. Only Slate's entries go from `~/.config/mimeapps.list` (what `make_default` wrote): choices made for other
 /// apps stay (GIO's `reset_type_associations` would forget those too).
 fn stop_default() -> Result<usize, String> {
@@ -839,7 +839,7 @@ pub fn window(application: &gtk4::Application, test: Option<Rc<testmode::Test>>)
     middle.append(&text);
     middle.append(&vbar);
     middle.append(&panel);
-    // the light/dark switch at the menu bar's end, as on Windows (View → Theme has the system setting too)
+    // the light/dark switch at the menu bar's end, as on Windows (Settings → Theme has the system setting too)
     let theme_btn = gtk4::Button::from_icon_name("weather-clear-night-symbolic");
     theme_btn.add_css_class("flat");
     theme_btn.add_css_class("slate-theme");
@@ -1372,7 +1372,7 @@ fn connect(ui: &Rc<Ui>, prev: &gtk4::Button, next: &gtk4::Button, lines_btn: &gt
         ui.try_quit();
         if ui.closing.get() { glib::Propagation::Proceed } else { glib::Propagation::Stop }
     });
-    // View → Find bar → Close when you click in the text: the keyboard going from the find bar to the text closes the
+    // Settings → Find bar → Close when you click in the text: the keyboard going from the find bar to the text closes the
     // bar (a jump from the structure panel; a click in the text closes it when it's let go: `text_released`).
     let last_focus: RefCell<Option<glib::WeakRef<gtk4::Widget>>> = RefCell::new(None);
     ui.window.connect_focus_widget_notify(move |w| {
@@ -1634,6 +1634,9 @@ fn commands() -> Vec<(&'static str, Cmd, &'static [&'static str])> {
         ("new-tab", Cmd::NewTab, &["<Control>n", "<Control>t"]),
         ("open-selection", Cmd::OpenSelection, &[]),
         ("reopen-where-left", Cmd::ReopenWhereLeft, &[]),
+        ("find-in-tabs", Cmd::FindInTabs, &[]),
+        ("replace-in-tabs", Cmd::ReplaceInTabs, &[]),
+        ("find-in-files", Cmd::FindInFiles, &["<Control><Shift>f"]),
         ("go-back", Cmd::GoBack, &["<Alt>Left"]),
         ("go-forward", Cmd::GoForward, &["<Alt>Right"]),
         ("open", Cmd::Open, &["<Control>o"]),
@@ -1782,7 +1785,7 @@ fn encoding_key(e: Encoding) -> &'static str {
     ENCODINGS.iter().find(|(x, _)| *x == e).map_or("utf8", |(_, k)| k)
 }
 
-/// The monospaced font families for View → Font: the system's own ("Monospace") first, then the others by name
+/// The monospaced font families for Settings → Font: the system's own ("Monospace") first, then the others by name
 /// (and the one in the settings, if it's neither).
 fn mono_families(ctx: &pango::Context, current: &str) -> Vec<String> {
     let mut v: Vec<String> = ctx.list_families().iter().filter(|f| f.is_monospace()).map(|f| f.name().to_string()).collect();
@@ -2032,7 +2035,7 @@ fn menus_beside(window: &gtk4::ApplicationWindow, items: &[gtk4::Widget]) {
     window.add_controller(keys);
 }
 
-/// View → Hide the menu bar (issue #10): Alt on its own opens the first menu, Alt and a menu's letter that menu (a
+/// Settings → Hide the menu bar (issue #10): Alt on its own opens the first menu, Alt and a menu's letter that menu (a
 /// hidden menu bar's letters aren't GTK's), the bar showing while one is; it hides again once they're all closed.
 fn hidden_menu_keys(ui: &Rc<Ui>) {
     let alt = |k: gdk::Key| matches!(k, gdk::Key::Alt_L | gdk::Key::Alt_R | gdk::Key::Meta_L | gdk::Key::Meta_R);
@@ -2043,16 +2046,19 @@ fn hidden_menu_keys(ui: &Rc<Ui>) {
         let Some(ui) = get_ui() else { return glib::Propagation::Proceed };
         ui.alt_alone.set(alt(key) && !state.intersects(others));
         let hidden = ui.app.try_borrow().is_ok_and(|a| a.settings.hide_menu_bar) && !ui.menu_row.is_visible();
-        if !hidden || !state.contains(gdk::ModifierType::ALT_MASK) || state.intersects(others) {
+        // (the find box's own Alt keys come first: Alt+S, Alt+H…)
+        let in_find = GtkWindowExt::focus(&ui.window).is_some_and(|f| f.is_ancestor(&ui.find_box));
+        if !hidden || in_find || !state.contains(gdk::ModifierType::ALT_MASK) || state.intersects(others) {
             return glib::Propagation::Proceed;
         }
-        // (the letters of _File, _Edit, _View, F_ormat, _Help)
+        // (the letters of _File, _Edit, _View, F_ormat, _Settings, _Help)
         let i = match key.to_lower() {
             gdk::Key::f => 0,
             gdk::Key::e => 1,
             gdk::Key::v => 2,
             gdk::Key::o => 3,
-            gdk::Key::h => 4,
+            gdk::Key::s => 4,
+            gdk::Key::h => 5,
             _ => return glib::Propagation::Proceed,
         };
         ui.open_hidden_menu(i);
@@ -2131,15 +2137,13 @@ fn menu_model(recent: &gio::Menu, format_extra: &gio::Menu, view_extra: &gio::Me
         None,
         &section(&[("Close tab", "close-tab"), ("Close other tabs", "close-others"), ("Close saved tabs", "close-saved"), ("Close all tabs", "close-all")]),
     );
-    file.append_section(
-        None,
-        &section(&[("Restore last session", "restore-session"), ("Reopen files where you left them", "reopen-where-left"), ("Quit", "quit")]),
-    );
+    file.append_section(None, &section(&[("Quit", "quit")]));
     bar.append_submenu(Some("_File"), &file);
     let edit = gio::Menu::new();
     edit.append_section(None, &section(&[("Undo", "undo"), ("Redo", "redo")]));
     edit.append_section(None, &section(&[("Cut", "cut"), ("Copy", "copy"), ("Paste", "paste"), ("Select all", "select-all")]));
     edit.append_section(None, &section(&[("Find…", "find"), ("Replace…", "replace"), ("Find next", "find-next"), ("Find previous", "find-prev"), ("Go to line…", "goto-line")]));
+    edit.append_section(None, &section(&[("Find in all tabs", "find-in-tabs"), ("Replace in all tabs", "replace-in-tabs"), ("Find in files…", "find-in-files")]));
     edit.append_section(None, &section(&[("Go back", "go-back"), ("Go forward", "go-forward")]));
     edit.append_section(None, &section(&[("Go to matching bracket", "goto-bracket"), ("Select inside brackets", "select-brackets")]));
     let marks = section(&[("Toggle bookmark", "toggle-bookmark"), ("Next bookmark", "next-bookmark"), ("Previous bookmark", "prev-bookmark")]);
@@ -2177,34 +2181,20 @@ fn menu_model(recent: &gio::Menu, format_extra: &gio::Menu, view_extra: &gio::Me
     edit.append_submenu(Some("Change case"), &case);
     edit.append_section(None, &section(&[("Time/date", "date-time")]));
     bar.append_submenu(Some("_Edit"), &edit);
+    // View: what the text shows; how Slate looks and works is under Settings (issue #14)
     let view = gio::Menu::new();
-    let first = section(&[
-        ("Word wrap", "wrap"),
-        ("Line numbers", "line-numbers"),
-        ("Show whitespace", "show-whitespace"),
-        ("Hide the menu bar", "hide-menu-bar"),
-        ("Spell check", "spell-check"),
-        ("Next word spelled wrong", "next-misspelling"),
-        ("Tabs in the title bar", "title-bar-tabs"),
-        ("Close Slate with the last tab", "close-with-last-tab"),
-        ("Character at the caret", "char-info"),
-    ]);
-    let find_bar = section(&[
-        ("Close when you click in the text", "find-close-on-leave"),
-        ("One for each tab", "find-per-tab"),
-        ("At the bottom (notices too)", "bars-at-bottom"),
-    ]);
-    first.insert_submenu(6, Some("Find bar"), &find_bar);
-    view.append_section(None, &first);
-    view.append_section(None, &section(&[("Show only matching lines", "filter-lines"), ("Show lines not matching", "filter-lines-not"), ("Clear highlights", "clear-highlights")]));
-    view.append_section(None, view_extra);
+    let first = section(&[("Word wrap", "wrap"), ("Show whitespace", "show-whitespace"), ("Spell check", "spell-check"), ("Next word spelled wrong", "next-misspelling")]);
     let zoom = section(&[("Zoom in", "zoom-in"), ("Zoom out", "zoom-out"), ("Reset zoom", "zoom-reset")]);
-    let rest = gio::Menu::new();
-    rest.append_submenu(Some("Zoom"), &zoom);
-    rest.append_submenu(Some("Font"), &font_menu(fonts));
-    let theme = section(&[("Use system setting", "theme-system"), ("Light", "theme-light"), ("Dark", "theme-dark")]);
-    rest.append_submenu(Some("Theme"), &theme);
-    view.append_section(None, &rest);
+    first.append_submenu(Some("Zoom"), &zoom);
+    view.append_section(None, &first);
+    let lines = gio::Menu::new();
+    lines.append_submenu(
+        Some("Matching lines"),
+        &section(&[("Show only matching lines", "filter-lines"), ("Show lines not matching", "filter-lines-not"), ("Clear highlights", "clear-highlights")]),
+    );
+    lines.append_section(None, &section(&[("Character at the caret", "char-info")]));
+    view.append_section(None, &lines);
+    view.append_section(None, view_extra);
     bar.append_submenu(Some("_View"), &view);
     let format = gio::Menu::new();
     format.append_section(None, &section(&[("Format JSON", "json-format"), ("Minify JSON", "json-minify"), ("Check JSON", "json-check")]));
@@ -2232,17 +2222,40 @@ fn menu_model(recent: &gio::Menu, format_extra: &gio::Menu, view_extra: &gio::Me
     rest.append_submenu(Some("Indentation"), &indent_menu());
     format.append_section(None, &rest);
     bar.append_submenu(Some("F_ormat"), &format);
-    let help = gio::Menu::new();
-    help.append_section(
+    // Settings: how Slate looks and works (issue #14)
+    let settings = gio::Menu::new();
+    let looks = section(&[("Line numbers", "line-numbers"), ("Tabs in the title bar", "title-bar-tabs"), ("Hide the menu bar", "hide-menu-bar")]);
+    let find_bar = section(&[
+        ("Close when you click in the text", "find-close-on-leave"),
+        ("One for each tab", "find-per-tab"),
+        ("At the bottom (notices too)", "bars-at-bottom"),
+    ]);
+    looks.append_submenu(Some("Find bar"), &find_bar);
+    looks.append_submenu(Some("Font"), &font_menu(fonts));
+    let theme = section(&[("Use system setting", "theme-system"), ("Light", "theme-light"), ("Dark", "theme-dark")]);
+    looks.append_submenu(Some("Theme"), &theme);
+    settings.append_section(None, &looks);
+    settings.append_section(
         None,
         &section(&[
-            ("Keyboard shortcuts", "shortcuts"),
+            ("Close Slate with the last tab", "close-with-last-tab"),
+            ("Restore last session", "restore-session"),
+            ("Reopen files where you left them", "reopen-where-left"),
+        ]),
+    );
+    settings.append_section(
+        None,
+        &section(&[
             ("Change keyboard shortcuts…", "change-shortcuts"),
             ("Open files with Slate…", "make-default"),
             ("Stop opening files with Slate…", "stop-default"),
+            ("Open settings folder", "open-data-folder"),
         ]),
     );
-    help.append_section(None, &section(&[("Open settings folder", "open-data-folder"), ("Report a problem…", "report-problem")]));
+    bar.append_submenu(Some("_Settings"), &settings);
+    let help = gio::Menu::new();
+    help.append_section(None, &section(&[("Keyboard shortcuts", "shortcuts")]));
+    help.append_section(None, &section(&[("Report a problem…", "report-problem")]));
     help.append_section(None, &section(&[("About Slate", "about")]));
     bar.append_submenu(Some("_Help"), &help);
     bar
@@ -2308,7 +2321,7 @@ fn indent_menu() -> gio::Menu {
     m
 }
 
-/// View → Font: the monospaced families, and sizes.
+/// Settings → Font: the monospaced families, and sizes.
 fn font_menu(fonts: &[String]) -> gio::Menu {
     let m = gio::Menu::new();
     let families = gio::Menu::new();
@@ -2360,7 +2373,7 @@ fn lang_menu() -> gio::Menu {
     m
 }
 
-const SHORTCUTS: &str = "Slate keyboard shortcuts (Help → Change keyboard shortcuts… gives commands other keys)
+const SHORTCUTS: &str = "Slate keyboard shortcuts (Settings → Change keyboard shortcuts… gives commands other keys)
 
   Ctrl+N / Ctrl+T          New tab
   Ctrl+O                   Open
@@ -2381,6 +2394,8 @@ const SHORTCUTS: &str = "Slate keyboard shortcuts (Help → Change keyboard shor
   Alt+S                    Find in selection (in the find box)
   Alt+A                   Next / previous match through all open tabs (in the find box: on or off)
   Alt+H                    Highlight the search in every tab, in a color of its own (in the find box)
+  Ctrl+Shift+F             Find in files (the folder of the tab's file, and its folders)
+  F7                       Next word spelled wrong (with its suggestions)
   Alt+drag, Shift+Alt+arrows  Column selection (type, paste, delete on every line)
   Ctrl+click               Add or take away a cursor (with Edit → Multiple cursors on)
   Ctrl+Shift+Up / Down     A cursor above / below (multiple cursors)
@@ -2397,6 +2412,7 @@ const SHORTCUTS: &str = "Slate keyboard shortcuts (Help → Change keyboard shor
                            around them)
   Ctrl+F2                  Bookmark the line (or take the bookmark off)
   F2 / Shift+F2            Next / previous bookmark
+  Alt+Left / Alt+Right     Go back / forward to where the caret jumped from (any tab)
   Ctrl+/                   Toggle comment
   Ctrl+D / Ctrl+Shift+K    Duplicate / delete the line
   Alt+Up / Alt+Down        Move the line up / down
@@ -2751,7 +2767,7 @@ impl Ui {
             return;
         }
         // a double-click in a tab of matching lines: that line, in the file
-        if n == 2 && self.app.try_borrow().is_ok_and(|a| a.tab().filter.is_some()) {
+        if n == 2 && self.app.try_borrow().is_ok_and(|a| a.tab().filter.is_some() || a.tab().results.is_some()) {
             self.with(|a| {
                 let pos = a.with_view(&g, |v, cx| v.pos_at(cx, x, y));
                 a.tab_mut().view.sel = Sel::at(pos);
@@ -3518,7 +3534,7 @@ impl Ui {
 
     /// The menus' check marks and dots follow the app: Word wrap, Line numbers, the theme, the tab's line breaks and
     /// language.
-    /// View → Find bar → At the bottom (issue #9): the notice, then the find bar, just above the status bar; else under
+    /// Settings → Find bar → At the bottom (issue #9): the notice, then the find bar, just above the status bar; else under
     /// the menu bar (and the tab strip) as usual. Opening them then doesn't move the text.
     fn place_bars(&self, bottom: bool) {
         if self.bars_bottom.replace(bottom) == bottom {
@@ -3538,7 +3554,7 @@ impl Ui {
         }
     }
 
-    /// View → Hide the menu bar: the bar shows, and menu `i` opens.
+    /// Settings → Hide the menu bar: the bar shows, and menu `i` opens.
     fn open_hidden_menu(&self, i: usize) {
         self.menu_row.set_visible(true);
         MENU_NEXT.set(Some(i));
@@ -3574,7 +3590,7 @@ impl Ui {
             ("theme-dark", theme == ThemeMode::Dark),
             ("eol-lf", tab.doc.eol == Eol::Lf),
             ("eol-crlf", tab.doc.eol == Eol::Crlf),
-            ("read-only", tab.read_only || tab.filter.is_some()),
+            ("read-only", tab.read_only || tab.filter.is_some() || tab.results.is_some()),
             ("restore-session", a.settings.restore_session),
             ("lang-for-ending", tab.ending().is_some_and(|e| a.settings.lang_for_ending(&e) == Some(tab.lang))),
             ("reopen-where-left", a.settings.reopen_where_left),
@@ -3586,7 +3602,7 @@ impl Ui {
         }
         self.set_action_state("set-lang", tab.lang.label().to_variant());
         self.place_bars(a.settings.bars_at_bottom);
-        // View → Hide the menu bar: shown again at once; hidden once its menus are closed
+        // Settings → Hide the menu bar: shown again at once; hidden once its menus are closed
         if !a.settings.hide_menu_bar && !self.menu_row.is_visible() {
             self.menu_row.set_visible(true);
         } else if a.settings.hide_menu_bar && self.menu_row.is_visible() {
@@ -4073,7 +4089,7 @@ impl Ui {
                 self.dialog(
                     "Stop opening files with Slate?",
                     "The kinds of files Slate opens when they're double-clicked go back to the system's own choice (not to \
-                     apps you picked before Slate). Slate stays installed; Help → Open files with Slate… sets it up again.",
+                     apps you picked before Slate). Slate stays installed; Settings → Open files with Slate… sets it up again.",
                     &[("Cancel", "cancel"), ("Stop", "stop")],
                     |answer| {
                         if let Some(ui) = get_ui() {
@@ -4123,7 +4139,7 @@ impl Ui {
         }
     }
 
-    /// Help → Change keyboard shortcuts…: the user's file (`crate::shortcuts`), made the first time listing every
+    /// Settings → Change keyboard shortcuts…: the user's file (`crate::shortcuts`), made the first time listing every
     /// command with its keys (test mode: only in its own data folder).
     fn change_shortcuts(&self) {
         if self.test.is_some() && std::env::var_os("SLATE_DATA_DIR").is_none() {
@@ -4153,7 +4169,7 @@ impl Ui {
                     let text = if mine.is_empty() {
                         SHORTCUTS.to_string()
                     } else {
-                        format!("{SHORTCUTS}\n\nYour own keys (Help → Change keyboard shortcuts…), in place of those above\n{mine}")
+                        format!("{SHORTCUTS}\n\nYour own keys (Settings → Change keyboard shortcuts…), in place of those above\n{mine}")
                     };
                     let mut i = a.add_text_tab(text.as_bytes(), None, Some(Lang::Plain));
                     a.tabs[i].doc.mark_saved();

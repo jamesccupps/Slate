@@ -301,7 +301,7 @@ fn plan(app: &mut App) -> Option<Plan> {
     let mut keep = Vec::new();
     for (i, tab) in app.tabs.iter_mut().enumerate() {
         // (a tab of matching lines isn't kept: it's made again from its file in a moment)
-        if tab.filter.is_some() {
+        if tab.filter.is_some() || tab.results.is_some() {
             continue;
         }
         let marks = tab.restore_marks.clone().unwrap_or_else(|| tab.view.bookmarks.clone());

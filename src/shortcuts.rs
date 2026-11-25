@@ -1,4 +1,4 @@
-//! Keyboard shortcuts the user can change (Help → Change keyboard shortcuts…), shared by both apps: every command's
+//! Keyboard shortcuts the user can change (Settings → Change keyboard shortcuts…), shared by both apps: every command's
 //! name and the keys it has, and the user's file (`shortcuts.txt` in the data folder) read over them.
 //!
 //! The file lists every command, each line commented out with the keys it has (`# duplicate-line = Ctrl+D`); a line
@@ -283,6 +283,9 @@ const ALL: &[Command] = &[
     text(E, "lower", "Ctrl+U"),
     text(E, "title-case", ""),
     text(E, "date-time", "F5"),
+    any(E, "find-in-tabs", ""),
+    any(E, "replace-in-tabs", ""),
+    any(E, "find-in-files", "Ctrl+Shift+F"),
     text(E, "go-back", "Alt+Left"),
     text(E, "go-forward", "Alt+Right"),
     any(E, "overtype", ""),

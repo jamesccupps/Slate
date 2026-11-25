@@ -53,7 +53,7 @@ pub enum Ask {
     Quit,
     About,
     Shortcuts,
-    /// Help → Change keyboard shortcuts…: the user's file opened (made the first time).
+    /// Settings → Change keyboard shortcuts…: the user's file opened (made the first time).
     ChangeShortcuts,
     /// Make Slate the default app for the file types it opens?
     MakeDefault,
@@ -85,10 +85,14 @@ pub enum Cmd {
     OpenSelection,
     /// The text's menu's Open “name”: what's at this place (`links::target_in`).
     OpenAt(u64),
+    /// Edit → Find in all tabs, Replace in all tabs, Find in files (the find bar's search; `core::many`, issue #15).
+    FindInTabs,
+    ReplaceInTabs,
+    FindInFiles,
     /// Edit → Go back / Go forward: where the caret jumped from (`edit::Nav`, issue #11).
     GoBack,
     GoForward,
-    /// File → Reopen files where you left them (`Settings::reopen_where_left`).
+    /// Settings → Reopen files where you left them (`Settings::reopen_where_left`).
     ReopenWhereLeft,
     Open,
     Save,
@@ -150,14 +154,14 @@ pub enum Cmd {
     SetLang(Lang),
     /// Format → Language → Always open .x files as … (the current tab's ending and language; issue #13).
     LangForEnding,
-    /// View → Hide the menu bar (`Settings::hide_menu_bar`, issue #10).
+    /// Settings → Hide the menu bar (`Settings::hide_menu_bar`, issue #10).
     HideMenuBar,
-    /// View → Find bar → At the bottom (`Settings::bars_at_bottom`, issue #9).
+    /// Settings → Find bar → At the bottom (`Settings::bars_at_bottom`, issue #9).
     BarsAtBottom,
     InsertDateTime,
     About,
     Shortcuts,
-    /// Help → Change keyboard shortcuts… (`crate::shortcuts`).
+    /// Settings → Change keyboard shortcuts… (`crate::shortcuts`).
     ChangeShortcuts,
     MakeDefault,
     StopDefault,
@@ -170,9 +174,9 @@ pub enum Cmd {
     ClearHighlights,
     SpellCheck,
     TitleBarTabs,
-    /// View → Close Slate with the last tab (`Settings::close_with_last_tab`).
+    /// Settings → Close Slate with the last tab (`Settings::close_with_last_tab`).
     CloseWithLastTab,
-    /// View → Find bar: Close when you click in the text (`Settings::find_close_on_leave`), One for each tab
+    /// Settings → Find bar: Close when you click in the text (`Settings::find_close_on_leave`), One for each tab
     /// (`Settings::find_per_tab`).
     FindCloseOnLeave,
     FindPerTab,
@@ -216,18 +220,18 @@ pub enum Cmd {
     CloseAll,
     /// The list of all tabs (when they don't fit): show this one.
     ShowTab(usize),
-    /// File → Restore last session.
+    /// Settings → Restore last session.
     ToggleRestoreSession,
     /// File → Open recent → Clear list.
     ClearRecent,
-    /// Help → Open settings folder, Report a problem….
+    /// Settings → Open settings folder, Report a problem….
     OpenDataFolder,
     ReportProblem,
     /// Format → Indentation: spaces (true) or tabs, for this document (picked: not guessed again) and new ones; how
     /// wide a tab shows, and a level of spaces.
     IndentSpaces(bool),
     TabSize(u32),
-    /// View → Font: the size in points (the family is the `font` action's).
+    /// Settings → Font: the size in points (the family is the `font` action's).
     FontSize(u8),
     /// Format → Formatting indent: spaces per level when JSON and XML are formatted.
     JsonIndent(u32),
@@ -350,6 +354,8 @@ pub struct Tab {
     pub canon: Option<PathBuf>,
     /// What the tab is called when it isn't a file's (Keyboard shortcuts).
     pub title_override: Option<String>,
+    /// A tab of results (Find in all tabs, Find in files): where each of its lines goes (Enter, a double-click).
+    pub results: Option<std::sync::Arc<crate::core::many::Results>>,
     /// An unsaved tab's number, as on Windows: "Untitled 2" (1 is plain "Untitled"), the lowest no other unsaved tab
     /// has when it's made.
     pub untitled: u32,
@@ -493,12 +499,12 @@ pub struct App {
     pub focused: bool,
     /// Files of tabs closed lately, for Reopen closed tab.
     pub closed: Vec<PathBuf>,
-    /// The only tab, which the user is closing with View → Close Slate with the last tab on: once it's gone (after
+    /// The only tab, which the user is closing with Settings → Close Slate with the last tab on: once it's gone (after
     /// its question, or its save), Slate quits (`remove_tab`).
     pub quit_with_tab: Option<u64>,
     /// The tab the find bar's state (`find.open`, `find.replace`) is about (`follow_find_bar`).
     pub find_owner: u64,
-    /// The user's keyboard shortcuts (Help → Change keyboard shortcuts…), over Slate's own; changed: the window
+    /// The user's keyboard shortcuts (Settings → Change keyboard shortcuts…), over Slate's own; changed: the window
     /// sets its accelerators again (`set_accels`).
     pub keymap: crate::shortcuts::Keymap,
     pub shortcuts_changed: bool,
@@ -542,6 +548,10 @@ pub struct App {
     pub nav: edit::Nav,
     /// Replace all with this search and replacement instead of the find bar's (a word's spelling changed everywhere).
     pub replace_with: Option<(Matcher, Vec<u8>)>,
+    /// Find in all tabs or in files on another thread, and the title of the tab of results it makes (issue #15).
+    pub many: Option<(Job<Result<crate::core::many::Results, String>>, String)>,
+    /// Replace in all tabs while its tasks run: the tabs, how many are done, the matches replaced, the tabs that had any.
+    pub replacing: Option<(Vec<u64>, usize, u64, u64)>,
     /// The status bar's column (document version, caret, column) and selection size (version, start, end,
     /// characters), counted once for each.
     pub col_cache: std::cell::Cell<Option<(u64, u64, u64)>>,
@@ -618,6 +628,8 @@ impl App {
             menu_word: None,
             nav: Default::default(),
             replace_with: None,
+            many: None,
+            replacing: None,
             col_cache: Default::default(),
             sel_cache: Default::default(),
             field_cache: Default::default(),
@@ -735,6 +747,7 @@ impl App {
             session_version: 0,
             canon: None,
             title_override: None,
+            results: None,
             reload: None,
             read_only: false,
             filter: None,
@@ -799,7 +812,7 @@ impl App {
             doc.path = Some(p.clone());
             let mut tab = self.make_tab(doc);
             tab.opened_from = self.tabs.get(self.active).map(|t| t.id).filter(|_| !reuse);
-            // (where it was left: File → Reopen files where you left them)
+            // (where it was left: Settings → Reopen files where you left them)
             tab.restore_at = self.settings.place_of(p).map(|(caret, top)| (caret, caret, top));
             let notify = self.notify.clone();
             let full = p.clone();
@@ -1040,9 +1053,244 @@ impl App {
         self.dirty_view = true;
     }
 
-    /// Enter or a double-click in a tab of matching lines: the caret's line, in the tab the lines came from.
+    /// Edit → Find in all tabs (issue #15): the lines the find bar's search matches in every tab (not tabs of matching
+    /// lines or of results), listed in a tab of results.
+    fn list_in_tabs(&mut self) {
+        use crate::core::many::{self, Place, Results};
+        let Some(m) = self.search_for_many("Find in all tabs") else { return };
+        let q = self.find.query.text.clone();
+        let srcs: Vec<(u64, String, crate::core::buffer::Snapshot)> = self
+            .tabs
+            .iter_mut()
+            .filter(|t| t.filter.is_none() && t.results.is_none() && !t.loading())
+            .map(|t| {
+                let name = match t.doc.path.as_deref().and_then(|p| p.parent()).filter(|d| !d.as_os_str().is_empty()) {
+                    Some(dir) => format!("{}  —  {}", t.title(), dir.display()),
+                    None => t.title(),
+                };
+                (t.id, name, t.doc.snapshot())
+            })
+            .collect();
+        let n = srcs.len() as u64;
+        let job = Job::spawn(n, self.notify.clone(), move |ctx| {
+            let mut groups = Vec::new();
+            let mut left = many::HITS_MAX;
+            for (id, name, snap) in srcs {
+                if ctx.cancelled() {
+                    return Err("Stopped".to_string());
+                }
+                let (hits, total) = many::lines_with(&m, &snap, left, Some(ctx));
+                left -= hits.len();
+                if total > 0 {
+                    groups.push((name, hits.into_iter().map(|h| (Place::Tab(id, h.line), h.text)).collect(), total));
+                }
+                ctx.progress.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            let lines: u64 = groups.iter().map(|g: &(String, Vec<(Place, String)>, u64)| g.2).sum();
+            let head = format!(
+                "“{q}” in {} of {}: {} (Enter or a double-click goes to one)",
+                groups.len(),
+                edit::plural(n, "tab", "tabs"),
+                edit::plural(lines, "line", "lines")
+            );
+            Ok(Results::build(head, groups))
+        });
+        self.many = Some((job, format!("Found: {}", short_query(&self.find.query.text))));
+        self.flash("Looking in every tab…", false);
+    }
+
+    /// Edit → Find in files (issue #15): the lines the find bar's search matches in the text files in the folder of the
+    /// tab's file and the folders in it (`many::in_files`), listed in a tab of results. On another thread: Esc stops it.
+    fn find_in_files(&mut self) {
+        use crate::core::many::{self, Place, Results};
+        // (a name given relative to where Slate started: in that folder)
+        let root = self.tab().doc.path.as_deref().and_then(|p| p.parent()).map(|d| std::path::absolute(if d.as_os_str().is_empty() { Path::new(".") } else { d }).unwrap_or_else(|_| d.to_path_buf()));
+        let Some(root) = root else {
+            self.flash("Find in files looks in the folder of the tab's file: save this one first, or go to a tab with a file.", false);
+            return;
+        };
+        let Some(m) = self.search_for_many("Find in files") else { return };
+        let q = self.find.query.text.clone();
+        let shown = root.display().to_string();
+        let name = root.file_name().map_or_else(|| shown.clone(), |n| n.to_string_lossy().into_owned());
+        let base = root.clone();
+        let job = Job::spawn(1, self.notify.clone(), move |ctx| {
+            let r = many::in_files(&m, &root, ctx);
+            if ctx.cancelled() {
+                return Err("Find in files stopped".to_string());
+            }
+            let lines: u64 = r.files.iter().map(|f| f.total).sum();
+            let mut head = format!(
+                "“{q}” in {shown}: {} in {} of {} (Enter or a double-click opens one)",
+                edit::plural(lines, "line", "lines"),
+                r.files.len(),
+                edit::plural(r.searched as u64, "file", "files"),
+            );
+            if r.skipped > 0 {
+                head.push_str(&format!("; {} passed over (binary, or over 32 MB)", edit::plural(r.skipped as u64, "file", "files")));
+            }
+            if r.cut {
+                head.push_str("; stopped there: too many to list");
+            }
+            let groups = r
+                .files
+                .into_iter()
+                .map(|f| {
+                    let name = f.path.strip_prefix(&base).unwrap_or(&f.path).display().to_string();
+                    let lines = f.hits.into_iter().map(|h| (Place::File(f.path.clone(), h.line), h.text)).collect();
+                    (name, lines, f.total)
+                })
+                .collect();
+            Ok(Results::build(head, groups))
+        });
+        self.many = Some((job, format!("Found in files: {}", short_query(&self.find.query.text))));
+        self.flash(format!("Looking in the files in {name}… (Esc stops)"), false);
+    }
+
+    /// The find bar's search for `what` (Find in all tabs, …), or None with the find bar opened to type one.
+    fn search_for_many(&mut self, what: &str) -> Option<Matcher> {
+        if self.many.is_some() {
+            self.flash("Still looking (Esc stops it)", true);
+            return None;
+        }
+        match (self.find.matcher.clone(), self.find.error.clone()) {
+            (Some(m), _) => {
+                edit::remember(&mut self.settings.find_history, &self.find.query.text.clone());
+                Some(m)
+            }
+            (None, Some(e)) => {
+                self.flash(e, true);
+                None
+            }
+            (None, None) => {
+                self.exec(Cmd::Find);
+                self.flash(format!("Type what to find, then Edit → {what}"), false);
+                None
+            }
+        }
+    }
+
+    /// Find in all tabs or in files finished: its results in a tab of their own (read only, not kept in the session).
+    fn poll_many(&mut self) -> bool {
+        let Some((job, _)) = self.many.as_mut() else { return false };
+        let Some(r) = job.take() else { return true };
+        let Some((_, title)) = self.many.take() else { return false };
+        match r {
+            Ok(results) => {
+                let mut doc = Document::from_text(results.text.as_bytes());
+                doc.mark_saved();
+                let mut tab = self.make_tab(doc);
+                tab.title_override = Some(title);
+                tab.untitled = 0;
+                tab.read_only = true;
+                tab.lang = Lang::Plain;
+                tab.lang_picked = true;
+                tab.results = Some(std::sync::Arc::new(results));
+                self.tabs.push(tab);
+                self.active = self.tabs.len() - 1;
+                self.dirty_title = true;
+                self.dirty_view = true;
+                self.flash("Enter or a double-click on a line goes there", false);
+            }
+            Err(e) => self.flash(e, false),
+        }
+        false
+    }
+
+    /// Edit → Replace in all tabs (issue #15): the find bar's search replaced with its replacement in every tab that can
+    /// be edited, each as its own Replace all (one undo step in each tab).
+    fn replace_in_tabs(&mut self) {
+        if self.replacing.is_some() {
+            self.flash("Still replacing (Esc stops it in the tab shown)", true);
+            return;
+        }
+        let Some(m) = self.search_for_many("Replace in all tabs") else { return };
+        let typed = self.find.replacement.clone();
+        edit::remember(&mut self.settings.replace_history, &typed);
+        let ids: Vec<u64> = self
+            .tabs
+            .iter()
+            .filter(|t| !t.read_only && t.filter.is_none() && t.results.is_none() && t.task.is_none() && !t.loading() && t.doc.is_ready())
+            .map(|t| t.id)
+            .collect();
+        if ids.is_empty() {
+            self.flash("No tab to replace in", false);
+            return;
+        }
+        self.replacing = Some((ids.clone(), 0, 0, 0));
+        for id in ids {
+            let Some(i) = self.tabs.iter().position(|t| t.id == id) else { continue };
+            let replacement = edit::replacement(&typed, self.find.query.regex, self.tabs[i].doc.eol.as_bytes());
+            self.replace_with = Some((m.clone(), replacement));
+            self.start_task_in(i, TaskKind::ReplaceAll);
+            // (a task that didn't start: done at once)
+            if self.replace_with.take().is_some() || self.tabs[i].task.is_none() {
+                if let Some(b) = self.replacing.as_mut() {
+                    b.1 += 1;
+                }
+            }
+        }
+        self.flash("Replacing in every tab…", false);
+        self.replaced_check();
+    }
+
+    /// One tab's Replace all of Replace in all tabs finished: its text changed (no message of its own).
+    fn replaced_in(&mut self, i: usize, kind: TaskKind, version: u64, r: TaskResult) {
+        let count = match &r {
+            TaskResult::Content { count, .. } => *count,
+            _ => 0,
+        };
+        if count > 0 || !matches!(r, TaskResult::Content { .. }) {
+            self.finish_task(i, kind, version, r);
+        }
+        if let Some(b) = self.replacing.as_mut() {
+            b.1 += 1;
+            b.2 += count;
+            b.3 += (count > 0) as u64;
+        }
+        self.replaced_check();
+    }
+
+    /// Replace in all tabs: once every tab's is done, what it did.
+    fn replaced_check(&mut self) {
+        if let Some((ids, done, count, tabs)) = self.replacing.take() {
+            if done < ids.len() {
+                self.replacing = Some((ids, done, count, tabs));
+                return;
+            }
+            let msg = if count == 0 {
+                "No matches to replace in any tab".to_string()
+            } else {
+                format!("Replaced {} in {}", edit::plural(count, "match", "matches"), edit::plural(tabs, "tab", "tabs"))
+            };
+            self.flash(msg, false);
+        }
+    }
+
+    /// Enter or a double-click in a tab of matching lines: the caret's line, in the tab the lines came from. In a tab of
+    /// results (Find in all tabs, Find in files): that result's tab or file, at its line.
     pub fn go_to_source(&mut self) {
         let tab = self.tab();
+        if let Some(r) = tab.results.clone() {
+            use crate::core::many::Place;
+            let Some(place) = tab.doc.line_of(tab.view.sel.caret).and_then(|l| r.place(l).cloned()) else { return };
+            match place {
+                Place::Tab(id, line) => {
+                    let Some(i) = self.tabs.iter().position(|t| t.id == id) else {
+                        self.flash("That tab is closed.", true);
+                        return;
+                    };
+                    self.active = i;
+                    self.find.found = None;
+                    self.tabs[i].goto = Some((line + 1, 1));
+                    self.goto_now(i);
+                    self.dirty_title = true;
+                }
+                // (`open_paths` takes `name:line`, and goes to the tab that has it if one does)
+                Place::File(p, line) => self.open_paths(&[PathBuf::from(format!("{}:{}", p.display(), line + 1))]),
+            }
+            return;
+        }
         let Some(f) = &tab.filter else { return };
         let Some(line) = tab.doc.line_of(tab.view.sel.caret).and_then(|l| f.map.source(l)) else { return };
         let source = f.source;
@@ -1087,6 +1335,7 @@ impl App {
         }) || self.find_running()
             || self.disk_job.is_some()
             || self.session_job.is_some()
+            || self.many.is_some()
     }
 
     /// The status bar's word count runs (test mode's `jobs:counts` waits for it too).
@@ -1297,6 +1546,7 @@ impl App {
             }
         }
         running |= self.poll_find();
+        running |= self.poll_many();
         running |= self.poll_disk();
         running |= session::poll(self);
         running
@@ -1423,7 +1673,12 @@ impl App {
             match t.job.take() {
                 Some(r) => {
                     let task = self.tabs[i].task.take().unwrap();
-                    self.finish_task(i, task.kind, task.version, r);
+                    let id = self.tabs[i].id;
+                    if task.kind == TaskKind::ReplaceAll && self.replacing.as_ref().is_some_and(|b| b.0.contains(&id)) {
+                        self.replaced_in(i, task.kind, task.version, r);
+                    } else {
+                        self.finish_task(i, task.kind, task.version, r);
+                    }
                 }
                 None => running = true,
             }
@@ -1777,7 +2032,7 @@ impl App {
 
     /// Closes tab `i`: right away when it has nothing unsaved (or the session keeps its text: no, a closed tab's
     /// text isn't kept anywhere, so unsaved changes are asked about).
-    /// Ctrl+W, a tab's ×: `close_tab`; with View → Close Slate with the last tab on, Slate quits once the only tab is
+    /// Ctrl+W, a tab's ×: `close_tab`; with Settings → Close Slate with the last tab on, Slate quits once the only tab is
     /// gone (after its question, or its save).
     pub fn close_tab_by_user(&mut self, i: usize) {
         let last = self.settings.close_with_last_tab && self.tabs.len() == 1;
@@ -1871,7 +2126,7 @@ impl App {
         }
         if self.tabs.is_empty() {
             self.new_untitled();
-            // (the user closed the last tab, and Slate goes with it: View → Close Slate with the last tab)
+            // (the user closed the last tab, and Slate goes with it: Settings → Close Slate with the last tab)
             if self.quit_with_tab.take() == Some(id) && self.settings.close_with_last_tab {
                 self.asks.push(Ask::Quit);
             }
@@ -2052,7 +2307,7 @@ impl App {
         }
     }
 
-    /// Notes where each tab's file was left (File → Reopen files where you left them), as Slate closes.
+    /// Notes where each tab's file was left (Settings → Reopen files where you left them), as Slate closes.
     pub fn remember_places(&mut self) {
         let places: Vec<(PathBuf, u64, u64)> = self
             .tabs
@@ -2600,7 +2855,7 @@ impl App {
                     self.after_edit(true);
                 }
             }
-            Key::Return | Key::KP_Enter if !ctrl && !alt && self.tab().filter.is_some() => self.go_to_source(),
+            Key::Return | Key::KP_Enter if !ctrl && !alt && (self.tab().filter.is_some() || self.tab().results.is_some()) => self.go_to_source(),
             Key::Return | Key::KP_Enter if !ctrl && !alt => {
                 if self.editable() {
                     let unit = self.tabs[self.active].indent.unit();
@@ -2641,6 +2896,9 @@ impl App {
                 } else if let Some(t) = self.tabs[self.active].task.as_ref() {
                     t.job.cancel();
                     self.flash("Cancelling…", false);
+                } else if let Some((job, _)) = &self.many {
+                    // (Find in all tabs or in files: stopped)
+                    job.cancel();
                 } else if !self.tabs[self.active].view.sel.is_empty() {
                     let c = self.tabs[self.active].view.sel.caret;
                     self.tabs[self.active].view.sel = Sel::at(c);
@@ -2743,6 +3001,9 @@ impl App {
             | Cmd::LineEndCarets
             | Cmd::RemoveLastCaret => self.caret_cmd(cmd),
             Cmd::OpenSelection => self.open_selection(None),
+            Cmd::FindInTabs => self.list_in_tabs(),
+            Cmd::ReplaceInTabs => self.replace_in_tabs(),
+            Cmd::FindInFiles => self.find_in_files(),
             Cmd::GoBack => self.go_nav(true),
             Cmd::GoForward => self.go_nav(false),
             Cmd::ReopenWhereLeft => {
@@ -3077,7 +3338,7 @@ impl App {
                 self.settings.hide_menu_bar = !self.settings.hide_menu_bar;
                 self.settings.save();
                 if self.settings.hide_menu_bar {
-                    self.flash("The menu bar shows when you press Alt (View → Hide the menu bar brings it back)", false);
+                    self.flash("The menu bar shows when you press Alt (Settings → Hide the menu bar brings it back)", false);
                 }
             }
             Cmd::LangForEnding => {
@@ -3102,8 +3363,8 @@ impl App {
             Cmd::StopDefault => self.asks.push(Ask::StopDefault),
             Cmd::ToggleReadOnly => {
                 let tab = &mut self.tabs[self.active];
-                if tab.filter.is_some() {
-                    self.flash("A tab of matching lines stays read only.", false);
+                if tab.filter.is_some() || tab.results.is_some() {
+                    self.flash("A tab of matching lines or results stays read only.", false);
                 } else {
                     tab.read_only = !tab.read_only;
                     let on = tab.read_only;
@@ -3404,12 +3665,17 @@ impl App {
     }
 
     fn start_task(&mut self, kind: TaskKind) {
+        self.start_task_in(self.active, kind);
+    }
+
+    /// `start_task` in tab `i` (Replace in all tabs: another than the one shown, its editing checked before).
+    fn start_task_in(&mut self, i: usize, kind: TaskKind) {
         let notify = self.notify.clone();
         let changes = !matches!(
             kind,
             TaskKind::Json(json::Mode::Validate) | TaskKind::Xml(json::Mode::Validate) | TaskKind::Filter(_) | TaskKind::CsvCheck(_) | TaskKind::Hash { .. }
         );
-        if changes && !self.editable() {
+        if changes && i == self.active && !self.editable() {
             return;
         }
         let indent = vec![b' '; self.settings.json_indent as usize];
@@ -3441,8 +3707,8 @@ impl App {
             },
             _ => None,
         };
-        let mut replacement = edit::replacement(&self.find.replacement, self.find.query.regex, self.tab().doc.eol.as_bytes());
-        let mut scope = self.tab().view.scope;
+        let mut replacement = edit::replacement(&self.find.replacement, self.find.query.regex, self.tabs[i].doc.eol.as_bytes());
+        let mut scope = self.tabs[i].view.scope;
         match self.replace_with.take().filter(|_| kind == TaskKind::ReplaceAll) {
             Some((_, r)) => (replacement, scope) = (r, None),
             None if kind == TaskKind::ReplaceAll => {
@@ -3452,7 +3718,7 @@ impl App {
             }
             None => {}
         }
-        let tab = &mut self.tabs[self.active];
+        let tab = &mut self.tabs[i];
         if tab.task.is_some() {
             self.flash("Still working on the previous task (Esc cancels it).", true);
             return;
@@ -4333,7 +4599,7 @@ pub fn report_url() -> String {
     let body = format!(
         "**What happened?**\n\n\n**What did you expect?**\n\n\n**How to make it happen, if you know:**\n1. \n\n---\n\
          Slate {} on {system} ({})\n\n\
-         If Slate crashed: crash.log in Slate's settings folder (Help → Open settings folder) helps find out why. It \
+         If Slate crashed: crash.log in Slate's settings folder (Settings → Open settings folder) helps find out why. It \
          can contain bits of the text you had open, so attach it only if that's all right.",
         env!("CARGO_PKG_VERSION"),
         std::env::consts::ARCH
@@ -4350,6 +4616,11 @@ pub fn detect(path: Option<&Path>, doc: &Document) -> Lang {
 
 pub fn default_indent(s: &Settings) -> Indent {
     if s.use_spaces { Indent::Spaces(s.tab_size) } else { Indent::Tabs }
+}
+
+/// A search as a tab's title shows it: 30 characters at most.
+fn short_query(q: &str) -> String {
+    if q.chars().count() > 30 { q.chars().take(29).collect::<String>() + "…" } else { q.to_string() }
 }
 
 /// `notes.txt:120:5` from a command line: the file without the suffix, and the line and column (1 when there's

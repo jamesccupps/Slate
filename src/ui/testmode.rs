@@ -161,6 +161,7 @@ fn busy(cell: &Cell) -> bool {
         || a.count_job.is_some()
         || matches!(a.update, super::app::UpdateState::Checking { .. } | super::app::UpdateState::Downloading { .. })
         || a.session_job.is_some()
+        || a.many.is_some()
 }
 
 fn vk_of(name: &str) -> Option<u16> {
@@ -225,6 +226,9 @@ fn cmd_of(name: &str) -> Option<Cmd> {
         "ToggleSpellCheck" => Cmd::ToggleSpellCheck,
         "OpenSelection" => Cmd::OpenSelection,
         "GoBack" => Cmd::GoBack,
+        "FindInTabs" => Cmd::FindInTabs,
+        "ReplaceInTabs" => Cmd::ReplaceInTabs,
+        "FindInFiles" => Cmd::FindInFiles,
         "ToggleBarsAtBottom" => Cmd::ToggleBarsAtBottom,
         "ToggleHideMenuBar" => Cmd::ToggleHideMenuBar,
         "ToggleReopenWhereLeft" => Cmd::ToggleReopenWhereLeft,

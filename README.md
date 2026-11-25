@@ -23,7 +23,7 @@ JSON file opens instantly, scrolls smoothly, and can be searched, edited, format
 - Find and replace with match case, whole word and regular expressions; fast on huge files (on several cores).
   Find in selection (Alt+S), Find next and previous through all open tabs (Alt+A), searches kept highlighted in
   every tab, each in a color of its own (Alt+H), the last searches and replacements with Up and Down, and `\n` /
-  `\t` in a regular expression's replacement for a line break or a tab. *View → Find bar* can close the bar
+  `\t` in a regular expression's replacement for a line break or a tab. *Settings → Find bar* can close the bar
   when you click back in the text, or give each tab its own.
 - Column selection (Alt+drag, Shift+Alt+arrows: type, paste and delete on every line) and dragging selected text
   to another place (with Ctrl, a copy). Multiple cursors when you turn them on (*Edit → Multiple cursors*):
@@ -73,17 +73,17 @@ JSON file opens instantly, scrolls smoothly, and can be searched, edited, format
 - Go to line, word wrap, line numbers, show whitespace, the matching bracket highlighted (Ctrl+M goes to it,
   Ctrl+Shift+M selects inside the brackets), overtype, zoom, dark and light themes (follows Windows, or switch with the sun/moon button).
   With Windows' high contrast on, Slate uses its colors, and Magnifier follows the text cursor.
-- Tabs in the title bar, as in Windows 11's Notepad (*View → Tabs in the title bar* puts them back under it).
+- Tabs in the title bar, as in Windows 11's Notepad (*Settings → Tabs in the title bar* puts them back under it).
   Reopen closed tabs (Ctrl+Shift+T), close the other, the saved or all tabs, and a list of all tabs when they don't
-  fit; *View → Close Slate with the last tab* makes closing the only tab close Slate. The files opened last are on the taskbar button's menu (on Linux, in the desktop's recent files). The status
+  fit; *Settings → Close Slate with the last tab* makes closing the only tab close Slate. The files opened last are on the taskbar button's menu (on Linux, in the desktop's recent files). The status
   bar counts words and characters, and shows the language, line endings, encoding and indentation: click one to
   change it.
 - Detects and keeps the encoding (UTF-8, UTF-8 with BOM, UTF-16, ANSI) and line endings (CRLF / LF). Saving as ANSI
   asks first if some characters would turn into "?".
 - Notices when another program changes an open file; reloads it automatically when you have no unsaved changes
   (handy for log files).
-- A single small `Slate.exe` that runs from any folder. *Help → Open files with Slate…* adds it to "Open with",
-  the Start menu and the right-click menu; *Help → Stop opening files with Slate…* takes that back. Scripts that
+- A single small `Slate.exe` that runs from any folder. *Settings → Open files with Slate…* adds it to "Open with",
+  the Start menu and the right-click menu; *Settings → Stop opening files with Slate…* takes that back. Scripts that
   Windows runs when they're double-clicked (`.bat`, `.cmd`, `.vbs`, `.js`, `.reg`, `.py`…) are left alone: open
   them with *Edit with Slate* on the right-click menu.
 - Keeps itself up to date: at most once a day it asks GitHub for the latest release, and when there's a newer one
@@ -126,7 +126,7 @@ The usual ones work as in Notepad (Ctrl+N, O, S, F, H, G, Z, Y, A, X, C, V), plu
 | Insert | Overtype on / off |
 | F5 | Insert the time and date |
 
-*Help → Keyboard shortcuts* lists them all. On Linux, Alt+1 … Alt+9 go to a tab too. *Help → Change keyboard
+*Help → Keyboard shortcuts* lists them all. On Linux, Alt+1 … Alt+9 go to a tab too. *Settings → Change keyboard
 shortcuts…* opens a short file listing every command with its keys: take the `#` off a line, write other keys
 (`duplicate-line = Ctrl+Shift+D`, or nothing for none) and save, and Slate uses them at once, in its menus too.
 
@@ -134,7 +134,7 @@ shortcuts…* opens a short file listing every command with its keys: take the `
 
 Get `Slate.exe` from the [latest release](https://github.com/jamesccupps/Slate/releases/latest) and run it from
 any folder. It needs 64-bit Windows 10 or 11. `Slate.exe --install` sets it up for your account without asking
-anything (what *Help → Open files with Slate…* does, for scripts and package managers).
+anything (what *Settings → Open files with Slate…* does, for scripts and package managers).
 
 `Slate.exe` is code-signed (publisher: James Cupps, through Microsoft's Artifact Signing) since 0.8.0. While the
 certificate is new, Windows' SmartScreen may still show "Windows protected your PC" the first time; choose *More
@@ -177,7 +177,7 @@ sudo apt update && sudo apt install slate
 ![Slate on Linux (GTK 4): a Python file, light theme](docs/images/slate-linux.png)
 
 Slate is then in the menu (Accessories), opens files from the file manager, and `slate notes.txt` opens a file from
-a terminal; **Help → Open files with Slate…** makes it the app that opens text, Markdown, CSV, JSON, XML, YAML, log
+a terminal; **Settings → Open files with Slate…** makes it the app that opens text, Markdown, CSV, JSON, XML, YAML, log
 and code files when they're double-clicked. The package also adds Slate's own apt repository (signed; `/etc/apt/sources.list.d/slate.list`), so
 `sudo apt upgrade` keeps Slate up to date along with the rest of the system; removing Slate removes that too. The
 [latest release](https://github.com/jamesccupps/Slate/releases/latest) also has the packages to download yourself
@@ -195,8 +195,8 @@ as they change. Not on Linux yet:
 ## Where Slate keeps things
 
 - Settings, the session (open tabs and unsaved text) and `crash.log` are in `%LOCALAPPDATA%\Slate Text Editor`
-  (*Help → Open settings folder*; on Linux `~/.local/share/slate`; Slate 0.15 and older kept them in
-  `%LOCALAPPDATA%\Slate`, and moves them by itself). *File → Restore last session* turns the session off: closing
+  (*Settings → Open settings folder*; on Linux `~/.local/share/slate`; Slate 0.15 and older kept them in
+  `%LOCALAPPDATA%\Slate`, and moves them by itself). *Settings → Restore last session* turns the session off: closing
   then asks about unsaved changes, like Notepad used to.
 - **Portable mode:** put an empty file named `Slate.portable` next to `Slate.exe`, and Slate keeps all of that, and
   its temporary files, in a `data` folder beside it instead (handy on a USB stick or a fast drive).
@@ -205,14 +205,14 @@ as they change. Not on Linux yet:
 ## Updates and privacy
 
 The update check is one request to `api.github.com` for the latest release of this repository; it sends nothing
-about you or your files. Turn it off with *Help → Check for updates automatically*. Slate doesn't send anything
+about you or your files. Turn it off with *Settings → Check for updates automatically*. Slate doesn't send anything
 else anywhere. If it crashes, it writes `crash.log` (and on Windows a small crash dump) in its settings folder, and
 only there; *Help → Report a problem…* opens a GitHub issue form with the version filled in, which you can
 edit and send yourself, attaching those files if you like.
 
 ## Uninstalling
 
-To keep Slate but stop it opening files when they're double-clicked: *Help → Stop opening files with Slate…*; the
+To keep Slate but stop it opening files when they're double-clicked: *Settings → Stop opening files with Slate…*; the
 file types you set to open with Slate go back to Windows' own choice. To remove it: if you used *Open files with
 Slate…* (or winget), Windows Settings → Apps → Installed apps → Slate → Uninstall removes it. With Scoop:
 `scoop uninstall slate`. Otherwise just delete `Slate.exe`. Your settings and unsaved text stay in `%LOCALAPPDATA%\Slate Text Editor` (or the portable `data` folder): delete

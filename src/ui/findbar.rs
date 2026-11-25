@@ -61,7 +61,7 @@ pub enum Part {
 
 pub struct FindBar {
     pub open: bool,
-    /// Above the status bar (View → Find bar → At the bottom): its border is along its top.
+    /// Above the status bar (Settings → Find bar → At the bottom): its border is along its top.
     pub at_bottom: bool,
     pub mode: Mode,
     pub find_edit: HWND,

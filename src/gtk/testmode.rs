@@ -657,7 +657,7 @@ fn value(what: &str, test: &Test) -> String {
             ui.find_box.is_visible()
         ),
         "menubar" => ui.menu_row.is_visible().to_string(),
-        // the window's rows from the top, of those that move (View → Find bar → At the bottom)
+        // the window's rows from the top, of those that move (Settings → Find bar → At the bottom)
         "bars" => {
             let mut names = Vec::new();
             let mut w = ui.find_box.parent().and_then(|p| p.first_child());

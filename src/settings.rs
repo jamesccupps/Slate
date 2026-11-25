@@ -48,22 +48,22 @@ pub struct Settings {
     pub line_numbers: bool,
     /// Dots for spaces, arrows for tabs, marks for line breaks.
     pub show_whitespace: bool,
-    /// View → Hide the menu bar (issue #10): it shows while Alt (or F10) gives it the keyboard, or a menu is open.
+    /// Settings → Hide the menu bar (issue #10): it shows while Alt (or F10) gives it the keyboard, or a menu is open.
     pub hide_menu_bar: bool,
     /// Words spelled wrong underlined (`crate::spell`).
     pub spell_check: bool,
     /// Windows: the tabs in the title bar, as in Windows 11's Notepad (Windows' own title bar in high contrast).
     pub tabs_in_title_bar: bool,
-    /// View → Close Slate with the last tab: closing the only tab (Ctrl+W, its ×) closes Slate too; off, an empty tab
+    /// Settings → Close Slate with the last tab: closing the only tab (Ctrl+W, its ×) closes Slate too; off, an empty tab
     /// stays, as in Notepad.
     pub close_with_last_tab: bool,
-    /// View → Find bar → Close when you click in the text: the keyboard leaving the find bar (or Go to's) for the
+    /// Settings → Find bar → Close when you click in the text: the keyboard leaving the find bar (or Go to's) for the
     /// text closes it (issue #6). Off: it stays open until Esc.
     pub find_close_on_leave: bool,
-    /// View → Find bar → One for each tab: each tab keeps its find bar open or closed, a new one's closed; the
+    /// Settings → Find bar → One for each tab: each tab keeps its find bar open or closed, a new one's closed; the
     /// search itself is shared. Off: one bar for the window, open whichever tab shows.
     pub find_per_tab: bool,
-    /// View → Find bar → At the bottom (issue #9): the find bar and a tab's notice sit above the status bar, so opening
+    /// Settings → Find bar → At the bottom (issue #9): the find bar and a tab's notice sit above the status bar, so opening
     /// them doesn't move the text.
     pub bars_at_bottom: bool,
     /// Edit → Multiple cursors → Use multiple cursors: Ctrl+click and the Multiple cursors commands make more than one
@@ -74,7 +74,7 @@ pub struct Settings {
     pub use_spaces: bool,
     pub json_indent: u32,
     pub restore_session: bool,
-    /// File → Reopen files where you left them: a file opened again starts where its caret and scroll were when its
+    /// Settings → Reopen files where you left them: a file opened again starts where its caret and scroll were when its
     /// tab closed (`places`, issue #11).
     pub reopen_where_left: bool,
     /// Those places, newest first (`PLACES_MAX`).
