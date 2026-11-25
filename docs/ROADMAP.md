@@ -230,19 +230,19 @@ match inside CRLF, moving mixed line endings, EditorConfig for new files, no spe
 mode never opening Windows' Open dialog or Explorer). Details in the
 [0.19.2 release notes](release-notes-0.19.2.md). What the review found that 0.19.2 didn't take is *Next*, item 4.
 
-## 0.20.0 (beta, branch `beta-0.20`, being reviewed)
+## 0.20.0
 
 The nine things a user asked for after 0.19.2 (issues #7 to #15), on both platforms: Find in all tabs, Find in
 files and Replace in all tabs (#15); Go back / forward and files reopening where you left them (#11); F7 and Change
 every … to (#12); Open selected file or link (#7); your own file endings (#13); Interface text size (#8); Hide the
 menu bar (#10); the find bar at the bottom (#9); a Settings menu (#14). Details in the
 [0.20.0 release notes](release-notes-0.20.0.md). Not done from those issues: a command palette (*Later*), a list
-to pick a place to go back to, hiding the status bar (its messages need a place). The beta's review
-(2026-11-25, another chat) found no slowdown against 0.19.3 on either platform; its findings (a Linux reopened
+to pick a place to go back to, hiding the status bar (its messages need a place). Reviewed as a beta
+twice (2026-11-25, another chat): no slowdown against 0.19.3 on either platform; its findings (a Linux reopened
 place inside a character, Replace in all tabs' replacement and bookkeeping, Esc and the status for Find in files,
 binary files read whole, Change every in code and links, F7's time, the interface size's reach, Linux's Open selected
-making new files, Alt after Alt+drag, and the smaller ones) are fixed in the beta, with the Linux menu bar's endless
-switching (in 0.19 too) found in the VM. Windows' Edit menu items for the new commands have no access letters: every
+making new files, Alt after Alt+drag, and the smaller ones) are fixed, with the Linux menu bar's endless switching (in
+0.19 too) found in the VM; the second round's nine small ones too (F7 now goes round the text in parts). Windows' Edit menu items for the new commands have no access letters: every
 letter in their words is another item's.
 
 ## 0.19.3
